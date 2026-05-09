@@ -1,0 +1,222 @@
+/**
+ * Vitest mock for the `vscode` module.
+ *
+ * The `vscode` module is a virtual module provided by VS Code's extension host
+ * at runtime — it does NOT exist as an installable npm package. Vitest (running
+ * in node) cannot resolve `import * as vscode from 'vscode'` without this mock.
+ *
+ * This mock provides only the minimal surface area needed by the unit tests.
+ * It is NOT a full VS Code API polyfill.
+ */
+
+// ---------------------------------------------------------------------------
+// Enums / Constants
+// ---------------------------------------------------------------------------
+
+export enum ChatResultFeedbackKind {
+    Helpful = 1,
+    Unhelpful = 2,
+}
+
+// ---------------------------------------------------------------------------
+// Classes
+// ---------------------------------------------------------------------------
+
+export class ThemeIcon {
+    constructor(
+        public id: string,
+        public color?: ThemeColor,
+    ) {}
+}
+
+export class ThemeColor {
+    constructor(public id: string) {}
+}
+
+export class OutputChannel {
+    public readonly lines: string[] = [];
+
+    constructor(public readonly name: string) {}
+
+    appendLine(message: string): void {
+        this.lines.push(message);
+    }
+
+    append(_message: string): void {
+        // no-op for tests
+    }
+
+    clear(): void {
+        this.lines.length = 0;
+    }
+
+    show(_preserveFocus?: boolean): void {
+        // no-op for tests
+    }
+
+    hide(): void {
+        // no-op for tests
+    }
+
+    dispose(): void {
+        this.lines.length = 0;
+    }
+}
+
+export class ChatParticipant {
+    public iconPath: ThemeIcon | { light: ThemeIcon; dark: ThemeIcon } | undefined;
+    private _feedbackListeners: Array<(e: ChatResultFeedback) => unknown> = [];
+
+    constructor(
+        public readonly id: string,
+        public readonly handler: ChatRequestHandler,
+    ) {}
+
+    onDidReceiveFeedback(
+        listener: (e: ChatResultFeedback) => unknown,
+    ): { dispose(): void } {
+        this._feedbackListeners.push(listener);
+        return { dispose: () => { /* no-op */ } };
+    }
+
+    dispose(): void {
+        this._feedbackListeners = [];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interfaces (minimal shape for unit tests)
+// ---------------------------------------------------------------------------
+
+/** Promise-like interface (from VS Code API) */
+export interface Thenable<T> {
+    then<TResult1 = T, TResult2 = never>(
+        onfulfilled?: ((value: T) => TResult1 | Thenable<TResult1>) | null,
+        onrejected?: ((reason: unknown) => TResult2 | Thenable<TResult2>) | null,
+    ): Thenable<TResult1 | TResult2>;
+}
+
+export interface ExtensionContext {
+    subscriptions: Array<{ dispose(): void }>;
+    extensionPath: string;
+    extensionUri: Uri;
+    globalState: Memento;
+    workspaceState: Memento;
+    storageUri: Uri | undefined;
+    globalStorageUri: Uri;
+    logUri: Uri;
+}
+
+export interface Uri {
+    scheme: string;
+    authority: string;
+    path: string;
+    fsPath: string;
+    query: string;
+    fragment: string;
+    with(change: { scheme?: string; authority?: string; path?: string; query?: string; fragment?: string }): Uri;
+}
+
+export interface Memento {
+    get<T>(key: string): T | undefined;
+    get<T>(key: string, defaultValue: T): T;
+    update(key: string, value: unknown): Thenable<void>;
+}
+
+export type ChatRequestHandler = (
+    request: ChatRequest,
+    context: ChatContext,
+    stream: ChatResponseStream,
+    token: CancellationToken,
+) => Promise<ChatResult>;
+
+export interface ChatRequest {
+    prompt: string;
+    command: string | undefined;
+    references: Array<unknown>;
+    toolReferences?: unknown[];
+    toolInvocationToken?: string;
+    model?: unknown;
+}
+
+export interface ChatContext {
+    history: Array<unknown>;
+}
+
+/**
+ * Mock for proposed API: ChatToolInvocationPart
+ * This is NOT in @types/vscode — available at runtime with chatParticipantAdditions.
+ */
+export class ChatToolInvocationPart {
+    toolName: string;
+    toolCallId: string;
+    isError?: boolean;
+    invocationMessage?: string;
+    originMessage?: string;
+    pastTenseMessage?: string;
+    isConfirmed?: boolean;
+    isComplete?: boolean;
+    toolSpecificData?: any;
+    subAgentInvocationId?: string;
+    presentation?: 'hidden' | 'hiddenAfterComplete';
+    enablePartialUpdate?: boolean;
+
+    constructor(toolName: string, toolCallId: string, errorMessage?: string) {
+        this.toolName = toolName;
+        this.toolCallId = toolCallId;
+        this.isError = !!errorMessage;
+    }
+}
+
+export interface ChatResponseStream {
+    markdown(value: string): void;
+    progress(value: string): void;
+    push(part: unknown): void;
+    anchor?(value: unknown, title?: string): void;
+    button?(command: unknown): void;
+    filetree?(value: unknown, baseUri?: unknown): void;
+    reference?(value: unknown, iconPath?: unknown): void;
+    /** Proposed API: stream thinking tokens */
+    thinkingProgress?(delta: unknown): void;
+    /** Proposed API: begin streaming tool invocation */
+    beginToolInvocation?(toolCallId: string, toolName: string, streamData?: unknown): void;
+    /** Proposed API: update streaming tool invocation */
+    updateToolInvocation?(toolCallId: string, streamData: unknown): void;
+}
+
+export interface CancellationToken {
+    isCancellationRequested: boolean;
+    onCancellationRequested: (listener: () => unknown) => { dispose(): void };
+}
+
+export interface ChatResult {
+    metadata: Record<string, unknown>;
+}
+
+export interface ChatResultFeedback {
+    readonly kind: ChatResultFeedbackKind;
+    readonly result: ChatResult;
+}
+
+// ---------------------------------------------------------------------------
+// Namespaces
+// ---------------------------------------------------------------------------
+
+export const window = {
+    createOutputChannel(name: string): OutputChannel {
+        return new OutputChannel(name);
+    },
+};
+
+export const chat = {
+    createChatParticipant(
+        id: string,
+        handler: ChatRequestHandler,
+    ): ChatParticipant {
+        return new ChatParticipant(id, handler);
+    },
+};
+
+export const workspace = {
+    workspaceFolders: undefined as Array<{ uri: Uri; name: string; index: number }> | undefined,
+};

@@ -1,0 +1,61 @@
+{
+  "name": "opencode-copilot",
+  "displayName": "OpenCode Copilot",
+  "version": "0.1.0",
+  "description": "AI coding assistant powered by OpenCode",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "enabledApiProposals": [
+    "chatParticipantAdditions"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "opencode-copilot.opencode",
+        "fullName": "OpenCode",
+        "name": "opencode",
+        "description": "AI coding assistant powered by OpenCode",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "new",
+            "description": "Start a new conversation session"
+          },
+          {
+            "name": "help",
+            "description": "Show available commands"
+          },
+          {
+            "name": "model",
+            "description": "Show or change the current model"
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
+    "watch": "npm run compile -- --sourcemap --watch",
+    "lint": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.40",
+    "@types/vscode": "^1.118.0",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.5"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.14.41"
+  }
+}
