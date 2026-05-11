@@ -42,6 +42,7 @@ describe('routeCommand', () => {
       client: null,
       activeSessionId: null,
       serverStatus: 'stopped',
+      turnMap: [],
       outputChannel: {
         name: 'test',
         lines: [] as string[],

@@ -137,10 +137,27 @@ export interface ChatRequest {
     toolReferences?: unknown[];
     toolInvocationToken?: string;
     model?: unknown;
+    /** Proposed API (chatParticipantPrivate): unique per chat panel */
+    sessionId: string;
 }
 
 export interface ChatContext {
-    history: Array<unknown>;
+    history: Array<ChatRequestTurn | ChatResponseTurn>;
+}
+
+/** Mock for vscode.ChatRequestTurn */
+export class ChatRequestTurn {
+    constructor(
+        public readonly prompt: string,
+        public readonly command: string | undefined = undefined,
+    ) {}
+}
+
+/** Mock for vscode.ChatResponseTurn */
+export class ChatResponseTurn {
+    constructor(
+        public readonly result: { metadata?: Record<string, unknown> } = { metadata: {} },
+    ) {}
 }
 
 /**
