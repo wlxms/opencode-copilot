@@ -6,9 +6,8 @@
     "lib": ["ES2022"],
     "outDir": "out",
     "rootDir": "src",
-    "baseUrl": ".",
     "paths": {
-      "vscode": ["src/test/vscode-mock.ts"]
+      "vscode": ["./src/test/vscode-mock.ts"]
     },
     "types": ["node"],
     "strict": true,

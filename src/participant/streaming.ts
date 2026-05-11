@@ -114,10 +114,16 @@ export class StreamBridge {
   private toolMetas: Map<string, ToolMeta> = new Map();
   private hasThinking: boolean = false;
   private hasToolUI: boolean = false;
+  private _idleReceived: boolean = false;
 
   /** Get the OpenCode message ID of the user message in this turn, if captured */
   getUserMessageId(): string | null {
     return this.userMessageId;
+  }
+
+  /** Whether session.idle was received via SSE (server finished processing) */
+  wasIdleReceived(): boolean {
+    return this._idleReceived;
   }
 
   async bridgeEventsToStream(
@@ -156,6 +162,7 @@ export class StreamBridge {
         this.handlePartDelta(evt, stream);
         return false;
       case 'session.idle':
+        this._idleReceived = true;
         return true;
     }
     return false;

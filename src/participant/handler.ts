@@ -1,5 +1,4 @@
 import * as vscode from 'vscode';
-import { StreamBridge } from './streaming';
 import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
 import type { ExtensionState, TurnMapping } from '../types';
@@ -33,9 +32,7 @@ export async function ensureServer(
 
   try {
     stream.progress('🔄 Starting OpenCode...');
-    // Use the current VSCode workspace directory as the server CWD
-    const workspacePath = getWorkspaceDirectory();
-    const url = await state.serverManager.start(workspacePath);
+    const url = await state.serverManager.start();
     state.serverStatus = 'running';
     state.client = state.serverManager.getClient();
     if (!state.client) {
@@ -114,7 +111,8 @@ async function resolveSession(
   // --- No mapping: new VSCode chat → create fresh OpenCode session ---
   if (!chatState) {
     const result = await client.session.create({
-      directory,
+      body: {},
+      query: directory ? { directory } : undefined,
     });
     const sessionId = result.data?.id ?? result.id;
     state.activeSessionId = sessionId;
@@ -159,9 +157,9 @@ async function resolveSession(
         const entry = fullMap[i];
         if (entry?.opencodeMessageId) {
           await client.session.revert({
-            sessionID: chatState.opencodeSessionId,
-            messageID: entry.opencodeMessageId,
-            directory,
+            path: { id: chatState.opencodeSessionId },
+            body: { messageID: entry.opencodeMessageId },
+            query: directory ? { directory } : undefined,
           });
           reverted++;
           state.outputChannel.appendLine(
@@ -184,7 +182,8 @@ async function resolveSession(
         `[handler] Revert failed (${msg}), creating new session`,
       );
       const result = await client.session.create({
-        directory,
+        body: {},
+        query: directory ? { directory } : undefined,
       });
       const sessionId = result.data?.id ?? result.id;
       chatState.opencodeSessionId = sessionId;
@@ -219,10 +218,9 @@ async function resolveSession(
  *  3. Check for empty prompt
  *  4. Start OpenCode server if not running
  *  5. Resolve or fork session (handles VSCode rewind)
- *  6. Subscribe to SSE events
- *  7. Send the user prompt
- *  8. Bridge events to VSCode chat stream
- *  9. Record user message ID in turn map
+ *  6. Send prompt via POST /session/{id}/message (synchronous)
+ *  7. Render response parts directly to VSCode stream
+ *  8. Record user message ID in turn map
  */
 export function createParticipantHandler(
   state: ExtensionState,
@@ -263,35 +261,63 @@ export function createParticipantHandler(
       const sessionId = await resolveSession(client, state, context, stream, vscodeSessionId, directory);
       if (!sessionId) return { metadata: {} };
 
-      // 6. Subscribe to events BEFORE sending prompt
-      const events = await client.event.subscribe();
-
-      // 7. Fire the prompt WITHOUT awaiting — events stream concurrently.
+      // 6. Send the prompt and wait for the full response.
+      //    prompt() POST /session/{id}/message is synchronous — it waits
+      //    for the server to finish processing and returns the full result
+      //    with data.parts containing all response parts (text, reasoning, tool, etc.).
+      //    Server-Sent Events (SSE) via /event only deliver server-level events
+      //    (server.connected) — session processing events DO NOT flow through SSE.
       state.outputChannel.appendLine(
         `[handler] Prompting session ${sessionId} with: ${request.prompt.substring(0, 50)}`,
       );
-      // Use v2 flat format so buildClientParams correctly maps parameters
-      const promptPromise = client.session
-        .prompt({
-          sessionID: sessionId,
-          parts: [{ type: 'text', text: request.prompt }],
-          directory,
-        })
-        .catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : 'Prompt failed';
-          state.outputChannel.appendLine(`[handler] Prompt error: ${msg}`);
-        });
 
-      // 8. Bridge events to VSCode chat stream
-      const bridge = new StreamBridge();
-      await bridge.bridgeEventsToStream(events, stream, token);
+      const result = await client.session.prompt({
+        path: { id: sessionId },
+        body: { parts: [{ type: 'text', text: request.prompt }] },
+        query: directory ? { directory } : undefined,
+      });
 
-      // 9. Ensure prompt promise settles before returning
-      await promptPromise;
+      state.outputChannel.appendLine(
+        `[handler] Prompt completed: parts=${result?.data?.parts?.length ?? 0}`,
+      );
 
-      // 10. Record the user message ID for per-chat turn tracking
+      // 7. Render the response parts directly to the VSCode chat stream.
+      //    No SSE subscription needed — the full response is in result.data.parts.
+      const parts: Array<{ type: string; text?: string; messageID?: string; id?: string; [key: string]: any }> = result?.data?.parts ?? [];
+      let userMessageId: string | null = null;
+
+      for (const part of parts) {
+        if (token.isCancellationRequested) break;
+
+        // Capture the first messageID as userMessageId for turn tracking
+        if (!userMessageId && part.messageID) {
+          userMessageId = part.messageID;
+        }
+
+        switch (part.type) {
+          case 'text': {
+            // Render AI text response
+            if (part.text) {
+              stream.markdown(part.text);
+            }
+            break;
+          }
+          case 'reasoning': {
+            // Show thinking progress (proposed API)
+            const s = stream as any;
+            if (typeof s.thinkingProgress === 'function' && part.text) {
+              s.thinkingProgress({ text: part.text, id: part.id });
+            }
+            break;
+          }
+          // tool, step-start, step-finish — skipped for now
+        }
+      }
+
+      // 8. Record the user message ID for per-chat turn tracking.
+      //    userMessageId is the text part's messageID from the server response,
+      //    representing the AI-generated message that corresponds to this turn.
       const chatState = state.sessionMap.get(vscodeSessionId);
-      const userMessageId = bridge.getUserMessageId();
       if (chatState && userMessageId) {
         chatState.turnMap.push({
           vscodeTurn: chatState.turnMap.length,
@@ -302,7 +328,7 @@ export function createParticipantHandler(
         );
       }
 
-      // 11. Return metadata for future turn recovery
+      // 9. Return metadata for future turn recovery
       return {
         metadata: {
           sessionId,

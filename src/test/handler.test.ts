@@ -156,9 +156,15 @@ describe('createParticipantHandler', () => {
     const handler = createParticipantHandler(state);
     mockServerManager.start.mockResolvedValue('http://127.0.0.1:51777');
     mockServerManager.getClient.mockReturnValue(mockSdkClient);
-    mockSdkClient.session.create.mockResolvedValue({ id: 'session-1' });
-    mockSdkClient.event.subscribe.mockResolvedValue({ stream: emptyEventStream() });
-    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+    mockSdkClient.session.create.mockResolvedValue({ data: { id: 'session-1' } });
+    mockSdkClient.session.prompt.mockResolvedValue({
+      data: {
+        info: { role: 'assistant', tokens: { total: 100 } },
+        parts: [{ type: 'step-start', id: 'p0', messageID: 'msg-1' },
+                { type: 'text', id: 'p1', messageID: 'msg-2', text: 'Hello!' },
+                { type: 'step-finish', id: 'p2', messageID: 'msg-1' }],
+      },
+    });
 
     const result = await handler(
       { prompt: 'write a test', command: undefined, references: [], sessionId: 'chat-new' },
@@ -168,16 +174,23 @@ describe('createParticipantHandler', () => {
     expect(mockServerManager.start).toHaveBeenCalledOnce();
     expect(state.serverStatus).toBe('running');
     expect(state.client).toBe(mockSdkClient);
-    expect(mockSdkClient.session.create).toHaveBeenCalledWith({ directory: '/test/workspace' });
+    expect(mockSdkClient.session.create).toHaveBeenCalledWith({
+      body: {},
+      query: { directory: '/test/workspace' },
+    });
     expect(state.activeSessionId).toBe('session-1');
     expect(state.sessionMap.get('chat-new')?.opencodeSessionId).toBe('session-1');
-    expect(state.sessionMap.get('chat-new')?.turnMap).toEqual([]);
-    expect(mockSdkClient.event.subscribe).toHaveBeenCalledOnce();
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      sessionID: 'session-1',
-      parts: [{ type: 'text', text: 'write a test' }],
-      directory: '/test/workspace',
+      path: { id: 'session-1' },
+      body: { parts: [{ type: 'text', text: 'write a test' }] },
+      query: { directory: '/test/workspace' },
     });
+    // Response parts should be rendered to stream
+    expect(stream.markdown).toHaveBeenCalledWith('Hello!');
+    // Turn map recorded from the first part's messageID
+    expect(state.sessionMap.get('chat-new')?.turnMap).toEqual([
+      { vscodeTurn: 0, opencodeMessageId: 'msg-1' },
+    ]);
     expect(result.metadata).toHaveProperty('sessionId', 'session-1');
   });
 
@@ -192,8 +205,12 @@ describe('createParticipantHandler', () => {
     state.sessionMap.set('chat-multi', sessionState('existing-session'));
 
     const handler = createParticipantHandler(state);
-    mockSdkClient.event.subscribe.mockResolvedValue({ stream: emptyEventStream() });
-    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+    mockSdkClient.session.prompt.mockResolvedValue({
+      data: {
+        info: { role: 'assistant', tokens: { total: 50 } },
+        parts: [{ type: 'text', id: 'p1', messageID: 'msg-ai-2', text: 'Response to follow up' }],
+      },
+    });
 
     const priorResponseTurn = new vscode.ChatResponseTurn({
       metadata: { sessionId: 'existing-session', turnMap: [{ vscodeTurn: 0, opencodeMessageId: 'msg-0' }] },
@@ -208,10 +225,11 @@ describe('createParticipantHandler', () => {
     expect(mockServerManager.start).not.toHaveBeenCalled();
     expect(mockSdkClient.session.create).not.toHaveBeenCalled();
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      sessionID: 'existing-session',
-      parts: [{ type: 'text', text: 'follow up' }],
-      directory: '/test/workspace',
+      path: { id: 'existing-session' },
+      body: { parts: [{ type: 'text', text: 'follow up' }] },
+      query: { directory: '/test/workspace' },
     });
+    expect(stream.markdown).toHaveBeenCalledWith('Response to follow up');
     expect(result.metadata).toHaveProperty('sessionId', 'existing-session');
   });
 
@@ -288,9 +306,9 @@ describe('createParticipantHandler', () => {
     expect(mockServerManager.start).not.toHaveBeenCalled();
     expect(mockSdkClient.session.create).not.toHaveBeenCalled();
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      sessionID: 'existing-id',
-      parts: [{ type: 'text', text: 'question' }],
-      directory: '/test/workspace',
+      path: { id: 'existing-id' },
+      body: { parts: [{ type: 'text', text: 'question' }] },
+      query: { directory: '/test/workspace' },
     });
   });
 
@@ -314,7 +332,10 @@ describe('createParticipantHandler', () => {
     );
 
     expect(mockSdkClient.session.fork).not.toHaveBeenCalled();
-    expect(mockSdkClient.session.create).toHaveBeenCalledWith({ directory: '/test/workspace' });
+    expect(mockSdkClient.session.create).toHaveBeenCalledWith({
+      body: {},
+      query: { directory: '/test/workspace' },
+    });
     expect(state.activeSessionId).toBe('new-session');
     const cs = state.sessionMap.get('brand-new-chat');
     expect(cs?.opencodeSessionId).toBe('new-session');
@@ -342,7 +363,10 @@ describe('createParticipantHandler', () => {
     );
 
     expect(mockSdkClient.session.fork).not.toHaveBeenCalled();
-    expect(mockSdkClient.session.create).toHaveBeenCalledWith({ directory: '/test/workspace' });
+    expect(mockSdkClient.session.create).toHaveBeenCalledWith({
+      body: {},
+      query: { directory: '/test/workspace' },
+    });
     expect(state.activeSessionId).toBe('rewound-session');
     expect(state.sessionMap.get('new-chat-2')?.opencodeSessionId).toBe('rewound-session');
     expect(state.sessionMap.get('new-chat-2')?.turnMap).toEqual([]);
@@ -387,10 +411,14 @@ describe('createParticipantHandler', () => {
     // Should revert msg-2 then msg-1 (undo from last to first)
     expect(mockSdkClient.session.revert).toHaveBeenCalledTimes(2);
     expect(mockSdkClient.session.revert).toHaveBeenNthCalledWith(1, {
-      sessionID: 'original-session', messageID: 'msg-2', directory: '/test/workspace',
+      path: { id: 'original-session' },
+      body: { messageID: 'msg-2' },
+      query: { directory: '/test/workspace' },
     });
     expect(mockSdkClient.session.revert).toHaveBeenNthCalledWith(2, {
-      sessionID: 'original-session', messageID: 'msg-1', directory: '/test/workspace',
+      path: { id: 'original-session' },
+      body: { messageID: 'msg-1' },
+      query: { directory: '/test/workspace' },
     });
 
     // Same session, turnMap trimmed
