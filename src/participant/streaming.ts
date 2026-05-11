@@ -85,6 +85,92 @@ type Stream = vscode.ChatResponseStream & {
 const VS = vscode as any;
 
 // =======================================================================
+// Tool rendering (shared between SSE streaming and direct prompt response)
+// =======================================================================
+
+/**
+ * Render a single completed/error ToolPart from a prompt() response
+ * directly to the VSCode chat stream.
+ *
+ * Used by handler.ts for the direct prompt() approach (no SSE).
+ * Mirrors the completed/error handling in StreamBridge.handleToolState
+ * but without pending→running→completed state machine — the tool
+ * is already in its final state when prompt() returns.
+ */
+export function renderToolPart(
+  stream: vscode.ChatResponseStream,
+  part: { type: 'tool'; tool: string; callID: string; state: any; [key: string]: any },
+): void {
+  const toolName: string = part.tool ?? 'unknown';
+  const callID: string = part.callID ?? part.id;
+  const state = part.state;
+  if (!state) return;
+
+  const hasToolUI = typeof (stream as any).beginToolInvocation === 'function';
+
+  switch (state.status) {
+    case 'completed':
+      renderCompletedTool(stream, toolName, callID, state, hasToolUI);
+      break;
+    case 'error':
+      renderErrorTool(stream, toolName, callID, state, hasToolUI);
+      break;
+    // pending/running are intermediate states only seen in SSE streaming
+    // — the direct prompt() response only contains completed/error tools
+  }
+}
+
+function renderCompletedTool(
+  stream: vscode.ChatResponseStream,
+  toolName: string,
+  callID: string,
+  state: any,
+  hasToolUI: boolean,
+): void {
+  const title: string = state.title ?? toolName;
+  const input: Record<string, unknown> = state.input ?? {};
+  const output: string = state.output ?? '';
+  const timeStart: number | undefined = state.time?.start;
+  const timeEnd: number | undefined = state.time?.end;
+
+  if (hasToolUI && VS.ChatToolInvocationPart) {
+    try {
+      const p: ToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callID);
+      p.enablePartialUpdate = true;
+      p.isComplete = true;
+      p.invocationMessage = formatInvocationMsg(toolName, input, title);
+      p.pastTenseMessage = formatPastTenseMsg(toolName, title, timeStart, timeEnd);
+      p.toolSpecificData = buildToolSpecificData(toolName, title, input, output, timeStart, timeEnd);
+      (stream as any).push(p);
+      return;
+    } catch {
+      // fall through to markdown fallback
+    }
+  }
+  renderToolFallback(stream as any, toolName, input, output, title);
+}
+
+function renderErrorTool(
+  stream: vscode.ChatResponseStream,
+  toolName: string,
+  callID: string,
+  state: any,
+  hasToolUI: boolean,
+): void {
+  if (hasToolUI && VS.ChatToolInvocationPart) {
+    try {
+      const p: ToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callID, state.error);
+      p.isComplete = true;
+      (stream as any).push(p);
+      return;
+    } catch {
+      // fall through
+    }
+  }
+  stream.markdown(`\n⚠️ **${toolName}** failed: \`${state.error}\`\n`);
+}
+
+// =======================================================================
 // StreamBridge
 // =======================================================================
 
@@ -281,9 +367,7 @@ export class StreamBridge {
       if (this.hasToolUI && VS.ChatToolInvocationPart) {
         this.pushToolInvocation(stream, callID, toolName, state);
       } else {
-        this.renderToolFallback(
-          stream, toolName, state.input, state.output, state.title,
-        );
+        renderToolFallback(stream, toolName, state.input, state.output, state.title);
       }
       this.toolMetas.delete(callID);
       this.toolCallIds.delete(part.id);
@@ -314,158 +398,18 @@ export class StreamBridge {
       );
       part.enablePartialUpdate = true;
       part.isComplete = true;
-      part.invocationMessage = this.formatInvocationMsg(toolName, input, title);
-      part.pastTenseMessage = this.formatPastTenseMsg(toolName, title, timeStart, timeEnd);
+      part.invocationMessage = formatInvocationMsg(toolName, input, title);
+      part.pastTenseMessage = formatPastTenseMsg(toolName, title, timeStart, timeEnd);
 
       // Select and attach the appropriate toolSpecificData
-      part.toolSpecificData = this.buildToolSpecificData(
+      part.toolSpecificData = buildToolSpecificData(
         toolName, title, input, output, timeStart, timeEnd,
       );
 
       stream.push(part);
     } catch {
-      this.renderToolFallback(stream, toolName, state.input, state.output, state.title);
+      renderToolFallback(stream, toolName, state.input, state.output, state.title);
     }
-  }
-
-  // -------------------------------------------------------------------
-  // Build toolSpecificData based on tool name
-  // -------------------------------------------------------------------
-
-  private buildToolSpecificData(
-    toolName: string,
-    title: string,
-    input: Record<string, unknown>,
-    output: string,
-    timeStart?: number,
-    timeEnd?: number,
-  ): ToolSpecificData | undefined {
-    switch (toolName) {
-      case 'bash':
-      case 'shell': {
-        const lang = input.language as string
-          ?? detectLanguage(title)
-          ?? 'bash';
-        return {
-          commandLine: {
-            original: (input.command as string) ?? title,
-          },
-          language: lang,
-          output: output ? { text: output } : undefined,
-          state:
-            timeStart != null
-              ? { duration: timeEnd != null ? timeEnd - timeStart : undefined }
-              : undefined,
-        } satisfies TerminalToolData;
-      }
-
-      case 'read':
-      case 'list':
-      case 'grep': {
-        return {
-          input: formatInput(input, title),
-          output: truncate(output, 2000),
-        } satisfies SimpleToolResultData;
-      }
-
-      case 'write':
-      case 'edit': {
-        // Show as file reference if filePath is available
-        const filePath = input.filePath as string | undefined;
-        if (filePath) {
-          return {
-            values: [{ path: filePath }],
-          } satisfies ToolResourcesData;
-        }
-        return {
-          input: formatInput(input, title),
-          output: truncate(output, 2000),
-        } satisfies SimpleToolResultData;
-      }
-
-      case 'task':
-      case 'subagent': {
-        return {
-          description: (input.description as string) ?? title,
-          agentName: (input.agentName as string) ?? toolName,
-          prompt: (input.prompt as string) ?? formatInput(input, ''),
-          result: truncate(output, 4000),
-        } satisfies SubagentToolData;
-      }
-
-      default:
-        // Generic fallback
-        if (Object.keys(input).length > 0 || output) {
-          return {
-            input: formatInput(input, title),
-            output: truncate(output, 2000),
-          } satisfies SimpleToolResultData;
-        }
-        return undefined;
-    }
-  }
-
-  // -------------------------------------------------------------------
-  // Message formatting
-  // -------------------------------------------------------------------
-
-  private formatInvocationMsg(
-    toolName: string,
-    input: Record<string, unknown>,
-    title: string,
-  ): string {
-    const display = title || toolName;
-    if (!input || Object.keys(input).length === 0) {
-      return `Running ${display}`;
-    }
-    const firstKey = Object.keys(input)[0];
-    const firstVal = input[firstKey];
-    const short = typeof firstVal === 'string'
-      ? firstVal.length > 60 ? firstVal.substring(0, 57) + '...' : firstVal
-      : JSON.stringify(firstVal);
-    return `Running ${display} (${firstKey}: ${short})`;
-  }
-
-  private formatPastTenseMsg(
-    toolName: string,
-    title: string,
-    timeStart?: number,
-    timeEnd?: number,
-  ): string {
-    const display = title || toolName;
-    const pastVerb = { read: 'Read', bash: 'Ran', write: 'Wrote', list: 'Listed', grep: 'Searched', edit: 'Edited', task: 'Completed subagent' }[toolName] ?? 'Executed';
-    let msg = `${pastVerb} ${display}`;
-    if (timeStart != null && timeEnd != null) {
-      const dur = ((timeEnd - timeStart) / 1000).toFixed(1);
-      msg += ` (${dur}s)`;
-    }
-    return msg;
-  }
-
-  // -------------------------------------------------------------------
-  // Markdown fallback (no proposed API)
-  // -------------------------------------------------------------------
-
-  private renderToolFallback(
-    stream: Stream,
-    toolName: string,
-    input: Record<string, unknown> | undefined,
-    output: string | undefined,
-    title?: string,
-  ): void {
-    const display = title ?? toolName;
-    const inputLine = input && Object.keys(input).length > 0
-      ? Object.entries(input)
-          .map(([k, v]) => `**${k}**: \`${typeof v === 'string' ? v : JSON.stringify(v)}\``)
-          .join(', ')
-      : '';
-
-    stream.markdown(`\n🔧 **${display}** \`${toolName}\``);
-    if (inputLine) stream.markdown(` — ${inputLine}`);
-    if (output) {
-      stream.markdown(`\n\`\`\`\n${truncate(output, 300)}\n\`\`\`\n`);
-    }
-    stream.markdown('\n');
   }
 
   private reset(): void {
@@ -474,6 +418,145 @@ export class StreamBridge {
     this.toolCallIds.clear();
     this.toolMetas.clear();
   }
+}
+
+// =======================================================================
+// Tool-specific data builder (shared between direct & SSE rendering)
+// =======================================================================
+
+/**
+ * Build toolSpecificData for ChatToolInvocationPart based on tool name.
+ * Maps OpenCode tool types to VSCode ChatToolInvocationPart data shapes.
+ */
+function buildToolSpecificData(
+  toolName: string,
+  title: string,
+  input: Record<string, unknown>,
+  output: string,
+  timeStart?: number,
+  timeEnd?: number,
+): ToolSpecificData | undefined {
+  switch (toolName) {
+    case 'bash':
+    case 'shell': {
+      const lang = (input.language as string)
+        ?? detectLanguage(title)
+        ?? 'bash';
+      return {
+        commandLine: {
+          original: (input.command as string) ?? title,
+        },
+        language: lang,
+        output: output ? { text: output } : undefined,
+        state:
+          timeStart != null
+            ? { duration: timeEnd != null ? timeEnd - timeStart : undefined }
+            : undefined,
+      } satisfies TerminalToolData;
+    }
+
+    case 'read':
+    case 'list':
+    case 'grep': {
+      return {
+        input: formatInput(input, title),
+        output: truncate(output, 2000),
+      } satisfies SimpleToolResultData;
+    }
+
+    case 'write':
+    case 'edit': {
+      // Show as file reference if filePath is available
+      const filePath = input.filePath as string | undefined;
+      if (filePath) {
+        return {
+          values: [{ path: filePath }],
+        } satisfies ToolResourcesData;
+      }
+      return {
+        input: formatInput(input, title),
+        output: truncate(output, 2000),
+      } satisfies SimpleToolResultData;
+    }
+
+    case 'task':
+    case 'subagent': {
+      return {
+        description: (input.description as string) ?? title,
+        agentName: (input.agentName as string) ?? toolName,
+        prompt: (input.prompt as string) ?? formatInput(input, ''),
+        result: truncate(output, 4000),
+      } satisfies SubagentToolData;
+    }
+
+    default:
+      // Generic fallback
+      if (Object.keys(input).length > 0 || output) {
+        return {
+          input: formatInput(input, title),
+          output: truncate(output, 2000),
+        } satisfies SimpleToolResultData;
+      }
+      return undefined;
+  }
+}
+
+/** Format the "Running <tool>" message shown during execution */
+function formatInvocationMsg(
+  toolName: string,
+  input: Record<string, unknown>,
+  title: string,
+): string {
+  const display = title || toolName;
+  if (!input || Object.keys(input).length === 0) {
+    return `Running ${display}`;
+  }
+  const firstKey = Object.keys(input)[0];
+  const firstVal = input[firstKey];
+  const short = typeof firstVal === 'string'
+    ? firstVal.length > 60 ? firstVal.substring(0, 57) + '...' : firstVal
+    : JSON.stringify(firstVal);
+  return `Running ${display} (${firstKey}: ${short})`;
+}
+
+/** Format the past-tense message shown after a tool completes */
+function formatPastTenseMsg(
+  toolName: string,
+  title: string,
+  timeStart?: number,
+  timeEnd?: number,
+): string {
+  const display = title || toolName;
+  const pastVerb = { read: 'Read', bash: 'Ran', write: 'Wrote', list: 'Listed', grep: 'Searched', edit: 'Edited', task: 'Completed subagent' }[toolName] ?? 'Executed';
+  let msg = `${pastVerb} ${display}`;
+  if (timeStart != null && timeEnd != null) {
+    const dur = ((timeEnd - timeStart) / 1000).toFixed(1);
+    msg += ` (${dur}s)`;
+  }
+  return msg;
+}
+
+/** Markdown fallback when ChatToolInvocationPart is unavailable */
+function renderToolFallback(
+  stream: Stream,
+  toolName: string,
+  input: Record<string, unknown> | undefined,
+  output: string | undefined,
+  title?: string,
+): void {
+  const display = title ?? toolName;
+  const inputLine = input && Object.keys(input).length > 0
+    ? Object.entries(input)
+        .map(([k, v]) => `**${k}**: \`${typeof v === 'string' ? v : JSON.stringify(v)}\``)
+        .join(', ')
+    : '';
+
+  stream.markdown(`\n🔧 **${display}** \`${toolName}\``);
+  if (inputLine) stream.markdown(` — ${inputLine}`);
+  if (output) {
+    stream.markdown(`\n\`\`\`\n${truncate(output, 300)}\n\`\`\`\n`);
+  }
+  stream.markdown('\n');
 }
 
 // =======================================================================

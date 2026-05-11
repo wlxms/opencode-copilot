@@ -1,7 +1,11 @@
 import * as vscode from 'vscode';
 import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
+import { renderToolPart } from './streaming';
 import type { ExtensionState, TurnMapping } from '../types';
+
+/** Sleep for ms milliseconds */
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
  * Get the VSCode workspace root path for the first workspace folder.
@@ -218,8 +222,8 @@ async function resolveSession(
  *  3. Check for empty prompt
  *  4. Start OpenCode server if not running
  *  5. Resolve or fork session (handles VSCode rewind)
- *  6. Send prompt via POST /session/{id}/message (synchronous)
- *  7. Render response parts directly to VSCode stream
+ *  6. Start prompt via promptAsync (returns immediately)
+ *  7. Poll for progressive parts, render as they appear
  *  8. Record user message ID in turn map
  */
 export function createParticipantHandler(
@@ -261,58 +265,175 @@ export function createParticipantHandler(
       const sessionId = await resolveSession(client, state, context, stream, vscodeSessionId, directory);
       if (!sessionId) return { metadata: {} };
 
-      // 6. Send the prompt and wait for the full response.
-      //    prompt() POST /session/{id}/message is synchronous — it waits
-      //    for the server to finish processing and returns the full result
-      //    with data.parts containing all response parts (text, reasoning, tool, etc.).
-      //    Server-Sent Events (SSE) via /event only deliver server-level events
-      //    (server.connected) — session processing events DO NOT flow through SSE.
+      // 6. Start prompt processing via promptAsync (returns immediately).
+      //    The server processes the prompt asynchronously. We poll for the
+      //    assistant message and render its parts progressively as they appear.
+      //    SSE (/event) was proven to NOT deliver session processing events —
+      //    only server.connected is emitted.
       state.outputChannel.appendLine(
-        `[handler] Prompting session ${sessionId} with: ${request.prompt.substring(0, 50)}`,
+        `[handler] Prompting session ${sessionId} (async): ${request.prompt.substring(0, 50)}`,
       );
 
-      const result = await client.session.prompt({
+      await client.session.promptAsync({
         path: { id: sessionId },
         body: { parts: [{ type: 'text', text: request.prompt }] },
         query: directory ? { directory } : undefined,
       });
 
-      state.outputChannel.appendLine(
-        `[handler] Prompt completed: parts=${result?.data?.parts?.length ?? 0}`,
-      );
-
-      // 7. Render the response parts directly to the VSCode chat stream.
-      //    No SSE subscription needed — the full response is in result.data.parts.
-      const parts: Array<{ type: string; text?: string; messageID?: string; id?: string; [key: string]: any }> = result?.data?.parts ?? [];
+      // 7. Poll for progressive results.
+      //    Parts appear in batches as the server generates them.
+      //    We render each batch immediately for a streaming-like experience.
       let userMessageId: string | null = null;
+      let lastPartCount = 0;
+      let trackedMsgId: string | null = null;
+      const POLL_INTERVAL = 400;       // ms between polls
+      const MAX_POLL_MS = 120_000;     // 2 min timeout
+      const POLL_STATUS_EVERY = 5;     // Check status every N polls
 
-      for (const part of parts) {
-        if (token.isCancellationRequested) break;
+      stream.progress('🤔 Thinking...');
+      const pollStart = Date.now();
+      let pollCount = 0;
 
-        // Capture the first messageID as userMessageId for turn tracking
-        if (!userMessageId && part.messageID) {
-          userMessageId = part.messageID;
+      while (!token.isCancellationRequested) {
+        if (Date.now() - pollStart > MAX_POLL_MS) {
+          state.outputChannel.appendLine(`[handler] Poll timeout (${MAX_POLL_MS}ms)`);
+          break;
         }
 
-        switch (part.type) {
-          case 'text': {
-            // Render AI text response
-            if (part.text) {
-              stream.markdown(part.text);
+        await sleep(POLL_INTERVAL);
+        pollCount++;
+
+        try {
+          // Fetch latest messages for the session
+          const msgsResult = await client.session.messages({
+            path: { id: sessionId },
+            query: { limit: 3 },
+          });
+          const msgs: Array<{ info?: { role?: string; id?: string }; parts?: Array<any> }> =
+            msgsResult?.data ?? [];
+          if (!Array.isArray(msgs)) continue;
+
+          // Find the latest assistant message
+          let assistantMsg: { info?: { role?: string; id?: string }; parts?: Array<any> } | null = null;
+          for (const item of msgs) {
+            if (item?.info?.role === 'assistant') {
+              assistantMsg = item;
             }
-            break;
           }
-          case 'reasoning': {
-            // Show thinking progress (proposed API)
-            const s = stream as any;
-            if (typeof s.thinkingProgress === 'function' && part.text) {
-              s.thinkingProgress({ text: part.text, id: part.id });
+          if (!assistantMsg) continue;
+
+          const msgId = assistantMsg.info?.id ?? '';
+          const parts = assistantMsg.parts ?? [];
+
+          // Track a new assistant message (takes over from previous)
+          if (msgId !== trackedMsgId) {
+            trackedMsgId = msgId;
+            lastPartCount = 0;
+          }
+
+          // Render any new parts since last poll
+          if (parts.length > lastPartCount) {
+            for (let i = lastPartCount; i < parts.length; i++) {
+              const part = parts[i];
+              // Capture the first messageID as userMessageId for turn tracking
+              if (!userMessageId && part.messageID) {
+                userMessageId = part.messageID;
+              }
+
+              switch (part.type) {
+                case 'text':
+                  if (part.text) stream.markdown(part.text);
+                  break;
+                case 'reasoning': {
+                  // Show thinking progress progressively
+                  const s = stream as any;
+                  if (typeof s.thinkingProgress === 'function' && part.text) {
+                    s.thinkingProgress({ text: part.text, id: part.id });
+                  }
+                  break;
+                }
+                case 'tool':
+                  renderToolPart(stream, part);
+                  break;
+                // step-start, step-finish — informational, no rendering needed
+              }
             }
-            break;
+            lastPartCount = parts.length;
           }
-          // tool, step-start, step-finish — skipped for now
+
+          // Periodically check if the session has finished processing
+          if (pollCount % POLL_STATUS_EVERY === 0) {
+            try {
+              const statusResult = await client.session.status();
+              const sessionStatus = statusResult?.data?.[sessionId];
+              if (sessionStatus?.type === 'idle') {
+                // Session idle → processing done, all parts should be available.
+                // Do a final fetch to catch any parts we might have missed between
+                // the last message poll and the status check.
+                try {
+                  const finalMsgs = await client.session.messages({
+                    path: { id: sessionId },
+                    query: { limit: 3 },
+                  });
+                  const finalItems: Array<{ info?: { role?: string; id?: string }; parts?: Array<any> }> =
+                    finalMsgs?.data ?? [];
+                  if (Array.isArray(finalItems)) {
+                    for (const item of finalItems) {
+                      if (item?.info?.role === 'assistant' && (item.info.id === trackedMsgId || !trackedMsgId)) {
+                        const finalParts = item.parts ?? [];
+                        for (let i = lastPartCount; i < finalParts.length; i++) {
+                          const p = finalParts[i];
+                          if (!userMessageId && p.messageID) userMessageId = p.messageID;
+                          switch (p.type) {
+                            case 'text': if (p.text) stream.markdown(p.text); break;
+                            case 'reasoning': {
+                              const s = stream as any;
+                              if (typeof s.thinkingProgress === 'function' && p.text) s.thinkingProgress({ text: p.text, id: p.id });
+                              break;
+                            }
+                            case 'tool': renderToolPart(stream, p); break;
+                          }
+                        }
+                        lastPartCount = Math.max(lastPartCount, finalParts.length);
+                      }
+                    }
+                  }
+                } catch {
+                  // Ignore final fetch errors
+                }
+                break;
+              }
+              if (sessionStatus?.type === 'retry') {
+                state.outputChannel.appendLine(
+                  `[handler] Session retry: ${sessionStatus.message}`,
+                );
+                break;
+              }
+            } catch {
+              // Ignore status fetch errors — keep polling
+            }
+          }
+        } catch (err) {
+          state.outputChannel.appendLine(
+            `[handler] Poll error: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          // Continue polling on transient errors
         }
       }
+
+      // If the user cancelled, abort the session on the server
+      if (token.isCancellationRequested) {
+        try {
+          await client.session.abort({ path: { id: sessionId } });
+        } catch {
+          // Ignore abort errors
+        }
+        return { metadata: {} };
+      }
+
+      state.outputChannel.appendLine(
+        `[handler] Polling complete: ${lastPartCount} parts rendered, ${Math.round((Date.now() - pollStart) / 100) / 10}s`,
+      );
 
       // 8. Record the user message ID for per-chat turn tracking.
       //    userMessageId is the text part's messageID from the server response,

@@ -213,3 +213,5 @@ describe('OpenCode server integration — prompt + SSE ordering', () => {
     });
   });
 });
+
+

@@ -8,6 +8,10 @@ const mockSdkClient = {
   session: {
     create: vi.fn(),
     prompt: vi.fn(),
+    promptAsync: vi.fn(),
+    messages: vi.fn(),
+    status: vi.fn(),
+    abort: vi.fn(),
     fork: vi.fn(),
     revert: vi.fn(),
     deleteMessage: vi.fn(),
@@ -25,11 +29,25 @@ import * as vscode from 'vscode';
 import { createParticipantHandler } from '../participant/handler';
 import type { ExtensionState } from '../types';
 
+/** Helper: set up standard promptAsync + messages + status mocks */
+function setupPromptMock(
+  parts: Array<Record<string, any>> = [],
+  sessionId: string = 'session-1',
+) {
+  mockSdkClient.session.promptAsync.mockResolvedValue({});
+  mockSdkClient.session.messages.mockResolvedValue({
+    data: [{ info: { role: 'assistant', id: 'msg-asst-1' }, parts }],
+  });
+  mockSdkClient.session.status.mockResolvedValue({
+    data: { [sessionId]: { type: 'idle' } },
+  });
+  mockSdkClient.session.abort.mockResolvedValue(undefined);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-async function* emptyEventStream(): AsyncIterable<any> {}
 
 /** Create a SessionState object for test convenience */
 function sessionState(id: string, turnMap: Array<{ vscodeTurn: number; opencodeMessageId: string }> = []) {
@@ -157,14 +175,10 @@ describe('createParticipantHandler', () => {
     mockServerManager.start.mockResolvedValue('http://127.0.0.1:51777');
     mockServerManager.getClient.mockReturnValue(mockSdkClient);
     mockSdkClient.session.create.mockResolvedValue({ data: { id: 'session-1' } });
-    mockSdkClient.session.prompt.mockResolvedValue({
-      data: {
-        info: { role: 'assistant', tokens: { total: 100 } },
-        parts: [{ type: 'step-start', id: 'p0', messageID: 'msg-1' },
-                { type: 'text', id: 'p1', messageID: 'msg-2', text: 'Hello!' },
-                { type: 'step-finish', id: 'p2', messageID: 'msg-1' }],
-      },
-    });
+    setupPromptMock(
+      [{ type: 'text', id: 'p1', messageID: 'msg-2', text: 'Hello!' }],
+      'session-1',
+    );
 
     const result = await handler(
       { prompt: 'write a test', command: undefined, references: [], sessionId: 'chat-new' },
@@ -180,7 +194,7 @@ describe('createParticipantHandler', () => {
     });
     expect(state.activeSessionId).toBe('session-1');
     expect(state.sessionMap.get('chat-new')?.opencodeSessionId).toBe('session-1');
-    expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
+    expect(mockSdkClient.session.promptAsync).toHaveBeenCalledWith({
       path: { id: 'session-1' },
       body: { parts: [{ type: 'text', text: 'write a test' }] },
       query: { directory: '/test/workspace' },
@@ -189,7 +203,7 @@ describe('createParticipantHandler', () => {
     expect(stream.markdown).toHaveBeenCalledWith('Hello!');
     // Turn map recorded from the first part's messageID
     expect(state.sessionMap.get('chat-new')?.turnMap).toEqual([
-      { vscodeTurn: 0, opencodeMessageId: 'msg-1' },
+      { vscodeTurn: 0, opencodeMessageId: 'msg-2' },
     ]);
     expect(result.metadata).toHaveProperty('sessionId', 'session-1');
   });
@@ -205,12 +219,10 @@ describe('createParticipantHandler', () => {
     state.sessionMap.set('chat-multi', sessionState('existing-session'));
 
     const handler = createParticipantHandler(state);
-    mockSdkClient.session.prompt.mockResolvedValue({
-      data: {
-        info: { role: 'assistant', tokens: { total: 50 } },
-        parts: [{ type: 'text', id: 'p1', messageID: 'msg-ai-2', text: 'Response to follow up' }],
-      },
-    });
+    setupPromptMock(
+      [{ type: 'text', id: 'p1', messageID: 'msg-ai-2', text: 'Response to follow up' }],
+      'existing-session',
+    );
 
     const priorResponseTurn = new vscode.ChatResponseTurn({
       metadata: { sessionId: 'existing-session', turnMap: [{ vscodeTurn: 0, opencodeMessageId: 'msg-0' }] },
@@ -224,7 +236,7 @@ describe('createParticipantHandler', () => {
 
     expect(mockServerManager.start).not.toHaveBeenCalled();
     expect(mockSdkClient.session.create).not.toHaveBeenCalled();
-    expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
+    expect(mockSdkClient.session.promptAsync).toHaveBeenCalledWith({
       path: { id: 'existing-session' },
       body: { parts: [{ type: 'text', text: 'follow up' }] },
       query: { directory: '/test/workspace' },
@@ -290,8 +302,7 @@ describe('createParticipantHandler', () => {
     state.sessionMap.set('chat-skip', sessionState('existing-id'));
 
     const handler = createParticipantHandler(state);
-    mockSdkClient.event.subscribe.mockResolvedValue({ stream: emptyEventStream() });
-    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+    setupPromptMock([], 'existing-id');
 
     const priorResponseTurn = new vscode.ChatResponseTurn({
       metadata: { sessionId: 'existing-id', turnMap: [{ vscodeTurn: 0, opencodeMessageId: 'msg-0' }] },
@@ -305,7 +316,7 @@ describe('createParticipantHandler', () => {
 
     expect(mockServerManager.start).not.toHaveBeenCalled();
     expect(mockSdkClient.session.create).not.toHaveBeenCalled();
-    expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
+    expect(mockSdkClient.session.promptAsync).toHaveBeenCalledWith({
       path: { id: 'existing-id' },
       body: { parts: [{ type: 'text', text: 'question' }] },
       query: { directory: '/test/workspace' },
@@ -323,8 +334,7 @@ describe('createParticipantHandler', () => {
 
     const handler = createParticipantHandler(state);
     mockSdkClient.session.create.mockResolvedValue({ data: { id: 'new-session' } });
-    mockSdkClient.event.subscribe.mockResolvedValue({ stream: emptyEventStream() });
-    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+    setupPromptMock([], 'new-session');
 
     const result = await handler(
       { prompt: 'fresh start', command: undefined, references: [], sessionId: 'brand-new-chat' },
@@ -354,8 +364,7 @@ describe('createParticipantHandler', () => {
 
     const handler = createParticipantHandler(state);
     mockSdkClient.session.create.mockResolvedValue({ data: { id: 'rewound-session' } });
-    mockSdkClient.event.subscribe.mockResolvedValue({ stream: emptyEventStream() });
-    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+    setupPromptMock([], 'rewound-session');
 
     const result = await handler(
       { prompt: 'rewound message', command: undefined, references: [], sessionId: 'new-chat-2' },
@@ -388,8 +397,7 @@ describe('createParticipantHandler', () => {
 
     const handler = createParticipantHandler(state);
     mockSdkClient.session.revert.mockResolvedValue({ data: { id: 'original-session' } });
-    mockSdkClient.event.subscribe.mockResolvedValue({ stream: emptyEventStream() });
-    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+    setupPromptMock([], 'original-session');
 
     const priorResponseTurn = new vscode.ChatResponseTurn({
       metadata: {
