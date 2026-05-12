@@ -115,6 +115,11 @@ export class StreamBridge {
   private hasThinking: boolean = false;
   private hasToolUI: boolean = false;
 
+  /** Get the OpenCode message ID of the user message in this turn, if captured */
+  getUserMessageId(): string | null {
+    return this.userMessageId;
+  }
+
   async bridgeEventsToStream(
     events: { stream: AsyncIterable<any> },
     stream: vscode.ChatResponseStream,
@@ -457,7 +462,7 @@ export class StreamBridge {
   }
 
   private reset(): void {
-    this.userMessageId = null;
+    // userMessageId intentionally NOT reset — caller reads it after bridging
     this.partKinds.clear();
     this.toolCallIds.clear();
     this.toolMetas.clear();

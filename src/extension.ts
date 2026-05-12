@@ -17,6 +17,7 @@ export function activate(context: vscode.ExtensionContext) {
     activeSessionId: null,
     serverStatus: 'stopped',
     outputChannel,
+    sessionMap: new Map(),
   };
 
   const participant = vscode.chat.createChatParticipant(

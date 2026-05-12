@@ -7,7 +7,8 @@
     "vscode": "^1.95.0"
   },
   "enabledApiProposals": [
-    "chatParticipantAdditions"
+    "chatParticipantAdditions",
+    "chatParticipantPrivate"
   ],
   "categories": [
     "Other"
