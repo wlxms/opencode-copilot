@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { StreamBridge } from './streaming';
 import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
-import type { ExtensionState, TurnMapping } from '../types';
+import type { ExtensionState, OpenCodeClient, TurnMapping } from '../types';
 
 /**
  * Get the VSCode workspace root path for the first workspace folder.
@@ -21,7 +21,7 @@ function getWorkspaceDirectory(): string | undefined {
 export async function ensureServer(
   state: ExtensionState,
   stream: vscode.ChatResponseStream,
-): Promise<any | null> {
+): Promise<OpenCodeClient | null> {
   if (state.client) {
     return state.client;
   }
@@ -97,7 +97,7 @@ function recoverFromHistory(
  * Each VSCode chat has its own turnMap, so switching chats doesn't lose rewind context.
  */
 async function resolveSession(
-  client: any,
+  client: OpenCodeClient,
   state: ExtensionState,
   context: vscode.ChatContext,
   stream: vscode.ChatResponseStream,
@@ -137,7 +137,7 @@ async function resolveSession(
           path: { id: recovered.sessionId },
           query: directory ? { directory } : undefined,
         });
-        const existingId = sessionResult?.data?.id ?? sessionResult?.id;
+        const existingId = sessionResult.data?.id;
         if (existingId) {
           // Session is valid — restore the mapping
           const turnMap = recovered.turnMap;
@@ -164,7 +164,10 @@ async function resolveSession(
       body: {},
       query: directory ? { directory } : undefined,
     });
-    const sessionId = result.data?.id ?? result.id;
+    const sessionId = result.data?.id;
+    if (!sessionId) {
+      return null;
+    }
     state.activeSessionId = sessionId;
     state.sessionMap.set(vscodeSessionId, {
       opencodeSessionId: sessionId,
@@ -235,7 +238,10 @@ async function resolveSession(
         body: {},
         query: directory ? { directory } : undefined,
       });
-      const sessionId = result.data?.id ?? result.id;
+      const sessionId = result.data?.id;
+      if (!sessionId) {
+        return null;
+      }
       chatState.opencodeSessionId = sessionId;
       chatState.turnMap = [];
       state.activeSessionId = sessionId;
@@ -312,8 +318,9 @@ export function createParticipantHandler(
       const sessionId = await resolveSession(client, state, context, stream, vscodeSessionId, directory);
       if (!sessionId) return { metadata: {} };
 
-      // 6. Subscribe to events BEFORE sending prompt
-      const events = await client.event.subscribe();
+      const events = state.eventBroker.openSessionStream(sessionId);
+      // 6. Ensure the shared global-event broker is running after the session queue exists
+      await state.eventBroker.ensureStarted(client, state.outputChannel);
 
       // 7. Fire the prompt WITHOUT awaiting — events stream concurrently.
       //    If we await prompt(), all SSE events fire during that await and
@@ -330,9 +337,12 @@ export function createParticipantHandler(
         state.outputChannel.appendLine(`[handler] Prompt error: ${msg}`);
       });
 
+      state.outputChannel.appendLine(`[handler] bridgeEventsToStream start for session ${sessionId}`);
       // 8. Bridge events to VSCode chat stream (consumes as they arrive)
-      const bridge = new StreamBridge();
+      const bridge = new StreamBridge({ logger: state.outputChannel, sessionId });
       await bridge.bridgeEventsToStream(events, stream, token);
+
+      state.eventBroker.closeSessionStream(sessionId);
 
       // 9. Ensure prompt promise settles before returning
       await promptPromise;
@@ -340,6 +350,9 @@ export function createParticipantHandler(
       // 10. Record the user message ID for per-chat turn tracking
       const chatState = state.sessionMap.get(vscodeSessionId);
       const userMessageId = bridge.getUserMessageId();
+      state.outputChannel.appendLine(
+        `[handler] User message ID for turn chatState && userMessageId: ${!!chatState && !!userMessageId} (${userMessageId})`,
+      );
       if (chatState && userMessageId) {
         chatState.turnMap.push({
           vscodeTurn: chatState.turnMap.length,

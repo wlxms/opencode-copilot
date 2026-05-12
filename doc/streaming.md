@@ -26,6 +26,23 @@ OpenCode 服务端通过 `/event` SSE 端点推送两种粒度的实时事件：
 
 ## SSE 事件处理流程
 
+### 端点选择：使用 `/global/event`，不再为每个请求单独订阅 `/event`
+
+当前 SDK/服务端组合里，`client.event.subscribe()` 对应 `/event`，真实运行时只稳定产出服务级事件，例如 `server.connected`，不足以承载会话内的 `message.part.*` 流式事件。
+
+因此当前实现改为：
+
+1. 扩展级只建立一个 `/global/event` 订阅
+2. 在扩展内按 `sessionID` 做事件分发
+3. 每个 VS Code chat 请求只消费自己会话对应的事件队列
+
+这避免了两个问题：
+
+- 每个请求各自建立 `/global/event` 连接会重复消费同一份全局事件流
+- 直接在 `StreamBridge` 里过滤全局事件，仍然会暴露跨会话 `session.idle`、子代理事件、目录级事件等串流干扰
+
+---
+
 ### 事件时序
 
 一个完整的对话回合，SSE 事件按以下顺序到达：
@@ -43,25 +60,30 @@ message.part.delta    field=text        ← AI token 增量 → markdown()
 session.idle                             ← 回合结束信号
 ```
 
-### 消费模式：Fire-and-Forget
+### 消费模式：Broker + Fire-and-Forget
 
 ```typescript
-// 1. 先订阅 SSE（必须在 prompt 之前）
-const events = await client.event.subscribe();
+// 1. 先为当前 OpenCode session 打开一个本地事件队列
+const events = state.eventBroker.openSessionStream(sessionId);
 
-// 2. Fire-and-forget：不 await prompt，让事件并发流过
+// 2. 确保扩展级全局 SSE broker 已启动
+await state.eventBroker.ensureStarted(client, outputChannel);
+
+// 3. Fire-and-forget：不 await prompt，让事件并发流过
 const promptPromise = client.session
   .prompt({ path: { id: sessionId }, body: { parts: [...] } })
   .catch(err => { /* log error */ });
 
-// 3. 消费事件流（并发的）
+// 4. 消费当前 session 对应的事件流（并发的）
 await bridge.bridgeEventsToStream(events, stream, token);
 
-// 4. 最后才 await prompt
+// 5. 最后才 await prompt
 await promptPromise;
 ```
 
 **为什么不能 await prompt()：** `prompt()` 内部是 HTTP POST，服务端在处理期间保持连接。如果 await，所有 SSE 事件在 await 期间触发，但此时没有任何消费者在读取事件流 → 事件丢失。
+
+**为什么要先打开 session 队列，再启动 broker：** 在测试环境或异常场景里，全局 SSE 可能很快结束。如果先启动 broker、后创建 session 队列，当前请求可能会拿到一个永远等不到结束信号的空队列。
 
 ---
 
@@ -102,7 +124,87 @@ client.session.prompt({
 });
 ```
 
-`flat` 格式会让 SDK 生成错误的 HTTP 请求 → 服务端无法正确关联 session → SSE `/event` 端点只收到 `server.connected` 生命周期事件，收不到 `message.part.*` 处理事件。
+`flat` 格式会让 SDK 生成错误的 HTTP 请求 → 服务端无法正确关联 session → SSE 只会收到服务级生命周期事件，收不到当前会话的 `message.part.*` 处理事件。
+
+---
+
+## 多会话模型
+
+### VS Code 侧状态边界
+
+VS Code chat participant 是在扩展 `activate()` 中创建一次的，请求处理函数运行在同一个扩展 host 进程里。因此：
+
+- 扩展内存是共享的
+- 不能假设“每个聊天页一个独立 participant 实例”
+- 必须显式按 chat/session 维度做状态隔离
+
+当前实现的隔离方式：
+
+- `request.sessionId` 标识 VS Code chat 会话
+- `state.sessionMap` 维护 `VS Code chat sessionId -> OpenCode sessionId`
+- `context.history` 只代表当前 chat session 的历史，而不是所有聊天页的全局历史
+
+### 为什么不能做“切换聊天页时再重放缓存”
+
+当前 VS Code Chat API 没有提供“用户切换到某个聊天页”时的 participant 回调，也没有允许扩展在请求处理函数结束后重新拿到同一条响应的 `ChatResponseStream`。
+
+因此能做的是：
+
+- 在请求仍进行中时，持续把该请求对应的 OpenCode 事件路由到它自己的 `ChatResponseStream`
+- 在扩展级缓存尚未被当前请求消费的会话事件，直到该请求的 bridge 消费它们
+
+不能做的是：
+
+- 在请求处理函数已经返回后，等用户切换回某个聊天页，再把旧缓存“补画”到那条历史响应里
+
+换句话说，支持的是“多会话并发中的正确路由”，不是“已结束请求的任意时刻重放”。
+
+---
+
+## GlobalEventBroker 设计
+
+### 目标
+
+`GlobalEventBroker` 是扩展级单例，负责：
+
+1. 只建立一次 `/global/event` 长连接
+2. 按 `sessionID` 将事件路由到会话专属队列
+3. 通过 `partID -> sessionID` 映射把 `message.part.delta` 路由回正确会话
+4. 在 `session.idle` 时关闭对应会话队列，结束该次请求的 bridge
+
+### 为什么需要 partID 映射
+
+`message.part.delta` 事件只有 `partID`，没有稳定的 `sessionID` 字段。为了把 delta 路由回正确会话，broker 必须先从 `message.part.updated` 中记录：
+
+```typescript
+partID -> sessionID
+```
+
+之后再用这个映射分发 delta。
+
+### 生命周期
+
+```typescript
+handler(request)
+  -> openSessionStream(sessionId)
+  -> ensureStarted(client)
+  -> prompt(...)
+  -> bridgeEventsToStream(sessionQueue)
+
+broker
+  -> global.event()
+  -> dispatch by sessionID
+  -> close session queue on session.idle
+```
+
+### 对多会话并发的影响
+
+这种设计下：
+
+- 同时发起多个 chat 请求时，共享一个全局 SSE 连接
+- 每个请求消费自己的 session 队列
+- 其他会话的 `session.idle` 不会提前结束当前请求
+- 非当前会话的 delta 不会串到错误的 chat 页里
 
 ---
 
@@ -159,6 +261,12 @@ class StreamBridge {
 }
 ```
 
+`StreamBridge` 不再负责从全局事件里“挑出”自己的会话，而是假设输入流已经由 `GlobalEventBroker` 过滤到当前 session。它的职责只剩下：
+
+- 把会话内 SSE 事件翻译成 VS Code Chat UI 输出
+- 维护当前请求的 `userMessageId` / `partKinds` / tool state
+- 在 `session.idle` 时正常结束当前桥接
+
 ### userMessageId 的生命周期
 
 ```
@@ -199,14 +307,14 @@ V3 (92e566e)     同步太慢 → 改用 promptAsync() + 400ms 轮询
 
 ### V2 的根因
 
-V2 将 SDK 调用从 `path/body` 格式改为 `flat` 格式：
+V2 将 SDK 调用从 `path/body` 格式改为 `flat` 格式，并错误依赖 `/event`：
 
 ```typescript
 // V2 错误的 flat 格式
 client.session.prompt({ sessionID, parts, directory })
 ```
 
-导致 SSE 事件不触发。V2.5 的注释记录了这个误判：
+导致会话事件无法稳定进入渲染链路。V2.5 的注释记录了这个误判：
 
 > *"Server-Sent Events (SSE) via /event only deliver server-level events (server.connected) — session processing events DO NOT flow through SSE."*
 
@@ -223,6 +331,9 @@ client.session.prompt({ sessionID, parts, directory })
 ### 教训
 
 1. **SDK 格式必须使用 `path/body/query`**，不要发明 flat 格式
-2. **SSE 事件不触发时，先排查 SDK 调用格式**，不要假设 SSE 不可用
-3. **不要为了解决一个问题（revert）而引入更大的问题（重写渲染层）**
-4. **解耦是关键**：revert 逻辑（sessionMap + turnMap + resolveSession）与渲染逻辑（SSE + StreamBridge）完全独立，可以独立移植
+2. **`/event` 与 `/global/event` 的语义不同**，不能把服务级 SSE 当成会话级 SSE
+3. **多会话场景要在扩展内做 broker/mux**，不要为每个请求各拉一条全局 SSE
+4. **SSE 事件不触发时，先排查 SDK 调用格式和订阅端点**，不要假设 SSE 不可用
+5. **没有聊天切换事件，就不要设计“切页重放”能力**，应聚焦在进行中请求的正确路由
+6. **不要为了解决一个问题（revert）而引入更大的问题（重写渲染层）**
+7. **解耦是关键**：revert 逻辑（sessionMap + turnMap + resolveSession）与渲染逻辑（broker + StreamBridge）完全独立，可以独立移植

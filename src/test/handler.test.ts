@@ -1,3 +1,4 @@
+import { GlobalEventBroker } from '../participant/event-broker';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ---------------------------------------------------------------------------
@@ -7,8 +8,15 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const mockSdkClient = {
   session: {
     create: vi.fn(),
+    get: vi.fn(),
     prompt: vi.fn(),
     revert: vi.fn(),
+  },
+  global: {
+    event: vi.fn(),
+  },
+  config: {
+    providers: vi.fn(),
   },
   event: {
     subscribe: vi.fn(),
@@ -21,15 +29,35 @@ const mockSdkClient = {
 
 import * as vscode from 'vscode';
 import { createParticipantHandler } from '../participant/handler';
-import type { ExtensionState } from '../types';
+import type { OpenCodeEvent } from '../types/events';
+import type { ExtensionState, OpenCodeClient, OpenCodeServerController } from '../types';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /** Empty async generator for event subscribe mock */
-async function* emptyEventStream(): AsyncIterable<any> {
+async function* emptyEventStream(): AsyncIterable<OpenCodeEvent> {
   // No events — completes immediately
+}
+
+function createRequest(
+  overrides: Partial<vscode.ChatRequest> & Pick<vscode.ChatRequest, 'prompt'>,
+): vscode.ChatRequest {
+  const { prompt, ...rest } = overrides;
+  return {
+    prompt,
+    command: undefined,
+    references: [],
+    toolReferences: [],
+    toolInvocationToken: undefined,
+    model: undefined,
+    id: 'req-1',
+    sessionId: 'chat-test',
+    sessionResource: { fsPath: '/test/chat' } as vscode.Uri,
+    attempt: 0,
+    ...rest,
+  } as unknown as vscode.ChatRequest;
 }
 
 // ---------------------------------------------------------------------------
@@ -63,7 +91,7 @@ describe('createParticipantHandler', () => {
     };
 
     state = {
-      serverManager: mockServerManager,
+      serverManager: mockServerManager as unknown as OpenCodeServerController,
       client: null,
       activeSessionId: null,
       serverStatus: 'stopped',
@@ -77,6 +105,7 @@ describe('createParticipantHandler', () => {
         hide: vi.fn(),
         dispose: vi.fn(),
       } as unknown as vscode.OutputChannel,
+      eventBroker: new GlobalEventBroker(),
       sessionMap: new Map(),
     };
 
@@ -84,12 +113,12 @@ describe('createParticipantHandler', () => {
       markdown: vi.fn(),
       progress: vi.fn(),
       push: vi.fn(),
-    };
+    } as unknown as vscode.ChatResponseStream;
 
     token = {
       isCancellationRequested: false,
       onCancellationRequested: vi.fn(() => ({ dispose: vi.fn() })),
-    };
+    } as unknown as vscode.CancellationToken;
 
     // Set workspace folders for consistent test behavior
     (vscode.workspace as { workspaceFolders: unknown }).workspaceFolders = [
@@ -122,7 +151,7 @@ describe('createParticipantHandler', () => {
     };
 
     const result = await handler(
-      { prompt: 'hello', command: undefined, references: [] },
+      createRequest({ prompt: 'hello' }),
       { history: [] },
       stream,
       cancelledToken,
@@ -140,7 +169,7 @@ describe('createParticipantHandler', () => {
     const handler = createParticipantHandler(state);
 
     await handler(
-      { prompt: '', command: undefined, references: [] },
+      createRequest({ prompt: '' }),
       { history: [] },
       stream,
       token,
@@ -156,7 +185,7 @@ describe('createParticipantHandler', () => {
     const handler = createParticipantHandler(state);
 
     await handler(
-      { prompt: '   ', command: undefined, references: [] },
+      createRequest({ prompt: '   ' }),
       { history: [] },
       stream,
       token,
@@ -175,7 +204,7 @@ describe('createParticipantHandler', () => {
     const handler = createParticipantHandler(state);
 
     await handler(
-      { prompt: '/help', command: 'help', references: [] },
+      createRequest({ prompt: '/help', command: 'help' }),
       { history: [] },
       stream,
       token,
@@ -200,13 +229,13 @@ describe('createParticipantHandler', () => {
     mockSdkClient.session.create.mockResolvedValue({
       data: { id: 'session-1' },
     });
-    mockSdkClient.event.subscribe.mockResolvedValue({
+    mockSdkClient.global.event.mockResolvedValue({
       stream: emptyEventStream(),
     });
     mockSdkClient.session.prompt.mockResolvedValue(undefined);
 
     const result = await handler(
-      { prompt: 'write a test', command: undefined, references: [], sessionId: 'chat-1' },
+      createRequest({ prompt: 'write a test', sessionId: 'chat-1' }),
       { history: [] },
       stream,
       token,
@@ -227,7 +256,7 @@ describe('createParticipantHandler', () => {
     expect(state.activeSessionId).toBe('session-1');
 
     // Events subscribed
-    expect(mockSdkClient.event.subscribe).toHaveBeenCalledOnce();
+    expect(mockSdkClient.global.event).toHaveBeenCalledOnce();
 
     // Prompt sent with correct format (path/body/query)
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
@@ -242,9 +271,9 @@ describe('createParticipantHandler', () => {
     expect(stream.progress).toHaveBeenCalled();
 
     // Result contains session metadata
-    expect(result.metadata).toHaveProperty('sessionId', 'session-1');
+    expect(result!.metadata).toHaveProperty('sessionId', 'session-1');
     // turnMap should be in metadata
-    expect(result.metadata).toHaveProperty('turnMap');
+    expect(result!.metadata).toHaveProperty('turnMap');
   });
 
   // -----------------------------------------------------------------------
@@ -253,7 +282,7 @@ describe('createParticipantHandler', () => {
 
   it('should reuse active session for multi-turn conversation', async () => {
     state.serverStatus = 'running';
-    state.client = mockSdkClient;
+    state.client = mockSdkClient as OpenCodeClient;
     // Pre-populate sessionMap with existing session
     state.sessionMap.set('chat-1', {
       opencodeSessionId: 'existing-session',
@@ -262,13 +291,13 @@ describe('createParticipantHandler', () => {
 
     const handler = createParticipantHandler(state);
 
-    mockSdkClient.event.subscribe.mockResolvedValue({
+    mockSdkClient.global.event.mockResolvedValue({
       stream: emptyEventStream(),
     });
     mockSdkClient.session.prompt.mockResolvedValue(undefined);
 
     const result = await handler(
-      { prompt: 'follow up', command: undefined, references: [], sessionId: 'chat-1' },
+      createRequest({ prompt: 'follow up', sessionId: 'chat-1' }),
       { history: [] },
       stream,
       token,
@@ -286,7 +315,7 @@ describe('createParticipantHandler', () => {
       },
       query: { directory: '/test/workspace' },
     });
-    expect(result.metadata).toHaveProperty('sessionId', 'existing-session');
+    expect(result!.metadata).toHaveProperty('sessionId', 'existing-session');
   });
 
   // -----------------------------------------------------------------------
@@ -300,7 +329,7 @@ describe('createParticipantHandler', () => {
     mockServerManager.getClient.mockReturnValue(null);
 
     await handler(
-      { prompt: 'hello', command: undefined, references: [] },
+      createRequest({ prompt: 'hello' }),
       { history: [] },
       stream,
       token,
@@ -322,7 +351,7 @@ describe('createParticipantHandler', () => {
     );
 
     await handler(
-      { prompt: 'hello', command: undefined, references: [] },
+      createRequest({ prompt: 'hello' }),
       { history: [] },
       stream,
       token,
@@ -349,7 +378,7 @@ describe('createParticipantHandler', () => {
     );
 
     await handler(
-      { prompt: 'hello', command: undefined, references: [], sessionId: 'chat-err' },
+      createRequest({ prompt: 'hello', sessionId: 'chat-err' }),
       { history: [] },
       stream,
       token,
@@ -365,7 +394,7 @@ describe('createParticipantHandler', () => {
     mockServerManager.start.mockRejectedValue('string error');
 
     await handler(
-      { prompt: 'hello', command: undefined, references: [] },
+      createRequest({ prompt: 'hello' }),
       { history: [] },
       stream,
       token,
@@ -382,7 +411,7 @@ describe('createParticipantHandler', () => {
 
   it('should skip server start if already running with client', async () => {
     state.serverStatus = 'running';
-    state.client = mockSdkClient;
+    state.client = mockSdkClient as OpenCodeClient;
     // Pre-populate sessionMap so session is reused
     state.sessionMap.set('chat-running', {
       opencodeSessionId: 'existing-id',
@@ -391,13 +420,13 @@ describe('createParticipantHandler', () => {
 
     const handler = createParticipantHandler(state);
 
-    mockSdkClient.event.subscribe.mockResolvedValue({
+    mockSdkClient.global.event.mockResolvedValue({
       stream: emptyEventStream(),
     });
     mockSdkClient.session.prompt.mockResolvedValue(undefined);
 
     await handler(
-      { prompt: 'question', command: undefined, references: [], sessionId: 'chat-running' },
+      createRequest({ prompt: 'question', sessionId: 'chat-running' }),
       { history: [] },
       stream,
       token,

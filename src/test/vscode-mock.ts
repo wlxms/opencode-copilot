@@ -145,6 +145,28 @@ export interface ChatContext {
     history: Array<unknown>;
 }
 
+type MockToolSpecificData =
+        | {
+                commandLine: { original: string; userEdited?: string; toolEdited?: string };
+                language: string;
+                presentationOverrides?: { commandLine: string; language?: string };
+                output?: { text: string };
+                state?: { exitCode?: number; duration?: number };
+            }
+        | {
+                input: string;
+                output: string;
+            }
+        | {
+                values: Array<{ path: string; line?: number; character?: number }>;
+            }
+        | {
+                description?: string;
+                agentName?: string;
+                prompt?: string;
+                result?: string;
+            };
+
 /**
  * Mock for proposed API: ChatToolInvocationPart
  * This is NOT in @types/vscode — available at runtime with chatParticipantAdditions.
@@ -158,7 +180,7 @@ export class ChatToolInvocationPart {
     pastTenseMessage?: string;
     isConfirmed?: boolean;
     isComplete?: boolean;
-    toolSpecificData?: any;
+    toolSpecificData?: MockToolSpecificData;
     subAgentInvocationId?: string;
     presentation?: 'hidden' | 'hiddenAfterComplete';
     enablePartialUpdate?: boolean;

@@ -4,6 +4,27 @@
  * This module provides typed helper functions for common operations.
  */
 
+interface SessionLike {
+  id?: string;
+  title?: string;
+  time?: { created?: number };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function unwrapData(result: unknown): unknown {
+  if (isRecord(result) && 'data' in result) {
+    return result.data;
+  }
+  return result;
+}
+
+function asSessionLike(value: unknown): SessionLike {
+  return isRecord(value) ? value as SessionLike : {};
+}
+
 export interface SessionData {
   id: string;
   title: string;
@@ -11,18 +32,18 @@ export interface SessionData {
 }
 
 /** Extract a single session's data from an SDK response */
-export function extractSession(result: any): SessionData {
-  const data = result?.data ?? result;
+export function extractSession(result: unknown): SessionData {
+  const data = asSessionLike(unwrapData(result));
   return {
-    id: data.id,
+    id: data.id ?? '',
     title: data.title ?? '',
     createdAt: new Date(data.time?.created ?? Date.now()),
   };
 }
 
 /** Extract a session list from an SDK response */
-export function extractSessions(result: any): SessionData[] {
-  const list = result?.data ?? result;
+export function extractSessions(result: unknown): SessionData[] {
+  const list = unwrapData(result);
   if (!Array.isArray(list)) return [];
   return list.map(extractSession);
 }

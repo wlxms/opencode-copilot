@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import type { Model, Provider } from '@opencode-ai/sdk';
 import type { ExtensionState } from '../types';
 import { ErrorMessages } from './errors';
 import { ensureServer } from './handler';
@@ -35,9 +36,13 @@ async function handleNewCommand(
   if (!client) return;
   try {
     const result = await client.session.create({ body: {} });
-    state.activeSessionId = result.data.id;
+    const sessionId = result.data?.id;
+    if (!sessionId) {
+      throw new Error('Session not created');
+    }
+    state.activeSessionId = sessionId;
     stream.markdown('🆕 Started a new conversation session.');
-    state.outputChannel.appendLine(`[commands] New session: ${result.data.id}`);
+    state.outputChannel.appendLine(`[commands] New session: ${sessionId}`);
   } catch {
     stream.markdown(ErrorMessages.SESSION_ERROR);
   }
@@ -65,14 +70,12 @@ async function handleModelCommand(
   if (!client) return;
   try {
     const providersResp = await client.config.providers();
-    const providerList = providersResp.data?.providers ?? [];
+    const providerList: Provider[] = providersResp.data?.providers ?? [];
     if (providerList.length > 0) {
       const lines: string[] = ['## Available Models', ''];
       for (const p of providerList) {
-        const models = Object.values(p.models ?? {}) as any[];
-        const active = models.filter(
-          (m: any) => m.status === 'active',
-        );
+        const models: Model[] = Object.values(p.models ?? {});
+        const active = models.filter((model) => model.status === 'active');
         if (active.length > 0) {
           lines.push(`**${p.name}** (${p.id}):`);
           for (const m of active) {
