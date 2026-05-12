@@ -57,27 +57,37 @@ export async function ensureServer(
 // Session sync: VSCode chat session → OpenCode session via request.sessionId
 // -----------------------------------------------------------------------
 
+/** Result of scanning chat history metadata for recoverable state */
+interface RecoveredHistory {
+  turnMap: TurnMapping[];
+  sessionId: string | null;
+}
+
 /**
- * Recover turnMap from previous ChatResponseTurn metadata in history.
- * Used only for rewind/fork detection — session identity comes from
- * state.sessionMap keyed by request.sessionId.
+ * Recover turnMap and sessionId from previous ChatResponseTurn metadata in history.
+ * Scans from newest to oldest, returns the first match with valid data.
+ * Used for session recovery after VSCode restart and rewind/fork detection.
  */
-function recoverTurnMapFromHistory(
+function recoverFromHistory(
   context: vscode.ChatContext,
-): TurnMapping[] {
+): RecoveredHistory {
   const history = context.history;
   for (let i = history.length - 1; i >= 0; i--) {
     const turn = history[i];
     if (turn instanceof vscode.ChatResponseTurn) {
       const meta = turn.result?.metadata as {
         turnMap?: TurnMapping[];
+        sessionId?: string;
       } | undefined;
-      if (meta?.turnMap && meta.turnMap.length > 0) {
-        return meta.turnMap;
+      if (meta) {
+        return {
+          turnMap: meta.turnMap ?? [],
+          sessionId: meta.sessionId ?? null,
+        };
       }
     }
   }
-  return [];
+  return { turnMap: [], sessionId: null };
 }
 
 /**
@@ -111,8 +121,45 @@ async function resolveSession(
     `sessionMapSize=${state.sessionMap.size}`,
   );
 
-  // --- No mapping: new VSCode chat → create fresh OpenCode session ---
+  // --- No mapping: try to recover from history metadata, or create fresh ---
   if (!chatState) {
+    const recovered = recoverFromHistory(context);
+
+    // Attempt to recover a previously used OpenCode session from chat history
+    if (recovered.sessionId) {
+      state.outputChannel.appendLine(
+        `[handler] No sessionMap entry for ${vscodeSessionId}, found sessionId=${recovered.sessionId} in history metadata`,
+      );
+
+      try {
+        // Verify the session still exists on the OpenCode server
+        const sessionResult = await client.session.get({
+          path: { id: recovered.sessionId },
+          query: directory ? { directory } : undefined,
+        });
+        const existingId = sessionResult?.data?.id ?? sessionResult?.id;
+        if (existingId) {
+          // Session is valid — restore the mapping
+          const turnMap = recovered.turnMap;
+          state.activeSessionId = recovered.sessionId;
+          state.sessionMap.set(vscodeSessionId, {
+            opencodeSessionId: recovered.sessionId,
+            turnMap,
+          });
+          state.outputChannel.appendLine(
+            `[handler] Recovered OpenCode session ${recovered.sessionId} for VSCode chat ${vscodeSessionId} (turnMap=${turnMap.length})`,
+          );
+          return recovered.sessionId;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        state.outputChannel.appendLine(
+          `[handler] Recovered session ${recovered.sessionId} not found or expired (${msg}), creating new session`,
+        );
+      }
+    }
+
+    // Fallback: create a fresh OpenCode session
     const result = await client.session.create({
       body: {},
       query: directory ? { directory } : undefined,
@@ -130,7 +177,7 @@ async function resolveSession(
   }
 
   // --- Existing chat: check for rewind using per-chat turnMap ---
-  const priorTurnMap = recoverTurnMapFromHistory(context);
+  const priorTurnMap = recoverFromHistory(context).turnMap;
   const perChatTurnMap = chatState.turnMap;
   const expectedTurns = Math.max(perChatTurnMap.length, priorTurnMap.length);
 
