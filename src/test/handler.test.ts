@@ -8,6 +8,7 @@ const mockSdkClient = {
   session: {
     create: vi.fn(),
     prompt: vi.fn(),
+    revert: vi.fn(),
   },
   event: {
     subscribe: vi.fn(),
@@ -76,6 +77,7 @@ describe('createParticipantHandler', () => {
         hide: vi.fn(),
         dispose: vi.fn(),
       } as unknown as vscode.OutputChannel,
+      sessionMap: new Map(),
     };
 
     stream = {
@@ -204,7 +206,7 @@ describe('createParticipantHandler', () => {
     mockSdkClient.session.prompt.mockResolvedValue(undefined);
 
     const result = await handler(
-      { prompt: 'write a test', command: undefined, references: [] },
+      { prompt: 'write a test', command: undefined, references: [], sessionId: 'chat-1' },
       { history: [] },
       stream,
       token,
@@ -217,19 +219,23 @@ describe('createParticipantHandler', () => {
     // Client was set
     expect(state.client).toBe(mockSdkClient);
 
-    // Session was created
-    expect(mockSdkClient.session.create).toHaveBeenCalledWith({ body: {} });
+    // Session was created with workspace directory
+    expect(mockSdkClient.session.create).toHaveBeenCalledWith({
+      body: {},
+      query: { directory: '/test/workspace' },
+    });
     expect(state.activeSessionId).toBe('session-1');
 
     // Events subscribed
     expect(mockSdkClient.event.subscribe).toHaveBeenCalledOnce();
 
-    // Prompt sent with correct format
+    // Prompt sent with correct format (path/body/query)
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
       path: { id: 'session-1' },
       body: {
         parts: [{ type: 'text', text: 'write a test' }],
       },
+      query: { directory: '/test/workspace' },
     });
 
     // Progress was reported
@@ -237,6 +243,8 @@ describe('createParticipantHandler', () => {
 
     // Result contains session metadata
     expect(result.metadata).toHaveProperty('sessionId', 'session-1');
+    // turnMap should be in metadata
+    expect(result.metadata).toHaveProperty('turnMap');
   });
 
   // -----------------------------------------------------------------------
@@ -244,9 +252,13 @@ describe('createParticipantHandler', () => {
   // -----------------------------------------------------------------------
 
   it('should reuse active session for multi-turn conversation', async () => {
-    state.activeSessionId = 'existing-session';
     state.serverStatus = 'running';
     state.client = mockSdkClient;
+    // Pre-populate sessionMap with existing session
+    state.sessionMap.set('chat-1', {
+      opencodeSessionId: 'existing-session',
+      turnMap: [],
+    });
 
     const handler = createParticipantHandler(state);
 
@@ -256,7 +268,7 @@ describe('createParticipantHandler', () => {
     mockSdkClient.session.prompt.mockResolvedValue(undefined);
 
     const result = await handler(
-      { prompt: 'follow up', command: undefined, references: [] },
+      { prompt: 'follow up', command: undefined, references: [], sessionId: 'chat-1' },
       { history: [] },
       stream,
       token,
@@ -266,12 +278,13 @@ describe('createParticipantHandler', () => {
     expect(mockServerManager.start).not.toHaveBeenCalled();
     // Should NOT create session (reusing existing)
     expect(mockSdkClient.session.create).not.toHaveBeenCalled();
-    // Should send message to existing session
+    // Should send message to existing session with directory query
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
       path: { id: 'existing-session' },
       body: {
         parts: [{ type: 'text', text: 'follow up' }],
       },
+      query: { directory: '/test/workspace' },
     });
     expect(result.metadata).toHaveProperty('sessionId', 'existing-session');
   });
@@ -336,7 +349,7 @@ describe('createParticipantHandler', () => {
     );
 
     await handler(
-      { prompt: 'hello', command: undefined, references: [] },
+      { prompt: 'hello', command: undefined, references: [], sessionId: 'chat-err' },
       { history: [] },
       stream,
       token,
@@ -370,7 +383,11 @@ describe('createParticipantHandler', () => {
   it('should skip server start if already running with client', async () => {
     state.serverStatus = 'running';
     state.client = mockSdkClient;
-    state.activeSessionId = 'existing-id';
+    // Pre-populate sessionMap so session is reused
+    state.sessionMap.set('chat-running', {
+      opencodeSessionId: 'existing-id',
+      turnMap: [],
+    });
 
     const handler = createParticipantHandler(state);
 
@@ -380,7 +397,7 @@ describe('createParticipantHandler', () => {
     mockSdkClient.session.prompt.mockResolvedValue(undefined);
 
     await handler(
-      { prompt: 'question', command: undefined, references: [] },
+      { prompt: 'question', command: undefined, references: [], sessionId: 'chat-running' },
       { history: [] },
       stream,
       token,
@@ -393,6 +410,7 @@ describe('createParticipantHandler', () => {
       body: {
         parts: [{ type: 'text', text: 'question' }],
       },
+      query: { directory: '/test/workspace' },
     });
   });
 });

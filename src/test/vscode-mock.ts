@@ -137,6 +137,8 @@ export interface ChatRequest {
     toolReferences?: unknown[];
     toolInvocationToken?: string;
     model?: unknown;
+    /** From chatParticipantPrivate proposed API — identifies the VSCode chat panel */
+    sessionId?: string;
 }
 
 export interface ChatContext {
@@ -219,4 +221,22 @@ export const chat = {
 
 export const workspace = {
     workspaceFolders: undefined as Array<{ uri: Uri; name: string; index: number }> | undefined,
+};
+
+// ---------------------------------------------------------------------------
+// Turn types for chat history
+// ---------------------------------------------------------------------------
+
+export class ChatRequestTurn {
+    constructor(
+        public readonly prompt: string,
+        public readonly command: string | undefined,
+    ) {}
+}
+
+export class ChatResponseTurn {
+    constructor(
+        public readonly responses: unknown[],
+        public readonly result?: ChatResult,
+    ) {}
 };

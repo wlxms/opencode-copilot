@@ -19,9 +19,12 @@ export class OpenCodeServerManager {
 
   /**
    * Start the OpenCode server.
-   * The server inherits the current process working directory.
+   * @param cwd - Working directory for the opencode server (project root).
+   *              The server needs to spawn in the project context for proper
+   *              initialization (auth, config, etc.).
+   *              Additionally, query.directory is passed on each API call.
    */
-  async start(): Promise<string> {
+  async start(cwd?: string): Promise<string> {
     if (this.status === 'running' && this.serverUrl) {
       return this.serverUrl;
     }
@@ -29,7 +32,13 @@ export class OpenCodeServerManager {
     this.status = 'starting';
     this.serverUrl = null;
 
+    const originalCwd = process.cwd();
     try {
+      // Temporarily switch CWD so cross-spawn inherits the workspace path
+      if (cwd) {
+        process.chdir(cwd);
+      }
+
       // DO NOT set OPENCODE_SERVER_PASSWORD — it causes 401 Unauthorized
       delete process.env.OPENCODE_SERVER_PASSWORD;
 
@@ -48,6 +57,11 @@ export class OpenCodeServerManager {
         );
       }
       throw new Error(`Failed to start OpenCode server: ${msg}`);
+    } finally {
+      // Always restore original CWD
+      if (cwd) {
+        process.chdir(originalCwd);
+      }
     }
   }
 
