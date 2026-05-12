@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as vscode from 'vscode';
 import { StreamBridge } from '../participant/streaming';
+import type { MessagePartDeltaEvent, OpenCodeEvent, SessionIdleEvent } from '../types/events';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -13,7 +14,7 @@ type MockStream = vscode.ChatResponseStream & {
 };
 
 function mockStream(opts?: { withProposed?: boolean }): MockStream {
-  const stream: any = {
+  const stream: Partial<MockStream> = {
     markdown: vi.fn(),
     progress: vi.fn(),
     push: vi.fn(),
@@ -33,11 +34,32 @@ function mockToken(isCancelled = false): vscode.CancellationToken {
   };
 }
 
-function eventStream(events: any[]): { stream: AsyncIterable<any> } {
-  async function* gen(): AsyncIterable<any> {
+function eventStream(events: OpenCodeEvent[]): { stream: AsyncIterable<OpenCodeEvent> } {
+  async function* gen(): AsyncIterable<OpenCodeEvent> {
     for (const e of events) yield e;
   }
   return { stream: gen() };
+}
+
+function deltaEvent(delta: string, partID = 'prt_ai1'): MessagePartDeltaEvent {
+  return {
+    type: 'message.part.delta',
+    properties: { partID, delta, field: 'text' },
+  };
+}
+
+function idleEvent(): SessionIdleEvent {
+  return {
+    type: 'session.idle',
+    properties: {},
+  };
+}
+
+function idleEventFor(sessionID: string): SessionIdleEvent {
+  return {
+    type: 'session.idle',
+    properties: { sessionID },
+  };
 }
 
 function toolEvents(opts: {
@@ -48,7 +70,7 @@ function toolEvents(opts: {
   title?: string;
   timeStart?: number;
   timeEnd?: number;
-}) {
+}): OpenCodeEvent[] {
   const partId = 'prt_tool001';
   return [
     {
@@ -63,10 +85,10 @@ function toolEvents(opts: {
       type: 'message.part.updated',
       properties: { part: { type: 'tool', tool: opts.toolName, id: partId, callID: opts.callID, state: { status: 'completed', input: opts.input ?? {}, output: opts.output ?? '', title: opts.title, time: { start: opts.timeStart ?? 0, end: opts.timeEnd ?? 100 } } } },
     },
-  ];
+  ] satisfies OpenCodeEvent[];
 }
 
-function fullTurnEvents(opts: { tools?: any[]; aiDeltas?: string[] }) {
+function fullTurnEvents(opts: { tools?: OpenCodeEvent[]; aiDeltas?: string[] }): OpenCodeEvent[] {
   const tools = opts.tools ?? toolEvents({ toolName: 'read', callID: 'call_001', input: { filePath: '/f.txt' }, output: 'hello' });
   const aiDeltas = opts.aiDeltas ?? ['OK'];
 
@@ -75,9 +97,9 @@ function fullTurnEvents(opts: { tools?: any[]; aiDeltas?: string[] }) {
     { type: 'message.part.updated', properties: { part: { type: 'step-start', messageID: 'msg_a1', id: 'prt_s1' } } },
     ...tools,
     { type: 'message.part.updated', properties: { part: { type: 'text', text: '', messageID: 'msg_a1', id: 'prt_ai1' } } },
-    ...aiDeltas.map((d: string) => ({ type: 'message.part.delta', properties: { partID: 'prt_ai1', delta: d, field: 'text' } })),
-    { type: 'session.idle', properties: {} },
-  ];
+    ...aiDeltas.map((d: string) => deltaEvent(d)),
+    idleEvent(),
+  ] satisfies OpenCodeEvent[];
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +119,22 @@ describe('StreamBridge', () => {
     const result = await bridge.bridgeEventsToStream(events, stream, mockToken());
     expect(result).toBe(true);
     expect(stream.markdown).toHaveBeenCalledWith('OK');
+  });
+
+  it('should stream AI text even when user echo is missing', async () => {
+    const stream = mockStream();
+    const events = eventStream([
+      { type: 'message.part.updated', properties: { part: { type: 'step-start', messageID: 'msg_a1', id: 'prt_s1' } } },
+      { type: 'message.part.updated', properties: { part: { type: 'text', text: 'Hello', messageID: 'msg_a1', id: 'prt_ai1' } } },
+      deltaEvent(' world', 'prt_ai1'),
+      idleEvent(),
+    ]);
+
+    const result = await bridge.bridgeEventsToStream(events, stream, mockToken());
+
+    expect(result).toBe(true);
+    expect(stream.markdown).toHaveBeenCalledWith(' world');
+    expect(bridge.getUserMessageId()).toBeNull();
   });
 
   // --- Tool: read → SimpleToolResultData ---
@@ -191,7 +229,9 @@ describe('StreamBridge', () => {
     }));
     await bridge.bridgeEventsToStream(events, stream, mockToken());
     expect(stream.progress).toHaveBeenCalledWith('🔧 read...');
-    const m = (stream.markdown as ReturnType<typeof vi.fn>).mock.calls.map((c: any[]) => c[0]).join('');
+    const m = (stream.markdown as ReturnType<typeof vi.fn>).mock.calls
+      .map((c) => c[0] as string)
+      .join('');
     expect(m).toContain('f.txt');
   });
 
@@ -203,8 +243,8 @@ describe('StreamBridge', () => {
     const events = eventStream([
       { type: 'message.part.updated', properties: { part: { type: 'text', text: 'hi', messageID: 'msg_u1', id: 'prt_u1' } } },
       { type: 'message.part.updated', properties: { part: { type: 'reasoning', text: '', messageID: 'msg_a1', id: pid } } },
-      { type: 'message.part.delta', properties: { partID: pid, delta: 'think', field: 'text' } },
-      { type: 'session.idle', properties: {} },
+      deltaEvent('think', pid),
+      idleEvent(),
     ]);
     await bridge.bridgeEventsToStream(events, stream, mockToken());
     expect(stream.thinkingProgress).toHaveBeenCalledWith(expect.objectContaining({ text: 'think' }));
@@ -217,12 +257,36 @@ describe('StreamBridge', () => {
     const events = eventStream([
       { type: 'message.part.updated', properties: { part: { type: 'text', text: 'hi', messageID: 'msg_u1', id: 'prt_u1' } } },
       { type: 'message.part.updated', properties: { part: { type: 'text', text: '', messageID: 'msg_a1', id: 'prt_ai1' } } },
-      { type: 'message.part.delta', properties: { partID: 'prt_ai1', delta: 'Yes', field: 'text' } },
-      { type: 'session.idle', properties: {} },
-      { type: 'message.part.delta', properties: { partID: 'prt_ai1', delta: 'IGNORED', field: 'text' } },
+      deltaEvent('Yes'),
+      idleEvent(),
+      deltaEvent('IGNORED'),
     ]);
     await bridge.bridgeEventsToStream(events, stream, mockToken());
     expect(stream.markdown).toHaveBeenCalledWith('Yes');
+    expect(stream.markdown).not.toHaveBeenCalledWith('IGNORED');
+  });
+
+  it('should ignore session.idle from a different session when target session is set', async () => {
+    const stream = mockStream();
+    const scopedBridge = new StreamBridge({ sessionId: 'ses_target' });
+    const events = eventStream([
+      {
+        type: 'message.part.updated',
+        properties: {
+          part: { type: 'text', text: '', messageID: 'msg_a1', id: 'prt_ai1', sessionID: 'ses_target' },
+        },
+      },
+      deltaEvent('Hello', 'prt_ai1'),
+      idleEventFor('ses_other'),
+      deltaEvent(' world', 'prt_ai1'),
+      idleEventFor('ses_target'),
+      deltaEvent('IGNORED', 'prt_ai1'),
+    ]);
+
+    await scopedBridge.bridgeEventsToStream(events, stream, mockToken());
+
+    expect(stream.markdown).toHaveBeenCalledWith('Hello');
+    expect(stream.markdown).toHaveBeenCalledWith(' world');
     expect(stream.markdown).not.toHaveBeenCalledWith('IGNORED');
   });
 
@@ -254,13 +318,13 @@ describe('StreamBridge', () => {
 
   it('should handle empty delta', async () => {
     const stream = mockStream();
-    await bridge.bridgeEventsToStream(eventStream([{ type: 'message.part.delta', properties: { partID: 'x', delta: '' } }, { type: 'session.idle', properties: {} }]), stream, mockToken());
+    await bridge.bridgeEventsToStream(eventStream([deltaEvent('', 'x'), idleEvent()]), stream, mockToken());
     expect(stream.markdown).not.toHaveBeenCalled();
   });
 
   it('should handle unknown partID delta', async () => {
     const stream = mockStream();
-    await bridge.bridgeEventsToStream(eventStream([{ type: 'message.part.delta', properties: { partID: 'prt_unknown', delta: 'x' } }, { type: 'session.idle', properties: {} }]), stream, mockToken());
+    await bridge.bridgeEventsToStream(eventStream([deltaEvent('x', 'prt_unknown'), idleEvent()]), stream, mockToken());
     expect(stream.markdown).not.toHaveBeenCalledWith('x');
   });
 
@@ -272,7 +336,7 @@ describe('StreamBridge', () => {
       { type: 'message.part.updated', properties: { part: { type: 'step-start', messageID: 'msg_a1', id: 'prt_s1' } } },
       { type: 'message.part.updated', properties: { part: { type: 'tool', tool: 'read', id: pid, state: { status: 'pending', input: {} } } } },
       { type: 'message.part.updated', properties: { part: { type: 'tool', tool: 'read', id: pid, state: { status: 'completed', input: { filePath: '/x.txt' }, output: 'ok' } } } },
-      { type: 'session.idle', properties: {} },
+      idleEvent(),
     ]);
     await bridge.bridgeEventsToStream(events, stream, mockToken());
     expect(stream.beginToolInvocation).toHaveBeenCalledWith(pid, 'read');

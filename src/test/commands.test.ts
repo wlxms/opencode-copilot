@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as vscode from 'vscode';
-import type { ExtensionState } from '../types';
+import type { ExtensionState, OpenCodeClient, OpenCodeServerController } from '../types';
+import { GlobalEventBroker } from '../participant/event-broker';
 import { routeCommand } from '../participant/commands';
 
 // ---------------------------------------------------------------------------
@@ -12,7 +13,12 @@ function createMockClient() {
   return {
     session: {
       create: vi.fn(),
+      get: vi.fn(),
       prompt: vi.fn(),
+      revert: vi.fn(),
+    },
+    global: {
+      event: vi.fn(),
     },
     config: {
       providers: vi.fn(),
@@ -37,8 +43,12 @@ describe('routeCommand', () => {
     state = {
       serverManager: {
         start: vi.fn().mockRejectedValue(new Error('Server not available')),
+        stop: vi.fn().mockResolvedValue(undefined),
+        getStatus: vi.fn().mockReturnValue('error'),
+        isRunning: vi.fn().mockReturnValue(false),
+        getUrl: vi.fn().mockReturnValue(null),
         getClient: vi.fn().mockReturnValue(null),
-      },
+      } as unknown as OpenCodeServerController,
       client: null,
       activeSessionId: null,
       serverStatus: 'stopped',
@@ -52,16 +62,18 @@ describe('routeCommand', () => {
         hide: vi.fn(),
         dispose: vi.fn(),
       } as unknown as vscode.OutputChannel,
+      eventBroker: new GlobalEventBroker(),
+      sessionMap: new Map(),
     };
     stream = {
       markdown: vi.fn(),
       progress: vi.fn(),
       push: vi.fn(),
-    };
+    } as unknown as vscode.ChatResponseStream;
     token = {
       isCancellationRequested: false,
       onCancellationRequested: vi.fn(),
-    };
+    } as unknown as vscode.CancellationToken;
   });
 
   // -----------------------------------------------------------------------
@@ -73,7 +85,7 @@ describe('routeCommand', () => {
     mockClient.session.create.mockResolvedValue({
       data: { id: 'session-new' },
     });
-    state.client = mockClient;
+    state.client = mockClient as OpenCodeClient;
 
     await routeCommand('new', state, stream, token);
 
@@ -100,7 +112,7 @@ describe('routeCommand', () => {
     mockClient.session.create.mockRejectedValue(
       new Error('Session limit reached'),
     );
-    state.client = mockClient;
+    state.client = mockClient as OpenCodeClient;
 
     await routeCommand('new', state, stream, token);
 
@@ -161,7 +173,7 @@ describe('routeCommand', () => {
         ],
       },
     });
-    state.client = mockClient;
+    state.client = mockClient as OpenCodeClient;
 
     await routeCommand('model', state, stream, token);
 
@@ -193,7 +205,7 @@ describe('routeCommand', () => {
     mockClient.config.providers.mockRejectedValue(
       new Error('API error'),
     );
-    state.client = mockClient;
+    state.client = mockClient as OpenCodeClient;
 
     await routeCommand('model', state, stream, token);
 
@@ -207,7 +219,7 @@ describe('routeCommand', () => {
     mockClient.config.providers.mockResolvedValue({
       data: { providers: [] },
     });
-    state.client = mockClient;
+    state.client = mockClient as OpenCodeClient;
 
     await routeCommand('model', state, stream, token);
 
@@ -233,7 +245,7 @@ describe('routeCommand', () => {
     mockClient.session.create.mockResolvedValue({
       data: { id: 'session-case' },
     });
-    state.client = mockClient;
+    state.client = mockClient as OpenCodeClient;
 
     await routeCommand('New', state, stream, token);
 
@@ -264,7 +276,7 @@ describe('routeCommand', () => {
         ],
       },
     });
-    state.client = mockClient;
+    state.client = mockClient as OpenCodeClient;
 
     await routeCommand('model', state, stream, token);
 

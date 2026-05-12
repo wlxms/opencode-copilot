@@ -1,3 +1,8 @@
+import type {
+  EventSubscribeResponse,
+  FilePart,
+} from '@opencode-ai/sdk';
+
 /** Real SSE event types from the OpenCode server */
 
 // Server lifecycle
@@ -51,6 +56,13 @@ export type PartType =
   | 'text'
   | 'reasoning'
   | 'tool'
+  | 'file'
+  | 'agent'
+  | 'snapshot'
+  | 'patch'
+  | 'subtask'
+  | 'retry'
+  | 'compaction'
   | 'tool_use'
   | 'tool_result'
   | 'step-start'
@@ -64,3 +76,143 @@ export type PartType =
  * - state.title: display name (on completed)
  */
 export type ToolCallStatus = 'pending' | 'running' | 'completed';
+
+export interface MessagePartDeltaEvent {
+  type: 'message.part.delta';
+  properties: {
+    partID: string;
+    delta: string;
+    field?: string;
+  };
+}
+
+export type ToolInput = Record<string, unknown>;
+
+export type StreamToolState =
+  | {
+      status: 'pending';
+      input: ToolInput;
+      raw?: string;
+    }
+  | {
+      status: 'running';
+      input: ToolInput;
+      title?: string;
+      metadata?: Record<string, unknown>;
+      time?: { start?: number };
+    }
+  | {
+      status: 'completed';
+      input: ToolInput;
+      output?: string;
+      title?: string;
+      metadata?: Record<string, unknown>;
+      time?: { start?: number; end?: number; compacted?: number };
+      attachments?: FilePart[];
+    }
+  | {
+      status: 'error';
+      input: ToolInput;
+      error?: string;
+      metadata?: Record<string, unknown>;
+      time?: { start?: number; end?: number };
+    };
+
+interface BaseStreamPart {
+  id: string;
+  type: PartType;
+  messageID?: string;
+  sessionID?: string;
+}
+
+export interface TextStreamPart extends BaseStreamPart {
+  type: 'text';
+  messageID: string;
+  text: string;
+  synthetic?: boolean;
+  ignored?: boolean;
+  time?: { start: number; end?: number };
+  metadata?: Record<string, unknown>;
+}
+
+export interface ReasoningStreamPart extends BaseStreamPart {
+  type: 'reasoning';
+  messageID: string;
+  text: string;
+  metadata?: Record<string, unknown>;
+  time?: { start?: number; end?: number };
+}
+
+export interface StreamToolPart extends BaseStreamPart {
+  callID?: string;
+  type: 'tool';
+  tool: string;
+  state: StreamToolState;
+  metadata?: Record<string, unknown>;
+}
+
+export interface StepStartStreamPart extends BaseStreamPart {
+  type: 'step-start';
+  snapshot?: string;
+}
+
+export interface StepFinishStreamPart extends BaseStreamPart {
+  type: 'step-finish';
+  reason?: string;
+  snapshot?: string;
+  cost?: number;
+  tokens?: {
+    input: number;
+    output: number;
+    reasoning: number;
+    cache: { read: number; write: number };
+  };
+}
+
+export interface OtherStreamPart extends BaseStreamPart {
+  type: Exclude<PartType, 'text' | 'reasoning' | 'tool' | 'step-start' | 'step-finish'>;
+  [key: string]: unknown;
+}
+
+export type StreamPart =
+  | TextStreamPart
+  | ReasoningStreamPart
+  | StreamToolPart
+  | StepStartStreamPart
+  | StepFinishStreamPart
+  | OtherStreamPart;
+
+export interface MessagePartUpdatedEvent {
+  type: 'message.part.updated';
+  properties: {
+    part: StreamPart;
+    delta?: string;
+  };
+}
+
+export interface SessionIdleEvent {
+  type: 'session.idle';
+  properties: {
+    sessionID?: string;
+  };
+}
+
+type OtherSdkEvents = Exclude<
+  EventSubscribeResponse,
+  | Extract<EventSubscribeResponse, { type: 'message.part.updated' }>
+  | Extract<EventSubscribeResponse, { type: 'session.idle' }>
+>;
+
+export type OpenCodeEvent =
+  | OtherSdkEvents
+  | MessagePartUpdatedEvent
+  | MessagePartDeltaEvent
+  | SessionIdleEvent;
+
+export interface OpenCodeGlobalEventEnvelope {
+  directory: string;
+  payload: OpenCodeEvent;
+}
+
+export type OpenCodeStreamEvent = OpenCodeEvent | OpenCodeGlobalEventEnvelope;
+export type OpenCodeEventStream = { stream: AsyncIterable<OpenCodeStreamEvent> };

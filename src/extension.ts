@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { OpenCodeServerManager } from './opencode/server';
 import { createParticipantHandler } from './participant/handler';
+import { GlobalEventBroker } from './participant/event-broker';
 import type { ExtensionState } from './types';
 
 let state: ExtensionState | undefined;
@@ -17,6 +18,7 @@ export function activate(context: vscode.ExtensionContext) {
     activeSessionId: null,
     serverStatus: 'stopped',
     outputChannel,
+    eventBroker: new GlobalEventBroker(),
     sessionMap: new Map(),
   };
 

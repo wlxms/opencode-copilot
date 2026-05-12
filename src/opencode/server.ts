@@ -1,4 +1,5 @@
 import { createOpencode } from '@opencode-ai/sdk';
+import type { OpenCodeClient, OpenCodeServerController } from '../types';
 
 export type ServerStatus = 'stopped' | 'starting' | 'running' | 'error';
 
@@ -12,8 +13,11 @@ export type ServerStatus = 'stopped' | 'starting' | 'running' | 'error';
  *   // ...
  *   await manager.stop();
  */
-export class OpenCodeServerManager {
-  private instance: { server: { url: string; close: () => void }; client: any } | null = null;
+export class OpenCodeServerManager implements OpenCodeServerController {
+  private instance: {
+    server: { url: string; close: () => void };
+    client: OpenCodeClient;
+  } | null = null;
   private status: ServerStatus = 'stopped';
   private serverUrl: string | null = null;
 
@@ -42,10 +46,14 @@ export class OpenCodeServerManager {
       // DO NOT set OPENCODE_SERVER_PASSWORD — it causes 401 Unauthorized
       delete process.env.OPENCODE_SERVER_PASSWORD;
 
-      this.instance = await createOpencode({
+      const instance = await createOpencode({
         port: 0,
       });
-      this.serverUrl = this.instance.server.url;
+      this.instance = {
+        server: instance.server,
+        client: instance.client,
+      };
+      this.serverUrl = instance.server.url;
       this.status = 'running';
       return this.serverUrl;
     } catch (err) {
@@ -75,7 +83,7 @@ export class OpenCodeServerManager {
   }
 
   /** Get the SDK OpencodeClient instance, or null if not running */
-  getClient(): any | null {
+  getClient(): OpenCodeClient | null {
     return this.instance?.client ?? null;
   }
 
