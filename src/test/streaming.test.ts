@@ -139,7 +139,7 @@ describe('StreamBridge', () => {
 
   // --- Tool: read → SimpleToolResultData ---
 
-  it('should push read tool as SimpleToolResultData', async () => {
+  it('should push read tool as ChatSimpleToolResultData', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({
       tools: toolEvents({ toolName: 'read', callID: 'call_rd', input: { filePath: '/src/main.ts' }, output: 'line1\nline2', title: 'main.ts', timeStart: 1000, timeEnd: 1500 }),
@@ -147,21 +147,21 @@ describe('StreamBridge', () => {
     await bridge.bridgeEventsToStream(events, stream, mockToken());
     expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_rd', 'read');
     expect(stream.push).toHaveBeenCalled();
-    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    expect(pushed.toolName).toBe('read');
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls[1][0];
     expect(pushed.isComplete).toBe(true);
+    expect(pushed.toolName).toBe('read');
     expect(pushed.pastTenseMessage).toMatch(/Read.*main\.ts/);
   });
 
   // --- Tool: bash → TerminalToolData ---
 
-  it('should push bash tool as TerminalToolData', async () => {
+  it('should push bash tool as ChatTerminalToolInvocationData', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({
       tools: toolEvents({ toolName: 'bash', callID: 'call_sh', input: { command: 'ls -la' }, output: 'total 42', title: 'bash', timeStart: 1000, timeEnd: 3200 }),
     }));
     await bridge.bridgeEventsToStream(events, stream, mockToken());
-    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls[1][0];
     expect(pushed.toolSpecificData.commandLine.original).toBe('ls -la');
     expect(pushed.toolSpecificData.output.text).toContain('total 42');
     expect(pushed.pastTenseMessage).toMatch(/Ran bash.*2\.2s/);
@@ -169,25 +169,25 @@ describe('StreamBridge', () => {
 
   // --- Tool: write with filePath → ToolResourcesData ---
 
-  it('should push write tool with filePath as ToolResourcesData', async () => {
+  it('should push write tool with filePath as ChatToolResourcesInvocationData', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({
       tools: toolEvents({ toolName: 'write', callID: 'call_wr', input: { filePath: '/src/new.ts', content: 'x' }, output: 'ok', title: 'new.ts' }),
     }));
     await bridge.bridgeEventsToStream(events, stream, mockToken());
-    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls[1][0];
     expect(pushed.toolSpecificData.values).toBeDefined();
   });
 
   // --- Tool: task/subagent → SubagentToolData ---
 
-  it('should push subagent tool as SubagentToolData', async () => {
+  it('should push subagent tool as ChatSubagentToolInvocationData', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({
       tools: toolEvents({ toolName: 'task', callID: 'call_sub', input: { agentName: 'code-search', prompt: 'Find foo()' }, output: 'Found 5', title: 'search' }),
     }));
     await bridge.bridgeEventsToStream(events, stream, mockToken());
-    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls[1][0];
     expect(pushed.toolSpecificData.agentName).toBe('code-search');
     expect(pushed.toolSpecificData.result).toBe('Found 5');
   });
@@ -217,7 +217,7 @@ describe('StreamBridge', () => {
     }));
     await bridge.bridgeEventsToStream(events, stream, mockToken());
     expect(stream.beginToolInvocation).toHaveBeenCalledTimes(2);
-    expect(stream.push).toHaveBeenCalledTimes(2);
+    expect(stream.push).toHaveBeenCalledTimes(4);
   });
 
   // --- Fallback without proposed API ---
@@ -311,7 +311,7 @@ describe('StreamBridge', () => {
     await bridge.bridgeEventsToStream(eventStream(fullTurnEvents({ tools: toolEvents({ toolName: 'read', callID: 'call_a', output: 'a' }) })), s1, mockToken());
     const s2 = mockStream();
     await bridge.bridgeEventsToStream(eventStream(fullTurnEvents({ tools: toolEvents({ toolName: 'read', callID: 'call_b', output: 'b' }) })), s2, mockToken());
-    expect((s2.push as ReturnType<typeof vi.fn>).mock.calls[0][0].toolSpecificData.output).toBe('b');
+    expect((s2.push as ReturnType<typeof vi.fn>).mock.calls[1][0].toolSpecificData.output).toBe('b');
   });
 
   // --- Edge cases ---
