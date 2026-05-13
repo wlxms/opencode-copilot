@@ -534,4 +534,155 @@ describe('createParticipantHandler', () => {
     // abort should NOT have been called for a normal completion
     expect(mockSdkClient.session.abort).not.toHaveBeenCalled();
   });
+
+  // -----------------------------------------------------------------------
+  // Checkpoint / externalEdit flow
+  // -----------------------------------------------------------------------
+
+  it('should degrade gracefully when ExternalEditCtor is unavailable', async () => {
+    const handler = createParticipantHandler(state);
+
+    // Ensure ChatResponseExternalEditPart is NOT available
+    (vscode as any).ChatResponseExternalEditPart = undefined;
+
+    // Set up full flow mocks
+    state.serverStatus = 'running';
+    state.client = mockSdkClient as OpenCodeClient;
+    state.sessionMap.set('chat-cp-1', {
+      opencodeSessionId: 'existing-session',
+      turnMap: [],
+    });
+
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
+    const result = await handler(
+      createRequest({ prompt: 'test checkpoint', sessionId: 'chat-cp-1' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    // Should complete without error
+    expect(result!.metadata).toHaveProperty('sessionId', 'existing-session');
+
+    // Should log that checkpoint is unavailable
+    expect(state.outputChannel.appendLine).toHaveBeenCalledWith(
+      expect.stringContaining('Checkpoint unavailable'),
+    );
+
+    // stream.push should NOT have been called (no external edit part)
+    expect(stream.push).not.toHaveBeenCalled();
+  });
+
+  it('should skip checkpoint when no open files are present', async () => {
+    const handler = createParticipantHandler(state);
+
+    // Make ExternalEditCtor available as a mock class
+    const MockExternalEditCtor = vi.fn().mockImplementation((uris: unknown, cb: unknown) => ({
+      uris,
+      callback: cb,
+    }));
+    (vscode as any).ChatResponseExternalEditPart = MockExternalEditCtor;
+
+    // No text documents open
+    (vscode.workspace as { textDocuments: unknown }).textDocuments = [];
+
+    // Set up full flow mocks
+    state.serverStatus = 'running';
+    state.client = mockSdkClient as OpenCodeClient;
+    state.sessionMap.set('chat-cp-2', {
+      opencodeSessionId: 'existing-session',
+      turnMap: [],
+    });
+
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
+    const result = await handler(
+      createRequest({ prompt: 'test checkpoint skip', sessionId: 'chat-cp-2' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    // Should complete without error
+    expect(result!.metadata).toHaveProperty('sessionId', 'existing-session');
+
+    // Should log that checkpoint was skipped (no files)
+    expect(state.outputChannel.appendLine).toHaveBeenCalledWith(
+      expect.stringContaining('Checkpoint skipped'),
+    );
+
+    // The ExternalEditCtor should NOT have been instantiated
+    expect(MockExternalEditCtor).not.toHaveBeenCalled();
+
+    // Clean up
+    delete (vscode as any).ChatResponseExternalEditPart;
+  });
+
+  it('should enable checkpoint when ExternalEditCtor is available and files are open', async () => {
+    const handler = createParticipantHandler(state);
+
+    // Mock ExternalEditCtor as a plain function (vi.fn() with arrow
+    // functions can't be used with `new` in vitest).
+    let capturedUris: unknown = null;
+    let capturedCallback: (() => Promise<unknown>) | null = null;
+
+    const ExternalEditCtor = function(this: unknown, uris: unknown, cb: () => Promise<unknown>) {
+      capturedUris = uris;
+      capturedCallback = cb;
+      return { uris, callback: cb };
+    };
+    (vscode as any).ChatResponseExternalEditPart = ExternalEditCtor;
+
+    // Simulate open text documents (file scheme, not untitled)
+    const mockDocs = [
+      { uri: vscode.Uri.file('/src/app.ts'), isUntitled: false },
+      { uri: vscode.Uri.file('/src/util.ts'), isUntitled: false },
+    ];
+    (vscode.workspace as { textDocuments: unknown }).textDocuments = mockDocs;
+
+    // Set up full flow mocks
+    state.serverStatus = 'running';
+    state.client = mockSdkClient as OpenCodeClient;
+    state.sessionMap.set('chat-cp-3', {
+      opencodeSessionId: 'existing-session',
+      turnMap: [],
+    });
+
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
+    const result = await handler(
+      createRequest({ prompt: 'test checkpoint enabled', sessionId: 'chat-cp-3' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    // Handler returns immediately after pushing ExternalEditPart (callback runs later)
+    // sessionId is set from resolveSession, so it should be in metadata
+    expect(result!.metadata).toHaveProperty('sessionId', 'existing-session');
+
+    // Should log checkpoint enabled
+    expect(state.outputChannel.appendLine).toHaveBeenCalledWith(
+      expect.stringContaining('Checkpoint enabled'),
+    );
+
+    // ExternalEditCtor should have been instantiated with the open file URIs
+    expect(capturedUris).toHaveLength(2);
+
+    // stream.push should have been called with the external edit part
+    expect(stream.push).toHaveBeenCalledOnce();
+
+    // Clean up
+    delete (vscode as any).ChatResponseExternalEditPart;
+  });
 });

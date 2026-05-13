@@ -175,6 +175,47 @@ export class ChatToolInvocationPart {
 }
 
 // ---------------------------------------------------------------------------
+// ChatResponseExternalEditPart
+// ---------------------------------------------------------------------------
+
+export interface ChatWorkspaceFileEdit {
+  oldResource?: Uri;
+  newResource?: Uri;
+}
+
+/**
+ * A chat response part representing an external file edit.
+ * Source: vscode.proposed.chatParticipantAdditions.d.ts
+ */
+export class ChatResponseExternalEditPart {
+  readonly uris: readonly Uri[];
+  readonly callback: () => Thenable<unknown>;
+  readonly applied: Thenable<string>;
+
+  constructor(uris: readonly Uri[], callback: () => Thenable<unknown>) {
+    this.uris = uris;
+    this.callback = callback;
+    this.applied = Promise.resolve('');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ChatResponseWorkspaceEditPart
+// ---------------------------------------------------------------------------
+
+/**
+ * A chat response part representing a workspace edit.
+ * Source: vscode.proposed.chatParticipantAdditions.d.ts
+ */
+export class ChatResponseWorkspaceEditPart {
+  readonly edits: readonly ChatWorkspaceFileEdit[];
+
+  constructor(edits: readonly ChatWorkspaceFileEdit[]) {
+    this.edits = edits;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // ExtendedChatResponseParts — lists all proposed chat response parts
 // ---------------------------------------------------------------------------
 
@@ -186,7 +227,7 @@ export interface ExtendedChatResponseParts {
   ChatResponsePart: unknown;
   ChatResponseTextEditPart: unknown;
   ChatResponseNotebookEditPart: unknown;
-  ChatResponseWorkspaceEditPart: unknown;
+  ChatResponseWorkspaceEditPart: ChatResponseWorkspaceEditPart;
   ChatResponseConfirmationPart: unknown;
   ChatResponseCodeCitationPart: unknown;
   ChatResponseReferencePart2: unknown;
@@ -196,7 +237,7 @@ export interface ExtendedChatResponseParts {
   ChatToolInvocationPart: ChatToolInvocationPart;
   ChatResponseMultiDiffPart: unknown;
   ChatResponseThinkingProgressPart: unknown;
-  ChatResponseExternalEditPart: unknown;
+  ChatResponseExternalEditPart: ChatResponseExternalEditPart;
   ChatResponseQuestionCarouselPart: unknown;
 }
 
