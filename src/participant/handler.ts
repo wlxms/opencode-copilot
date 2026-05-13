@@ -276,6 +276,7 @@ async function resolveSession(
  *  5. Resolve or fork session (handles VSCode rewind)
  *  6. Subscribe to SSE events
  *  7. Send the user prompt
+ *  7b. Hook cancellation → abort OpenCode backend
  *  8. Bridge events to VSCode chat stream
  *  9. Record user message ID in turn map
  */
@@ -337,10 +338,39 @@ export function createParticipantHandler(
         state.outputChannel.appendLine(`[handler] Prompt error: ${msg}`);
       });
 
+      // 7b. Subscribe to VSCode cancellation → abort OpenCode session.
+      //     When the user clicks "Stop" in the chat UI, VSCode fires
+      //     CancellationToken.onCancellationRequested. We forward this
+      //     to the OpenCode backend via session.abort() to stop ongoing
+      //     AI processing, tool execution, and token generation.
+      let aborted = false;
+      const cancelDisposable = token.onCancellationRequested(() => {
+        if (aborted) return;
+        aborted = true;
+        state.outputChannel.appendLine(
+          `[handler] Cancellation requested, aborting OpenCode session ${sessionId}`,
+        );
+        client.session.abort({
+          path: { id: sessionId },
+          query: directory ? { directory } : undefined,
+        }).then((result) => {
+          state.outputChannel.appendLine(
+            `[handler] Abort result: ${JSON.stringify(result?.data)}`,
+          );
+        }).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          state.outputChannel.appendLine(`[handler] Abort error: ${msg}`);
+        });
+      });
+
       state.outputChannel.appendLine(`[handler] bridgeEventsToStream start for session ${sessionId}`);
       // 8. Bridge events to VSCode chat stream (consumes as they arrive)
       const bridge = new StreamBridge({ logger: state.outputChannel, sessionId });
-      await bridge.bridgeEventsToStream(events, stream, token);
+      try {
+        await bridge.bridgeEventsToStream(events, stream, token);
+      } finally {
+        cancelDisposable.dispose();
+      }
 
       state.eventBroker.closeSessionStream(sessionId);
 
@@ -363,7 +393,7 @@ export function createParticipantHandler(
         );
       }
 
-      // 11. Return metadata for future turn recovery
+      // 12. Return metadata for future turn recovery
       return {
         metadata: {
           sessionId,

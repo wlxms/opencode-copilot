@@ -11,6 +11,7 @@ const mockSdkClient = {
     get: vi.fn(),
     prompt: vi.fn(),
     revert: vi.fn(),
+    abort: vi.fn(),
   },
   global: {
     event: vi.fn(),
@@ -120,6 +121,9 @@ describe('createParticipantHandler', () => {
       onCancellationRequested: vi.fn(() => ({ dispose: vi.fn() })),
     } as unknown as vscode.CancellationToken;
 
+    // Default abort mock — resolves to prevent handler crash on cancellation
+    mockSdkClient.session.abort.mockResolvedValue({ data: true });
+
     // Set workspace folders for consistent test behavior
     (vscode.workspace as { workspaceFolders: unknown }).workspaceFolders = [
       {
@@ -161,6 +165,8 @@ describe('createParticipantHandler', () => {
     expect(mockServerManager.start).not.toHaveBeenCalled();
   });
 
+  // -----------------------------------------------------------------------
+  // Empty prompt
   // -----------------------------------------------------------------------
   // Empty prompt
   // -----------------------------------------------------------------------
@@ -441,5 +447,91 @@ describe('createParticipantHandler', () => {
       },
       query: { directory: '/test/workspace' },
     });
+  });
+
+  // -----------------------------------------------------------------------
+  // Cancellation during active session → abort
+  // -----------------------------------------------------------------------
+
+  it('should call session.abort when cancelled mid-session', async () => {
+    const handler = createParticipantHandler(state);
+
+    // Set up a running server with client
+    state.client = mockSdkClient as unknown as OpenCodeClient;
+    state.serverStatus = 'running';
+    mockSdkClient.session.create.mockResolvedValue({
+      data: { id: 'session-abort-test' },
+    });
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+
+    // Create a token that fires cancellation via onCancellationRequested callback
+    let cancelCallback: (() => void) | undefined;
+    const cancelToken = {
+      isCancellationRequested: false,
+      onCancellationRequested: vi.fn((cb: () => void) => {
+        cancelCallback = cb;
+        return { dispose: vi.fn() };
+      }),
+    } as unknown as vscode.CancellationToken;
+
+    // Fire the handler — it will subscribe to cancellation
+    const handlerPromise = handler(
+      createRequest({ prompt: 'hello' }),
+      { history: [] },
+      stream,
+      cancelToken,
+    );
+
+    // Give the handler a tick to register the cancellation listener
+    await vi.waitFor(() => {
+      expect(cancelCallback).toBeDefined();
+    });
+
+    // Simulate VSCode firing cancellation (user clicks "Stop")
+    cancelCallback!();
+
+    // Wait for handler to complete
+    await handlerPromise;
+
+    // Verify abort was called with the correct session ID
+    expect(mockSdkClient.session.abort).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: { id: 'session-abort-test' },
+        query: { directory: '/test/workspace' },
+      }),
+    );
+  });
+
+  it('should not call session.abort when handler completes normally', async () => {
+    const handler = createParticipantHandler(state);
+
+    state.client = mockSdkClient as unknown as OpenCodeClient;
+    state.serverStatus = 'running';
+    mockSdkClient.session.create.mockResolvedValue({
+      data: { id: 'session-normal' },
+    });
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+
+    await handler(
+      createRequest({ prompt: 'hello' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    // abort should NOT have been called for a normal completion
+    expect(mockSdkClient.session.abort).not.toHaveBeenCalled();
   });
 });
