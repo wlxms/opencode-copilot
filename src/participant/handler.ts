@@ -3,6 +3,8 @@ import { StreamBridge } from './streaming';
 import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
 import type { ExtensionState, OpenCodeClient, TurnMapping } from '../types';
+import type { ChatResponseExternalEditPart } from '../types/vscode-proposed-additions';
+import { CheckpointManager, collectOpenFileUris } from './checkpoint';
 
 /**
  * Get the VSCode workspace root path for the first workspace folder.
@@ -289,6 +291,9 @@ export function createParticipantHandler(
     stream: vscode.ChatResponseStream,
     token: vscode.CancellationToken,
   ): Promise<vscode.ChatResult> => {
+    // Create checkpoint before outer try so it's always in scope for catch/finally cleanup.
+    // CheckpointManager is lightweight — creating it on early-return paths is acceptable.
+    const checkpoint = new CheckpointManager();
     try {
       // 1. Early cancellation check
       if (token.isCancellationRequested) {
@@ -319,91 +324,160 @@ export function createParticipantHandler(
       const sessionId = await resolveSession(client, state, context, stream, vscodeSessionId, directory);
       if (!sessionId) return { metadata: {} };
 
-      const events = state.eventBroker.openSessionStream(sessionId);
-      // 6. Ensure the shared global-event broker is running after the session queue exists
-      await state.eventBroker.ensureStarted(client, state.outputChannel);
-
-      // 7. Fire the prompt WITHOUT awaiting — events stream concurrently.
-      //    If we await prompt(), all SSE events fire during that await and
-      //    are lost before bridgeEventsToStream starts consuming them.
-      state.outputChannel.appendLine(
-        `[handler] Prompting session ${sessionId} with: ${request.prompt.substring(0, 50)}`,
-      );
-      const promptPromise = client.session.prompt({
-        path: { id: sessionId },
-        body: { parts: [{ type: 'text', text: request.prompt }] },
-        query: directory ? { directory } : undefined,
-      }).catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : 'Prompt failed';
-        state.outputChannel.appendLine(`[handler] Prompt error: ${msg}`);
-      });
-
-      // 7b. Subscribe to VSCode cancellation → abort OpenCode session.
-      //     When the user clicks "Stop" in the chat UI, VSCode fires
-      //     CancellationToken.onCancellationRequested. We forward this
-      //     to the OpenCode backend via session.abort() to stop ongoing
-      //     AI processing, tool execution, and token generation.
-      let aborted = false;
-      const cancelDisposable = token.onCancellationRequested(() => {
-        if (aborted) return;
-        aborted = true;
-        state.outputChannel.appendLine(
-          `[handler] Cancellation requested, aborting OpenCode session ${sessionId}`,
-        );
-        client.session.abort({
-          path: { id: sessionId },
-          query: directory ? { directory } : undefined,
-        }).then((result) => {
-          state.outputChannel.appendLine(
-            `[handler] Abort result: ${JSON.stringify(result?.data)}`,
-          );
-        }).catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          state.outputChannel.appendLine(`[handler] Abort error: ${msg}`);
-        });
-      });
-
-      state.outputChannel.appendLine(`[handler] bridgeEventsToStream start for session ${sessionId}`);
-      // 8. Bridge events to VSCode chat stream (consumes as they arrive)
-      const bridge = new StreamBridge({ logger: state.outputChannel, sessionId });
+      // 5b. Checkpoint: collect open files for proactive baseline capture
+      // (checkpoint instance created above, before outer try)
+      let fileUris: vscode.Uri[] = [];
       try {
-        await bridge.bridgeEventsToStream(events, stream, token);
-      } finally {
-        cancelDisposable.dispose();
+        fileUris = collectOpenFileUris();
+      } catch {
+        // vscode.workspace.textDocuments may not be available (e.g., test mock)
       }
+      checkpoint.setFileUris(fileUris);
 
-      state.eventBroker.closeSessionStream(sessionId);
+      // Runtime check: ChatResponseExternalEditPart available?
+      const ExternalEditCtor = (vscode as any).ChatResponseExternalEditPart as
+        | (new (uris: readonly vscode.Uri[], callback: () => Thenable<unknown>) => ChatResponseExternalEditPart)
+        | undefined;
 
-      // 9. Ensure prompt promise settles before returning
-      await promptPromise;
+      const executeTurnWithBridge = async (): Promise<void> => {
+        const events = state.eventBroker.openSessionStream(sessionId);
+        await state.eventBroker.ensureStarted(client, state.outputChannel);
 
-      // 10. Record the user message ID for per-chat turn tracking
-      const chatState = state.sessionMap.get(vscodeSessionId);
-      const userMessageId = bridge.getUserMessageId();
-      state.outputChannel.appendLine(
-        `[handler] User message ID for turn chatState && userMessageId: ${!!chatState && !!userMessageId} (${userMessageId})`,
-      );
-      if (chatState && userMessageId) {
-        chatState.turnMap.push({
-          vscodeTurn: chatState.turnMap.length,
-          opencodeMessageId: userMessageId,
-        });
+        checkpoint.createIdlePromise();
+
+        // 7. Fire the prompt WITHOUT awaiting
         state.outputChannel.appendLine(
-          `[handler] Recorded turn ${chatState.turnMap.length - 1}: messageID=${userMessageId} (total turns=${chatState.turnMap.length})`,
+          `[handler] Prompting session ${sessionId} with: ${request.prompt.substring(0, 50)}`,
         );
+        const promptPromise = client.session.prompt({
+          path: { id: sessionId },
+          body: { parts: [{ type: 'text', text: request.prompt }] },
+          query: directory ? { directory } : undefined,
+        }).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : 'Prompt failed';
+          state.outputChannel.appendLine(`[handler] Prompt error: ${msg}`);
+        });
+
+        // 7b. Cancel → abort OpenCode session
+        let aborted = false;
+        const cancelDisposable = token.onCancellationRequested(() => {
+          if (aborted) return;
+          aborted = true;
+          state.outputChannel.appendLine(
+            `[handler] Cancellation requested, aborting OpenCode session ${sessionId}`,
+          );
+          client.session.abort({
+            path: { id: sessionId },
+            query: directory ? { directory } : undefined,
+          }).then((result) => {
+            state.outputChannel.appendLine(
+              `[handler] Abort result: ${JSON.stringify(result?.data)}`,
+            );
+          }).catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            state.outputChannel.appendLine(`[handler] Abort error: ${msg}`);
+          });
+          // Also resolve idle promise so externalEdit callback can complete
+          checkpoint.resolveIdle();
+          // Note: VS Code's checkpoint undo is the primary undo mechanism.
+          // OpenCode's session.revert() (used in resolveSession for rewind)
+          // serves as a fallback for cases where VS Code checkpoint is unavailable.
+        });
+
+        state.outputChannel.appendLine(`[handler] bridgeEventsToStream start for session ${sessionId}`);
+        const bridge = new StreamBridge({
+          logger: state.outputChannel,
+          sessionId,
+          knownFileUris: new Set(fileUris.map(u => u.toString())),
+        });
+        try {
+          await bridge.bridgeEventsToStream(events, stream, token);
+        } finally {
+          cancelDisposable.dispose();
+        }
+
+        state.eventBroker.closeSessionStream(sessionId);
+
+        // 9. Ensure prompt promise settles
+        await promptPromise;
+
+        // 10. Record user message ID
+        const chatState = state.sessionMap.get(vscodeSessionId);
+        const userMessageId = bridge.getUserMessageId();
+        state.outputChannel.appendLine(
+          `[handler] User message ID for turn: ${!!chatState && !!userMessageId} (${userMessageId})`,
+        );
+        if (chatState && userMessageId) {
+          chatState.turnMap.push({
+            vscodeTurn: chatState.turnMap.length,
+            opencodeMessageId: userMessageId,
+          });
+          state.outputChannel.appendLine(
+            `[handler] Recorded turn ${chatState.turnMap.length - 1}: messageID=${userMessageId} (total turns=${chatState.turnMap.length})`,
+          );
+        }
+
+        // Signal checkpoint complete
+        checkpoint.resolveIdle();
+        checkpoint.dispose();
+      };
+
+      try {
+        if (ExternalEditCtor && fileUris.length > 0) {
+          // --- WITH CHECKPOINT: wrap prompt+bridge in externalEdit callback ---
+          state.outputChannel.appendLine(
+            `[handler] Checkpoint enabled: ${fileUris.length} open files tracked`,
+          );
+
+          const externalEditPart = new ExternalEditCtor(fileUris, async () => {
+            // This callback runs AFTER baseline capture (send start=true completes first)
+            return await executeTurnWithBridge();
+          });
+
+          // Push the part — VS Code processes it via microtask:
+          //   1. send(start=true) — captures file baselines
+          //   2. await callback() — runs executeTurnWithBridge()
+          //   3. send(start=false) — finalizes externalEdit
+          // We MUST await part.applied to keep the handler alive until the
+          // callback finishes. Otherwise the handler returns early, VS Code
+          // closes the response stream, and subsequent stream operations fail.
+          (stream as any).push(externalEditPart);
+          await externalEditPart.applied;
+        } else {
+          // --- WITHOUT CHECKPOINT: original flow (graceful degradation) ---
+          if (!ExternalEditCtor) {
+            state.outputChannel.appendLine(
+              `[handler] Checkpoint unavailable: ChatResponseExternalEditPart not supported in this VS Code version`,
+            );
+          } else {
+            state.outputChannel.appendLine(
+              `[handler] Checkpoint skipped: no open files to track`,
+            );
+          }
+          await executeTurnWithBridge();
+        }
+      } finally {
+        // Ensure checkpoint is always cleaned up, even on error or cancellation.
+        // In the externalEdit path, the callback handles its own dispose().
+        // This finally is a safety net for the fallback path and error cases.
+        if (!ExternalEditCtor || fileUris.length === 0) {
+          checkpoint.dispose();
+        }
       }
 
       // 12. Return metadata for future turn recovery
       return {
         metadata: {
           sessionId,
-          turnMap: chatState?.turnMap ?? [],
+          turnMap: state.sessionMap.get(vscodeSessionId)?.turnMap ?? [],
         },
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unexpected error';
       stream.markdown(`⚠️ ${msg}`);
       state.outputChannel.appendLine(`[handler] Error: ${msg}`);
+      // Safety net: ensure checkpoint is disposed on unexpected errors
+      checkpoint.dispose();
       return { metadata: {} };
     }
   };

@@ -18,6 +18,9 @@ import type {
   ChatToolSpecificData,
   ChatToolInvocationPart,
   ChatToolInvocationStreamData,
+  ChatWorkspaceFileEdit,
+  ChatResponseExternalEditPart,
+  ChatResponseWorkspaceEditPart,
 } from '../types/vscode-proposed-additions';
 
 /** Extended stream with proposed API methods */
@@ -39,6 +42,13 @@ type ProposedVscode = typeof vscode & {
     prompt?: string,
     result?: string,
   ) => ChatSubagentToolInvocationData;
+  ChatResponseExternalEditPart?: new (
+    uris: readonly vscode.Uri[],
+    callback: () => Thenable<unknown>,
+  ) => ChatResponseExternalEditPart;
+  ChatResponseWorkspaceEditPart?: new (
+    edits: readonly ChatWorkspaceFileEdit[],
+  ) => ChatResponseWorkspaceEditPart;
 };
 
 // Runtime access to proposed classes (may not exist)
@@ -51,6 +61,9 @@ interface StreamBridgeLogger {
 interface StreamBridgeOptions {
   logger?: StreamBridgeLogger;
   sessionId?: string;
+  /** URIs of files known to exist at the start of the turn */
+  knownFileUris?: Set<string>;
+
 }
 
 // =======================================================================
@@ -88,10 +101,13 @@ export class StreamBridge {
   private progressivePushed: Set<string> = new Set();
   private readonly logger?: StreamBridgeLogger;
   private readonly sessionId?: string;
+  /** URIs of files that existed before the turn started (proactive baseline) */
+  private knownFileUris: Set<string>;
 
   constructor(options: StreamBridgeOptions = {}) {
     this.logger = options.logger;
     this.sessionId = options.sessionId;
+    this.knownFileUris = options.knownFileUris ?? new Set();
   }
 
   /** Get the OpenCode message ID of the user message in this turn, if captured */
@@ -339,6 +355,37 @@ export class StreamBridge {
           getToolOutput(state),
           getToolTitle(state),
         );
+      }
+      // Track new file creation via ChatResponseWorkspaceEditPart
+      if (toolName === 'write' && VS.ChatResponseWorkspaceEditPart && stream.push) {
+        const input = state.input as Record<string, unknown> | undefined;
+        const filePath = input?.filePath as string | undefined;
+        if (filePath) {
+          const fileUri = vscode.Uri.file(filePath).toString();
+          const isNewFile = !this.knownFileUris.has(fileUri);
+          if (isNewFile) {
+            try {
+              const editPart = new VS.ChatResponseWorkspaceEditPart([
+                { newResource: vscode.Uri.file(filePath) },
+              ]);
+              stream.push(editPart as unknown as vscode.ChatResponsePart);
+              this.log(`pushed WorkspaceEditPart for new file: ${filePath}`);
+            } catch {
+              // Best-effort; checkpoint still works via externalEdit baseline
+            }
+          }
+        }
+      }
+      // Best-effort diagnostic: log when edit/write touches files outside the proactive set
+      if ((toolName === 'edit' || toolName === 'write') && this.knownFileUris.size > 0) {
+        const input = state.input as Record<string, unknown> | undefined;
+        const filePath = input?.filePath as string | undefined;
+        if (filePath) {
+          const fileUri = vscode.Uri.file(filePath).toString();
+          if (!this.knownFileUris.has(fileUri)) {
+            this.log(`tool ${toolName} touched file not in proactive set: ${filePath} (best-effort tracking)`);
+          }
+        }
       }
       this.toolMetas.delete(callID);
       this.toolCallIds.delete(part.id);
