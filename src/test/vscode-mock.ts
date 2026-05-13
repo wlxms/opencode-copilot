@@ -9,6 +9,8 @@
  * It is NOT a full VS Code API polyfill.
  */
 
+import type { ChatToolSpecificData, ChatToolInvocationStreamData } from '../types/vscode-proposed-additions';
+
 // ---------------------------------------------------------------------------
 // Enums / Constants
 // ---------------------------------------------------------------------------
@@ -107,14 +109,39 @@ export interface ExtensionContext {
     logUri: Uri;
 }
 
-export interface Uri {
-    scheme: string;
-    authority: string;
-    path: string;
-    fsPath: string;
-    query: string;
-    fragment: string;
-    with(change: { scheme?: string; authority?: string; path?: string; query?: string; fragment?: string }): Uri;
+export class Uri {
+    readonly scheme: string;
+    readonly authority: string;
+    readonly path: string;
+    readonly fragment: string;
+    readonly query: string;
+    readonly fsPath: string;
+
+    static file(path: string): Uri {
+        return new Uri('file', '', path, '', '');
+    }
+
+    static parse(value: string): Uri {
+        // basic parse — enough for tests
+        return new Uri('file', '', value, '', '');
+    }
+
+    constructor(scheme: string, authority: string, path: string, query: string, fragment: string) {
+        this.scheme = scheme;
+        this.authority = authority;
+        this.path = path;
+        this.query = query;
+        this.fragment = fragment;
+        this.fsPath = path.replace(/\//g, '\\');
+    }
+
+    with(_change: unknown): Uri {
+        return this;
+    }
+
+    toString(): string {
+        return `${this.scheme}://${this.authority}${this.path}`;
+    }
 }
 
 export interface Memento {
@@ -145,28 +172,6 @@ export interface ChatContext {
     history: Array<unknown>;
 }
 
-type MockToolSpecificData =
-        | {
-                commandLine: { original: string; userEdited?: string; toolEdited?: string };
-                language: string;
-                presentationOverrides?: { commandLine: string; language?: string };
-                output?: { text: string };
-                state?: { exitCode?: number; duration?: number };
-            }
-        | {
-                input: string;
-                output: string;
-            }
-        | {
-                values: Array<{ path: string; line?: number; character?: number }>;
-            }
-        | {
-                description?: string;
-                agentName?: string;
-                prompt?: string;
-                result?: string;
-            };
-
 /**
  * Mock for proposed API: ChatToolInvocationPart
  * This is NOT in @types/vscode — available at runtime with chatParticipantAdditions.
@@ -180,7 +185,7 @@ export class ChatToolInvocationPart {
     pastTenseMessage?: string;
     isConfirmed?: boolean;
     isComplete?: boolean;
-    toolSpecificData?: MockToolSpecificData;
+    toolSpecificData?: ChatToolSpecificData;
     subAgentInvocationId?: string;
     presentation?: 'hidden' | 'hiddenAfterComplete';
     enablePartialUpdate?: boolean;
@@ -203,9 +208,9 @@ export interface ChatResponseStream {
     /** Proposed API: stream thinking tokens */
     thinkingProgress?(delta: unknown): void;
     /** Proposed API: begin streaming tool invocation */
-    beginToolInvocation?(toolCallId: string, toolName: string, streamData?: unknown): void;
+    beginToolInvocation?(toolCallId: string, toolName: string, streamData?: ChatToolInvocationStreamData): void;
     /** Proposed API: update streaming tool invocation */
-    updateToolInvocation?(toolCallId: string, streamData: unknown): void;
+    updateToolInvocation?(toolCallId: string, streamData: ChatToolInvocationStreamData): void;
 }
 
 export interface CancellationToken {

@@ -10,85 +10,21 @@ import type {
   TextStreamPart,
   ToolCallStatus,
 } from '../types/events';
-
-// =======================================================================
-// Proposed API types (chatParticipantAdditions)
-// Available at runtime but not in @types/vscode — declared locally.
-// Source: microsoft/vscode vscode.proposed.chatParticipantAdditions.d.ts
-// =======================================================================
-
-/** Thinking delta for stream.thinkingProgress() */
-interface ThinkingDelta {
-  text?: string | string[];
-  id?: string;
-  metadata?: { readonly [key: string]: unknown };
-}
-
-/** Streaming data for beginToolInvocation / updateToolInvocation */
-interface StreamToolData {
-  partialInput?: unknown;
-}
-
-// ---------- toolSpecificData variants ----------
-
-/** Terminal/shell command invocation */
-interface TerminalToolData {
-  commandLine: { original: string; userEdited?: string; toolEdited?: string };
-  language: string;
-  presentationOverrides?: { commandLine: string; language?: string };
-  output?: { text: string };
-  state?: { exitCode?: number; duration?: number };
-}
-
-/** Collapsible input/output for file reads, list, etc. */
-interface SimpleToolResultData {
-  input: string;
-  output: string;
-}
-
-/** File/resource list (collapsible) */
-interface ToolResourcesData {
-  values: Array<{ path: string; line?: number; character?: number }>;
-}
-
-/** Subagent invocation — click to expand subagent details */
-interface SubagentToolData {
-  description?: string;
-  agentName?: string;
-  prompt?: string;
-  result?: string;
-}
-
-/** Union of all tool-specific data types for ChatToolInvocationPart.toolSpecificData */
-type ToolSpecificData =
-  | TerminalToolData
-  | SimpleToolResultData
-  | ToolResourcesData
-  | SubagentToolData;
-
-// ---------- ChatToolInvocationPart shape ----------
-
-interface ToolInvocationPart {
-  toolName: string;
-  toolCallId: string;
-  isError?: boolean;
-  invocationMessage?: string;
-  originMessage?: string;
-  pastTenseMessage?: string;
-  isConfirmed?: boolean;
-  isComplete?: boolean;
-  toolSpecificData?: ToolSpecificData;
-  subAgentInvocationId?: string;
-  presentation?: 'hidden' | 'hiddenAfterComplete';
-  enablePartialUpdate?: boolean;
-  constructor(toolName: string, toolCallId: string, errorMessage?: string): void;
-}
+import type {
+  ChatTerminalToolInvocationData,
+  ChatSimpleToolResultData,
+  ChatToolResourcesInvocationData,
+  ChatSubagentToolInvocationData,
+  ChatToolSpecificData,
+  ChatToolInvocationPart,
+  ChatToolInvocationStreamData,
+} from '../types/vscode-proposed-additions';
 
 /** Extended stream with proposed API methods */
 type Stream = vscode.ChatResponseStream & {
-  thinkingProgress?(delta: ThinkingDelta): void;
-  beginToolInvocation?(callId: string, name: string, data?: StreamToolData): void;
-  updateToolInvocation?(callId: string, data: StreamToolData): void;
+  thinkingProgress?(delta: { text?: string | string[]; id?: string; metadata?: { readonly [key: string]: unknown } }): void;
+  beginToolInvocation?(callId: string, name: string, data?: ChatToolInvocationStreamData): void;
+  updateToolInvocation?(callId: string, data: ChatToolInvocationStreamData): void;
 };
 
 type ProposedVscode = typeof vscode & {
@@ -96,7 +32,13 @@ type ProposedVscode = typeof vscode & {
     toolName: string,
     toolCallId: string,
     errorMessage?: string,
-  ) => ToolInvocationPart;
+  ) => ChatToolInvocationPart;
+  ChatSubagentToolInvocationData?: new (
+    description?: string,
+    agentName?: string,
+    prompt?: string,
+    result?: string,
+  ) => ChatSubagentToolInvocationData;
 };
 
 // Runtime access to proposed classes (may not exist)
@@ -125,12 +67,12 @@ interface StreamBridgeOptions {
  * - stream.markdown()                   → AI text token streaming
  *
  * toolSpecificData mapping (OpenCode tool → VSCode type):
- *   read          → SimpleToolResultData (collapsible input/output)
- *   bash          → TerminalToolData (terminal UI with exit code)
- *   write         → ToolResourcesData (file reference list)
- *   list / grep   → SimpleToolResultData (collapsible listing)
- *   task          → SubagentToolData (click to expand subagent)
- *   (other)       → SimpleToolResultData (generic fallback)
+ *   read          → ChatSimpleToolResultData (collapsible input/output)
+ *   bash          → ChatTerminalToolInvocationData (terminal UI with exit code)
+ *   write         → ChatToolResourcesInvocationData (file reference list)
+ *   list / grep   → ChatSimpleToolResultData (collapsible listing)
+ *   task          → ChatSubagentToolInvocationData (click to expand subagent)
+ *   (other)       → ChatSimpleToolResultData (generic fallback)
  */
 export class StreamBridge {
   private userMessageId: string | null = null;
@@ -142,6 +84,8 @@ export class StreamBridge {
   private hasThinking: boolean = false;
   private hasToolUI: boolean = false;
   private assistantPhaseStarted: boolean = false;
+  /** Tracks which tool callIDs have received a progressive push (isComplete=false) part */
+  private progressivePushed: Set<string> = new Set();
   private readonly logger?: StreamBridgeLogger;
   private readonly sessionId?: string;
 
@@ -350,6 +294,26 @@ export class StreamBridge {
         stream.updateToolInvocation(callID, {
           partialInput: state.input ?? {},
         });
+        // Progressive push: push ChatToolInvocationPart with isComplete=false
+        // to show the "tool running" spinner in VSCode UI.
+        // The part will be updated/overwritten when completed status arrives.
+        if (VS.ChatToolInvocationPart && stream.push && !this.progressivePushed.has(callID)) {
+          try {
+            const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callID);
+            part.isComplete = false;
+            part.isError = false;
+            part.enablePartialUpdate = true;
+            part.invocationMessage = this.formatInvocationMsg(
+              toolName,
+              state.input ?? {},
+              getToolTitle(state) ?? toolName,
+            );
+            stream.push(part as unknown as vscode.ChatResponsePart);
+            this.progressivePushed.add(callID);
+          } catch {
+            // Progressive push is best-effort; existing updateToolInvocation is sufficient
+          }
+        }
         return true;
       }
       return false;
@@ -382,13 +346,18 @@ export class StreamBridge {
     }
 
     if (status === 'error') {
-      this.renderToolFallback(
-        stream,
-        toolName,
-        state.input,
-        state.error,
-        getToolTitle(state) ?? toolName,
-      );
+      // Try to push ChatToolInvocationPart with isError=true
+      if (this.hasToolUI && VS.ChatToolInvocationPart) {
+        this.pushToolInvocation(stream, callID, toolName, state, true);
+      } else {
+        this.renderToolFallback(
+          stream,
+          toolName,
+          state.input,
+          state.error,
+          getToolTitle(state) ?? toolName,
+        );
+      }
       this.toolMetas.delete(callID);
       this.toolCallIds.delete(part.id);
       return true;
@@ -406,6 +375,7 @@ export class StreamBridge {
     callID: string,
     toolName: string,
     state: StreamToolState,
+    isError?: boolean,
   ): void {
     try {
       const meta = this.toolMetas.get(callID);
@@ -416,24 +386,45 @@ export class StreamBridge {
       const timeStart = time?.start ?? meta?.timeStart;
       const timeEnd = time?.end ?? meta?.timeEnd;
 
-      const ChatToolInvocationPart = VS.ChatToolInvocationPart;
-      if (!ChatToolInvocationPart) {
+      const ChatToolInvocationPartCtor = VS.ChatToolInvocationPart;
+      if (!ChatToolInvocationPartCtor) {
         throw new Error('ChatToolInvocationPart unavailable');
       }
 
-      const part: ToolInvocationPart = new ChatToolInvocationPart(
+      const part: ChatToolInvocationPart = new ChatToolInvocationPartCtor(
         toolName,
         callID,
       );
-      part.enablePartialUpdate = true;
-      part.isComplete = true;
-      part.invocationMessage = this.formatInvocationMsg(toolName, input, title);
-      part.pastTenseMessage = this.formatPastTenseMsg(toolName, title, timeStart, timeEnd);
 
-      // Select and attach the appropriate toolSpecificData
-      part.toolSpecificData = this.buildToolSpecificData(
-        toolName, title, input, output, timeStart, timeEnd,
-      );
+      if (isError) {
+        // Error state: show error styling with invocation message
+        part.isError = true;
+        part.invocationMessage = state.status === 'error' && state.error
+          ? state.error
+          : `Tool ${toolName} failed`;
+        // No pastTenseMessage or toolSpecificData for errors
+      } else {
+        // Success/complete state
+        part.enablePartialUpdate = true;
+        part.isComplete = true;
+        part.invocationMessage = this.formatInvocationMsg(toolName, input, title);
+        part.pastTenseMessage = this.formatPastTenseMsg(toolName, title, timeStart, timeEnd);
+
+        // Select and attach the appropriate toolSpecificData
+        part.toolSpecificData = this.buildToolSpecificData(
+          toolName, title, input, output, timeStart, timeEnd,
+        );
+      }
+
+      // Set subAgentInvocationId for task/subagent tools
+      if (toolName === 'task' || toolName === 'subagent') {
+        part.subAgentInvocationId = callID;
+      }
+
+      // Set presentation for internal/structural tools
+      if (toolName === 'internal' || toolName === 'step-start' || toolName === 'step-finish') {
+        part.presentation = 'hiddenAfterComplete';
+      }
 
       stream.push(part as unknown as vscode.ChatResponsePart);
     } catch {
@@ -458,7 +449,7 @@ export class StreamBridge {
     output: string,
     timeStart?: number,
     timeEnd?: number,
-  ): ToolSpecificData | undefined {
+  ): ChatToolSpecificData | undefined {
     switch (toolName) {
       case 'bash':
       case 'shell': {
@@ -475,8 +466,8 @@ export class StreamBridge {
             timeStart != null
               ? { duration: timeEnd != null ? timeEnd - timeStart : undefined }
               : undefined,
-        } satisfies TerminalToolData;
-      }
+        } satisfies ChatTerminalToolInvocationData;
+        }
 
       case 'read':
       case 'list':
@@ -484,7 +475,7 @@ export class StreamBridge {
         return {
           input: formatInput(input, title),
           output: truncate(output, 2000),
-        } satisfies SimpleToolResultData;
+        } satisfies ChatSimpleToolResultData;
       }
 
       case 'write':
@@ -493,23 +484,36 @@ export class StreamBridge {
         const filePath = input.filePath as string | undefined;
         if (filePath) {
           return {
-            values: [{ path: filePath }],
-          } satisfies ToolResourcesData;
+            values: [vscode.Uri.file(filePath)],
+          } satisfies ChatToolResourcesInvocationData;
         }
         return {
           input: formatInput(input, title),
           output: truncate(output, 2000),
-        } satisfies SimpleToolResultData;
+        } satisfies ChatSimpleToolResultData;
       }
 
       case 'task':
       case 'subagent': {
+        const description = (input.description as string) ?? title;
+        const agentName = (input.agentName as string) ?? toolName;
+        const prompt = (input.prompt as string) ?? formatInput(input, '');
+        const result = truncate(output, 4000);
+        // Use ChatSubagentToolInvocationData constructor if available at runtime
+        if (VS.ChatSubagentToolInvocationData) {
+          return new VS.ChatSubagentToolInvocationData(
+            description,
+            agentName,
+            prompt,
+            result,
+          ) as ChatSubagentToolInvocationData satisfies ChatSubagentToolInvocationData;
+        }
         return {
-          description: (input.description as string) ?? title,
-          agentName: (input.agentName as string) ?? toolName,
-          prompt: (input.prompt as string) ?? formatInput(input, ''),
-          result: truncate(output, 4000),
-        } satisfies SubagentToolData;
+          description,
+          agentName,
+          prompt,
+          result,
+        } satisfies ChatSubagentToolInvocationData;
       }
 
       default:
@@ -518,7 +522,7 @@ export class StreamBridge {
           return {
             input: formatInput(input, title),
             output: truncate(output, 2000),
-          } satisfies SimpleToolResultData;
+          } satisfies ChatSimpleToolResultData;
         }
         return undefined;
     }
@@ -592,6 +596,7 @@ export class StreamBridge {
     this.partKinds.clear();
     this.toolCallIds.clear();
     this.toolMetas.clear();
+    this.progressivePushed.clear();
     this.assistantPhaseStarted = false;
   }
 
