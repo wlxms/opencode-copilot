@@ -34,6 +34,10 @@ export interface OpenCodeClient {
       body: { messageID: string; partID?: string };
       query?: { directory?: string };
     }): Promise<OpenCodeApiResponse<SessionRevertResponse>>;
+    abort(options: {
+      path: { id: string };
+      query?: { directory?: string };
+    }): Promise<OpenCodeApiResponse<boolean>>;
   };
   global: {
     event(): Promise<OpenCodeEventStream>;

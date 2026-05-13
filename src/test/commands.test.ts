@@ -16,6 +16,7 @@ function createMockClient() {
       get: vi.fn(),
       prompt: vi.fn(),
       revert: vi.fn(),
+      abort: vi.fn(),
     },
     global: {
       event: vi.fn(),
