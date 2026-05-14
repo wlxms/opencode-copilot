@@ -5,6 +5,7 @@ import type {
   OpenCodeEventStream,
   OpenCodeStreamEvent,
   ReasoningStreamPart,
+  SessionDiffEvent,
   StreamToolPart,
   StreamToolState,
   TextStreamPart,
@@ -19,9 +20,13 @@ import type {
   ChatToolInvocationPart,
   ChatToolInvocationStreamData,
   ChatWorkspaceFileEdit,
+  ChatResponseDiffEntry,
   ChatResponseExternalEditPart,
+  ChatResponseMultiDiffPart,
   ChatResponseWorkspaceEditPart,
 } from '../types/vscode-proposed-additions';
+import { ExternalEditTracker } from './external-edit-tracker';
+import type { PermissionAskedEvent } from '../types/events';
 
 /** Extended stream with proposed API methods */
 type Stream = vscode.ChatResponseStream & {
@@ -49,6 +54,11 @@ type ProposedVscode = typeof vscode & {
   ChatResponseWorkspaceEditPart?: new (
     edits: readonly ChatWorkspaceFileEdit[],
   ) => ChatResponseWorkspaceEditPart;
+  ChatResponseMultiDiffPart?: new (
+    value: ChatResponseDiffEntry[],
+    title: string,
+    readOnly?: boolean,
+  ) => ChatResponseMultiDiffPart;
 };
 
 // Runtime access to proposed classes (may not exist)
@@ -63,7 +73,16 @@ interface StreamBridgeOptions {
   sessionId?: string;
   /** URIs of files known to exist at the start of the turn */
   knownFileUris?: Set<string>;
-
+  /** Per-edit tracker for externalEdit checkpoints */
+  tracker?: ExternalEditTracker;
+  /** OpenCode client for replying to permission.asked */
+  client?: { postSessionIdPermissionsPermissionId(options: {
+    path: { id: string; permissionID: string };
+    body?: { response: 'once' | 'always' | 'reject' };
+    query?: { directory?: string };
+  }): Promise<unknown> };
+  /** Workspace directory for API calls */
+  directory?: string;
 }
 
 // =======================================================================
@@ -103,11 +122,17 @@ export class StreamBridge {
   private readonly sessionId?: string;
   /** URIs of files that existed before the turn started (proactive baseline) */
   private knownFileUris: Set<string>;
+  private readonly tracker?: ExternalEditTracker;
+  private readonly client?: StreamBridgeOptions['client'];
+  private readonly directory?: string;
 
   constructor(options: StreamBridgeOptions = {}) {
     this.logger = options.logger;
     this.sessionId = options.sessionId;
     this.knownFileUris = options.knownFileUris ?? new Set();
+    this.tracker = options.tracker;
+    this.client = options.client;
+    this.directory = options.directory;
   }
 
   /** Get the OpenCode message ID of the user message in this turn, if captured */
@@ -137,6 +162,11 @@ export class StreamBridge {
           this.log('bridge stop: cancellation requested');
           stream.markdown(`\n⚠️ ${msg}\n`);
           break;
+        }
+        // Handle permission.asked as sync barrier (async, blocks loop until baseline captured + auto-reply)
+        if (evt.type === 'permission.asked') {
+          await this.handlePermissionAsked(evt as PermissionAskedEvent, stream);
+          continue;
         }
         const result = this.processEvent(evt, s);
         if (result.rendered) {
@@ -185,8 +215,57 @@ export class StreamBridge {
         return { stop: false, rendered: this.handlePartDelta(evt, stream) };
       case 'session.idle':
         return { stop: true, rendered: false };
+      case 'session.diff':
+        return { stop: false, rendered: this.handleSessionDiff(evt as SessionDiffEvent, stream) };
+      // permission.asked is handled directly in bridgeEventsToStream (async)
+      case 'permission.asked':
+        return { stop: false, rendered: false };
     }
     return { stop: false, rendered: false };
+  }
+
+  // -------------------------------------------------------------------
+  // permission.asked — sync barrier for per-edit externalEdit
+  // -------------------------------------------------------------------
+
+  private async handlePermissionAsked(evt: PermissionAskedEvent, stream: vscode.ChatResponseStream): Promise<boolean> {
+    const props = evt.properties;
+    const callID = props.tool?.callID;
+    const filepath = props.metadata?.filepath;
+    const sessionId = props.sessionID;
+    const permissionId = props.id;
+
+    this.log(
+      `permission.asked: id=${permissionId}, callID=${callID ?? 'none'}, ` +
+      `filepath=${filepath ?? 'none'}, sessionID=${sessionId ?? 'none'}`,
+    );
+
+    // If we have a tracker and this is an edit-related permission with a file path, track it
+    if (this.tracker && callID && filepath) {
+      const fileUri = vscode.Uri.file(filepath);
+      try {
+        await this.tracker.trackEdit(callID, [fileUri], stream);
+        this.log(`trackEdit resolved for callID=${callID} — baseline captured`);
+      } catch (err) {
+        this.log(`trackEdit failed for callID=${callID}: ${err}`);
+      }
+    }
+
+    // Auto-reply "once" to resume the server
+    if (this.client && sessionId && permissionId) {
+      try {
+        await this.client.postSessionIdPermissionsPermissionId({
+          path: { id: sessionId, permissionID: permissionId },
+          body: { response: 'once' },
+          query: this.directory ? { directory: this.directory } : undefined,
+        });
+        this.log(`auto-replied 'once' for permission ${permissionId}`);
+      } catch (err) {
+        this.log(`auto-reply failed for permission ${permissionId}: ${err}`);
+      }
+    }
+
+    return false; // no visual rendering needed
   }
 
   // -------------------------------------------------------------------
@@ -263,6 +342,45 @@ export class StreamBridge {
     }
 
     return false;
+  }
+
+  // -------------------------------------------------------------------
+  // session.diff → ChatResponseMultiDiffPart (shows +/- lines in UI)
+  // -------------------------------------------------------------------
+
+  private handleSessionDiff(evt: SessionDiffEvent, stream: Stream): boolean {
+    const diffs = evt.properties?.diff;
+    if (!diffs?.length) return false;
+
+    if (!VS.ChatResponseMultiDiffPart || !stream.push) {
+      return false;
+    }
+
+    const entries: ChatResponseDiffEntry[] = diffs
+      .filter((d) => d.status !== 'deleted')
+      .map((d) => {
+        const uri = vscode.Uri.file(d.file);
+        const entry: ChatResponseDiffEntry = {
+          modifiedUri: uri,
+          added: d.additions || undefined,
+          removed: d.deletions || undefined,
+        };
+        if (d.status !== 'added') {
+          entry.originalUri = uri;
+        }
+        return entry;
+      });
+
+    if (!entries.length) return false;
+
+    try {
+      const diffPart = new VS.ChatResponseMultiDiffPart(entries, 'File Changes', true);
+      stream.push(diffPart as unknown as vscode.ChatResponsePart);
+      this.log(`pushed MultiDiffPart: ${entries.length} file(s) changed`);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   // -------------------------------------------------------------------
@@ -389,6 +507,13 @@ export class StreamBridge {
       }
       this.toolMetas.delete(callID);
       this.toolCallIds.delete(part.id);
+
+      // Complete the per-edit externalEdit checkpoint for this tool call
+      if (this.tracker) {
+        this.tracker.completeEdit(callID);
+        this.log(`completeEdit called for callID=${callID}`);
+      }
+
       return true;
     }
 
@@ -762,6 +887,10 @@ function describeEvent(evt: OpenCodeEvent): string {
       return `message.part.delta partID=${evt.properties.partID} len=${evt.properties.delta.length}`;
     case 'session.idle':
       return `session.idle sessionID=${evt.properties.sessionID ?? 'unknown'}`;
+    case 'session.diff': {
+      const diffCount = evt.properties?.diff?.length ?? 0;
+      return `session.diff files=${diffCount}`;
+    }
     default:
       return evt.type;
   }
