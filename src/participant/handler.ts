@@ -4,7 +4,9 @@ import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
 import type { ExtensionState, OpenCodeClient, TurnMapping } from '../types';
 import type { ChatResponseExternalEditPart } from '../types/vscode-proposed-additions';
-import { CheckpointManager, collectOpenFileUris } from './checkpoint';
+import { CheckpointManager, CheckpointSignal, collectOpenFileUris } from './checkpoint';
+import { getCheckpointMode } from '../config';
+import type { CheckpointMode } from '../config';
 
 /**
  * Get the VSCode workspace root path for the first workspace folder.
@@ -324,11 +326,33 @@ export function createParticipantHandler(
       const sessionId = await resolveSession(client, state, context, stream, vscodeSessionId, directory);
       if (!sessionId) return { metadata: {} };
 
+      // 5a. Read checkpoint supervision mode from VSCode settings
+      const checkpointMode: CheckpointMode = getCheckpointMode();
+      state.outputChannel.appendLine(`[handler] Checkpoint mode: ${checkpointMode}`);
+
+      // 5b. Permission mode: configure OpenCode to require approval before edits.
+      // This makes the server emit `permission.asked` events and block until
+      // we reply — giving us a precise, race-free synchronization point.
+      let permissionModeActivated = false;
+      if (checkpointMode === 'permission') {
+        try {
+          await client.config.update({
+            body: { permission: { edit: 'ask' } },
+            query: directory ? { directory } : undefined,
+          });
+          state.outputChannel.appendLine('[handler] Permission mode: edit permission set to "ask"');
+          permissionModeActivated = true;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          state.outputChannel.appendLine(`[handler] Permission mode: config.update failed (${msg}), falling back to turn mode`);
+        }
+      }
+
       // 5b. Checkpoint: collect open files for proactive baseline capture
       // (checkpoint instance created above, before outer try)
       let fileUris: vscode.Uri[] = [];
       try {
-        fileUris = collectOpenFileUris();
+        fileUris = collectOpenFileUris(directory);
       } catch {
         // vscode.workspace.textDocuments may not be available (e.g., test mock)
       }
@@ -338,6 +362,71 @@ export function createParticipantHandler(
       const ExternalEditCtor = (vscode as any).ChatResponseExternalEditPart as
         | (new (uris: readonly vscode.Uri[], callback: () => Thenable<unknown>) => ChatResponseExternalEditPart)
         | undefined;
+
+      // -------------------------------------------------------------------
+      // CheckpointSignal-based ExternalEditPart lifecycle
+      // -------------------------------------------------------------------
+      // Lifecycle variables shared between the SSE loop (via onCheckpointCycle)
+      // and the handler's ExternalEditPart push loop.
+      const touchedFiles: Set<string> = new Set();
+      const signal = new CheckpointSignal();
+      const pendingCycleAcks: Array<() => void> = [];
+      let isFirstCallback = true;
+      let isComplete = false;
+      let cycleCount = 0;
+
+      /**
+       * Called by StreamBridge at each checkpoint boundary. Notifies the signal
+       * so the current ExternalEditPart callback can return, then resolves once
+       * the next part has been pushed onto the stream.
+       */
+      const cycleCheckpoint = (): Promise<void> => {
+        cycleCount++;
+        state.outputChannel.appendLine(
+          `[handler] Checkpoint cycle #${cycleCount}: mode=${checkpointMode}`,
+        );
+        return new Promise<void>((resolve) => {
+          pendingCycleAcks.push(resolve);
+          signal.notify();
+        });
+      };
+
+      const resolveCycleAck = (): void => {
+        const resolve = pendingCycleAcks.shift();
+        resolve?.();
+      };
+
+      /**
+       * Callback for EVERY ExternalEditPart pushed on the stream.
+       *
+       * First call:  starts the SSE loop (executeTurnWithBridge) WITHOUT awaiting
+       *              it — the SSE loop and the signal-wait run concurrently.
+       * Subsequent:  only awaits the signal.
+       *
+       * When the signal is notified, the callback returns, VSCode finalises the part,
+       * and the handler knows it can push the next part.
+       */
+      const externalEditCallback = async (): Promise<void> => {
+        if (isFirstCallback) {
+          isFirstCallback = false;
+          // Start the SSE loop in the background — do NOT await it.
+          // When the loop ends (session.idle or error) we set isComplete and
+          // dispose the signal so the last part can finalise.
+          executeTurnWithBridge()
+            .catch((err: unknown) => {
+              const msg = err instanceof Error ? err.message : String(err);
+              state.outputChannel.appendLine(`[handler] executeTurnWithBridge error: ${msg}`);
+            })
+            .finally(() => {
+              isComplete = true;
+              signal.dispose(); // Resolve all waiting callbacks
+              checkpoint.dispose(); // Safety net — executeTurnWithBridge also calls this
+            });
+        }
+        if (!isComplete) {
+          await signal.wait(); // Wait until notified (by cycleCheckpoint or finalise)
+        }
+      };
 
       const executeTurnWithBridge = async (): Promise<void> => {
         const events = state.eventBroker.openSessionStream(sessionId);
@@ -379,6 +468,9 @@ export function createParticipantHandler(
           });
           // Also resolve idle promise so externalEdit callback can complete
           checkpoint.resolveIdle();
+          // Dispose the checkpoint signal so the callback can return and the
+          // handler can exit cleanly even when cancelled mid-cycle.
+          signal.dispose();
           // Note: VS Code's checkpoint undo is the primary undo mechanism.
           // OpenCode's session.revert() (used in resolveSession for rewind)
           // serves as a fallback for cases where VS Code checkpoint is unavailable.
@@ -389,6 +481,36 @@ export function createParticipantHandler(
           logger: state.outputChannel,
           sessionId,
           knownFileUris: new Set(fileUris.map(u => u.toString())),
+          checkpointMode,
+          // Auto-approve permission requests in permission mode.
+          // The server is blocked waiting for a reply — we approve immediately
+          // so the edit proceeds without user interaction, but the event gives
+          // us a precise per-tool checkpoint boundary.
+          onPermissionAsked: checkpointMode === 'permission'
+            ? async (permission) => {
+                try {
+                  await client.postSessionIdPermissionsPermissionId({
+                    body: { response: 'once' },
+                    path: { id: sessionId, permissionID: permission.id },
+                    query: directory ? { directory } : undefined,
+                  });
+                  state.outputChannel.appendLine(
+                    `[handler] Permission auto-approved: id=${permission.id} type=${permission.type}`,
+                  );
+                } catch (err) {
+                  const msg = err instanceof Error ? err.message : String(err);
+                  state.outputChannel.appendLine(
+                    `[handler] Permission auto-approve failed: ${msg}`,
+                  );
+                }
+              }
+            : undefined,
+          // Permission/message modes: cycle the ExternalEditPart gate at each
+          // checkpoint boundary.  Turn mode: no cycle — maintain existing single-part behaviour.
+          onCheckpointCycle: checkpointMode !== 'turn' ? cycleCheckpoint : undefined,
+          onToolEditFile: (uri) => {
+            touchedFiles.add(uri.toString());
+          },
         });
         try {
           await bridge.bridgeEventsToStream(events, stream, token);
@@ -423,45 +545,65 @@ export function createParticipantHandler(
       };
 
       try {
-        if (ExternalEditCtor && fileUris.length > 0) {
-          // --- WITH CHECKPOINT: wrap prompt+bridge in externalEdit callback ---
+        if (ExternalEditCtor) {
+          // --- WITH CHECKPOINT: only track files actually touched by this session ---
           state.outputChannel.appendLine(
-            `[handler] Checkpoint enabled: ${fileUris.length} open files tracked`,
+            `[handler] Checkpoint enabled: mode=${checkpointMode}`,
           );
 
-          const externalEditPart = new ExternalEditCtor(fileUris, async () => {
-            // This callback runs AFTER baseline capture (send start=true completes first)
-            return await executeTurnWithBridge();
-          });
+          // Helper: consume the tool-touched files for the next checkpoint part.
+          // A file-specific part stays active until the next cycle signal.
+          const consumeTouchedUris = (): { uris: vscode.Uri[]; count: number } => {
+            const uris = [...touchedFiles].map(s => vscode.Uri.parse(s));
+            const count = uris.length;
+            touchedFiles.clear();
+            return { uris, count };
+          };
 
-          // Push the part — VS Code processes it via microtask:
-          //   1. send(start=true) — captures file baselines
-          //   2. await callback() — runs executeTurnWithBridge()
-          //   3. send(start=false) — finalizes externalEdit
-          // We MUST await part.applied to keep the handler alive until the
-          // callback finishes. Otherwise the handler returns early, VS Code
-          // closes the response stream, and subsequent stream operations fail.
-          (stream as any).push(externalEditPart);
-          await externalEditPart.applied;
+          let part = new ExternalEditCtor([], externalEditCallback);
+          (stream as any).push(part);
+          resolveCycleAck();
+          await part.applied;
+
+          // Cycle through checkpoints as the bridge advances the lifecycle.
+          while (!isComplete) {
+            const { uris, count } = consumeTouchedUris();
+            part = new ExternalEditCtor(uris, externalEditCallback);
+            (stream as any).push(part);
+            resolveCycleAck();
+            if (count > 0) {
+              state.outputChannel.appendLine(
+                `[handler] Tracked ${count} tool-touched file(s) for ExternalEditPart`,
+              );
+            }
+            await part.applied;
+          }
         } else {
           // --- WITHOUT CHECKPOINT: original flow (graceful degradation) ---
-          if (!ExternalEditCtor) {
-            state.outputChannel.appendLine(
-              `[handler] Checkpoint unavailable: ChatResponseExternalEditPart not supported in this VS Code version`,
-            );
-          } else {
-            state.outputChannel.appendLine(
-              `[handler] Checkpoint skipped: no open files to track`,
-            );
-          }
+          state.outputChannel.appendLine(
+            `[handler] Checkpoint unavailable: ChatResponseExternalEditPart not supported in this VS Code version`,
+          );
           await executeTurnWithBridge();
         }
       } finally {
-        // Ensure checkpoint is always cleaned up, even on error or cancellation.
-        // In the externalEdit path, the callback handles its own dispose().
-        // This finally is a safety net for the fallback path and error cases.
-        if (!ExternalEditCtor || fileUris.length === 0) {
+        // Safety net: ensure checkpoint is disposed for the fallback path and
+        // error cases.  For the ExternalEditPart path, the callback's .finally
+        // handles disposal when executeTurnWithBridge completes.
+        if (!ExternalEditCtor) {
           checkpoint.dispose();
+        }
+
+        // Restore config if permission mode was activated — best-effort, fire-and-forget
+        if (permissionModeActivated) {
+          client.config.update({
+            body: { permission: { edit: 'allow' } },
+            query: directory ? { directory } : undefined,
+          }).then(() => {
+            state.outputChannel.appendLine('[handler] Permission mode deactivated — config restored');
+          }).catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            state.outputChannel.appendLine(`[handler] Permission mode: config restoration failed (${msg})`);
+          });
         }
       }
 

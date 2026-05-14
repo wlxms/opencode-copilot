@@ -18,6 +18,26 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "OpenCode Copilot",
+      "properties": {
+        "opencode-copilot.checkpointMode": {
+          "type": "string",
+          "default": "permission",
+          "enum": [
+            "permission",
+            "turn",
+            "message"
+          ],
+          "enumDescriptions": [
+            "Uses OpenCode permission protocol — zero race conditions, per-tool undo checkpoints (recommended).",
+            "Single checkpoint per turn — classic behaviour, undo only after turn ends.",
+            "Per-tool checkpoint with rapid window switching — fast but has a small race window."
+          ],
+          "description": "Controls how file-change checkpoints are captured during an AI turn. 'permission' mode uses OpenCode's native permission system for precise per-tool boundaries with zero race conditions."
+        }
+      }
+    },
     "chatParticipants": [
       {
         "id": "opencode-copilot.opencode",

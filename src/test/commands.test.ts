@@ -23,10 +23,12 @@ function createMockClient() {
     },
     config: {
       providers: vi.fn(),
+      update: vi.fn(),
     },
     event: {
       subscribe: vi.fn(),
     },
+    postSessionIdPermissionsPermissionId: vi.fn(),
   };
 }
 

@@ -18,11 +18,18 @@ const mockSdkClient = {
   },
   config: {
     providers: vi.fn(),
+    update: vi.fn().mockResolvedValue({ data: {} }),
   },
   event: {
     subscribe: vi.fn(),
   },
+  postSessionIdPermissionsPermissionId: vi.fn().mockResolvedValue({ data: true }),
 };
+
+// Mock the config module so getCheckpointMode() returns a deterministic value
+vi.mock('../config', () => ({
+  getCheckpointMode: () => 'turn' as const,
+}));
 
 // ---------------------------------------------------------------------------
 // Imports
@@ -577,14 +584,17 @@ describe('createParticipantHandler', () => {
     expect(stream.push).not.toHaveBeenCalled();
   });
 
-  it('should skip checkpoint when no open files are present', async () => {
+  it('should push ExternalEditPart even when no open files are present', async () => {
     const handler = createParticipantHandler(state);
 
-    // Make ExternalEditCtor available as a mock class
-    const MockExternalEditCtor = vi.fn().mockImplementation((uris: unknown, cb: unknown) => ({
-      uris,
-      callback: cb,
-    }));
+    // Mock ExternalEditCtor that properly handles the callback lifecycle
+    const MockExternalEditCtor = vi.fn().mockImplementation(function(this: any, uris: unknown, cb: () => Promise<unknown>) {
+      // Simulate VSCode's behaviour: call callback and set applied
+      this.applied = (async () => { await cb(); return uris; })();
+      this.uris = uris;
+      this.callback = cb;
+      return this;
+    });
     (vscode as any).ChatResponseExternalEditPart = MockExternalEditCtor;
 
     // No text documents open
@@ -613,13 +623,13 @@ describe('createParticipantHandler', () => {
     // Should complete without error
     expect(result!.metadata).toHaveProperty('sessionId', 'existing-session');
 
-    // Should log that checkpoint was skipped (no files)
+    // Should log checkpoint enabled (even with no open files)
     expect(state.outputChannel.appendLine).toHaveBeenCalledWith(
-      expect.stringContaining('Checkpoint skipped'),
+      expect.stringContaining('Checkpoint enabled'),
     );
 
-    // The ExternalEditCtor should NOT have been instantiated
-    expect(MockExternalEditCtor).not.toHaveBeenCalled();
+    // ExternalEditCtor SHOULD be called now (we always push it)
+    expect(MockExternalEditCtor).toHaveBeenCalled();
 
     // Clean up
     delete (vscode as any).ChatResponseExternalEditPart;
@@ -633,10 +643,17 @@ describe('createParticipantHandler', () => {
     let capturedUris: unknown = null;
     let capturedCallback: (() => Promise<unknown>) | null = null;
 
-    const ExternalEditCtor = function(this: unknown, uris: unknown, cb: () => Promise<unknown>) {
+    const ExternalEditCtor = function(this: any, uris: unknown, cb: () => Promise<unknown>) {
       capturedUris = uris;
       capturedCallback = cb;
-      return { uris, callback: cb };
+      // Simulate VSCode's behaviour: set `applied` to a Promise that resolves
+      // after the callback completes.  The callback starts executeTurnWithBridge
+      // in the background and awaits currentGate — when the bridge finishes,
+      // the gate resolves, the callback returns, and `applied` resolves.
+      this.applied = (async () => { await cb(); return uris; })();
+      this.uris = uris;
+      this.callback = cb;
+      return this;
     };
     (vscode as any).ChatResponseExternalEditPart = ExternalEditCtor;
 
@@ -676,8 +693,9 @@ describe('createParticipantHandler', () => {
       expect.stringContaining('Checkpoint enabled'),
     );
 
-    // ExternalEditCtor should have been instantiated with the open file URIs
-    expect(capturedUris).toHaveLength(2);
+    // ExternalEditCtor should have been instantiated — but with empty URIs
+    // (only tool-touched files are tracked, not proactive baseline open files)
+    expect(capturedUris).toHaveLength(0);
 
     // stream.push should have been called with the external edit part
     expect(stream.push).toHaveBeenCalledOnce();

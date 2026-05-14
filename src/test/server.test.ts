@@ -19,7 +19,9 @@ const mockClient = {
   },
   config: {
     providers: vi.fn(),
+    update: vi.fn(),
   },
+  postSessionIdPermissionsPermissionId: vi.fn(),
 };
 
 const mockInstance = {

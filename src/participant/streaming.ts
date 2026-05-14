@@ -4,12 +4,14 @@ import type {
   OpenCodeEvent,
   OpenCodeEventStream,
   OpenCodeStreamEvent,
+  PermissionAskedEvent,
   ReasoningStreamPart,
   StreamToolPart,
   StreamToolState,
   TextStreamPart,
   ToolCallStatus,
 } from '../types/events';
+import type { CheckpointMode } from '../config';
 import type {
   ChatTerminalToolInvocationData,
   ChatSimpleToolResultData,
@@ -63,7 +65,16 @@ interface StreamBridgeOptions {
   sessionId?: string;
   /** URIs of files known to exist at the start of the turn */
   knownFileUris?: Set<string>;
-
+  /** Checkpoint supervision mode */
+  checkpointMode?: CheckpointMode;
+  /** Called when a permission.asked SSE event arrives (permission mode) */
+  onPermissionAsked?: (permission: { id: string; sessionID: string; type: string; metadata: Record<string, unknown> }) => void | Promise<void>;
+  /** Called when a tool reaches completed status (message mode checkpoint boundary) */
+  onToolCompleted?: (toolName: string, callID: string) => void;
+  /** Called at checkpoint cycle boundaries to signal the ExternalEditPart callback. */
+  onCheckpointCycle?: () => void | Promise<void>;
+  /** Called when an edit/write tool touches a file. Receives the file URI so the handler can include it in subsequent ExternalEditPart pushes. */
+  onToolEditFile?: (uri: vscode.Uri) => void;
 }
 
 // =======================================================================
@@ -99,15 +110,30 @@ export class StreamBridge {
   private assistantPhaseStarted: boolean = false;
   /** Tracks which tool callIDs have received a progressive push (isComplete=false) part */
   private progressivePushed: Set<string> = new Set();
+  /** Tracks which callIDs have already triggered a checkpoint signal at running —
+   *  prevents duplicate signals when the server emits multiple running events
+   *  for the same tool call (e.g., partial input updates). */
+  private checkpointSignaled: Set<string> = new Set();
   private readonly logger?: StreamBridgeLogger;
   private readonly sessionId?: string;
   /** URIs of files that existed before the turn started (proactive baseline) */
   private knownFileUris: Set<string>;
+  private readonly checkpointMode?: CheckpointMode;
+  private readonly onPermissionAsked?: (permission: { id: string; sessionID: string; type: string; metadata: Record<string, unknown> }) => void | Promise<void>;
+  private readonly onToolCompleted?: (toolName: string, callID: string) => void;
+  private readonly onCheckpointCycle?: () => void | Promise<void>;
+  private readonly onToolEditFile?: (uri: vscode.Uri) => void;
+  private textDeltaLogged = 0;
 
   constructor(options: StreamBridgeOptions = {}) {
     this.logger = options.logger;
     this.sessionId = options.sessionId;
     this.knownFileUris = options.knownFileUris ?? new Set();
+    this.checkpointMode = options.checkpointMode;
+    this.onPermissionAsked = options.onPermissionAsked;
+    this.onToolCompleted = options.onToolCompleted;
+    this.onCheckpointCycle = options.onCheckpointCycle;
+    this.onToolEditFile = options.onToolEditFile;
   }
 
   /** Get the OpenCode message ID of the user message in this turn, if captured */
@@ -131,14 +157,16 @@ export class StreamBridge {
     try {
       for await (const rawEvt of events.stream) {
         const evt = unwrapStreamEvent(rawEvt);
-        this.log(`event: ${describeStreamEvent(rawEvt, evt)}`);
+        if (evt.type !== 'message.part.delta') {
+          this.log(`event: ${describeStreamEvent(rawEvt, evt)}`);
+        }
         if (token.isCancellationRequested) {
           const msg = 'Operation cancelled';
           this.log('bridge stop: cancellation requested');
           stream.markdown(`\n⚠️ ${msg}\n`);
           break;
         }
-        const result = this.processEvent(evt, s);
+        const result = await this.processEvent(evt, s, token);
         if (result.rendered) {
           await yieldToEventLoop();
         }
@@ -166,9 +194,7 @@ export class StreamBridge {
   // Event dispatch
   // -------------------------------------------------------------------
 
-  private processEvent(evt: OpenCodeEvent, stream: Stream): EventDispatchResult {
-    this.log(`processEvent enter: type=${evt.type}`);
-
+  private async processEvent(evt: OpenCodeEvent, stream: Stream, token: vscode.CancellationToken): Promise<EventDispatchResult> {
     if (!this.shouldProcessEvent(evt)) {
       const eventSessionId = getEventSessionId(evt);
       this.log(
@@ -178,13 +204,23 @@ export class StreamBridge {
       return { stop: false, rendered: false };
     }
 
+    if (evt.type === 'permission.asked') {
+      const p = evt.properties;
+      this.log(
+        `process permission.asked: permissionID=${p.id}, sessionID=${p.sessionID}, ` +
+        `permission=${p.permission}, callID=${p.tool?.callID ?? 'none'}, target=${this.sessionId ?? 'any'}`,
+      );
+    }
+
     switch (evt.type) {
       case 'message.part.updated':
-        return { stop: false, rendered: this.handlePartUpdated(evt, stream) };
+        return { stop: false, rendered: await this.handlePartUpdated(evt, stream, token) };
       case 'message.part.delta':
         return { stop: false, rendered: this.handlePartDelta(evt, stream) };
       case 'session.idle':
         return { stop: true, rendered: false };
+      case 'permission.asked':
+        return { stop: false, rendered: await this.handlePermissionAsked(evt, token) };
     }
     return { stop: false, rendered: false };
   }
@@ -193,7 +229,7 @@ export class StreamBridge {
   // message.part.updated
   // -------------------------------------------------------------------
 
-  private handlePartUpdated(evt: MessagePartUpdatedEvent, stream: Stream): boolean {
+  private async handlePartUpdated(evt: MessagePartUpdatedEvent, stream: Stream, token: vscode.CancellationToken): Promise<boolean> {
     const part = evt.properties?.part;
     if (!part) return false;
 
@@ -224,7 +260,7 @@ export class StreamBridge {
         this.assistantPhaseStarted = true;
         const toolPart = part as StreamToolPart;
         this.partKinds.set(toolPart.id, 'tool');
-        return this.handleToolState(toolPart, stream);
+        return this.handleToolState(toolPart, stream, token);
       }
       case 'step-start':
       case 'step-finish': {
@@ -250,14 +286,18 @@ export class StreamBridge {
     const partID = props.partID;
     const delta = props.delta;
     const kind = this.partKinds.get(partID);
-    this.log(`part.delta: partID=${partID}, kind=${kind ?? 'unknown'}, len=${delta.length}`);
-
     if (kind === 'reasoning') {
+      this.log(`part.delta: partID=${partID}, kind=reasoning, len=${delta.length}`);
       if (this.hasThinking && stream.thinkingProgress) {
         stream.thinkingProgress({ text: delta, id: partID });
         return true;
       }
     } else if (kind === 'text') {
+      this.textDeltaLogged += delta.length;
+      if (this.textDeltaLogged >= 100) {
+        this.log(`part.delta: kind=text, batch=${delta.length}, total=${this.textDeltaLogged}`);
+        this.textDeltaLogged = 0;
+      }
       stream.markdown(delta);
       return true;
     }
@@ -266,10 +306,82 @@ export class StreamBridge {
   }
 
   // -------------------------------------------------------------------
+  // permission.asked (permission-mode checkpoint boundary)
+  // -------------------------------------------------------------------
+
+  /**
+   * Handles `permission.asked` events emitted by the OpenCode server
+   * when a tool requires approval before proceeding.
+   *
+   * In permission mode the server blocks execution until we reply via
+   * POST /session/{id}/permissions/{permissionID}. We use that pause to
+   * start the checkpoint for the target file before sending the approval.
+   */
+  private async handlePermissionAsked(evt: PermissionAskedEvent, token: vscode.CancellationToken): Promise<boolean> {
+    const p = evt.properties;
+    this.log(`permission.asked: id=${p.id} sessionID=${p.sessionID} permission=${p.permission} callID=${p.tool?.callID ?? 'none'}`);
+    this.log(
+      `permission.asked metadata: keys=${Object.keys(p.metadata ?? {}).join(',') || 'none'}, ` +
+      `patterns=${Array.isArray(p.patterns) ? p.patterns.join('|') : 'none'}, always=${p.always.join('|') || 'none'}`,
+    );
+
+    // Pre-register the file being edited BEFORE approving.
+    // The server is blocked here — the file hasn't been modified yet.
+    // Extract file path from permission metadata or pattern.
+    this.preregisterFileFromPermission(p);
+
+    if (this.checkpointMode === 'permission' && p.permission === 'edit' && this.onCheckpointCycle) {
+      await this.onCheckpointCycle();
+      this.log(`[bridge] checkpoint signal: mode=permission, at=permission.asked (callID=${p.tool?.callID ?? 'none'})`);
+    }
+
+    if (this.checkpointMode === 'permission' && this.onPermissionAsked) {
+      try {
+        this.log(`permission.asked: approving permissionID=${p.id}`);
+        await this.onPermissionAsked({
+          id: p.id,
+          sessionID: p.sessionID,
+          type: p.permission,
+          metadata: p.metadata,
+        });
+        this.log(`permission.asked: approved permissionID=${p.id}`);
+      } catch (err: unknown) {
+        this.log(`permission auto-approve error: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    // Pre-register file from permission metadata so the next ExternalEditPart
+    // can target the file before the server resumes the edit.
+    return false; // no UI rendering for permission events
+  }
+
+  /**
+   * Extract file path from a permission event and pre-register it.
+    * The server is blocked at this point — the file hasn't been modified yet.
+    * Tries metadata.file_path, metadata.filePath, metadata.path, and patterns[0].
+   */
+  private preregisterFileFromPermission(p: { metadata: Record<string, unknown>; patterns?: string[]; permission: string }): void {
+    if (!this.onToolEditFile) return;
+    if (p.permission !== 'edit' && p.permission !== 'write') return;
+
+    // Try common metadata keys for the file path
+    const filePath =
+      (p.metadata.file_path as string | undefined) ??
+      (p.metadata.filePath as string | undefined) ??
+      (p.metadata.path as string | undefined) ??
+      ((p.patterns?.length === 1) ? p.patterns[0] : undefined);
+
+    if (filePath) {
+      this.onToolEditFile(vscode.Uri.file(filePath));
+      this.log(`pre-registered file for checkpoint: ${filePath} (at=permission.asked)`);
+    }
+  }
+
+  // -------------------------------------------------------------------
   // Tool call state machine: pending → running → completed
   // -------------------------------------------------------------------
 
-  private handleToolState(part: StreamToolPart, stream: Stream): boolean {
+  private async handleToolState(part: StreamToolPart, stream: Stream, token: vscode.CancellationToken): Promise<boolean> {
     const state = part.state;
     if (!state) return false;
 
@@ -306,6 +418,27 @@ export class StreamBridge {
         meta.title = getToolTitle(state);
         meta.timeStart = getToolTime(state)?.start;
       }
+
+      // Pre-register the file being edited BEFORE the edit happens.
+      // In message mode this is the earliest point where input.filePath is available.
+      // The file hasn't been modified on disk yet at this stage.
+      if ((toolName === 'edit' || toolName === 'write') && this.onToolEditFile) {
+        const input = state.input as Record<string, unknown> | undefined;
+        const filePath = input?.filePath as string | undefined;
+        if (filePath) {
+          this.onToolEditFile(vscode.Uri.file(filePath));
+          this.log(`pre-registered file for checkpoint: ${filePath} (at=${toolName}.running)`);
+        }
+      }
+      // Signal checkpoint boundary at tool.running only in message mode.
+      // Permission mode already starts its snapshot at permission.asked.
+      if (this.checkpointMode === 'message' && (toolName === 'edit' || toolName === 'write')
+          && this.onCheckpointCycle && !this.checkpointSignaled.has(callID)) {
+        this.checkpointSignaled.add(callID);
+        this.onCheckpointCycle();
+        this.log(`[bridge] checkpoint signal: mode=message, at=${toolName}.running (callID=${callID})`);
+      }
+
       if (this.hasToolUI && stream.updateToolInvocation) {
         stream.updateToolInvocation(callID, {
           partialInput: state.input ?? {},
@@ -356,22 +489,42 @@ export class StreamBridge {
           getToolTitle(state),
         );
       }
-      // Track new file creation via ChatResponseWorkspaceEditPart
-      if (toolName === 'write' && VS.ChatResponseWorkspaceEditPart && stream.push) {
+      // Track file changes via ChatResponseWorkspaceEditPart (both new and edited files)
+      if (toolName === 'edit' || toolName === 'write') {
         const input = state.input as Record<string, unknown> | undefined;
         const filePath = input?.filePath as string | undefined;
-        if (filePath) {
-          const fileUri = vscode.Uri.file(filePath).toString();
-          const isNewFile = !this.knownFileUris.has(fileUri);
-          if (isNewFile) {
+        if (filePath && VS.ChatResponseWorkspaceEditPart && stream.push) {
+          if (toolName === 'write') {
+            const fileUri = vscode.Uri.file(filePath).toString();
+            const isNewFile = !this.knownFileUris.has(fileUri);
             try {
-              const editPart = new VS.ChatResponseWorkspaceEditPart([
-                { newResource: vscode.Uri.file(filePath) },
-              ]);
-              stream.push(editPart as unknown as vscode.ChatResponsePart);
-              this.log(`pushed WorkspaceEditPart for new file: ${filePath}`);
+              const uri = vscode.Uri.file(filePath);
+              if (isNewFile) {
+                const editPart = new VS.ChatResponseWorkspaceEditPart([
+                  { newResource: uri },
+                ]);
+                stream.push(editPart as unknown as vscode.ChatResponsePart);
+                this.log(`pushed WorkspaceEditPart for new file: ${filePath}`);
+              } else {
+                const editPart = new VS.ChatResponseWorkspaceEditPart([
+                  { oldResource: uri, newResource: uri },
+                ]);
+                stream.push(editPart as unknown as vscode.ChatResponsePart);
+                this.log(`pushed WorkspaceEditPart for overwritten file: ${filePath}`);
+              }
             } catch {
               // Best-effort; checkpoint still works via externalEdit baseline
+            }
+          } else if (toolName === 'edit') {
+            try {
+              const uri = vscode.Uri.file(filePath);
+              const editPart = new VS.ChatResponseWorkspaceEditPart([
+                { oldResource: uri, newResource: uri },
+              ]);
+              stream.push(editPart as unknown as vscode.ChatResponsePart);
+              this.log(`pushed WorkspaceEditPart for edited file: ${filePath}`);
+            } catch {
+              // Best-effort
             }
           }
         }
@@ -387,8 +540,20 @@ export class StreamBridge {
           }
         }
       }
+      // Cleanup tool metadata for message mode.
+      if (this.checkpointMode === 'message' && (toolName === 'edit' || toolName === 'write')) {
+        this.log(`message-mode checkpoint: tool ${toolName} completed (callID=${callID}), no signal (already signaled at running)`);
+        this.onToolCompleted?.(toolName, callID);
+      }
+
+      if (this.checkpointMode === 'permission' && (toolName === 'edit' || toolName === 'write') && this.onCheckpointCycle) {
+        await this.onCheckpointCycle();
+        this.log(`[bridge] checkpoint signal: mode=permission, at=${toolName}.completed (callID=${callID})`);
+      }
+
       this.toolMetas.delete(callID);
       this.toolCallIds.delete(part.id);
+      this.checkpointSignaled.delete(callID);
       return true;
     }
 
@@ -644,6 +809,7 @@ export class StreamBridge {
     this.toolCallIds.clear();
     this.toolMetas.clear();
     this.progressivePushed.clear();
+    this.checkpointSignaled.clear();
     this.assistantPhaseStarted = false;
   }
 
@@ -731,6 +897,8 @@ function getEventSessionId(evt: OpenCodeEvent): string | undefined {
       return evt.properties?.part?.sessionID;
     case 'session.idle':
       return evt.properties?.sessionID;
+    case 'permission.asked':
+      return evt.properties?.sessionID;
     default:
       return undefined;
   }
@@ -762,6 +930,10 @@ function describeEvent(evt: OpenCodeEvent): string {
       return `message.part.delta partID=${evt.properties.partID} len=${evt.properties.delta.length}`;
     case 'session.idle':
       return `session.idle sessionID=${evt.properties.sessionID ?? 'unknown'}`;
+    case 'permission.asked': {
+      const p = evt.properties;
+      return `permission.asked id=${p.id} sessionID=${p.sessionID} permission=${p.permission}`;
+    }
     default:
       return evt.type;
   }

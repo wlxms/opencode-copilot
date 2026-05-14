@@ -23,6 +23,7 @@ export const EVENT_SESSION_STATUS = 'session.status' as const;
 export const EVENT_SESSION_DIFF = 'session.diff' as const;
 export const EVENT_SESSION_ERROR = 'session.error' as const;
 export const EVENT_SESSION_IDLE = 'session.idle' as const;
+export const EVENT_PERMISSION_ASKED = 'permission.asked' as const;
 
 /** All known real event type strings */
 export type RealEventType =
@@ -38,7 +39,8 @@ export type RealEventType =
   | typeof EVENT_SESSION_STATUS
   | typeof EVENT_SESSION_DIFF
   | typeof EVENT_SESSION_ERROR
-  | typeof EVENT_SESSION_IDLE;
+  | typeof EVENT_SESSION_IDLE
+  | typeof EVENT_PERMISSION_ASKED;
 
 /**
  * Part types in message.part.updated events.
@@ -197,6 +199,31 @@ export interface SessionIdleEvent {
   };
 }
 
+/**
+ * Emitted by OpenCode server when a tool requires permission approval
+ * before proceeding (e.g. edit, write). In permission-checkpoint mode the
+ * extension uses this as a precise synchronization point for per-tool
+ * checkpoint boundaries.
+ *
+ * The server blocks until a reply is received via
+ * POST /session/{id}/permissions/{permissionID}.
+ */
+export interface PermissionAskedEvent {
+  type: 'permission.asked';
+  properties: {
+    id: string;
+    sessionID: string;
+    permission: string;
+    patterns: string[];
+    metadata: Record<string, unknown>;
+    always: string[];
+    tool?: {
+      messageID: string;
+      callID?: string;
+    };
+  };
+}
+
 type OtherSdkEvents = Exclude<
   EventSubscribeResponse,
   | Extract<EventSubscribeResponse, { type: 'message.part.updated' }>
@@ -207,7 +234,8 @@ export type OpenCodeEvent =
   | OtherSdkEvents
   | MessagePartUpdatedEvent
   | MessagePartDeltaEvent
-  | SessionIdleEvent;
+  | SessionIdleEvent
+  | PermissionAskedEvent;
 
 export interface OpenCodeGlobalEventEnvelope {
   directory: string;

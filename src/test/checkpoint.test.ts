@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { CheckpointManager, collectOpenFileUris } from '../participant/checkpoint';
+import { CheckpointManager, collectOpenFileUris, CheckpointSignal } from '../participant/checkpoint';
 import * as vscode from 'vscode';
 
 // ---------------------------------------------------------------------------
@@ -172,5 +172,120 @@ describe('collectOpenFileUris', () => {
     expect(result).toEqual([]);
 
     (vscode.workspace as { textDocuments: unknown }).textDocuments = original;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CheckpointSignal unit tests
+// ---------------------------------------------------------------------------
+
+describe('CheckpointSignal', () => {
+  // -------------------------------------------------------------------------
+  // notify without waiter is silently dropped
+  // -------------------------------------------------------------------------
+
+  it('notify() without a waiter is silently dropped (no count accumulation)', async () => {
+    const signal = new CheckpointSignal();
+
+    // These notifies fire before any wait() is registered — they are no-ops
+    signal.notify();
+    signal.notify();
+    signal.notify();
+
+    // wait() should NOT return immediately — no buffered signals
+    let resolved = false;
+    const waitPromise = signal.wait().then(() => { resolved = true; });
+    expect(resolved).toBe(false);
+
+    // Only a new notify() should resolve the wait
+    signal.notify();
+    await waitPromise;
+    expect(resolved).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // wait before notify blocks until notify
+  // -------------------------------------------------------------------------
+
+  it('wait() before notify() blocks until notify()', async () => {
+    const signal = new CheckpointSignal();
+    let resolved = false;
+
+    const waitPromise = signal.wait().then(() => { resolved = true; });
+
+    // Should not be resolved yet
+    expect(resolved).toBe(false);
+
+    signal.notify();
+
+    await waitPromise;
+    expect(resolved).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // dispose resolves current waiter
+  // -------------------------------------------------------------------------
+
+  it('dispose() resolves current waiter', async () => {
+    const signal = new CheckpointSignal();
+    let resolved1 = false;
+
+    const p1 = signal.wait().then(() => { resolved1 = true; });
+
+    // Not resolved yet
+    expect(resolved1).toBe(false);
+
+    signal.dispose();
+
+    await p1;
+    expect(resolved1).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // dispose prevents future wait from blocking
+  // -------------------------------------------------------------------------
+
+  it('dispose() prevents future wait() from blocking', async () => {
+    const signal = new CheckpointSignal();
+
+    signal.dispose();
+
+    // After dispose, wait() should return immediately without notifying
+    await expect(signal.wait()).resolves.toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------------
+  // sequential wait/notify cycles work correctly
+  // -------------------------------------------------------------------------
+
+  it('sequential wait/notify cycles work correctly', async () => {
+    const signal = new CheckpointSignal();
+
+    // Cycle 1: wait → notify
+    const p1 = signal.wait();
+    signal.notify();
+    await expect(p1).resolves.toBeUndefined();
+
+    // Cycle 2: wait → notify
+    const p2 = signal.wait();
+    signal.notify();
+    await expect(p2).resolves.toBeUndefined();
+
+    // Cycle 3: wait → dispose (end of turn)
+    const p3 = signal.wait();
+    signal.dispose();
+    await expect(p3).resolves.toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------------
+  // notify after dispose is a no-op
+  // -------------------------------------------------------------------------
+
+  it('notify() after dispose() is a no-op', () => {
+    const signal = new CheckpointSignal();
+    signal.dispose();
+
+    // Should not throw — notify is guarded by disposed check
+    expect(() => signal.notify()).not.toThrow();
   });
 });

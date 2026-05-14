@@ -133,16 +133,32 @@ export class GlobalEventBroker {
   private dispatch(rawEvent: OpenCodeStreamEvent): void {
     const event = unwrapStreamEvent(rawEvent);
     const sessionId = this.getSessionId(event);
+    if (event.type === 'permission.asked') {
+      const p = event.properties;
+      this.log(
+        `dispatch permission.asked: permissionID=${p.id}, sessionID=${p.sessionID}, ` +
+        `permission=${p.permission}, callID=${p.tool?.callID ?? 'none'}, rawEnvelope=${'payload' in rawEvent}`,
+      );
+    }
     if (!sessionId) {
+      if (event.type === 'permission.asked') {
+        this.log('drop permission.asked: no sessionID resolved');
+      }
       return;
     }
 
     const channel = this.sessionChannels.get(sessionId);
     if (!channel) {
+      if (event.type === 'permission.asked') {
+        this.log(`drop permission.asked: no open channel for sessionID=${sessionId}`);
+      }
       return;
     }
 
     channel.push(rawEvent);
+    if (event.type === 'permission.asked') {
+      this.log(`forward permission.asked to session channel: sessionID=${sessionId}`);
+    }
     if (event.type === 'session.idle') {
       channel.close();
       this.sessionChannels.delete(sessionId);
@@ -163,6 +179,8 @@ export class GlobalEventBroker {
       case 'message.part.delta':
         return this.partSessions.get(event.properties.partID);
       case 'session.idle':
+        return event.properties?.sessionID;
+      case 'permission.asked':
         return event.properties?.sessionID;
       default:
         return getEventSessionIdFromProperties(event);
