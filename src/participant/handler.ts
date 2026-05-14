@@ -3,6 +3,9 @@ import { StreamBridge } from './streaming';
 import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
 import type { ExtensionState, OpenCodeClient, TurnMapping } from '../types';
+import type { ChatResponseExternalEditPart } from '../types/vscode-proposed-additions';
+import { CheckpointManager, collectOpenFileUris } from './checkpoint';
+import { ExternalEditTracker } from './external-edit-tracker';
 
 /**
  * Get the VSCode workspace root path for the first workspace folder.
@@ -68,33 +71,32 @@ interface RecoveredHistory {
  * Scans from newest to oldest, returns the first match with valid data.
  * Used for session recovery after VSCode restart and rewind/fork detection.
  */
-function recoverFromHistory(
-  context: vscode.ChatContext,
-): RecoveredHistory {
-  const history = context.history;
+function recoverFromHistory(context: vscode.ChatContext): RecoveredHistory {
+  const history = context.history ?? [];
   for (let i = history.length - 1; i >= 0; i--) {
     const turn = history[i];
-    if (turn instanceof vscode.ChatResponseTurn) {
-      const meta = turn.result?.metadata as {
-        turnMap?: TurnMapping[];
-        sessionId?: string;
-      } | undefined;
-      if (meta) {
-        return {
-          turnMap: meta.turnMap ?? [],
-          sessionId: meta.sessionId ?? null,
-        };
-      }
+    // ChatResponseTurn is a proposed API — access metadata via type assertion
+    const metadata = (turn as unknown as { metadata?: Record<string, unknown> })?.metadata;
+    if (!metadata) continue;
+
+    const sessionId = metadata.sessionId as string | undefined;
+    const turnMapRaw = metadata.turnMap as Array<{ vscodeTurn: number; opencodeMessageId: string }> | undefined;
+    if (sessionId && turnMapRaw && Array.isArray(turnMapRaw)) {
+      return { sessionId, turnMap: turnMapRaw };
     }
   }
-  return { turnMap: [], sessionId: null };
+  return { sessionId: null, turnMap: [] };
 }
 
 /**
- * Resolve or create the correct OpenCode session for this request.
+ * Resolve or create an OpenCode session for this VSCode chat.
  *
- * Uses request.sessionId to look up per-chat state (sessionMap<SessionState>).
- * Each VSCode chat has its own turnMap, so switching chats doesn't lose rewind context.
+ * Handles three cases:
+ * 1. **New chat** — no prior state → create a fresh OpenCode session
+ * 2. **Continue** — same number of history turns → reuse existing session
+ * 3. **Rewind** — fewer history turns → revert to the matching message
+ *
+ * Returns the OpenCode session ID, or null on error.
  */
 async function resolveSession(
   client: OpenCodeClient,
@@ -104,158 +106,88 @@ async function resolveSession(
   vscodeSessionId: string,
   directory?: string,
 ): Promise<string | null> {
-
-  // Count prior request turns for rewind detection
-  const requestTurns = context.history.filter(
-    (h): h is vscode.ChatRequestTurn => h instanceof vscode.ChatRequestTurn,
-  );
-  const currentTurnIndex = requestTurns.length;
-
-  // Look up per-chat session state
-  const chatState = state.sessionMap.get(vscodeSessionId);
-
-  state.outputChannel.appendLine(
-    `[handler] resolveSession: vscodeId=${vscodeSessionId}, ` +
-    `currentTurn=${currentTurnIndex}, ` +
-    `hasChatState=${!!chatState}, ` +
-    `sessionMapSize=${state.sessionMap.size}`,
-  );
-
-  // --- No mapping: try to recover from history metadata, or create fresh ---
+  // Get or create per-VSCode-chat state
+  let chatState = state.sessionMap.get(vscodeSessionId);
   if (!chatState) {
+    chatState = { opencodeSessionId: '', turnMap: [] };
+    state.sessionMap.set(vscodeSessionId, chatState);
+  }
+
+  // Check for metadata recovery (VSCode restart / tab restore)
+  if (!chatState.opencodeSessionId) {
     const recovered = recoverFromHistory(context);
-
-    // Attempt to recover a previously used OpenCode session from chat history
     if (recovered.sessionId) {
+      chatState.opencodeSessionId = recovered.sessionId;
+      chatState.turnMap = recovered.turnMap;
       state.outputChannel.appendLine(
-        `[handler] No sessionMap entry for ${vscodeSessionId}, found sessionId=${recovered.sessionId} in history metadata`,
+        `[handler] Recovered session from history: ${recovered.sessionId} (${recovered.turnMap.length} turns)`,
       );
-
-      try {
-        // Verify the session still exists on the OpenCode server
-        const sessionResult = await client.session.get({
-          path: { id: recovered.sessionId },
-          query: directory ? { directory } : undefined,
-        });
-        const existingId = sessionResult.data?.id;
-        if (existingId) {
-          // Session is valid — restore the mapping
-          const turnMap = recovered.turnMap;
-          state.activeSessionId = recovered.sessionId;
-          state.sessionMap.set(vscodeSessionId, {
-            opencodeSessionId: recovered.sessionId,
-            turnMap,
-          });
-          state.outputChannel.appendLine(
-            `[handler] Recovered OpenCode session ${recovered.sessionId} for VSCode chat ${vscodeSessionId} (turnMap=${turnMap.length})`,
-          );
-          return recovered.sessionId;
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        state.outputChannel.appendLine(
-          `[handler] Recovered session ${recovered.sessionId} not found or expired (${msg}), creating new session`,
-        );
-      }
     }
+  }
 
-    // Fallback: create a fresh OpenCode session
+  const history = context.history ?? [];
+  const currentTurnIndex = history.length;
+
+  // --- Case 1: New chat (no prior session) ---
+  if (!chatState.opencodeSessionId) {
     const result = await client.session.create({
-      body: {},
+      body: { title: `Chat ${vscodeSessionId.slice(0, 8)}` },
       query: directory ? { directory } : undefined,
     });
-    const sessionId = result.data?.id;
-    if (!sessionId) {
+    if (result.error || !result.data) {
+      stream.markdown('⚠️ Failed to create OpenCode session.');
       return null;
     }
-    state.activeSessionId = sessionId;
-    state.sessionMap.set(vscodeSessionId, {
-      opencodeSessionId: sessionId,
-      turnMap: [],
-    });
+    chatState.opencodeSessionId = result.data.id;
     state.outputChannel.appendLine(
-      `[handler] New VSCode chat ${vscodeSessionId} -> created OpenCode session ${sessionId}`,
+      `[handler] Created new OpenCode session ${chatState.opencodeSessionId} for VSCode chat ${vscodeSessionId}`,
     );
-    return sessionId;
+    return chatState.opencodeSessionId;
   }
 
-  // --- Existing chat: check for rewind using per-chat turnMap ---
-  const priorTurnMap = recoverFromHistory(context).turnMap;
-  const perChatTurnMap = chatState.turnMap;
-  const expectedTurns = Math.max(perChatTurnMap.length, priorTurnMap.length);
+  // --- Case 2: Continue (same turn count) ---
+  if (currentTurnIndex === chatState.turnMap.length) {
+    state.outputChannel.appendLine(
+      `[handler] Reusing OpenCode session ${chatState.opencodeSessionId} for VSCode chat ${vscodeSessionId} (turn ${currentTurnIndex}) ` +
+      `turnMap=${chatState.turnMap.length}`,
+    );
+    return chatState.opencodeSessionId;
+  }
 
-  state.outputChannel.appendLine(
-    `[handler] Rewind check: vscodeId=${vscodeSessionId}, ` +
-    `currentTurn=${currentTurnIndex}, expectedTurns=${expectedTurns}, ` +
-    `perChatMap=${perChatTurnMap.length}, metadataMap=${priorTurnMap.length}, ` +
-    `willFork=${currentTurnIndex < expectedTurns}`,
-  );
-
-  // --- Rewind detected: fewer turns in history than we know about ---
-  if (expectedTurns > 0 && currentTurnIndex < expectedTurns) {
-    const fullMap =
-      perChatTurnMap.length >= priorTurnMap.length
-        ? perChatTurnMap
-        : priorTurnMap;
-    // The message just BEFORE the rewind point — keep this as context anchor
-    const anchorEntry =
-      currentTurnIndex > 0
-        ? fullMap[currentTurnIndex - 1]
-        : undefined;
-
-    try {
-      // Revert unwanted messages (undo file changes)
-      let reverted = 0;
-      for (let i = expectedTurns - 1; i >= currentTurnIndex; i--) {
-        const entry = fullMap[i];
-        if (entry?.opencodeMessageId) {
-          await client.session.revert({
-            path: { id: chatState.opencodeSessionId },
-            body: { messageID: entry.opencodeMessageId },
-            query: directory ? { directory } : undefined,
-          });
-          reverted++;
-          state.outputChannel.appendLine(
-            `[handler] ↩ reverted turn ${entry.vscodeTurn}: ${entry.opencodeMessageId}`,
-          );
-        }
-      }
-      // Same session, trim turnMap, remember anchor for prompt
-      chatState.turnMap = fullMap.slice(0, currentTurnIndex);
-      state.activeSessionId = chatState.opencodeSessionId;
+  // --- Case 3: Rewind (fewer turns than recorded) → revert ---
+  if (currentTurnIndex < chatState.turnMap.length) {
+    const priorTurnMap = chatState.turnMap.slice(0, currentTurnIndex);
+    if (currentTurnIndex > 0) {
+      const targetMessageId = priorTurnMap[currentTurnIndex - 1].opencodeMessageId;
       state.outputChannel.appendLine(
-        `[handler] Reverted ${reverted} messages, rewound to turn ${currentTurnIndex}, ` +
-        `anchor=${anchorEntry?.opencodeMessageId ?? 'none'}`,
+        `[handler] Rewind detected: reverting session ${chatState.opencodeSessionId} to message ${targetMessageId}`,
       );
-      stream.progress(`🔙 Undone to checkpoint`);
-      return chatState.opencodeSessionId;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      state.outputChannel.appendLine(
-        `[handler] Revert failed (${msg}), creating new session`,
-      );
-      const result = await client.session.create({
-        body: {},
+      const revertResult = await client.session.revert({
+        path: { id: chatState.opencodeSessionId },
+        body: { messageID: targetMessageId },
         query: directory ? { directory } : undefined,
       });
-      const sessionId = result.data?.id;
-      if (!sessionId) {
-        return null;
+      if (revertResult.error) {
+        state.outputChannel.appendLine(
+          `[handler] Revert failed: ${JSON.stringify(revertResult.error)} — creating new session`,
+        );
+        const createResult = await client.session.create({
+          query: directory ? { directory } : undefined,
+        });
+        if (createResult.error || !createResult.data) {
+          stream.markdown('⚠️ Failed to create OpenCode session after revert failure.');
+          return null;
+        }
+        chatState.opencodeSessionId = createResult.data.id;
+        chatState.turnMap = [];
+        return chatState.opencodeSessionId;
       }
-      chatState.opencodeSessionId = sessionId;
-      chatState.turnMap = [];
-      state.activeSessionId = sessionId;
-      return sessionId;
+    } else {
+      // Rewound to the beginning — no prior message to revert to
+      state.outputChannel.appendLine(
+        `[handler] Full rewind for session ${chatState.opencodeSessionId} — no revert needed`,
+      );
     }
-  }
-
-  // --- Normal continuation: reuse existing OpenCode session ---
-  state.activeSessionId = chatState.opencodeSessionId;
-  // Only restore from metadata if it's more complete than per-chat turnMap
-  if (priorTurnMap.length > perChatTurnMap.length) {
-    state.outputChannel.appendLine(
-      `[handler] Restoring turnMap from metadata: ${priorTurnMap.length} > ${perChatTurnMap.length}`,
-    );
     chatState.turnMap = priorTurnMap;
   }
   state.outputChannel.appendLine(
@@ -277,7 +209,7 @@ async function resolveSession(
  *  6. Subscribe to SSE events
  *  7. Send the user prompt
  *  7b. Hook cancellation → abort OpenCode backend
- *  8. Bridge events to VSCode chat stream
+ *  8. Bridge events to VSCode chat stream (with per-edit externalEdit tracking)
  *  9. Record user message ID in turn map
  */
 export function createParticipantHandler(
@@ -289,6 +221,8 @@ export function createParticipantHandler(
     stream: vscode.ChatResponseStream,
     token: vscode.CancellationToken,
   ): Promise<vscode.ChatResult> => {
+    // Create per-edit tracker for the turn
+    const tracker = new ExternalEditTracker();
     try {
       // 1. Early cancellation check
       if (token.isCancellationRequested) {
@@ -319,85 +253,100 @@ export function createParticipantHandler(
       const sessionId = await resolveSession(client, state, context, stream, vscodeSessionId, directory);
       if (!sessionId) return { metadata: {} };
 
-      const events = state.eventBroker.openSessionStream(sessionId);
-      // 6. Ensure the shared global-event broker is running after the session queue exists
-      await state.eventBroker.ensureStarted(client, state.outputChannel);
-
-      // 7. Fire the prompt WITHOUT awaiting — events stream concurrently.
-      //    If we await prompt(), all SSE events fire during that await and
-      //    are lost before bridgeEventsToStream starts consuming them.
-      state.outputChannel.appendLine(
-        `[handler] Prompting session ${sessionId} with: ${request.prompt.substring(0, 50)}`,
-      );
-      const promptPromise = client.session.prompt({
-        path: { id: sessionId },
-        body: { parts: [{ type: 'text', text: request.prompt }] },
-        query: directory ? { directory } : undefined,
-      }).catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : 'Prompt failed';
-        state.outputChannel.appendLine(`[handler] Prompt error: ${msg}`);
-      });
-
-      // 7b. Subscribe to VSCode cancellation → abort OpenCode session.
-      //     When the user clicks "Stop" in the chat UI, VSCode fires
-      //     CancellationToken.onCancellationRequested. We forward this
-      //     to the OpenCode backend via session.abort() to stop ongoing
-      //     AI processing, tool execution, and token generation.
-      let aborted = false;
-      const cancelDisposable = token.onCancellationRequested(() => {
-        if (aborted) return;
-        aborted = true;
-        state.outputChannel.appendLine(
-          `[handler] Cancellation requested, aborting OpenCode session ${sessionId}`,
-        );
-        client.session.abort({
-          path: { id: sessionId },
-          query: directory ? { directory } : undefined,
-        }).then((result) => {
-          state.outputChannel.appendLine(
-            `[handler] Abort result: ${JSON.stringify(result?.data)}`,
-          );
-        }).catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          state.outputChannel.appendLine(`[handler] Abort error: ${msg}`);
-        });
-      });
-
-      state.outputChannel.appendLine(`[handler] bridgeEventsToStream start for session ${sessionId}`);
-      // 8. Bridge events to VSCode chat stream (consumes as they arrive)
-      const bridge = new StreamBridge({ logger: state.outputChannel, sessionId });
+      // 5b. Collect open file URIs for proactive baseline capture (used by streaming.ts)
+      let fileUris: vscode.Uri[] = [];
       try {
-        await bridge.bridgeEventsToStream(events, stream, token);
-      } finally {
-        cancelDisposable.dispose();
+        fileUris = collectOpenFileUris();
+      } catch {
+        // vscode.workspace.textDocuments may not be available (e.g., test mock)
       }
 
-      state.eventBroker.closeSessionStream(sessionId);
+      const executeTurnWithBridge = async (): Promise<void> => {
+        const events = state.eventBroker.openSessionStream(sessionId);
+        await state.eventBroker.ensureStarted(client, state.outputChannel);
 
-      // 9. Ensure prompt promise settles before returning
-      await promptPromise;
-
-      // 10. Record the user message ID for per-chat turn tracking
-      const chatState = state.sessionMap.get(vscodeSessionId);
-      const userMessageId = bridge.getUserMessageId();
-      state.outputChannel.appendLine(
-        `[handler] User message ID for turn chatState && userMessageId: ${!!chatState && !!userMessageId} (${userMessageId})`,
-      );
-      if (chatState && userMessageId) {
-        chatState.turnMap.push({
-          vscodeTurn: chatState.turnMap.length,
-          opencodeMessageId: userMessageId,
-        });
+        // 7. Fire the prompt WITHOUT awaiting
         state.outputChannel.appendLine(
-          `[handler] Recorded turn ${chatState.turnMap.length - 1}: messageID=${userMessageId} (total turns=${chatState.turnMap.length})`,
+          `[handler] Prompting session ${sessionId} with: ${request.prompt.substring(0, 50)}`,
         );
-      }
+        const promptPromise = client.session.prompt({
+          path: { id: sessionId },
+          body: { parts: [{ type: 'text', text: request.prompt }] },
+          query: directory ? { directory } : undefined,
+        }).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : 'Prompt failed';
+          state.outputChannel.appendLine(`[handler] Prompt error: ${msg}`);
+        });
+
+        // 7b. Cancel → abort OpenCode session
+        let aborted = false;
+        const cancelDisposable = token.onCancellationRequested(() => {
+          if (aborted) return;
+          aborted = true;
+          state.outputChannel.appendLine(
+            `[handler] Cancellation requested, aborting OpenCode session ${sessionId}`,
+          );
+          client.session.abort({
+            path: { id: sessionId },
+            query: directory ? { directory } : undefined,
+          }).then((result) => {
+            state.outputChannel.appendLine(
+              `[handler] Abort result: ${JSON.stringify(result?.data)}`,
+            );
+          }).catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            state.outputChannel.appendLine(`[handler] Abort error: ${msg}`);
+          });
+        });
+
+        state.outputChannel.appendLine(`[handler] bridgeEventsToStream start for session ${sessionId}`);
+        // Pass tracker + client to StreamBridge for per-edit externalEdit handling
+        const bridge = new StreamBridge({
+          logger: state.outputChannel,
+          sessionId,
+          knownFileUris: new Set(fileUris.map(u => u.toString())),
+          tracker,
+          client,
+          directory,
+        });
+        try {
+          await bridge.bridgeEventsToStream(events, stream, token);
+        } finally {
+          cancelDisposable.dispose();
+        }
+
+        state.eventBroker.closeSessionStream(sessionId);
+
+        // 9. Ensure prompt promise settles
+        await promptPromise;
+
+        // 10. Record user message ID
+        const chatState = state.sessionMap.get(vscodeSessionId);
+        const userMessageId = bridge.getUserMessageId();
+        state.outputChannel.appendLine(
+          `[handler] User message ID for turn: ${!!chatState && !!userMessageId} (${userMessageId})`,
+        );
+        if (chatState && userMessageId) {
+          chatState.turnMap.push({
+            vscodeTurn: chatState.turnMap.length,
+            opencodeMessageId: userMessageId,
+          });
+          state.outputChannel.appendLine(
+            `[handler] Recorded turn ${chatState.turnMap.length - 1}: messageID=${userMessageId} (total turns=${chatState.turnMap.length})`,
+          );
+        }
+      };
+
+      // Execute the turn directly — per-edit externalEdit tracking is handled
+      // by StreamBridge + ExternalEditTracker in the SSE event loop.
+      // Each permission.asked → trackEdit (baseline) → auto-reply → file change → completeEdit.
+      await executeTurnWithBridge();
 
       // 12. Return metadata for future turn recovery
       return {
         metadata: {
           sessionId,
-          turnMap: chatState?.turnMap ?? [],
+          turnMap: state.sessionMap.get(vscodeSessionId)?.turnMap ?? [],
         },
       };
     } catch (err) {
@@ -405,6 +354,9 @@ export function createParticipantHandler(
       stream.markdown(`⚠️ ${msg}`);
       state.outputChannel.appendLine(`[handler] Error: ${msg}`);
       return { metadata: {} };
+    } finally {
+      // Always dispose the tracker to clean up any lingering edits
+      tracker.dispose();
     }
   };
 }

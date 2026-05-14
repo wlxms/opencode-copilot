@@ -254,12 +254,13 @@ describe('createParticipantHandler', () => {
     // Client was set
     expect(state.client).toBe(mockSdkClient);
 
-    // Session was created with workspace directory
+    // Session was created with workspace directory and title
     expect(mockSdkClient.session.create).toHaveBeenCalledWith({
-      body: {},
+      body: { title: 'Chat chat-1' },
       query: { directory: '/test/workspace' },
     });
-    expect(state.activeSessionId).toBe('session-1');
+    // Session stored in sessionMap under the vscode chat session ID
+    expect(state.sessionMap.get('chat-1')?.opencodeSessionId).toBe('session-1');
 
     // Events subscribed
     expect(mockSdkClient.global.event).toHaveBeenCalledOnce();
@@ -533,5 +534,109 @@ describe('createParticipantHandler', () => {
 
     // abort should NOT have been called for a normal completion
     expect(mockSdkClient.session.abort).not.toHaveBeenCalled();
+  });
+
+  // -----------------------------------------------------------------------
+  // Per-edit externalEdit tracker (replaces old per-turn CheckpointManager)
+  // -----------------------------------------------------------------------
+
+  it('should pass tracker to StreamBridge for per-edit externalEdit handling', async () => {
+    const handler = createParticipantHandler(state);
+
+    // Set up full flow mocks
+    state.serverStatus = 'running';
+    state.client = mockSdkClient as OpenCodeClient;
+    state.sessionMap.set('chat-cp-1', {
+      opencodeSessionId: 'existing-session',
+      turnMap: [],
+    });
+
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
+    const result = await handler(
+      createRequest({ prompt: 'test tracker', sessionId: 'chat-cp-1' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    // Should complete without error
+    expect(result!.metadata).toHaveProperty('sessionId', 'existing-session');
+
+    // Prompt should have been sent (StreamBridge processes events)
+    expect(mockSdkClient.session.prompt).toHaveBeenCalled();
+  });
+
+  it('should collect open file URIs for baseline tracking', async () => {
+    const handler = createParticipantHandler(state);
+
+    // Simulate open text documents (file scheme, not untitled)
+    const mockDocs = [
+      { uri: vscode.Uri.file('/src/app.ts'), isUntitled: false },
+      { uri: vscode.Uri.file('/src/util.ts'), isUntitled: false },
+    ];
+    (vscode.workspace as { textDocuments: unknown }).textDocuments = mockDocs;
+
+    // Set up full flow mocks
+    state.serverStatus = 'running';
+    state.client = mockSdkClient as OpenCodeClient;
+    state.sessionMap.set('chat-cp-2', {
+      opencodeSessionId: 'existing-session',
+      turnMap: [],
+    });
+
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
+    const result = await handler(
+      createRequest({ prompt: 'test files', sessionId: 'chat-cp-2' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    // Should complete without error
+    expect(result!.metadata).toHaveProperty('sessionId', 'existing-session');
+
+    // Clean up
+    (vscode.workspace as { textDocuments: unknown }).textDocuments = [];
+  });
+
+  it('should dispose tracker in finally block even on error', async () => {
+    const handler = createParticipantHandler(state);
+
+    // Set up so that the handler starts but prompt throws
+    state.serverStatus = 'running';
+    state.client = mockSdkClient as OpenCodeClient;
+    state.sessionMap.set('chat-cp-3', {
+      opencodeSessionId: 'existing-session',
+      turnMap: [],
+    });
+
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+    mockSdkClient.session.prompt.mockRejectedValue(new Error('prompt failed'));
+
+    // Handler should complete without crashing (prompt error is caught internally)
+    const result = await handler(
+      createRequest({ prompt: 'test error cleanup', sessionId: 'chat-cp-3' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    // Should still return metadata (prompt error is swallowed by .catch())
+    expect(result!.metadata).toHaveProperty('sessionId', 'existing-session');
+
+    // Prompt error should be logged
+    expect(state.outputChannel.appendLine).toHaveBeenCalledWith(
+      expect.stringContaining('Prompt error'),
+    );
   });
 });

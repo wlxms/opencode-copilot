@@ -24,6 +24,10 @@ export const EVENT_SESSION_DIFF = 'session.diff' as const;
 export const EVENT_SESSION_ERROR = 'session.error' as const;
 export const EVENT_SESSION_IDLE = 'session.idle' as const;
 
+// Permission events
+export const EVENT_PERMISSION_ASKED = 'permission.asked' as const;
+export const EVENT_PERMISSION_REPLIED = 'permission.replied' as const;
+
 /** All known real event type strings */
 export type RealEventType =
   | typeof EVENT_SERVER_CONNECTED
@@ -38,7 +42,9 @@ export type RealEventType =
   | typeof EVENT_SESSION_STATUS
   | typeof EVENT_SESSION_DIFF
   | typeof EVENT_SESSION_ERROR
-  | typeof EVENT_SESSION_IDLE;
+  | typeof EVENT_SESSION_IDLE
+  | typeof EVENT_PERMISSION_ASKED
+  | typeof EVENT_PERMISSION_REPLIED;
 
 /**
  * Part types in message.part.updated events.
@@ -197,6 +203,48 @@ export interface SessionIdleEvent {
   };
 }
 
+export interface SnapshotFileDiff {
+  file: string;
+  patch: string;
+  additions: number;
+  deletions: number;
+  status?: 'added' | 'deleted' | 'modified';
+}
+
+export interface SessionDiffEvent {
+  type: 'session.diff';
+  properties: {
+    sessionID: string;
+    diff: SnapshotFileDiff[];
+  };
+}
+
+export interface PermissionAskedEvent {
+  type: 'permission.asked';
+  properties: {
+    id: string;
+    sessionID: string;
+    permission: string;
+    patterns: string[];
+    metadata: {
+      filepath?: string;
+      diff?: string;
+      [key: string]: unknown;
+    };
+    always: string[];
+    tool?: { messageID: string; callID: string };
+  };
+}
+
+export interface PermissionRepliedEvent {
+  type: 'permission.replied';
+  properties: {
+    sessionID: string;
+    permissionID: string;
+    response: string;
+  };
+}
+
 type OtherSdkEvents = Exclude<
   EventSubscribeResponse,
   | Extract<EventSubscribeResponse, { type: 'message.part.updated' }>
@@ -207,7 +255,10 @@ export type OpenCodeEvent =
   | OtherSdkEvents
   | MessagePartUpdatedEvent
   | MessagePartDeltaEvent
-  | SessionIdleEvent;
+  | SessionIdleEvent
+  | SessionDiffEvent
+  | PermissionAskedEvent
+  | PermissionRepliedEvent;
 
 export interface OpenCodeGlobalEventEnvelope {
   directory: string;

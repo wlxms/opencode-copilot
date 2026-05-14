@@ -164,6 +164,10 @@ export class GlobalEventBroker {
         return this.partSessions.get(event.properties.partID);
       case 'session.idle':
         return event.properties?.sessionID;
+      case 'permission.asked':
+        return event.properties?.sessionID;
+      case 'permission.replied':
+        return event.properties?.sessionID;
       default:
         return getEventSessionIdFromProperties(event);
     }
