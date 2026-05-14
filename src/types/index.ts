@@ -48,6 +48,12 @@ export interface OpenCodeClient {
   config: {
     providers(): Promise<OpenCodeApiResponse<ConfigProvidersResponse>>;
   };
+  /** Reply to a permission.asked request — approves or rejects the paused tool */
+  postSessionIdPermissionsPermissionId(options: {
+    path: { id: string; permissionID: string };
+    body?: { response: 'once' | 'always' | 'reject' };
+    query?: { directory?: string };
+  }): Promise<unknown>;
 }
 
 export interface OpenCodeServerController {

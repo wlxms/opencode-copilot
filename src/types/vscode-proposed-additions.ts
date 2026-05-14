@@ -216,6 +216,53 @@ export class ChatResponseWorkspaceEditPart {
 }
 
 // ---------------------------------------------------------------------------
+// ChatResponseDiffEntry & ChatResponseMultiDiffPart
+// ---------------------------------------------------------------------------
+
+/**
+ * Represents a single file diff entry in a multi diff view.
+ * Source: vscode.proposed.chatParticipantAdditions.d.ts
+ */
+export interface ChatResponseDiffEntry {
+  /**
+   * The original file URI (undefined for new files).
+   */
+  originalUri?: Uri;
+  /**
+   * The modified file URI (undefined for deleted files).
+   */
+  modifiedUri?: Uri;
+  /**
+   * Optional URI to navigate to when clicking on the file.
+   */
+  goToFileUri?: Uri;
+  /**
+   * Number of added lines to show in the UI.
+   */
+  added?: number;
+  /**
+   * Number of removed lines to show in the UI.
+   */
+  removed?: number;
+}
+
+/**
+ * A chat response part that shows multiple file diffs.
+ * Source: vscode.proposed.chatParticipantAdditions.d.ts
+ */
+export class ChatResponseMultiDiffPart {
+  value: ChatResponseDiffEntry[];
+  title: string;
+  readOnly?: boolean;
+
+  constructor(value: ChatResponseDiffEntry[], title: string, readOnly?: boolean) {
+    this.value = value;
+    this.title = title;
+    this.readOnly = readOnly;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // ExtendedChatResponseParts — lists all proposed chat response parts
 // ---------------------------------------------------------------------------
 
@@ -235,7 +282,7 @@ export interface ExtendedChatResponseParts {
   ChatResponseExtensionsPart: unknown;
   ChatResponsePullRequestPart: unknown;
   ChatToolInvocationPart: ChatToolInvocationPart;
-  ChatResponseMultiDiffPart: unknown;
+  ChatResponseMultiDiffPart: ChatResponseMultiDiffPart;
   ChatResponseThinkingProgressPart: unknown;
   ChatResponseExternalEditPart: ChatResponseExternalEditPart;
   ChatResponseQuestionCarouselPart: unknown;
