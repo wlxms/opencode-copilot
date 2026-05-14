@@ -131,6 +131,58 @@ export type ChatToolSpecificData =
   | ChatSubagentToolInvocationData;
 
 // ---------------------------------------------------------------------------
+// ChatResponseCodeblockUriPart
+// ---------------------------------------------------------------------------
+
+/**
+ * A chat response part that links a code block to a file URI.
+ * With isEdit=true, renders as an editable diff block with undo support.
+ *
+ * Source: vscode.proposed.chatParticipantAdditions.d.ts
+ */
+export class ChatResponseCodeblockUriPart {
+  isEdit?: boolean;
+  value: Uri;
+  undoStopId?: string;
+
+  constructor(value: Uri, isEdit?: boolean, undoStopId?: string) {
+    this.value = value;
+    this.isEdit = isEdit;
+    this.undoStopId = undoStopId;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ChatResponseTextEditPart
+// ---------------------------------------------------------------------------
+
+/**
+ * A chat response part that represents text edits to a file.
+ * Renders as an inline diff (green/red lines) in the chat UI.
+ *
+ * Usage pattern (Copilot CLI):
+ *   1. push(ChatResponseTextEditPart(uri, []))   — start edit group
+ *   2. push(ChatResponseTextEditPart(uri, true))  — done, trigger diff calc
+ *
+ * Source: vscode.proposed.chatParticipantAdditions.d.ts
+ */
+export class ChatResponseTextEditPart {
+  uri: Uri;
+  edits: import('vscode').TextEdit[];
+  isDone?: boolean;
+
+  constructor(uri: Uri, editsOrDone: import('vscode').TextEdit | import('vscode').TextEdit[] | true) {
+    this.uri = uri;
+    if (editsOrDone === true) {
+      this.isDone = true;
+      this.edits = [];
+    } else {
+      this.edits = Array.isArray(editsOrDone) ? editsOrDone : [editsOrDone];
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // ChatToolInvocationPart
 // ---------------------------------------------------------------------------
 
@@ -272,7 +324,7 @@ export class ChatResponseMultiDiffPart {
  */
 export interface ExtendedChatResponseParts {
   ChatResponsePart: unknown;
-  ChatResponseTextEditPart: unknown;
+  ChatResponseTextEditPart: ChatResponseTextEditPart;
   ChatResponseNotebookEditPart: unknown;
   ChatResponseWorkspaceEditPart: ChatResponseWorkspaceEditPart;
   ChatResponseConfirmationPart: unknown;

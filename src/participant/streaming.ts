@@ -20,9 +20,11 @@ import type {
   ChatToolInvocationPart,
   ChatToolInvocationStreamData,
   ChatWorkspaceFileEdit,
+  ChatResponseCodeblockUriPart as ChatResponseCodeblockUriPartType,
   ChatResponseDiffEntry,
   ChatResponseExternalEditPart,
   ChatResponseMultiDiffPart,
+  ChatResponseTextEditPart as ChatResponseTextEditPartType,
   ChatResponseWorkspaceEditPart,
 } from '../types/vscode-proposed-additions';
 import { ExternalEditTracker } from './external-edit-tracker';
@@ -59,6 +61,16 @@ type ProposedVscode = typeof vscode & {
     title: string,
     readOnly?: boolean,
   ) => ChatResponseMultiDiffPart;
+  ChatResponseCodeblockUriPart?: new (
+    value: vscode.Uri,
+    isEdit?: boolean,
+    undoStopId?: string,
+  ) => ChatResponseCodeblockUriPartType;
+  ChatResponseTextEditPart?: new (
+    uri: vscode.Uri,
+    editsOrDone: vscode.TextEdit | vscode.TextEdit[] | true,
+  ) => ChatResponseTextEditPartType;
+  ChatResponseMarkdownPart?: new (value: string | vscode.MarkdownString) => unknown;
 };
 
 // Runtime access to proposed classes (may not exist)
@@ -502,6 +514,28 @@ export class StreamBridge {
           const fileUri = vscode.Uri.file(filePath).toString();
           if (!this.knownFileUris.has(fileUri)) {
             this.log(`tool ${toolName} touched file not in proactive set: ${filePath} (best-effort tracking)`);
+          }
+        }
+      }
+
+      // Copilot-style inline diff display for edit/write tools
+      // Pushes: markdown fence → CodeblockUriPart(edit) → TextEditPart([]) → TextEditPart(done) → markdown fence
+      // VSCode reads the file from disk and renders an inline diff (green/red lines)
+      if ((toolName === 'edit' || toolName === 'write') && stream.push
+          && VS.ChatResponseCodeblockUriPart && VS.ChatResponseTextEditPart && VS.ChatResponseMarkdownPart) {
+        const input = state.input as Record<string, unknown> | undefined;
+        const filePath = input?.filePath as string | undefined;
+        if (filePath) {
+          try {
+            const uri = vscode.Uri.file(filePath);
+            stream.push(new VS.ChatResponseMarkdownPart('\n````\n') as unknown as vscode.ChatResponsePart);
+            stream.push(new VS.ChatResponseCodeblockUriPart(uri, true, callID) as unknown as vscode.ChatResponsePart);
+            stream.push(new VS.ChatResponseTextEditPart(uri, []) as unknown as vscode.ChatResponsePart);
+            stream.push(new VS.ChatResponseTextEditPart(uri, true) as unknown as vscode.ChatResponsePart);
+            stream.push(new VS.ChatResponseMarkdownPart('\n````\n') as unknown as vscode.ChatResponsePart);
+            this.log(`pushed Copilot-style textEdit diff for ${toolName}: ${filePath}`);
+          } catch (err) {
+            this.log(`textEdit diff push failed for ${filePath}: ${err}`);
           }
         }
       }
