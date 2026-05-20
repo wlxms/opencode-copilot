@@ -364,9 +364,7 @@ describe('StreamBridge', () => {
   }
 
   describe('permission.asked lifecycle', () => {
-    let mockClient: {
-      postSessionIdPermissionsPermissionId: ReturnType<typeof vi.fn>;
-    };
+    let mockReplyToPermission: ReturnType<typeof vi.fn>;
     let mockTracker: {
       hasEdit: ReturnType<typeof vi.fn>;
       isTrackingAny: ReturnType<typeof vi.fn>;
@@ -376,9 +374,7 @@ describe('StreamBridge', () => {
     };
 
     beforeEach(() => {
-      mockClient = {
-        postSessionIdPermissionsPermissionId: vi.fn().mockResolvedValue(undefined),
-      };
+      mockReplyToPermission = vi.fn(async () => undefined);
       mockTracker = {
         hasEdit: vi.fn().mockReturnValue(false),
         isTrackingAny: vi.fn().mockReturnValue(false),
@@ -392,7 +388,7 @@ describe('StreamBridge', () => {
       const stream = mockStream();
       const permBridge = new StreamBridge({
         sessionId: 'ses_target',
-        client: mockClient as any,
+        replyToPermission: mockReplyToPermission as any,
         tracker: mockTracker as any,
       });
       const events = eventStream([
@@ -420,13 +416,13 @@ describe('StreamBridge', () => {
         await Promise.resolve();
         trackEditResolved = true;
       });
-      mockClient.postSessionIdPermissionsPermissionId.mockImplementation(async () => {
+      mockReplyToPermission.mockImplementation(async () => {
         expect(trackEditResolved).toBe(true);
       });
 
       const permBridge = new StreamBridge({
         sessionId: 'ses_target',
-        client: mockClient as any,
+        replyToPermission: mockReplyToPermission as any,
         tracker: mockTracker as any,
       });
       const events = eventStream([
@@ -437,12 +433,12 @@ describe('StreamBridge', () => {
       await permBridge.bridgeEventsToStream(events, stream, mockToken());
 
       expect(mockTracker.trackEdit).toHaveBeenCalledTimes(1);
-      expect(mockClient.postSessionIdPermissionsPermissionId).toHaveBeenCalledTimes(1);
-      expect(mockClient.postSessionIdPermissionsPermissionId).toHaveBeenCalledWith(
-        expect.objectContaining({
-          path: { id: 'ses_target', permissionID: 'perm_42' },
-          body: { response: 'once' },
-        }),
+      expect(mockReplyToPermission).toHaveBeenCalledTimes(1);
+      expect(mockReplyToPermission).toHaveBeenCalledWith(
+        'ses_target',
+        'perm_42',
+        'once',
+        undefined,
       );
     });
 
@@ -450,7 +446,7 @@ describe('StreamBridge', () => {
       const stream = mockStream();
       const permBridge = new StreamBridge({
         sessionId: 'ses_target',
-        client: mockClient as any,
+        replyToPermission: mockReplyToPermission as any,
         tracker: mockTracker as any,
       });
       const events = eventStream([
@@ -469,7 +465,7 @@ describe('StreamBridge', () => {
       const stream = mockStream();
       const permBridge = new StreamBridge({
         sessionId: 'ses_target',
-        client: mockClient as any,
+        replyToPermission: mockReplyToPermission as any,
         tracker: mockTracker as any,
       });
       const events = eventStream([
@@ -481,14 +477,14 @@ describe('StreamBridge', () => {
 
       expect(mockTracker.trackEdit).not.toHaveBeenCalled();
       // Auto-reply should still fire
-      expect(mockClient.postSessionIdPermissionsPermissionId).toHaveBeenCalledTimes(1);
+      expect(mockReplyToPermission).toHaveBeenCalledTimes(1);
     });
 
     it('skips trackEdit when filepath is missing from metadata', async () => {
       const stream = mockStream();
       const permBridge = new StreamBridge({
         sessionId: 'ses_target',
-        client: mockClient as any,
+        replyToPermission: mockReplyToPermission as any,
         tracker: mockTracker as any,
       });
       const events = eventStream([
@@ -499,15 +495,15 @@ describe('StreamBridge', () => {
       await permBridge.bridgeEventsToStream(events, stream, mockToken());
 
       expect(mockTracker.trackEdit).not.toHaveBeenCalled();
-      expect(mockClient.postSessionIdPermissionsPermissionId).toHaveBeenCalledTimes(1);
+      expect(mockReplyToPermission).toHaveBeenCalledTimes(1);
     });
 
-    it('skips auto-reply when client is not provided', async () => {
+    it('skips auto-reply when reply callback is not provided', async () => {
       const stream = mockStream();
       const permBridge = new StreamBridge({
         sessionId: 'ses_target',
         tracker: mockTracker as any,
-        // no client
+        // no reply callback
       });
       const events = eventStream([
         permissionAskedEvent(),
@@ -519,7 +515,7 @@ describe('StreamBridge', () => {
       // trackEdit should still be called
       expect(mockTracker.trackEdit).toHaveBeenCalledTimes(1);
       // auto-reply should NOT be called
-      expect(mockClient.postSessionIdPermissionsPermissionId).not.toHaveBeenCalled();
+      expect(mockReplyToPermission).not.toHaveBeenCalled();
     });
 
     it('does not double-track an already-tracked callID', async () => {
@@ -527,7 +523,7 @@ describe('StreamBridge', () => {
       mockTracker.hasEdit.mockReturnValue(true); // already tracked
       const permBridge = new StreamBridge({
         sessionId: 'ses_target',
-        client: mockClient as any,
+        replyToPermission: mockReplyToPermission as any,
         tracker: mockTracker as any,
       });
       const events = eventStream([
@@ -540,7 +536,7 @@ describe('StreamBridge', () => {
       expect(mockTracker.trackEdit).not.toHaveBeenCalled();
       expect(mockTracker.hasEdit).toHaveBeenCalledWith('call_edit_001');
       // Auto-reply should still fire
-      expect(mockClient.postSessionIdPermissionsPermissionId).toHaveBeenCalledTimes(1);
+      expect(mockReplyToPermission).toHaveBeenCalledTimes(1);
     });
 
     it('does not track when file already has an active externalEditPart', async () => {
@@ -548,7 +544,7 @@ describe('StreamBridge', () => {
       mockTracker.isTrackingAny.mockReturnValue(true); // file already tracked
       const permBridge = new StreamBridge({
         sessionId: 'ses_target',
-        client: mockClient as any,
+        replyToPermission: mockReplyToPermission as any,
         tracker: mockTracker as any,
       });
       const events = eventStream([
@@ -565,7 +561,7 @@ describe('StreamBridge', () => {
       const stream = mockStream();
       const permBridge = new StreamBridge({
         sessionId: 'ses_target',
-        client: mockClient as any,
+        replyToPermission: mockReplyToPermission as any,
         tracker: mockTracker as any,
       });
       const events = eventStream([
@@ -580,7 +576,7 @@ describe('StreamBridge', () => {
 
       // Permission handling happened
       expect(mockTracker.trackEdit).toHaveBeenCalledTimes(1);
-      expect(mockClient.postSessionIdPermissionsPermissionId).toHaveBeenCalledTimes(1);
+      expect(mockReplyToPermission).toHaveBeenCalledTimes(1);
       // Subsequent text delta was rendered
       expect(stream.markdown).toHaveBeenCalledWith('Edit applied');
     });
@@ -589,7 +585,7 @@ describe('StreamBridge', () => {
       const stream = mockStream();
       const permBridge = new StreamBridge({
         sessionId: 'ses_target',
-        client: mockClient as any,
+        replyToPermission: mockReplyToPermission as any,
         tracker: mockTracker as any,
       });
       const events = eventStream([
@@ -610,7 +606,7 @@ describe('StreamBridge', () => {
       mockTracker.trackEdit.mockResolvedValue(undefined);
       const permBridge = new StreamBridge({
         sessionId: 'ses_target',
-        client: mockClient as any,
+        replyToPermission: mockReplyToPermission as any,
         tracker: mockTracker as any,
       });
       // Simulate: permission.asked → tool pending → tool completed → idle

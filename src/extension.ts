@@ -83,8 +83,8 @@ export function activate(context: vscode.ExtensionContext) {
 export function deactivate() {
   if (state) {
     state.outputChannel.appendLine('[extension] Deactivating...');
-    if (state.serverManager.isRunning()) {
-      state.serverManager.stop().catch((err: unknown) => {
+    if (state.backend.isRunning()) {
+      state.backend.stop().catch((err: unknown) => {
         state!.outputChannel.appendLine(
           `[extension] Stop error: ${err instanceof Error ? err.message : String(err)}`,
         );

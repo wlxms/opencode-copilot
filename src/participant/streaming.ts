@@ -75,12 +75,13 @@ interface StreamBridgeOptions {
   knownFileUris?: Set<string>;
   /** Per-edit tracker for externalEdit checkpoints */
   tracker?: ExternalEditTracker;
-  /** OpenCode client for replying to permission.asked */
-  client?: { postSessionIdPermissionsPermissionId(options: {
-    path: { id: string; permissionID: string };
-    body?: { response: 'once' | 'always' | 'reject' };
-    query?: { directory?: string };
-  }): Promise<unknown> };
+  /** Reply callback for permission.asked */
+  replyToPermission?: (
+    sessionId: string,
+    permissionId: string,
+    response: 'once' | 'always' | 'reject',
+    directory?: string,
+  ) => Promise<unknown>;
   /** Workspace directory for API calls */
   directory?: string;
 }
@@ -123,7 +124,7 @@ export class StreamBridge {
   /** URIs of files that existed before the turn started (proactive baseline) */
   private knownFileUris: Set<string>;
   private readonly tracker?: ExternalEditTracker;
-  private readonly client?: StreamBridgeOptions['client'];
+  private readonly replyToPermission?: StreamBridgeOptions['replyToPermission'];
   private readonly directory?: string;
 
   constructor(options: StreamBridgeOptions = {}) {
@@ -131,7 +132,7 @@ export class StreamBridge {
     this.sessionId = options.sessionId;
     this.knownFileUris = options.knownFileUris ?? new Set();
     this.tracker = options.tracker;
-    this.client = options.client;
+    this.replyToPermission = options.replyToPermission;
     this.directory = options.directory;
   }
 
@@ -266,13 +267,9 @@ export class StreamBridge {
     }
 
     // Auto-reply "once" to resume the server
-    if (this.client && sessionId && permissionId) {
+    if (this.replyToPermission && sessionId && permissionId) {
       try {
-        await this.client.postSessionIdPermissionsPermissionId({
-          path: { id: sessionId, permissionID: permissionId },
-          body: { response: 'once' },
-          query: this.directory ? { directory: this.directory } : undefined,
-        });
+        await this.replyToPermission(sessionId, permissionId, 'once', this.directory);
         this.log(`auto-replied 'once' for permission ${permissionId}`);
       } catch (err) {
         this.log(`auto-reply failed for permission ${permissionId}: ${err}`);

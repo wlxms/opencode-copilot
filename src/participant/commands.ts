@@ -44,10 +44,10 @@ async function handleNewCommand(
   state: ExtensionState,
   stream: vscode.ChatResponseStream,
 ): Promise<void> {
-  const client = await ensureServer(state, stream);
-  if (!client) return;
+  const ready = await ensureServer(state, stream);
+  if (!ready) return;
   try {
-    const result = await client.session.create({ body: {} });
+    const result = await state.backend.sessions.create();
     const sessionId = result.data?.id;
     if (!sessionId) {
       throw new Error('Session not created');
@@ -81,8 +81,8 @@ async function handleModelCommand(
   state: ExtensionState,
   stream: vscode.ChatResponseStream,
 ): Promise<void> {
-  const client = await ensureServer(state, stream);
-  if (!client) return;
+  const ready = await ensureServer(state, stream);
+  if (!ready) return;
   try {
     const modelsResp = await state.backend.config.models();
     const modelList = modelsResp.data ?? [];
@@ -513,8 +513,8 @@ async function handleTestExternalEditE2ECommand(
   // 1. Start server
   stream.markdown('🧪 **E2E Test: real OpenCode prompt → file edit → externalEdit**\n\n');
   stream.markdown('1️⃣ Starting OpenCode server...\n\n');
-  const client = await ensureServer(state, stream);
-  if (!client) return;
+  const ready = await ensureServer(state, stream);
+  if (!ready) return;
   const directory = workspaceFolders[0].uri.fsPath;
 
   // 2. Create temp file for the edit target
@@ -528,11 +528,8 @@ async function handleTestExternalEditE2ECommand(
   stream.markdown('3️⃣ Creating session...\n\n');
   let sessionId: string;
   try {
-    const sessionResp = await client.session.create({
-      body: {},
-      query: { directory },
-    });
-    sessionId = sessionResp.data?.id ?? '';
+      const sessionResp = await state.backend.sessions.create({ directory });
+      sessionId = sessionResp.data?.id ?? '';
     if (!sessionId) throw new Error('empty session id');
     stream.markdown(`   Session: \`${sessionId}\`\n\n`);
   } catch (err) {
@@ -553,10 +550,10 @@ async function handleTestExternalEditE2ECommand(
   const prompt = `Edit the file ${tmpPath}: replace "hello world" with "hello e2e test". Do not add any other text.`;
   state.outputChannel.appendLine(`[e2e] Prompt: ${prompt}`);
 
-  let eventStream: import('../types/events').OpenCodeEventStream;
+  let eventStream: import('../acp/backend').AcpEventStream;
   try {
-    await state.eventBroker.ensureStarted(client, state.outputChannel);
-    eventStream = state.eventBroker.openSessionStream(sessionId);
+    await state.backend.events.ensureStarted();
+    eventStream = state.backend.events.openSessionStream(sessionId);
   } catch (err) {
     stream.markdown(`❌ Failed to subscribe to events: ${err}\n\n`);
     try { unlinkSync(tmpPath); } catch { /* best effort */ }
@@ -565,11 +562,7 @@ async function handleTestExternalEditE2ECommand(
   }
 
   // Send prompt (fire and don't await)
-  const promptPromise = client.session.prompt({
-    path: { id: sessionId },
-    body: { parts: [{ type: 'text', text: prompt }] },
-    query: { directory },
-  }).catch((err: unknown) => {
+  const promptPromise = state.backend.sessions.prompt(sessionId, prompt, directory).catch((err: unknown) => {
     state.outputChannel.appendLine(`[e2e] Prompt error: ${err}`);
   });
 
@@ -583,24 +576,22 @@ async function handleTestExternalEditE2ECommand(
   let editCallID = '';
 
   try {
-    for await (const rawEvt of eventStream.stream) {
+    for await (const evt of eventStream.stream) {
       if (token.isCancellationRequested) break;
-      const evt = ('payload' in rawEvt) ? rawEvt.payload : rawEvt as import('../types/events').OpenCodeEvent;
       eventCount++;
       const evtType = evt.type;
 
       if (evtType === 'permission.asked') {
         permissionAskedCount++;
-        const props = (evt as import('../types/events').PermissionAskedEvent).properties;
-        const callID = props.tool?.callID ?? '';
-        const filepath = props.metadata?.filepath ?? '';
+        const callID = evt.tool?.callId ?? '';
+        const filepath = evt.metadata?.filepath ?? '';
         stream.markdown(
-          `[${eventCount}] 🔐 permission.asked id=${props.id ?? '?'} ` +
+          `[${eventCount}] 🔐 permission.asked id=${evt.permissionId ?? '?'} ` +
           `callID=${callID || '(empty)'} ` +
           `filepath=${filepath || '(empty)'}\n`,
         );
         // If filepath matches target, parallel trackEdit + "once"
-        if (filepath && tmpPath && filepath.toLowerCase() === tmpPath.toLowerCase()) {
+        if (typeof filepath === 'string' && filepath && tmpPath && filepath.toLowerCase() === tmpPath.toLowerCase()) {
           editCallID = callID;
           stream.markdown(`     🎯 Matched target file — parallel trackEdit + "once"\n`);
           await Promise.all([
@@ -611,13 +602,9 @@ async function handleTestExternalEditE2ECommand(
               stream.markdown(`     ❌ trackEdit error: ${err}\n`);
             }),
             (async () => {
-              if (client && props.sessionID && props.id) {
+              if (evt.sessionId && evt.permissionId) {
                 try {
-                  await client.postSessionIdPermissionsPermissionId({
-                    path: { id: props.sessionID, permissionID: props.id },
-                    body: { response: 'once' },
-                    query: { directory },
-                  });
+                  await state.backend.permissions.reply(evt.sessionId, evt.permissionId, 'once', directory);
                   stream.markdown(`     ✅ Replied "once"\n`);
                 } catch (err) {
                   stream.markdown(`     ❌ Reply failed: ${err}\n`);
@@ -625,26 +612,22 @@ async function handleTestExternalEditE2ECommand(
               }
             })(),
           ]);
-        } else if (client && props.sessionID && props.id) {
+        } else if (evt.sessionId && evt.permissionId) {
           // Non-matching filepath — just reply "once"
           try {
-            await client.postSessionIdPermissionsPermissionId({
-              path: { id: props.sessionID, permissionID: props.id },
-              body: { response: 'once' },
-              query: { directory },
-            });
+            await state.backend.permissions.reply(evt.sessionId, evt.permissionId, 'once', directory);
             stream.markdown(`     ✅ Replied "once"\n`);
           } catch (err) {
             stream.markdown(`     ❌ Reply failed: ${err}\n`);
           }
         }
-      } else if (evtType === 'message.part.updated') {
-        const part = (evt as any).properties?.part;
+      } else if (evtType === 'part.updated') {
+        const part = evt.part;
         if (part?.type === 'tool' && part?.state?.status === 'completed') {
           toolCompletedCount++;
-          const toolCallID = part.callID ?? part.id ?? '';
+          const toolCallID = part.callId ?? part.id ?? '';
           stream.markdown(
-            `[${eventCount}] 🔧 tool completed: ${part.tool ?? '?'} callID=${toolCallID}\n`,
+            `[${eventCount}] 🔧 tool completed: ${part.toolName ?? '?'} callID=${toolCallID}\n`,
           );
           // completeEdit when the matched tool finishes
           if (baselineCaptured && !editComplete && editCallID && toolCallID === editCallID) {
@@ -659,7 +642,7 @@ async function handleTestExternalEditE2ECommand(
           }
         } else if (part?.type === 'tool' && part?.state?.status) {
           stream.markdown(
-            `[${eventCount}] 🔧 tool ${part.state.status}: ${part.tool ?? '?'}\n`,
+            `[${eventCount}] 🔧 tool ${part.state.status}: ${part.toolName ?? '?'}\n`,
           );
         }
       } else if (evtType === 'session.idle') {
@@ -713,7 +696,7 @@ async function handleTestExternalEditE2ECommand(
   }
 
   // Cleanup
-  state.eventBroker.closeSessionStream(sessionId);
+  state.backend.events.closeSessionStream(sessionId);
   try { if (existsSync(tmpPath)) { unlinkSync(tmpPath); } } catch { /* best effort */ }
   tracker.dispose();
 
