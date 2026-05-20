@@ -84,18 +84,21 @@ async function handleModelCommand(
   const client = await ensureServer(state, stream);
   if (!client) return;
   try {
-    const providersResp = await client.config.providers();
-    const providerList: Provider[] = providersResp.data?.providers ?? [];
-    if (providerList.length > 0) {
+    const modelsResp = await state.backend.config.models();
+    const modelList = modelsResp.data ?? [];
+    if (modelList.length > 0) {
       const lines: string[] = ['## Available Models', ''];
-      for (const p of providerList) {
-        const models: Model[] = Object.values(p.models ?? {});
-        const active = models.filter((model) => model.status === 'active');
-        if (active.length > 0) {
-          lines.push(`**${p.name}** (${p.id}):`);
-          for (const m of active) {
-            lines.push(`  - \`${m.id}\` — ${m.name}`);
-          }
+      const grouped = new Map<string, Array<{ id: string; name?: string }>>();
+      for (const model of modelList) {
+        const provider = model.provider ?? 'unknown';
+        const existing = grouped.get(provider) ?? [];
+        existing.push({ id: model.id, name: model.name });
+        grouped.set(provider, existing);
+      }
+      for (const [provider, models] of grouped) {
+        lines.push(`**${provider}**:`);
+        for (const model of models) {
+          lines.push(`  - \`${model.id}\`${model.name ? ` — ${model.name}` : ''}`);
         }
       }
       stream.markdown(lines.join('\n'));

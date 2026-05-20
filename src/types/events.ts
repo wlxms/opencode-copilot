@@ -240,8 +240,10 @@ export interface PermissionRepliedEvent {
   type: 'permission.replied';
   properties: {
     sessionID: string;
-    permissionID: string;
-    response: string;
+    /** The original permission request ID (field name per SDK v2 SSE event) */
+    requestID: string;
+    /** 'once' | 'always' | 'reject' */
+    reply: string;
   };
 }
 
