@@ -8,6 +8,7 @@ import type {
 } from '@opencode-ai/sdk';
 import type { OpenCodeEventStream } from './events';
 import type { GlobalEventBroker } from '../participant/event-broker';
+import type { AcpBackend } from '../acp/backend';
 
 export interface OpenCodeApiResponse<T, E = unknown> {
   data?: T;
@@ -88,6 +89,8 @@ export interface SessionState {
 
 /** Global extension state shared across modules */
 export interface ExtensionState {
+  /** ACP-compatible backend abstraction used by all surfaces */
+  backend: AcpBackend;
   /** The OpenCode server manager instance */
   serverManager: OpenCodeServerController;
   /** SDK OpencodeClient from createOpencode() (null until started) */
