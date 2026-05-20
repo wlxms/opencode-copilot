@@ -6,17 +6,28 @@ import * as vscode from 'vscode';
  * Adapted from Copilot's ExternalEditTracker pattern:
  *
  * Lifecycle per edit:
- *   1. trackEdit(editKey, uris, stream) → calls stream.externalEdit()
- *   2. VSCode: send(start=true) → captures file baselines
- *   3. callback runs: proceedWithEdit() resolves → caller knows baseline is captured
+ *   1. trackEdit(editKey, uris, stream) → pushes ChatResponseExternalEditPart
+ *   2. VSCode Pipeline: send(start=true) → captures file baselines from entry model
+ *   3. Pipeline calls callback → proceedWithEdit() resolves → caller knows baseline is captured
  *   4. callback blocks on deferred until completeEdit() is called
  *   5. completeEdit(editKey) → deferred resolves → callback returns
- *   6. VSCode: send(start=false) → enables undo checkpoint
+ *   6. VSCode Pipeline: send(start=false) → stopExternalEdits
+ *   7. part.applied resolves → undoStopId returned
  *
  * Usage with OpenCode permission flow:
  *   - permission.asked arrives → trackEdit(callID, [fileUri], stream)
  *   - trackEdit resolves (baseline captured) → auto-reply "once"
  *   - tool=completed arrives → completeEdit(callID)
+ *
+ * IMPORTANT — Windows URI Casing:
+ *   VSCode's ExternalEditPart performs strict URI path comparison internally.
+ *   On Windows, vscode.Uri.file("D:\\path") produces path="/D:/path" (uppercase drive),
+ *   but VSCode workspace URIs normalize to "/d:/path" (lowercase drive). This casing
+ *   mismatch causes diff capture to silently fail (shows +0-0 instead of actual diff).
+ *   Callers MUST normalize the URI before passing it to trackEdit(), e.g.:
+ *     const rawUri = vscode.Uri.file(filepath);
+ *     const norm = rawUri.path.replace(/^\/([A-Z]):\//, (_, d) => `/${d.toLowerCase()}:`);
+ *     const fileUri = norm !== rawUri.path ? rawUri.with({ path: norm }) : rawUri;
  */
 export class ExternalEditTracker {
   private _ongoingEdits = new Map<
@@ -24,29 +35,30 @@ export class ExternalEditTracker {
     {
       complete: () => void;
       onDidComplete: Thenable<string>;
+      uris: readonly vscode.Uri[];
     }
   >();
 
-  /**
-   * Returns true if there is an active edit being tracked for the given key.
-   */
   hasEdit(editKey: string): boolean {
     return this._ongoingEdits.has(editKey);
   }
 
   /**
-   * Start tracking an external edit for the given URIs.
-   *
-   * Resolves when VSCode has captured the file baselines (send(start=true) complete).
-   * The caller can then safely proceed with the edit (e.g., reply "once" to permission).
-   *
-   * After the edit completes, call completeEdit(editKey) to finalize the checkpoint.
-   *
-   * @param editKey Unique identifier (typically tool callID from permission.asked)
-   * @param uris File URIs to track
-   * @param stream VSCode ChatResponseStream (must support proposed externalEdit API)
-   * @param token Optional cancellation token
+   * Check if any of the given URIs are already being tracked by an active edit.
+   * Used to prevent pushing duplicate ExternalEditParts for the same file.
    */
+  isTrackingAny(uris: readonly vscode.Uri[]): boolean {
+    const uriSet = new Set(uris.map(u => u.toString()));
+    for (const edit of this._ongoingEdits.values()) {
+      for (const u of edit.uris) {
+        if (uriSet.has(u.toString())) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   async trackEdit(
     editKey: string,
     uris: vscode.Uri[],
@@ -57,13 +69,14 @@ export class ExternalEditTracker {
       return;
     }
 
-    // Check if stream.externalEdit is available (proposed API)
-    const externalEditFn = (stream as any).externalEdit as
-      | ((target: vscode.Uri | vscode.Uri[], callback: () => Thenable<unknown>) => Thenable<string>)
+    const ExternalEditCtor = (vscode as any).ChatResponseExternalEditPart as
+      | (new (
+          uris: readonly vscode.Uri[],
+          callback: () => Thenable<unknown>,
+        ) => { applied: Thenable<string> })
       | undefined;
 
-    if (!externalEditFn || typeof externalEditFn !== 'function') {
-      // Proposed API not available — skip external edit tracking
+    if (!ExternalEditCtor) {
       return;
     }
 
@@ -81,35 +94,22 @@ export class ExternalEditTracker {
         });
       }
 
-      const onDidComplete = externalEditFn.call(
-        stream,
-        uris,
-        async () => {
-          // send(start=true) has completed — baseline captured
-          resolveTrackEdit();
+      const part = new ExternalEditCtor(uris, async () => {
+        resolveTrackEdit();
+        await deferredPromise;
+        cancelDisposable?.dispose();
+      });
 
-          // Block until completeEdit() is called
-          await deferredPromise;
-          cancelDisposable?.dispose();
-        },
-      );
+      (stream as any).push(part);
 
       this._ongoingEdits.set(editKey, {
-        onDidComplete,
+        onDidComplete: part.applied,
         complete: () => deferredResolve?.(),
+        uris,
       });
     });
   }
 
-  /**
-   * Complete an ongoing external edit.
-   *
-   * Resolves the deferred promise inside the callback, allowing
-   * send(start=false) to execute and the undo checkpoint to be created.
-   *
-   * @param editKey The same key passed to trackEdit
-   * @returns The applied Thenable from stream.externalEdit, or undefined if not tracked
-   */
   completeEdit(editKey: string): Thenable<string> | undefined {
     const edit = this._ongoingEdits.get(editKey);
     if (!edit) {
@@ -120,9 +120,6 @@ export class ExternalEditTracker {
     return edit.onDidComplete;
   }
 
-  /**
-   * Clean up all ongoing edits (e.g., on cancellation or error).
-   */
   dispose(): void {
     for (const edit of this._ongoingEdits.values()) {
       edit.complete();

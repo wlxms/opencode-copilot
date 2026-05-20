@@ -242,12 +242,26 @@ export class StreamBridge {
 
     // If we have a tracker and this is an edit-related permission with a file path, track it
     if (this.tracker && callID && filepath) {
-      const fileUri = vscode.Uri.file(filepath);
-      try {
-        await this.tracker.trackEdit(callID, [fileUri], stream);
-        this.log(`trackEdit resolved for callID=${callID} — baseline captured`);
-      } catch (err) {
-        this.log(`trackEdit failed for callID=${callID}: ${err}`);
+      // Normalize URI to match VSCode's internal casing (lowercase drive letter on Windows).
+      const rawUri = vscode.Uri.file(filepath);
+      const normalizedPath = rawUri.path.replace(/^\/([A-Z]):\//, (_match, drive) => `/${drive.toLowerCase()}:`);
+      const fileUri = rawUri.path !== normalizedPath
+        ? rawUri.with({ path: normalizedPath })
+        : rawUri;
+
+      // Skip if this callID is already tracked, or if the file already has an active
+      // ExternalEditPart (VSCode only supports one per file at a time).
+      if (this.tracker.hasEdit(callID)) {
+        this.log(`trackEdit skipped — callID=${callID} already tracked`);
+      } else if (this.tracker.isTrackingAny([fileUri])) {
+        this.log(`trackEdit skipped — file ${filepath} already has an active edit, callID=${callID}`);
+      } else {
+        try {
+          await this.tracker.trackEdit(callID, [fileUri], stream);
+          this.log(`trackEdit resolved for callID=${callID} — baseline captured`);
+        } catch (err) {
+          this.log(`trackEdit failed for callID=${callID}: ${err}`);
+        }
       }
     }
 

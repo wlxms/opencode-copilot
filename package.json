@@ -37,6 +37,18 @@
           {
             "name": "model",
             "description": "Show or change the current model"
+          },
+          {
+            "name": "test-external-edit",
+            "description": "Test externalEdit bubble push"
+          },
+          {
+            "name": "test-external-edit-real",
+            "description": "Test externalEdit with direct disk write (simulates server)"
+          },
+          {
+            "name": "test-external-edit-e2e",
+            "description": "End-to-end test via real OpenCode prompt"
           }
         ]
       }

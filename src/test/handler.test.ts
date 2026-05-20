@@ -537,7 +537,7 @@ describe('createParticipantHandler', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Per-edit externalEdit tracker (replaces old per-turn CheckpointManager)
+  // Per-edit externalEdit tracker — injected into StreamBridge for permission.asked lifecycle
   // -----------------------------------------------------------------------
 
   it('should pass tracker to StreamBridge for per-edit externalEdit handling', async () => {
@@ -570,7 +570,7 @@ describe('createParticipantHandler', () => {
     expect(mockSdkClient.session.prompt).toHaveBeenCalled();
   });
 
-  it('should collect open file URIs for baseline tracking', async () => {
+  it('should collect open file URIs for knownFileUris new-file detection', async () => {
     const handler = createParticipantHandler(state);
 
     // Simulate open text documents (file scheme, not untitled)

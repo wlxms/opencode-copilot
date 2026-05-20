@@ -3,9 +3,8 @@ import { StreamBridge } from './streaming';
 import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
 import type { ExtensionState, OpenCodeClient, TurnMapping } from '../types';
-import type { ChatResponseExternalEditPart } from '../types/vscode-proposed-additions';
-import { CheckpointManager, collectOpenFileUris } from './checkpoint';
 import { ExternalEditTracker } from './external-edit-tracker';
+import { collectOpenFileUris } from './checkpoint';
 
 /**
  * Get the VSCode workspace root path for the first workspace folder.
@@ -221,7 +220,6 @@ export function createParticipantHandler(
     stream: vscode.ChatResponseStream,
     token: vscode.CancellationToken,
   ): Promise<vscode.ChatResult> => {
-    // Create per-edit tracker for the turn
     const tracker = new ExternalEditTracker();
     try {
       // 1. Early cancellation check
@@ -252,14 +250,6 @@ export function createParticipantHandler(
       const vscodeSessionId = request.sessionId ?? 'unknown';
       const sessionId = await resolveSession(client, state, context, stream, vscodeSessionId, directory);
       if (!sessionId) return { metadata: {} };
-
-      // 5b. Collect open file URIs for proactive baseline capture (used by streaming.ts)
-      let fileUris: vscode.Uri[] = [];
-      try {
-        fileUris = collectOpenFileUris();
-      } catch {
-        // vscode.workspace.textDocuments may not be available (e.g., test mock)
-      }
 
       const executeTurnWithBridge = async (): Promise<void> => {
         const events = state.eventBroker.openSessionStream(sessionId);
@@ -300,14 +290,22 @@ export function createParticipantHandler(
         });
 
         state.outputChannel.appendLine(`[handler] bridgeEventsToStream start for session ${sessionId}`);
-        // Pass tracker + client to StreamBridge for per-edit externalEdit handling
+
+        // Collect known file URIs for new-file detection in per-edit externalEdit flow
+        let knownFileUris: string[] = [];
+        try {
+          knownFileUris = collectOpenFileUris().map(u => u.toString());
+        } catch {
+          // vscode.workspace.textDocuments may not be available (e.g., test mock)
+        }
+
         const bridge = new StreamBridge({
           logger: state.outputChannel,
           sessionId,
-          knownFileUris: new Set(fileUris.map(u => u.toString())),
-          tracker,
+          knownFileUris: new Set(knownFileUris),
           client,
           directory,
+          tracker,
         });
         try {
           await bridge.bridgeEventsToStream(events, stream, token);
@@ -337,9 +335,7 @@ export function createParticipantHandler(
         }
       };
 
-      // Execute the turn directly — per-edit externalEdit tracking is handled
-      // by StreamBridge + ExternalEditTracker in the SSE event loop.
-      // Each permission.asked → trackEdit (baseline) → auto-reply → file change → completeEdit.
+      // 11. Execute turn with per-edit externalEdit lifecycle managed via tracker
       await executeTurnWithBridge();
 
       // 12. Return metadata for future turn recovery
@@ -355,7 +351,6 @@ export function createParticipantHandler(
       state.outputChannel.appendLine(`[handler] Error: ${msg}`);
       return { metadata: {} };
     } finally {
-      // Always dispose the tracker to clean up any lingering edits
       tracker.dispose();
     }
   };
