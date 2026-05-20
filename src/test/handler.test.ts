@@ -1,5 +1,6 @@
 import { GlobalEventBroker } from '../participant/event-broker';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { AcpBackend } from '../acp/backend';
 
 // ---------------------------------------------------------------------------
 // Mocks — must be before all imports
@@ -22,6 +23,7 @@ const mockSdkClient = {
   event: {
     subscribe: vi.fn(),
   },
+  postSessionIdPermissionsPermissionId: vi.fn(),
 };
 
 // ---------------------------------------------------------------------------
@@ -29,8 +31,10 @@ const mockSdkClient = {
 // ---------------------------------------------------------------------------
 
 import * as vscode from 'vscode';
-import { createParticipantHandler } from '../participant/handler';
+import { createParticipantHandler, denormalizeAcpEvent } from '../participant/handler';
 import type { OpenCodeEvent } from '../types/events';
+import type { AcpEvent, AcpPermissionRequestEvent, AcpStreamPart } from '../acp/types';
+import type { PermissionAskedEvent } from '../types/events';
 import type { ExtensionState, OpenCodeClient, OpenCodeServerController } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -91,7 +95,88 @@ describe('createParticipantHandler', () => {
       getClient: vi.fn(),
     };
 
+    const backend: AcpBackend = {
+      name: 'opencode',
+      start: vi.fn(),
+      stop: vi.fn(async () => undefined),
+      getStatus: vi.fn(() => state.serverStatus),
+      getUrl: vi.fn(() => 'http://127.0.0.1:51777'),
+      isRunning: vi.fn(() => state.serverStatus === 'running'),
+      sessions: {
+        create: vi.fn(async (options?: { title?: string; directory?: string }) => {
+          const result = await mockSdkClient.session.create({
+            body: options?.title ? { title: options.title } : undefined,
+            query: options?.directory ? { directory: options.directory } : undefined,
+          });
+          return { data: result.data ? { id: result.data.id ?? '', title: result.data.title ?? '', createdAt: new Date() } : undefined, error: result.error };
+        }),
+        get: vi.fn(async () => ({ data: undefined })),
+        prompt: vi.fn(async (id: string, text: string, directory?: string) => {
+          const result = await mockSdkClient.session.prompt({
+            path: { id },
+            body: { parts: [{ type: 'text', text }] },
+            query: directory ? { directory } : undefined,
+          });
+          return { data: result };
+        }),
+        revert: vi.fn(async (id: string, messageId: string, partId?: string, directory?: string) => {
+          const result = await mockSdkClient.session.revert({
+            path: { id },
+            body: { messageID: messageId, ...(partId ? { partID: partId } : {}) },
+            query: directory ? { directory } : undefined,
+          });
+          return { data: result };
+        }),
+        abort: vi.fn(async (id: string, directory?: string) => {
+          const result = await mockSdkClient.session.abort({
+            path: { id },
+            query: directory ? { directory } : undefined,
+          });
+          return { data: result.data };
+        }),
+        list: vi.fn(async () => ({ data: [] })),
+      },
+      config: {
+        models: vi.fn(async () => ({ data: [] })),
+      },
+      events: {
+        openSessionStream: vi.fn((sessionId: string) => ({
+          stream: (async function* () {
+            const global = await mockSdkClient.global.event();
+            for await (const event of global.stream) {
+              if (!('directory' in event && 'payload' in event)) {
+                yield event;
+                continue;
+              }
+              const payload = event.payload;
+              const payloadSession = payload.type === 'session.idle'
+                ? payload.properties?.sessionID
+                : payload.type === 'message.part.updated'
+                  ? payload.properties?.part?.sessionID
+                  : payload.type === 'message.part.delta'
+                    ? undefined
+                    : payload.type === 'session.diff'
+                      ? payload.properties?.sessionID
+                      : payload.type === 'permission.asked'
+                        ? payload.properties?.sessionID
+                        : undefined;
+              if (!payloadSession || payloadSession === sessionId) {
+                yield event;
+              }
+            }
+          })(),
+        })),
+        openGlobalStream: vi.fn(async () => ({ stream: (async function* () {})() })),
+        closeSessionStream: vi.fn(),
+        ensureStarted: vi.fn(async () => undefined),
+      },
+      permissions: {
+        reply: vi.fn(async () => undefined),
+      },
+    };
+
     state = {
+      backend,
       serverManager: mockServerManager as unknown as OpenCodeServerController,
       client: null,
       activeSessionId: null,
@@ -639,4 +724,251 @@ describe('createParticipantHandler', () => {
       expect.stringContaining('Prompt error'),
     );
   });
+
+  // -----------------------------------------------------------------------
+  // ACP → legacy event denormalization (compatibility layer)
+  // -----------------------------------------------------------------------
+
+  describe('denormalizeAcpEvent', () => {
+    // -- permission.asked --
+    it('should convert permission.asked to legacy format', () => {
+      const acp: AcpEvent = {
+        type: 'permission.asked',
+        permissionId: 'perm_1',
+        sessionId: 'ses_test',
+        permission: 'file:write',
+        patterns: ['/src/**'],
+        metadata: { filepath: '/src/app.ts', diff: '...' },
+        always: ['once'],
+        tool: { messageId: 'msg_1', callId: 'call_1' },
+      };
+      const result = denormalizeAcpEvent(acp);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('permission.asked');
+      const p = (result as PermissionAskedEvent).properties;
+      expect(p.id).toBe('perm_1');
+      expect(p.sessionID).toBe('ses_test');
+      expect(p.permission).toBe('file:write');
+      expect(p.patterns).toEqual(['/src/**']);
+      expect(p.metadata).toEqual({ filepath: '/src/app.ts', diff: '...' });
+      expect(p.always).toEqual(['once']);
+      expect(p.tool).toEqual({ messageID: 'msg_1', callID: 'call_1' });
+    });
+
+    it('should convert permission.asked without tool metadata', () => {
+      const acp: AcpEvent = {
+        type: 'permission.asked',
+        permissionId: 'perm_2',
+        sessionId: 'ses_test',
+        permission: 'command:bash',
+        patterns: [],
+        metadata: {},
+        always: [],
+      };
+      const result = denormalizeAcpEvent(acp);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('permission.asked');
+      const p = (result as PermissionAskedEvent).properties;
+      expect(p.id).toBe('perm_2');
+      expect(p.tool).toBeUndefined();
+    });
+
+    // -- permission.replied --
+    it('should convert permission.replied to legacy format', () => {
+      const acp: AcpEvent = {
+        type: 'permission.replied',
+        sessionId: 'ses_test',
+        permissionId: 'perm_1',
+        response: 'once',
+      };
+      const result = denormalizeAcpEvent(acp);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('permission.replied');
+      expect((result as { properties: Record<string, unknown> }).properties).toMatchObject({
+        sessionID: 'ses_test',
+        permissionID: 'perm_1',
+        response: 'once',
+      });
+    });
+
+    // -- part.updated → message.part.updated --
+    it('should convert part.updated (text) to message.part.updated', () => {
+      const acp: AcpEvent = {
+        type: 'part.updated',
+        part: {
+          id: 'prt_txt',
+          type: 'text',
+          messageId: 'msg_ai_1',
+          sessionId: 'ses_test',
+          text: 'Hello world',
+          synthetic: false,
+        } as AcpStreamPart,
+        delta: 'Hello',
+      };
+      const result = denormalizeAcpEvent(acp);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('message.part.updated');
+      const props = (result as { properties: Record<string, unknown> }).properties as Record<string, unknown>;
+      const part = props.part as Record<string, unknown>;
+      expect(part.type).toBe('text');
+      expect(part.id).toBe('prt_txt');
+      expect(part.messageID).toBe('msg_ai_1');
+      expect(part.sessionID).toBe('ses_test');
+      expect(part.text).toBe('Hello world');
+      expect(part.synthetic).toBe(false);
+      expect(props.delta).toBe('Hello');
+    });
+
+    it('should convert part.updated (reasoning) to message.part.updated', () => {
+      const acp: AcpEvent = {
+        type: 'part.updated',
+        part: {
+          id: 'prt_reason',
+          type: 'reasoning',
+          messageId: 'msg_ai_1',
+          sessionId: 'ses_test',
+          text: 'thinking...',
+        } as AcpStreamPart,
+      };
+      const result = denormalizeAcpEvent(acp);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('message.part.updated');
+      const part = ((result as { properties: Record<string, unknown> }).properties as Record<string, unknown>).part as Record<string, unknown>;
+      expect(part.type).toBe('reasoning');
+      expect(part.id).toBe('prt_reason');
+      expect(part.text).toBe('thinking...');
+    });
+
+    it('should convert part.updated (tool) to message.part.updated', () => {
+      const acp: AcpEvent = {
+        type: 'part.updated',
+        part: {
+          id: 'prt_tool',
+          type: 'tool',
+          messageId: 'msg_ai_1',
+          sessionId: 'ses_test',
+          toolName: 'read',
+          callId: 'call_read',
+          state: {
+            status: 'completed',
+            input: { filePath: '/a.txt' },
+            output: 'file content',
+            title: 'Read file',
+          },
+        } as AcpStreamPart,
+      };
+      const result = denormalizeAcpEvent(acp);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('message.part.updated');
+      const part = ((result as { properties: Record<string, unknown> }).properties as Record<string, unknown>).part as Record<string, unknown>;
+      expect(part.type).toBe('tool');
+      expect(part.tool).toBe('read');
+      expect(part.callID).toBe('call_read');
+      expect((part.state as Record<string, unknown>).status).toBe('completed');
+      expect((part.state as Record<string, unknown>).output).toBe('file content');
+    });
+
+    // -- part.delta → message.part.delta --
+    it('should convert part.delta to message.part.delta', () => {
+      const acp: AcpEvent = {
+        type: 'part.delta',
+        partId: 'prt_ai_1',
+        delta: 'Hello world',
+        field: 'text',
+      };
+      const result = denormalizeAcpEvent(acp);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('message.part.delta');
+      const props = (result as { properties: Record<string, unknown> }).properties;
+      expect(props.partID).toBe('prt_ai_1');
+      expect(props.delta).toBe('Hello world');
+      expect(props.field).toBe('text');
+    });
+
+    it('should convert part.delta without field', () => {
+      const acp: AcpEvent = {
+        type: 'part.delta',
+        partId: 'prt_ai_2',
+        delta: 'more text',
+      };
+      const result = denormalizeAcpEvent(acp);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('message.part.delta');
+      const props = (result as { properties: Record<string, unknown> }).properties;
+      expect(props.partID).toBe('prt_ai_2');
+      expect(props.delta).toBe('more text');
+      expect(props.field).toBeUndefined();
+    });
+
+    // -- session.diff --
+    it('should convert session.diff to legacy format', () => {
+      const acp: AcpEvent = {
+        type: 'session.diff',
+        sessionId: 'ses_test',
+        diffs: [
+          { file: '/src/app.ts', patch: '...', additions: 5, deletions: 2, status: 'modified' },
+          { file: '/src/new.ts', patch: '', additions: 10, deletions: 0, status: 'added' },
+        ],
+      };
+      const result = denormalizeAcpEvent(acp);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('session.diff');
+      const props = (result as { properties: Record<string, unknown> }).properties;
+      expect(props.sessionID).toBe('ses_test');
+      expect(props.diff).toHaveLength(2);
+      expect((props.diff as Array<Record<string, unknown>>)[0]).toMatchObject({
+        file: '/src/app.ts',
+        additions: 5,
+        deletions: 2,
+        status: 'modified',
+      });
+    });
+
+    // -- session.idle --
+    it('should convert session.idle to legacy format', () => {
+      const acp: AcpEvent = {
+        type: 'session.idle',
+        sessionId: 'ses_test',
+      };
+      const result = denormalizeAcpEvent(acp);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('session.idle');
+      const props = (result as { properties: Record<string, unknown> }).properties;
+      expect(props.sessionID).toBe('ses_test');
+    });
+
+    it('should convert session.idle without sessionId', () => {
+      const acp: AcpEvent = {
+        type: 'session.idle',
+      };
+      const result = denormalizeAcpEvent(acp);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('session.idle');
+    });
+
+    // -- lifecycle events → null (filtered out) --
+    it('should return null for session.created', () => {
+      expect(denormalizeAcpEvent({ type: 'session.created', sessionId: 'ses_test' })).toBeNull();
+    });
+
+    it('should return null for session.updated', () => {
+      expect(denormalizeAcpEvent({ type: 'session.updated', sessionId: 'ses_test' })).toBeNull();
+    });
+
+    it('should return null for session.deleted', () => {
+      expect(denormalizeAcpEvent({ type: 'session.deleted', sessionId: 'ses_test' })).toBeNull();
+    });
+
+    it('should return null for session.error', () => {
+      expect(denormalizeAcpEvent({ type: 'session.error', sessionId: 'ses_test' })).toBeNull();
+    });
+
+    it('should return null for server.connected', () => {
+      expect(denormalizeAcpEvent({ type: 'server.connected' })).toBeNull();
+    });
+
+    it('should return null for server.heartbeat', () => {
+      expect(denormalizeAcpEvent({ type: 'server.heartbeat' })).toBeNull();
+  });
+});
 });

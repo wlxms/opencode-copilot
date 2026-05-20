@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as vscode from 'vscode';
+import type { AcpBackend } from '../acp/backend';
+import type { AcpServerStatus } from '../acp/types';
 import type { ExtensionState, OpenCodeClient, OpenCodeServerController } from '../types';
 import { GlobalEventBroker } from '../participant/event-broker';
 import { routeCommand } from '../participant/commands';
@@ -27,6 +29,7 @@ function createMockClient() {
     event: {
       subscribe: vi.fn(),
     },
+    postSessionIdPermissionsPermissionId: vi.fn(),
   };
 }
 
@@ -41,7 +44,36 @@ describe('routeCommand', () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    const backend: AcpBackend = {
+      name: 'opencode',
+      start: vi.fn(),
+      stop: vi.fn(async () => undefined),
+      getStatus: vi.fn((): AcpServerStatus => 'stopped'),
+      getUrl: vi.fn(() => null),
+      isRunning: vi.fn(() => false),
+      sessions: {
+        create: vi.fn(),
+        get: vi.fn(),
+        prompt: vi.fn(),
+        revert: vi.fn(),
+        abort: vi.fn(),
+        list: vi.fn(),
+      },
+      config: {
+        models: vi.fn(async () => ({ data: [] })),
+      },
+      events: {
+        openSessionStream: vi.fn(),
+        openGlobalStream: vi.fn(),
+        closeSessionStream: vi.fn(),
+        ensureStarted: vi.fn(async () => undefined),
+      },
+      permissions: {
+        reply: vi.fn(async () => undefined),
+      },
+    };
     state = {
+      backend,
       serverManager: {
         start: vi.fn().mockRejectedValue(new Error('Server not available')),
         stop: vi.fn().mockResolvedValue(undefined),
@@ -145,36 +177,13 @@ describe('routeCommand', () => {
 
   it('should show providers and models for /model command', async () => {
     const mockClient = createMockClient();
-    mockClient.config.providers.mockResolvedValue({
-      data: {
-        providers: [
-          {
-            name: 'OpenAI',
-            id: 'openai',
-            models: {
-              'gpt-4o': { id: 'gpt-4o', name: 'GPT-4o', status: 'active' },
-              'gpt-3.5': {
-                id: 'gpt-3.5-turbo',
-                name: 'GPT-3.5 Turbo',
-                status: 'inactive',
-              },
-            },
-          },
-          {
-            name: 'Anthropic',
-            id: 'anthropic',
-            models: {
-              'claude-3': {
-                id: 'claude-3-opus',
-                name: 'Claude 3 Opus',
-                status: 'active',
-              },
-            },
-          },
-        ],
-      },
-    });
     state.client = mockClient as OpenCodeClient;
+    vi.mocked(state.backend.config.models).mockResolvedValue({
+      data: [
+        { id: 'gpt-4o', name: 'GPT-4o', provider: 'OpenAI' },
+        { id: 'claude-3-opus', name: 'Claude 3 Opus', provider: 'Anthropic' },
+      ],
+    });
 
     await routeCommand('model', state, stream, token);
 
@@ -203,10 +212,8 @@ describe('routeCommand', () => {
 
   it('should show error when providers call fails', async () => {
     const mockClient = createMockClient();
-    mockClient.config.providers.mockRejectedValue(
-      new Error('API error'),
-    );
     state.client = mockClient as OpenCodeClient;
+    vi.mocked(state.backend.config.models).mockRejectedValue(new Error('API error'));
 
     await routeCommand('model', state, stream, token);
 
@@ -217,10 +224,8 @@ describe('routeCommand', () => {
 
   it('should show message when no providers configured', async () => {
     const mockClient = createMockClient();
-    mockClient.config.providers.mockResolvedValue({
-      data: { providers: [] },
-    });
     state.client = mockClient as OpenCodeClient;
+    vi.mocked(state.backend.config.models).mockResolvedValue({ data: [] });
 
     await routeCommand('model', state, stream, token);
 
@@ -260,24 +265,8 @@ describe('routeCommand', () => {
 
   it('should skip providers with no active models in /model output', async () => {
     const mockClient = createMockClient();
-    mockClient.config.providers.mockResolvedValue({
-      data: {
-        providers: [
-          {
-            name: 'TestAI',
-            id: 'testai',
-            models: {
-              'test-model': {
-                id: 'test-model',
-                name: 'Test Model',
-                status: 'inactive',
-              },
-            },
-          },
-        ],
-      },
-    });
     state.client = mockClient as OpenCodeClient;
+    vi.mocked(state.backend.config.models).mockResolvedValue({ data: [] });
 
     await routeCommand('model', state, stream, token);
 
