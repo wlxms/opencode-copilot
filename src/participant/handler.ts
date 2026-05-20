@@ -3,7 +3,7 @@ import { StreamBridge } from './streaming';
 import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
 import type { AcpEvent, AcpStreamPart } from '../acp/types';
-import type { ExtensionState, OpenCodeClient, TurnMapping } from '../types';
+import type { ExtensionState, TurnMapping } from '../types';
 import { ExternalEditTracker } from './external-edit-tracker';
 import { collectOpenFileUris } from './checkpoint';
 
@@ -17,42 +17,39 @@ function getWorkspaceDirectory(): string | undefined {
 }
 
 /**
- * Ensure the OpenCode server is running and client is available.
+ * Ensure the OpenCode backend is running.
  * Starts the server lazily if not already running.
- * Returns the client, or null if server failed to start.
+ * Returns true on success, false on failure.
  */
 export async function ensureServer(
   state: ExtensionState,
   stream: vscode.ChatResponseStream,
-): Promise<OpenCodeClient | null> {
-  if (state.client) {
-    return state.client;
+): Promise<boolean> {
+  const status = state.backend.getStatus();
+  if (status === 'running') {
+    return true;
   }
 
-  if (state.serverStatus === 'starting') {
+  if (status === 'starting') {
     stream.markdown('⚠️ OpenCode server is starting up, please wait...');
-    return null;
+    return false;
   }
 
   try {
     stream.progress('🔄 Starting OpenCode...');
-    // Use the current VSCode workspace directory as the server CWD
     const workspacePath = getWorkspaceDirectory();
-    const url = await state.serverManager.start(workspacePath);
-    state.serverStatus = 'running';
-    state.client = state.serverManager.getClient();
-    if (!state.client) {
-      stream.markdown('⚠️ OpenCode client not available.');
-      state.serverStatus = 'error';
-      return null;
+    const result = await state.backend.start(workspacePath);
+    if (result.error || !result.data) {
+      const msg = typeof result.error === 'string' ? result.error : 'Unknown error';
+      stream.markdown(`⚠️ Failed to start OpenCode: ${msg}`);
+      return false;
     }
-    state.outputChannel.appendLine(`[handler] Server started at ${url}`);
-    return state.client;
+    state.outputChannel.appendLine(`[handler] Server started at ${result.data.url}`);
+    return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     stream.markdown(`⚠️ Failed to start OpenCode: ${msg}`);
-    state.serverStatus = 'error';
-    return null;
+    return false;
   }
 }
 
@@ -99,7 +96,6 @@ function recoverFromHistory(context: vscode.ChatContext): RecoveredHistory {
  * Returns the OpenCode session ID, or null on error.
  */
 async function resolveSession(
-  client: OpenCodeClient,
   state: ExtensionState,
   context: vscode.ChatContext,
   stream: vscode.ChatResponseStream,
@@ -126,13 +122,16 @@ async function resolveSession(
   }
 
   const history = context.history ?? [];
-  const currentTurnIndex = history.length;
+  const requestTurns = history.filter(
+    (h): h is vscode.ChatRequestTurn => h instanceof vscode.ChatRequestTurn,
+  );
+  const currentTurnIndex = requestTurns.length;
 
   // --- Case 1: New chat (no prior session) ---
   if (!chatState.opencodeSessionId) {
-    const result = await client.session.create({
-      body: { title: `Chat ${vscodeSessionId.slice(0, 8)}` },
-      query: directory ? { directory } : undefined,
+    const result = await state.backend.sessions.create({
+      title: `Chat ${vscodeSessionId.slice(0, 8)}`,
+      directory,
     });
     if (result.error || !result.data) {
       stream.markdown('⚠️ Failed to create OpenCode session.');
@@ -158,21 +157,41 @@ async function resolveSession(
   if (currentTurnIndex < chatState.turnMap.length) {
     const priorTurnMap = chatState.turnMap.slice(0, currentTurnIndex);
     if (currentTurnIndex > 0) {
-      const targetMessageId = priorTurnMap[currentTurnIndex - 1].opencodeMessageId;
       state.outputChannel.appendLine(
-        `[handler] Rewind detected: reverting session ${chatState.opencodeSessionId} to message ${targetMessageId}`,
+        `[handler] Rewind detected: reverting session ${chatState.opencodeSessionId} from turn ${currentTurnIndex} ` +
+        `(turnMap had ${chatState.turnMap.length} entries, keeping ${priorTurnMap.length})`,
       );
-      const revertResult = await client.session.revert({
-        path: { id: chatState.opencodeSessionId },
-        body: { messageID: targetMessageId },
-        query: directory ? { directory } : undefined,
-      });
-      if (revertResult.error) {
+      // Revert each extraneous message from back to front (oldest first)
+      let allSucceeded = true;
+      let revertCount = 0;
+      for (let i = chatState.turnMap.length - 1; i >= currentTurnIndex; i--) {
+        const entry = chatState.turnMap[i];
+        if (entry?.opencodeMessageId) {
+          const revertResult = await state.backend.sessions.revert(
+            chatState.opencodeSessionId,
+            entry.opencodeMessageId,
+            undefined,
+            directory,
+          );
+          revertCount++;
+          if (revertResult.error) {
+            state.outputChannel.appendLine(
+              `[handler] Revert failed for message ${entry.opencodeMessageId}: ${JSON.stringify(revertResult.error)}`,
+            );
+            allSucceeded = false;
+            break;
+          }
+        }
+      }
+      state.outputChannel.appendLine(
+        `[handler] Reverted ${revertCount} messages, allSucceeded=${allSucceeded}`,
+      );
+      if (!allSucceeded) {
         state.outputChannel.appendLine(
-          `[handler] Revert failed: ${JSON.stringify(revertResult.error)} — creating new session`,
+          `[handler] Revert failure — creating new session as fallback`,
         );
-        const createResult = await client.session.create({
-          query: directory ? { directory } : undefined,
+        const createResult = await state.backend.sessions.create({
+          directory,
         });
         if (createResult.error || !createResult.data) {
           stream.markdown('⚠️ Failed to create OpenCode session after revert failure.');
@@ -240,8 +259,8 @@ export function createParticipantHandler(
       }
 
       // 4. Start server if needed
-      const client = await ensureServer(state, stream);
-      if (!client) return { metadata: {} };
+      const ready = await ensureServer(state, stream);
+      if (!ready) return { metadata: {} };
 
       // 4b. Compute workspace directory for session/prompt API calls
       const directory = getWorkspaceDirectory();
@@ -249,7 +268,7 @@ export function createParticipantHandler(
       // 5. Resolve session (handles rewind via revert)
       // request.sessionId from chatParticipantPrivate identifies the VSCode chat
       const vscodeSessionId = request.sessionId ?? 'unknown';
-      const sessionId = await resolveSession(client, state, context, stream, vscodeSessionId, directory);
+      const sessionId = await resolveSession(state, context, stream, vscodeSessionId, directory);
       if (!sessionId) return { metadata: {} };
 
       const executeTurnWithBridge = async (): Promise<void> => {
@@ -310,7 +329,14 @@ export function createParticipantHandler(
           logger: state.outputChannel,
           sessionId,
           knownFileUris: new Set(knownFileUris),
-          client,
+          replyToPermission: (permissionSessionId, permissionId, response, permissionDirectory) => (
+            state.backend.permissions.reply(
+              permissionSessionId,
+              permissionId,
+              response,
+              permissionDirectory,
+            )
+          ),
           directory,
           tracker,
         });

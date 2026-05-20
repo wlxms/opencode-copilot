@@ -34,6 +34,7 @@ import * as vscode from 'vscode';
 import { createParticipantHandler, denormalizeAcpEvent } from '../participant/handler';
 import type { OpenCodeEvent } from '../types/events';
 import type { AcpEvent, AcpPermissionRequestEvent, AcpStreamPart } from '../acp/types';
+import type { AcpServerStatus } from '../acp/types';
 import type { PermissionAskedEvent } from '../types/events';
 import type { ExtensionState, OpenCodeClient, OpenCodeServerController } from '../types';
 
@@ -73,6 +74,7 @@ describe('createParticipantHandler', () => {
   let state: ExtensionState;
   let stream: vscode.ChatResponseStream;
   let token: vscode.CancellationToken;
+  let backendStatus: AcpServerStatus;
   let mockServerManager: {
     start: ReturnType<typeof vi.fn>;
     stop: ReturnType<typeof vi.fn>;
@@ -84,6 +86,7 @@ describe('createParticipantHandler', () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    backendStatus = 'stopped';
 
     // Mock server manager
     mockServerManager = {
@@ -97,11 +100,14 @@ describe('createParticipantHandler', () => {
 
     const backend: AcpBackend = {
       name: 'opencode',
-      start: vi.fn(),
+      start: vi.fn(async () => {
+        backendStatus = 'running';
+        return { data: { url: 'http://127.0.0.1:51777', status: 'running' as const } };
+      }),
       stop: vi.fn(async () => undefined),
-      getStatus: vi.fn(() => state.serverStatus),
+      getStatus: vi.fn(() => backendStatus),
       getUrl: vi.fn(() => 'http://127.0.0.1:51777'),
-      isRunning: vi.fn(() => state.serverStatus === 'running'),
+      isRunning: vi.fn(() => backendStatus === 'running'),
       sessions: {
         create: vi.fn(async (options?: { title?: string; directory?: string }) => {
           const result = await mockSdkClient.session.create({
@@ -125,6 +131,9 @@ describe('createParticipantHandler', () => {
             body: { messageID: messageId, ...(partId ? { partID: partId } : {}) },
             query: directory ? { directory } : undefined,
           });
+          if (result && typeof result === 'object' && 'error' in result) {
+            return { error: String(result.error) };
+          }
           return { data: result };
         }),
         abort: vi.fn(async (id: string, directory?: string) => {
@@ -247,7 +256,7 @@ describe('createParticipantHandler', () => {
     );
 
     expect(result).toEqual({ metadata: {} });
-    expect(mockServerManager.start).not.toHaveBeenCalled();
+    expect(state.backend.start).not.toHaveBeenCalled();
   });
 
   // -----------------------------------------------------------------------
@@ -269,7 +278,7 @@ describe('createParticipantHandler', () => {
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('/help'),
     );
-    expect(mockServerManager.start).not.toHaveBeenCalled();
+    expect(state.backend.start).not.toHaveBeenCalled();
   });
 
   it('should return early for whitespace-only prompt', async () => {
@@ -315,8 +324,6 @@ describe('createParticipantHandler', () => {
     const handler = createParticipantHandler(state);
 
     // Setup mocks for the full flow
-    mockServerManager.start.mockResolvedValue('http://127.0.0.1:51777');
-    mockServerManager.getClient.mockReturnValue(mockSdkClient);
     mockSdkClient.session.create.mockResolvedValue({
       data: { id: 'session-1' },
     });
@@ -333,11 +340,7 @@ describe('createParticipantHandler', () => {
     );
 
     // Server was started
-    expect(mockServerManager.start).toHaveBeenCalledOnce();
-    expect(state.serverStatus).toBe('running');
-
-    // Client was set
-    expect(state.client).toBe(mockSdkClient);
+    expect(state.backend.start).toHaveBeenCalledOnce();
 
     // Session was created with workspace directory and title
     expect(mockSdkClient.session.create).toHaveBeenCalledWith({
@@ -348,7 +351,7 @@ describe('createParticipantHandler', () => {
     expect(state.sessionMap.get('chat-1')?.opencodeSessionId).toBe('session-1');
 
     // Events subscribed
-    expect(mockSdkClient.global.event).toHaveBeenCalledOnce();
+    expect(state.backend.events.ensureStarted).toHaveBeenCalledOnce();
 
     // Prompt sent with correct format (path/body/query)
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
@@ -373,8 +376,7 @@ describe('createParticipantHandler', () => {
   // -----------------------------------------------------------------------
 
   it('should reuse active session for multi-turn conversation', async () => {
-    state.serverStatus = 'running';
-    state.client = mockSdkClient as OpenCodeClient;
+    backendStatus = 'running';
     // Pre-populate sessionMap with existing session
     state.sessionMap.set('chat-1', {
       opencodeSessionId: 'existing-session',
@@ -396,7 +398,7 @@ describe('createParticipantHandler', () => {
     );
 
     // Should NOT start server (already running)
-    expect(mockServerManager.start).not.toHaveBeenCalled();
+    expect(state.backend.start).not.toHaveBeenCalled();
     // Should NOT create session (reusing existing)
     expect(mockSdkClient.session.create).not.toHaveBeenCalled();
     // Should send message to existing session with directory query
@@ -411,14 +413,209 @@ describe('createParticipantHandler', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Client not available after start
+  // Rewind / revert
   // -----------------------------------------------------------------------
 
-  it('should show error when client is not available after server start', async () => {
+  it('should detect rewind and revert extraneous messages when user edits a previous turn', async () => {
+    backendStatus = 'running';
+    // Simulate 2 completed turns: turnMap has 2 entries
+    state.sessionMap.set('chat-revert-1', {
+      opencodeSessionId: 'revert-session',
+      turnMap: [
+        { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
+        { vscodeTurn: 1, opencodeMessageId: 'msg-1' },
+      ],
+    });
+
+    // Mock revert to succeed
+    mockSdkClient.session.revert.mockResolvedValue({ data: true });
+    mockSdkClient.global.event.mockResolvedValue({ stream: emptyEventStream() });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
     const handler = createParticipantHandler(state);
 
-    mockServerManager.start.mockResolvedValue('http://127.0.0.1:51777');
-    mockServerManager.getClient.mockReturnValue(null);
+    // History has only 1 ChatRequestTurn → currentTurnIndex = 1 < turnMap.length(2) → rewind
+    // @ts-expect-error — private ctor in vscode types, public in mock
+const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
+    const result = await handler(
+      createRequest({ prompt: 'edited follow-up', sessionId: 'chat-revert-1' }),
+      { history: [reqTurn] },
+      stream,
+      token,
+    );
+
+    // Should revert msg-1 (the extraneous turn, from back to front)
+    expect(mockSdkClient.session.revert).toHaveBeenCalledTimes(1);
+    expect(mockSdkClient.session.revert).toHaveBeenCalledWith({
+      path: { id: 'revert-session' },
+      body: { messageID: 'msg-1' },
+      query: { directory: '/test/workspace' },
+    });
+
+    // Should NOT create a new session
+    expect(mockSdkClient.session.create).not.toHaveBeenCalled();
+
+    // TurnMap should be trimmed to keep only the first entry
+    const chatState = state.sessionMap.get('chat-revert-1')!;
+    expect(chatState.turnMap).toEqual([
+      { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
+    ]);
+
+    // Should prompt on the same reverted session
+    expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
+      path: { id: 'revert-session' },
+      body: { parts: [{ type: 'text', text: 'edited follow-up' }] },
+      query: { directory: '/test/workspace' },
+    });
+    expect(result!.metadata).toHaveProperty('sessionId', 'revert-session');
+  });
+
+  it('should revert multiple extraneous messages when user rewinds multiple turns', async () => {
+    backendStatus = 'running';
+    // Simulate 3 completed turns
+    state.sessionMap.set('chat-revert-3', {
+      opencodeSessionId: 'revert-session-3',
+      turnMap: [
+        { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
+        { vscodeTurn: 1, opencodeMessageId: 'msg-1' },
+        { vscodeTurn: 2, opencodeMessageId: 'msg-2' },
+      ],
+    });
+
+    mockSdkClient.session.revert.mockResolvedValue({ data: true });
+    mockSdkClient.global.event.mockResolvedValue({ stream: emptyEventStream() });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
+    const handler = createParticipantHandler(state);
+
+    // History has only 1 ChatRequestTurn → currentTurnIndex = 1 < 3 → full rewind
+    // @ts-expect-error — private ctor in vscode types, public in mock
+const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
+    const result = await handler(
+      createRequest({ prompt: 'restart from turn 0', sessionId: 'chat-revert-3' }),
+      { history: [reqTurn] },
+      stream,
+      token,
+    );
+
+    // Should revert msg-2 first (back to front), then msg-1
+    expect(mockSdkClient.session.revert).toHaveBeenCalledTimes(2);
+    expect(mockSdkClient.session.revert).toHaveBeenNthCalledWith(1, {
+      path: { id: 'revert-session-3' },
+      body: { messageID: 'msg-2' },
+      query: { directory: '/test/workspace' },
+    });
+    expect(mockSdkClient.session.revert).toHaveBeenNthCalledWith(2, {
+      path: { id: 'revert-session-3' },
+      body: { messageID: 'msg-1' },
+      query: { directory: '/test/workspace' },
+    });
+
+    // TurnMap should keep only msg-0
+    const chatState = state.sessionMap.get('chat-revert-3')!;
+    expect(chatState.turnMap).toEqual([
+      { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
+    ]);
+    expect(result!.metadata).toHaveProperty('sessionId', 'revert-session-3');
+  });
+
+  it('should handle full rewind to beginning when no prior messages remain', async () => {
+    backendStatus = 'running';
+    // Simulate 2 completed turns
+    state.sessionMap.set('chat-revert-full', {
+      opencodeSessionId: 'full-rewind-session',
+      turnMap: [
+        { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
+        { vscodeTurn: 1, opencodeMessageId: 'msg-1' },
+      ],
+    });
+
+    mockSdkClient.global.event.mockResolvedValue({ stream: emptyEventStream() });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
+    const handler = createParticipantHandler(state);
+
+    // No request turns in history → currentTurnIndex = 0 < 2 → full rewind with no revert needed
+    const result = await handler(
+      createRequest({ prompt: 'start fresh', sessionId: 'chat-revert-full' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    // Should NOT call revert (no prior message to revert to)
+    expect(mockSdkClient.session.revert).not.toHaveBeenCalled();
+
+    // TurnMap should be empty
+    const chatState = state.sessionMap.get('chat-revert-full')!;
+    expect(chatState.turnMap).toEqual([]);
+
+    // Should prompt on the same session
+    expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
+      path: { id: 'full-rewind-session' },
+      body: { parts: [{ type: 'text', text: 'start fresh' }] },
+      query: { directory: '/test/workspace' },
+    });
+  });
+
+  it('should fall back to new session on revert failure', async () => {
+    backendStatus = 'running';
+    state.sessionMap.set('chat-revert-fail', {
+      opencodeSessionId: 'fail-session',
+      turnMap: [
+        { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
+        { vscodeTurn: 1, opencodeMessageId: 'msg-1' },
+      ],
+    });
+
+    // Mock revert to fail
+    mockSdkClient.session.revert.mockResolvedValue({ error: 'revert rejected' });
+    // Mock session.create fallback to succeed
+    mockSdkClient.session.create.mockResolvedValue({
+      data: { id: 'fallback-session' },
+    });
+    mockSdkClient.global.event.mockResolvedValue({ stream: emptyEventStream() });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
+    const handler = createParticipantHandler(state);
+
+    // @ts-expect-error — private ctor in vscode types, public in mock
+const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
+    const result = await handler(
+      createRequest({ prompt: 'after revert fail', sessionId: 'chat-revert-fail' }),
+      { history: [reqTurn] },
+      stream,
+      token,
+    );
+
+    // Should have attempted revert
+    expect(mockSdkClient.session.revert).toHaveBeenCalled();
+
+    // Should fall back by creating a new session
+    expect(mockSdkClient.session.create).toHaveBeenCalledWith({
+      query: { directory: '/test/workspace' },
+    });
+
+    // Should prompt on the fallback session
+    expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
+      path: { id: 'fallback-session' },
+      body: { parts: [{ type: 'text', text: 'after revert fail' }] },
+      query: { directory: '/test/workspace' },
+    });
+
+    // TurnMap should be reset
+    const chatState = state.sessionMap.get('chat-revert-fail')!;
+    expect(chatState.turnMap).toEqual([]);
+  });
+
+  // -----------------------------------------------------------------------
+  // Backend start failure
+  // -----------------------------------------------------------------------
+
+  it('should show error when backend fails to start', async () => {
+    const handler = createParticipantHandler(state);
+
+    vi.mocked(state.backend.start).mockResolvedValue({ error: 'backend unavailable' });
 
     await handler(
       createRequest({ prompt: 'hello' }),
@@ -428,7 +625,7 @@ describe('createParticipantHandler', () => {
     );
 
     expect(stream.markdown).toHaveBeenCalledWith(
-      expect.stringContaining('client not available'),
+      expect.stringContaining('Failed to start OpenCode'),
     );
   });
 
@@ -438,7 +635,7 @@ describe('createParticipantHandler', () => {
 
   it('should show error when server fails to start', async () => {
     const handler = createParticipantHandler(state);
-    mockServerManager.start.mockRejectedValue(
+    vi.mocked(state.backend.start).mockRejectedValue(
       new Error('OpenCode CLI not found'),
     );
 
@@ -463,8 +660,6 @@ describe('createParticipantHandler', () => {
 
   it('should catch errors and show them in stream', async () => {
     const handler = createParticipantHandler(state);
-    mockServerManager.start.mockResolvedValue('http://127.0.0.1:51777');
-    mockServerManager.getClient.mockReturnValue(mockSdkClient);
     mockSdkClient.session.create.mockRejectedValue(
       new Error('Session limit reached'),
     );
@@ -483,7 +678,7 @@ describe('createParticipantHandler', () => {
 
   it('should handle non-Error thrown values', async () => {
     const handler = createParticipantHandler(state);
-    mockServerManager.start.mockRejectedValue('string error');
+    vi.mocked(state.backend.start).mockRejectedValue('string error');
 
     await handler(
       createRequest({ prompt: 'hello' }),
@@ -501,9 +696,8 @@ describe('createParticipantHandler', () => {
   // Already running – skip server start
   // -----------------------------------------------------------------------
 
-  it('should skip server start if already running with client', async () => {
-    state.serverStatus = 'running';
-    state.client = mockSdkClient as OpenCodeClient;
+  it('should skip server start if already running', async () => {
+    backendStatus = 'running';
     // Pre-populate sessionMap so session is reused
     state.sessionMap.set('chat-running', {
       opencodeSessionId: 'existing-id',
@@ -524,7 +718,7 @@ describe('createParticipantHandler', () => {
       token,
     );
 
-    expect(mockServerManager.start).not.toHaveBeenCalled();
+    expect(state.backend.start).not.toHaveBeenCalled();
     expect(mockSdkClient.session.create).not.toHaveBeenCalled();
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
       path: { id: 'existing-id' },
@@ -542,9 +736,8 @@ describe('createParticipantHandler', () => {
   it('should call session.abort when cancelled mid-session', async () => {
     const handler = createParticipantHandler(state);
 
-    // Set up a running server with client
-    state.client = mockSdkClient as unknown as OpenCodeClient;
-    state.serverStatus = 'running';
+    // Set up a running backend
+    backendStatus = 'running';
     mockSdkClient.session.create.mockResolvedValue({
       data: { id: 'session-abort-test' },
     });
@@ -597,8 +790,7 @@ describe('createParticipantHandler', () => {
   it('should not call session.abort when handler completes normally', async () => {
     const handler = createParticipantHandler(state);
 
-    state.client = mockSdkClient as unknown as OpenCodeClient;
-    state.serverStatus = 'running';
+    backendStatus = 'running';
     mockSdkClient.session.create.mockResolvedValue({
       data: { id: 'session-normal' },
     });
@@ -629,8 +821,7 @@ describe('createParticipantHandler', () => {
     const handler = createParticipantHandler(state);
 
     // Set up full flow mocks
-    state.serverStatus = 'running';
-    state.client = mockSdkClient as OpenCodeClient;
+    backendStatus = 'running';
     state.sessionMap.set('chat-cp-1', {
       opencodeSessionId: 'existing-session',
       turnMap: [],
@@ -666,8 +857,7 @@ describe('createParticipantHandler', () => {
     (vscode.workspace as { textDocuments: unknown }).textDocuments = mockDocs;
 
     // Set up full flow mocks
-    state.serverStatus = 'running';
-    state.client = mockSdkClient as OpenCodeClient;
+    backendStatus = 'running';
     state.sessionMap.set('chat-cp-2', {
       opencodeSessionId: 'existing-session',
       turnMap: [],
@@ -696,8 +886,7 @@ describe('createParticipantHandler', () => {
     const handler = createParticipantHandler(state);
 
     // Set up so that the handler starts but prompt throws
-    state.serverStatus = 'running';
-    state.client = mockSdkClient as OpenCodeClient;
+    backendStatus = 'running';
     state.sessionMap.set('chat-cp-3', {
       opencodeSessionId: 'existing-session',
       turnMap: [],
