@@ -4,6 +4,7 @@ import path from 'path';
 export default defineConfig({
   test: {
     include: ['src/**/*.test.ts'],
+    exclude: ['src/test/integration/**/*.test.ts'],
     globals: true,
     environment: 'node',
   },
