@@ -52,7 +52,6 @@ async function handleNewCommand(
     if (!sessionId) {
       throw new Error('Session not created');
     }
-    state.activeSessionId = sessionId;
     stream.markdown('🆕 Started a new conversation session.');
     state.outputChannel.appendLine(`[commands] New session: ${sessionId}`);
   } catch {

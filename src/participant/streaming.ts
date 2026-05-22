@@ -1,16 +1,19 @@
 import * as vscode from 'vscode';
 import type {
-  MessagePartUpdatedEvent,
-  OpenCodeEvent,
-  OpenCodeEventStream,
-  OpenCodeStreamEvent,
-  ReasoningStreamPart,
-  SessionDiffEvent,
-  StreamToolPart,
-  StreamToolState,
-  TextStreamPart,
-  ToolCallStatus,
-} from '../types/events';
+  AcpEvent,
+  AcpStreamPart,
+  AcpTextPart,
+  AcpReasoningPart,
+  AcpToolPart,
+  AcpStepPart,
+  AcpToolState,
+  AcpPartUpdatedEvent,
+  AcpPartDeltaEvent,
+  AcpSessionIdleEvent,
+  AcpSessionDiffEvent,
+  AcpFileDiff,
+  AcpPermissionRequestEvent,
+} from '../acp/types';
 import type {
   ChatTerminalToolInvocationData,
   ChatSimpleToolResultData,
@@ -26,7 +29,7 @@ import type {
   ChatResponseWorkspaceEditPart,
 } from '../types/vscode-proposed-additions';
 import { ExternalEditTracker } from './external-edit-tracker';
-import type { PermissionAskedEvent } from '../types/events';
+import type { AcpEventStream } from '../acp/backend';
 
 /** Extended stream with proposed API methods */
 type Stream = vscode.ChatResponseStream & {
@@ -91,7 +94,7 @@ interface StreamBridgeOptions {
 // =======================================================================
 
 /**
- * Bridges OpenCode SSE events to a VSCode ChatResponseStream.
+ * Bridges OpenCode ACP events to a VSCode ChatResponseStream.
  *
  * Uses VSCode's proposed API (chatParticipantAdditions) for native rendering:
  * - stream.thinkingProgress()           → real-time thinking display
@@ -119,6 +122,8 @@ export class StreamBridge {
   private assistantPhaseStarted: boolean = false;
   /** Tracks which tool callIDs have received a progressive push (isComplete=false) part */
   private progressivePushed: Set<string> = new Set();
+  /** Timestamp of last processed delta (for inter-delta gap measurement) */
+  private lastDeltaTime: number = 0;
   private readonly logger?: StreamBridgeLogger;
   private readonly sessionId?: string;
   /** URIs of files that existed before the turn started (proactive baseline) */
@@ -141,37 +146,50 @@ export class StreamBridge {
     return this.userMessageId;
   }
 
-  async bridgeEventsToStream(
-    events: OpenCodeEventStream,
+  /**
+   * Primary bridge method: consume ACP events directly.
+   *
+   * @param events Async iterable of AcpEvent from the backend
+   * @param stream VS Code ChatResponseStream for rendering
+   * @param token Cancellation token
+   * @returns true if the stream completed without cancellation
+   */
+  async run(
+    events: AsyncIterable<AcpEvent>,
     stream: vscode.ChatResponseStream,
     token: vscode.CancellationToken,
   ): Promise<boolean> {
     const s = stream as Stream;
     this.hasThinking = typeof s.thinkingProgress === 'function';
     this.hasToolUI = typeof s.beginToolInvocation === 'function';
+    this.lastDeltaTime = 0;
     this.log(
       `bridge start: hasThinking=${this.hasThinking}, hasToolUI=${this.hasToolUI}, ` +
       `tokenCancelled=${token.isCancellationRequested}, targetSession=${this.sessionId ?? 'any'}`,
     );
 
     try {
-      for await (const rawEvt of events.stream) {
-        const evt = unwrapStreamEvent(rawEvt);
-        this.log(`event: ${describeStreamEvent(rawEvt, evt)}`);
+      for await (const event of events) {
         if (token.isCancellationRequested) {
           const msg = 'Operation cancelled';
           this.log('bridge stop: cancellation requested');
           stream.markdown(`\n⚠️ ${msg}\n`);
           break;
         }
+        const tEnter = Date.now();
         // Handle permission.asked as sync barrier (async, blocks loop until baseline captured + auto-reply)
-        if (evt.type === 'permission.asked') {
-          await this.handlePermissionAsked(evt as PermissionAskedEvent, stream);
+        if (event.type === 'permission.asked') {
+          await this.handlePermissionAsked(event, stream);
+          const tPerm = Date.now();
+          this.log(`[timing] permission.asked took ${tPerm - tEnter}ms`);
           continue;
         }
-        const result = this.processEvent(evt, s);
+        const result = this.processEvent(event, s);
+        const tProcessed = Date.now();
+        this.log(`[timing] processEvent: type=${event.type}, rendered=${result.rendered}, took ${tProcessed - tEnter}ms`);
         if (result.rendered) {
           await yieldToEventLoop();
+          this.log(`[timing] yieldToEventLoop resolved, total=${Date.now() - tEnter}ms`);
         }
         if (result.stop) {
           this.log('bridge stop: session.idle received');
@@ -193,48 +211,72 @@ export class StreamBridge {
     return !token.isCancellationRequested;
   }
 
+  /**
+   * @deprecated Use run() instead. Kept for backward compatibility with tests.
+   */
+  async bridgeEventsToStream(
+    events: AcpEventStream,
+    stream: vscode.ChatResponseStream,
+    token: vscode.CancellationToken,
+  ): Promise<boolean> {
+    return this.run(events.stream, stream, token);
+  }
+
   // -------------------------------------------------------------------
   // Event dispatch
   // -------------------------------------------------------------------
 
-  private processEvent(evt: OpenCodeEvent, stream: Stream): EventDispatchResult {
-    this.log(`processEvent enter: type=${evt.type}`);
+  private processEvent(event: AcpEvent, stream: Stream): EventDispatchResult {
+    this.log(`processEvent enter: type=${event.type}`);
 
-    if (!this.shouldProcessEvent(evt)) {
-      const eventSessionId = getEventSessionId(evt);
+    if (!this.shouldProcessEvent(event)) {
+      const eventSessionId = getEventSessionId(event);
       this.log(
-        `skip event: type=${evt.type}, sessionID=${eventSessionId ?? 'unknown'}, ` +
+        `skip event: type=${event.type}, sessionID=${eventSessionId ?? 'unknown'}, ` +
         `target=${this.sessionId ?? 'any'}`,
       );
       return { stop: false, rendered: false };
     }
 
-    switch (evt.type) {
-      case 'message.part.updated':
-        return { stop: false, rendered: this.handlePartUpdated(evt, stream) };
-      case 'message.part.delta':
-        return { stop: false, rendered: this.handlePartDelta(evt, stream) };
+    switch (event.type) {
+      case 'part.updated':
+        return { stop: false, rendered: this.handlePartUpdated(event, stream) };
+      case 'part.delta':
+        return { stop: false, rendered: this.handlePartDelta(event, stream) };
       case 'session.idle':
         return { stop: true, rendered: false };
       case 'session.diff':
-        return { stop: false, rendered: this.handleSessionDiff(evt as SessionDiffEvent, stream) };
-      // permission.asked is handled directly in bridgeEventsToStream (async)
+        return { stop: false, rendered: this.handleSessionDiff(event, stream) };
+      // permission.asked is handled directly in run() (async)
       case 'permission.asked':
         return { stop: false, rendered: false };
     }
     return { stop: false, rendered: false };
   }
 
+  private shouldProcessEvent(evt: AcpEvent): boolean {
+    if (!this.sessionId) return true;
+
+    switch (evt.type) {
+      case 'part.updated':
+      case 'session.idle': {
+        const eventSessionId = getEventSessionId(evt);
+        return !eventSessionId || eventSessionId === this.sessionId;
+      }
+      default:
+        return true;
+    }
+  }
+
   // -------------------------------------------------------------------
   // permission.asked — sync barrier for per-edit externalEdit
   // -------------------------------------------------------------------
 
-  private async handlePermissionAsked(evt: PermissionAskedEvent, stream: vscode.ChatResponseStream): Promise<boolean> {
-    const props = evt.properties;
-    const callID = props.tool?.callID;
-    const filepath = props.metadata?.filepath;
-    const sessionId = props.sessionID;
-    const permissionId = props.id;
+  private async handlePermissionAsked(event: AcpPermissionRequestEvent, stream: vscode.ChatResponseStream): Promise<boolean> {
+    const callID = event.tool?.callId;
+    const filepath = event.metadata?.filepath as string | undefined;
+    const sessionId = event.sessionId;
+    const permissionId = event.permissionId;
 
     this.log(
       `permission.asked: id=${permissionId}, callID=${callID ?? 'none'}, ` +
@@ -280,39 +322,39 @@ export class StreamBridge {
   }
 
   // -------------------------------------------------------------------
-  // message.part.updated
+  // part.updated
   // -------------------------------------------------------------------
 
-  private handlePartUpdated(evt: MessagePartUpdatedEvent, stream: Stream): boolean {
-    const part = evt.properties?.part;
+  private handlePartUpdated(event: AcpPartUpdatedEvent, stream: Stream): boolean {
+    const part = event.part;
     if (!part) return false;
 
-    this.log(`part.updated: ${describePart(part)}`);
+    this.log(`part.updated: partType=${part.type} id=${part.id} messageId=${part.messageId ?? 'unknown'}`);
 
     switch (part.type) {
       case 'text': {
-        const textPart = part as TextStreamPart;
-        const msgId = textPart.messageID;
-        if (!this.assistantPhaseStarted && !this.userMessageId && textPart.text && textPart.text.length > 0) {
+        const textPart = part as AcpTextPart;
+        const msgId = textPart.messageId;
+        if (!this.assistantPhaseStarted && !this.userMessageId && textPart.text && textPart.text.length > 0 && msgId) {
           this.userMessageId = msgId;
           this.log(`captured userMessageId=${msgId}`);
           return false;
         }
         if (msgId !== this.userMessageId || !this.userMessageId) {
           this.partKinds.set(textPart.id, 'text');
-          this.log(`registered text part id=${textPart.id}, messageID=${msgId}`);
+          this.log(`registered text part id=${textPart.id}, messageId=${msgId ?? 'none'}`);
         }
         return false;
       }
       case 'reasoning': {
         this.assistantPhaseStarted = true;
-        const reasoningPart = part as ReasoningStreamPart;
+        const reasoningPart = part as AcpReasoningPart;
         this.partKinds.set(reasoningPart.id, 'reasoning');
         return false;
       }
       case 'tool': {
         this.assistantPhaseStarted = true;
-        const toolPart = part as StreamToolPart;
+        const toolPart = part as AcpToolPart;
         this.partKinds.set(toolPart.id, 'tool');
         return this.handleToolState(toolPart, stream);
       }
@@ -327,20 +369,22 @@ export class StreamBridge {
   }
 
   // -------------------------------------------------------------------
-  // message.part.delta
+  // part.delta
   // -------------------------------------------------------------------
 
   private handlePartDelta(
-    evt: Extract<OpenCodeEvent, { type: 'message.part.delta' }>,
+    event: AcpPartDeltaEvent,
     stream: Stream,
   ): boolean {
-    const props = evt.properties;
-    if (!props?.delta) return false;
+    if (!event.delta) return false;
 
-    const partID = props.partID;
-    const delta = props.delta;
+    const partID = event.partId;
+    const delta = event.delta;
     const kind = this.partKinds.get(partID);
-    this.log(`part.delta: partID=${partID}, kind=${kind ?? 'unknown'}, len=${delta.length}`);
+    const now = Date.now();
+    const gap = this.lastDeltaTime ? now - this.lastDeltaTime : 0;
+    this.lastDeltaTime = now;
+    this.log(`part.delta: partID=${partID}, kind=${kind ?? 'unknown'}, len=${delta.length}, gap=${gap}ms`);
 
     if (kind === 'reasoning') {
       if (this.hasThinking && stream.thinkingProgress) {
@@ -359,8 +403,8 @@ export class StreamBridge {
   // session.diff → ChatResponseMultiDiffPart (shows +/- lines in UI)
   // -------------------------------------------------------------------
 
-  private handleSessionDiff(evt: SessionDiffEvent, stream: Stream): boolean {
-    const diffs = evt.properties?.diff;
+  private handleSessionDiff(event: AcpSessionDiffEvent, stream: Stream): boolean {
+    const diffs = event.diffs;
     if (!diffs?.length) return false;
 
     if (!VS.ChatResponseMultiDiffPart || !stream.push) {
@@ -398,12 +442,12 @@ export class StreamBridge {
   // Tool call state machine: pending → running → completed
   // -------------------------------------------------------------------
 
-  private handleToolState(part: StreamToolPart, stream: Stream): boolean {
+  private handleToolState(part: AcpToolPart, stream: Stream): boolean {
     const state = part.state;
     if (!state) return false;
 
-    const toolName = part.tool ?? 'unknown';
-    const callID = part.callID ?? part.id;
+    const toolName = part.toolName ?? 'unknown';
+    const callID = part.callId ?? part.id;
     const status = state.status;
     this.log(`tool.state: tool=${toolName}, callID=${callID}, status=${status}`);
 
@@ -461,7 +505,7 @@ export class StreamBridge {
         }
         return true;
       }
-      return false;
+      return true;
     }
 
     if (status === 'completed') {
@@ -557,7 +601,7 @@ export class StreamBridge {
     stream: Stream,
     callID: string,
     toolName: string,
-    state: StreamToolState,
+    state: AcpToolState,
     isError?: boolean,
   ): void {
     try {
@@ -786,20 +830,6 @@ export class StreamBridge {
   private log(message: string): void {
     this.logger?.appendLine(`[streaming] ${message}`);
   }
-
-  private shouldProcessEvent(evt: OpenCodeEvent): boolean {
-    if (!this.sessionId) return true;
-
-    switch (evt.type) {
-      case 'message.part.updated':
-      case 'session.idle': {
-        const eventSessionId = getEventSessionId(evt);
-        return !eventSessionId || eventSessionId === this.sessionId;
-      }
-      default:
-        return true;
-    }
-  }
 }
 
 // =======================================================================
@@ -847,26 +877,29 @@ function detectLanguage(title: string): string {
   return 'bash';
 }
 
-function getToolTitle(state: StreamToolState): string | undefined {
-  return 'title' in state ? state.title : undefined;
+function getToolTitle(state: AcpToolState): string | undefined {
+  return state.title;
 }
 
-function getToolOutput(state: StreamToolState): string | undefined {
-  return 'output' in state ? state.output : undefined;
+function getToolOutput(state: AcpToolState): string | undefined {
+  return state.output;
 }
 
 function getToolTime(
-  state: StreamToolState,
+  state: AcpToolState,
 ): { start?: number; end?: number } | undefined {
-  return 'time' in state ? state.time : undefined;
+  if (state.startTime != null || state.endTime != null) {
+    return { start: state.startTime, end: state.endTime };
+  }
+  return undefined;
 }
 
-function getEventSessionId(evt: OpenCodeEvent): string | undefined {
+function getEventSessionId(evt: AcpEvent): string | undefined {
   switch (evt.type) {
-    case 'message.part.updated':
-      return evt.properties?.part?.sessionID;
+    case 'part.updated':
+      return evt.part?.sessionId;
     case 'session.idle':
-      return evt.properties?.sessionID;
+      return evt.sessionId;
     default:
       return undefined;
   }
@@ -874,48 +907,4 @@ function getEventSessionId(evt: OpenCodeEvent): string | undefined {
 
 async function yieldToEventLoop(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
-}
-
-function unwrapStreamEvent(evt: OpenCodeStreamEvent): OpenCodeEvent {
-  return 'payload' in evt ? evt.payload : evt;
-}
-
-function describeStreamEvent(rawEvt: OpenCodeStreamEvent, evt: OpenCodeEvent): string {
-  const base = describeEvent(evt);
-  if ('payload' in rawEvt) {
-    return `${base} directory=${rawEvt.directory}`;
-  }
-  return base;
-}
-
-function describeEvent(evt: OpenCodeEvent): string {
-  switch (evt.type) {
-    case 'message.part.updated': {
-      const part = evt.properties?.part;
-      return part ? `message.part.updated ${describePart(part)}` : 'message.part.updated part=missing';
-    }
-    case 'message.part.delta':
-      return `message.part.delta partID=${evt.properties.partID} len=${evt.properties.delta.length}`;
-    case 'session.idle':
-      return `session.idle sessionID=${evt.properties.sessionID ?? 'unknown'}`;
-    case 'session.diff': {
-      const diffCount = evt.properties?.diff?.length ?? 0;
-      return `session.diff files=${diffCount}`;
-    }
-    default:
-      return evt.type;
-  }
-}
-
-function describePart(part: MessagePartUpdatedEvent['properties']['part']): string {
-  const base = `partType=${part.type} id=${part.id} messageID=${part.messageID ?? 'unknown'}`;
-  if (part.type === 'text') {
-    const textPart = part as TextStreamPart;
-    return `${base} textLen=${textPart.text.length}`;
-  }
-  if (part.type === 'tool') {
-    const toolPart = part as StreamToolPart;
-    return `${base} tool=${toolPart.tool} status=${toolPart.state.status}`;
-  }
-  return base;
 }

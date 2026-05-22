@@ -1,5 +1,5 @@
-import type { OpenCodeClient } from '../types';
-import type { OpenCodeEvent, OpenCodeEventStream, OpenCodeStreamEvent } from '../types/events';
+import type { OpenCodeClient } from '../../types';
+import type { OpenCodeEvent, OpenCodeEventStream, OpenCodeStreamEvent } from './sdk-events';
 
 interface LoggerLike {
   appendLine(message: string): void;

@@ -30,8 +30,7 @@
  * @module
  */
 import * as vscode from 'vscode';
-import type { OpenCodeClient, ExtensionState } from '../../types';
-import type { OpenCodeEventStream } from '../../types/events';
+import type { ExtensionState } from '../../types';
 import { AcpRenderer, renderToolFallback } from './acp-renderer';
 
 // ---------------------------------------------------------------------------
@@ -81,26 +80,29 @@ export function createStableHandler(
     logger.appendLine('[stable-participant] Handling request...');
 
     // 1. Ensure server is available
-    const client = await ensureServer(state, stream);
-    if (!client) {
+    const ready = await ensureServer(state, stream);
+    if (!ready) {
       return { metadata: { error: 'Server not available' } };
     }
 
     // 2. Create or reuse session
-    const sessionId = await resolveSession(state, client, request, logger);
+    const sessionId = await resolveSession(state, stream, request, logger);
     if (!sessionId) {
       stream.markdown('⚠️ Failed to create session.');
       return { metadata: { error: 'Session creation failed' } };
     }
 
     // 3. Send prompt
-    const eventStream = await sendPrompt(client, sessionId, request.prompt, logger);
-    if (!eventStream) {
+    const promptResult = await state.backend.sessions.prompt(sessionId, request.prompt, getWorkspaceDirectory());
+    if (promptResult.error) {
       stream.markdown('⚠️ Failed to send prompt.');
       return { metadata: { error: 'Prompt failed' } };
     }
 
-    // 4. Render events via the stable renderer
+    // 4. Open event stream for this session
+    const eventStream = state.backend.events.openSessionStream(sessionId);
+
+    // 5. Render events via the stable renderer
     const renderer = new AcpRenderer({ logger });
     renderer.probeStream(stream);
 
@@ -111,14 +113,13 @@ export function createStableHandler(
           break;
         }
 
-        const evt = 'payload' in rawEvt ? rawEvt.payload : rawEvt;
-        const result = renderer.renderEvent(evt, stream);
+        const renderResult = renderer.renderEvent(rawEvt as unknown as never, stream);
 
-        if (result.rendered) {
+        if ((renderResult as { rendered?: boolean }).rendered) {
           await yieldToEventLoop();
         }
 
-        if (evt.type === 'session.idle') {
+        if (rawEvt.type === 'session.idle') {
           logger.appendLine('[stable-participant] Session idle — turn complete');
           break;
         }
@@ -129,6 +130,7 @@ export function createStableHandler(
       stream.markdown(`\n⚠️ ${msg}\n`);
     } finally {
       renderer.reset();
+      state.backend.events.closeSessionStream(sessionId);
     }
 
     return { metadata: { sessionId } };
@@ -136,53 +138,50 @@ export function createStableHandler(
 }
 
 // =======================================================================
-// Internal helpers (simplified versions of handler.ts logic)
+// Internal helpers
 // =======================================================================
 
 /**
- * Ensure the OpenCode server is running and return a client.
+ * Ensure the OpenCode server is running.
  */
 async function ensureServer(
   state: ExtensionState,
   stream: vscode.ChatResponseStream,
-): Promise<OpenCodeClient | null> {
-  if (state.client) {
-    return state.client;
+): Promise<boolean> {
+  const status = state.backend.getStatus();
+  if (status === 'running') {
+    return true;
   }
 
-  if (state.serverStatus === 'starting') {
+  if (status === 'starting') {
     stream.markdown('⚠️ OpenCode server is starting up, please wait...');
-    return null;
+    return false;
   }
 
   try {
     stream.progress('\u{1F504} Starting OpenCode...');
     const workspacePath = getWorkspaceDirectory();
-    const url = await state.serverManager.start(workspacePath);
-    state.serverStatus = 'running';
-    state.client = state.serverManager.getClient();
-    if (!state.client) {
-      stream.markdown('⚠️ OpenCode client not available.');
-      state.serverStatus = 'error';
-      return null;
+    const result = await state.backend.start(workspacePath);
+    if (result.error || !result.data) {
+      const msg = typeof result.error === 'string' ? result.error : 'Unknown error';
+      stream.markdown(`⚠️ Failed to start OpenCode: ${msg}`);
+      return false;
     }
-    state.outputChannel.appendLine(`[stable-participant] Server started at ${url}`);
-    return state.client;
+    state.outputChannel.appendLine(`[stable-participant] Server started at ${result.data.url}`);
+    return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     stream.markdown(`\u26A0\uFE0F Failed to start OpenCode: ${msg}`);
-    state.serverStatus = 'error';
-    return null;
+    return false;
   }
 }
 
 /**
  * Resolve an OpenCode session ID — creating one if necessary.
- * Simplified version of the session recovery logic from handler.ts.
  */
 async function resolveSession(
   state: ExtensionState,
-  client: OpenCodeClient,
+  stream: vscode.ChatResponseStream,
   _request: vscode.ChatRequest,
   logger: { appendLine(m: string): void },
 ): Promise<string | null> {
@@ -198,11 +197,12 @@ async function resolveSession(
 
   // Create new session
   try {
-    const resp = await client.session.create({
-      query: { directory: getWorkspaceDirectory() },
+    const result = await state.backend.sessions.create({
+      directory: getWorkspaceDirectory(),
     });
-    const opencodeSessionId = resp.data?.id ?? null;
+    const opencodeSessionId = result.data?.id ?? null;
     if (!opencodeSessionId) {
+      stream.markdown('⚠️ Failed to create session.');
       return null;
     }
 
@@ -218,38 +218,6 @@ async function resolveSession(
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown';
     logger.appendLine(`[stable-participant] Session creation error: ${msg}`);
-    return null;
-  }
-}
-
-/**
- * Send a prompt to an OpenCode session and return the event stream.
- */
-async function sendPrompt(
-  client: OpenCodeClient,
-  sessionId: string,
-  prompt: string,
-  logger: { appendLine(m: string): void },
-): Promise<OpenCodeEventStream | null> {
-  try {
-    const eventResp = await client.global.event();
-    logger.appendLine('[stable-participant] Subscribing to global event feed');
-
-    const promptResp = await client.session.prompt({
-      path: { id: sessionId },
-      body: { parts: [{ type: 'text' as const, text: prompt }] },
-      query: { directory: getWorkspaceDirectory() },
-    });
-
-    if (promptResp.error) {
-      logger.appendLine(`[stable-participant] Prompt error: ${JSON.stringify(promptResp.error)}`);
-      return null;
-    }
-
-    return eventResp;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Unknown';
-    logger.appendLine(`[stable-participant] sendPrompt error: ${msg}`);
     return null;
   }
 }

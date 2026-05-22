@@ -2,8 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as vscode from 'vscode';
 import type { AcpBackend } from '../acp/backend';
 import type { AcpServerStatus } from '../acp/types';
-import type { ExtensionState, OpenCodeClient, OpenCodeServerController } from '../types';
-import { GlobalEventBroker } from '../participant/event-broker';
+import type { ExtensionState } from '../types';
 import { routeCommand } from '../participant/commands';
 
 // ---------------------------------------------------------------------------
@@ -79,17 +78,6 @@ describe('routeCommand', () => {
     };
     state = {
       backend,
-      serverManager: {
-        start: vi.fn().mockRejectedValue(new Error('Server not available')),
-        stop: vi.fn().mockResolvedValue(undefined),
-        getStatus: vi.fn().mockReturnValue('error'),
-        isRunning: vi.fn().mockReturnValue(false),
-        getUrl: vi.fn().mockReturnValue(null),
-        getClient: vi.fn().mockReturnValue(null),
-      } as unknown as OpenCodeServerController,
-      client: null,
-      activeSessionId: null,
-      serverStatus: 'stopped',
       outputChannel: {
         name: 'test',
         lines: [] as string[],
@@ -100,7 +88,6 @@ describe('routeCommand', () => {
         hide: vi.fn(),
         dispose: vi.fn(),
       } as unknown as vscode.OutputChannel,
-      eventBroker: new GlobalEventBroker(),
       sessionMap: new Map(),
     };
     stream = {
@@ -127,7 +114,6 @@ describe('routeCommand', () => {
 
     expect(state.backend.start).toHaveBeenCalledOnce();
     expect(state.backend.sessions.create).toHaveBeenCalledWith();
-    expect(state.activeSessionId).toBe('session-new');
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('Started a new conversation session'),
     );
@@ -141,7 +127,6 @@ describe('routeCommand', () => {
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('Failed to start OpenCode'),
     );
-    expect(state.activeSessionId).toBeNull();
   });
 
   it('should show error on /new when session creation fails', async () => {
@@ -154,7 +139,6 @@ describe('routeCommand', () => {
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('Session error'),
     );
-    expect(state.activeSessionId).toBeNull();
   });
 
   // -----------------------------------------------------------------------
@@ -253,7 +237,6 @@ describe('routeCommand', () => {
     await routeCommand('New', state, stream, token);
 
     expect(state.backend.sessions.create).toHaveBeenCalledOnce();
-    expect(state.activeSessionId).toBe('session-case');
   });
 
   // -----------------------------------------------------------------------

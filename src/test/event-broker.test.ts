@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { GlobalEventBroker } from '../participant/event-broker';
-import type { OpenCodeEvent, OpenCodeGlobalEventEnvelope } from '../types/events';
+import { GlobalEventBroker } from '../backends/opencode/event-broker';
+import type { OpenCodeEvent, OpenCodeGlobalEventEnvelope } from '../backends/opencode/sdk-events';
 
 function globalEvent(directory: string, payload: OpenCodeEvent): OpenCodeGlobalEventEnvelope {
   return { directory, payload };

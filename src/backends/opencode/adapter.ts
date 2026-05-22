@@ -7,7 +7,7 @@
  */
 
 import { OpenCodeServerManager } from '../../opencode/server';
-import { GlobalEventBroker } from '../../participant/event-broker';
+import { GlobalEventBroker } from './event-broker';
 import type {
   AcpBackend,
   AcpSessionOperations,
@@ -26,7 +26,7 @@ import type {
   AcpEvent,
 } from '../../acp/types';
 import { normalizeStreamEvent } from './events';
-import type { OpenCodeEventStream } from '../../types/events';
+import type { OpenCodeEventStream } from './sdk-events';
 
 // ===========================================================================
 // AcpEventStream implementation wrapping OpenCodeEventStream

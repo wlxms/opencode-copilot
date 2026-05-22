@@ -25,7 +25,7 @@ import type {
   ReasoningStreamPart,
   StreamToolPart,
   StreamToolState,
-} from '../../types/events';
+} from '../../backends/opencode/sdk-events';
 
 import type {
   ChatTerminalToolInvocationData,

@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { StreamBridge } from './streaming';
 import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
-import type { AcpEvent, AcpStreamPart } from '../acp/types';
+
 import type { ExtensionState, TurnMapping } from '../types';
 import { ExternalEditTracker } from './external-edit-tracker';
 import { collectOpenFileUris } from './checkpoint';
@@ -31,12 +31,12 @@ export async function ensureServer(
   }
 
   if (status === 'starting') {
-    stream.markdown('⚠️ OpenCode server is starting up, please wait...');
+    stream.progress('OpenCode is starting...');
     return false;
   }
 
   try {
-    stream.progress('🔄 Starting OpenCode...');
+    stream.progress('Starting OpenCode server...');
     const workspacePath = getWorkspaceDirectory();
     const result = await state.backend.start(workspacePath);
     if (result.error || !result.data) {
@@ -45,6 +45,7 @@ export async function ensureServer(
       return false;
     }
     state.outputChannel.appendLine(`[handler] Server started at ${result.data.url}`);
+    stream.progress('Server ready');
     return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
@@ -129,6 +130,7 @@ async function resolveSession(
 
   // --- Case 1: New chat (no prior session) ---
   if (!chatState.opencodeSessionId) {
+    stream.progress('Creating new session...');
     const result = await state.backend.sessions.create({
       title: `Chat ${vscodeSessionId.slice(0, 8)}`,
       directory,
@@ -138,6 +140,7 @@ async function resolveSession(
       return null;
     }
     chatState.opencodeSessionId = result.data.id;
+    stream.progress('Session ready');
     state.outputChannel.appendLine(
       `[handler] Created new OpenCode session ${chatState.opencodeSessionId} for VSCode chat ${vscodeSessionId}`,
     );
@@ -146,6 +149,7 @@ async function resolveSession(
 
   // --- Case 2: Continue (same turn count) ---
   if (currentTurnIndex === chatState.turnMap.length) {
+    stream.progress('Reusing existing session...');
     state.outputChannel.appendLine(
       `[handler] Reusing OpenCode session ${chatState.opencodeSessionId} for VSCode chat ${vscodeSessionId} (turn ${currentTurnIndex}) ` +
       `turnMap=${chatState.turnMap.length}`,
@@ -157,6 +161,7 @@ async function resolveSession(
   if (currentTurnIndex < chatState.turnMap.length) {
     const priorTurnMap = chatState.turnMap.slice(0, currentTurnIndex);
     if (currentTurnIndex > 0) {
+      stream.progress('Rewinding conversation...');
       state.outputChannel.appendLine(
         `[handler] Rewind detected: reverting session ${chatState.opencodeSessionId} from turn ${currentTurnIndex} ` +
         `(turnMap had ${chatState.turnMap.length} entries, keeping ${priorTurnMap.length})`,
@@ -272,6 +277,7 @@ export function createParticipantHandler(
       if (!sessionId) return { metadata: {} };
 
       const executeTurnWithBridge = async (): Promise<void> => {
+        stream.progress('Connecting to event stream...');
         const events = state.backend.events.openSessionStream(sessionId);
         try {
           await state.backend.events.ensureStarted();
@@ -281,6 +287,7 @@ export function createParticipantHandler(
         }
 
         // 7. Fire the prompt WITHOUT awaiting
+        stream.progress('Sending message...');
         state.outputChannel.appendLine(
           `[handler] Prompting session ${sessionId} with: ${request.prompt.substring(0, 50)}`,
         );
@@ -315,7 +322,8 @@ export function createParticipantHandler(
           });
         });
 
-        state.outputChannel.appendLine(`[handler] bridgeEventsToStream start for session ${sessionId}`);
+        state.outputChannel.appendLine(`[handler] bridge run start for session ${sessionId}`);
+        stream.progress('Waiting for response...');
 
         // Collect known file URIs for new-file detection in per-edit externalEdit flow
         let knownFileUris: string[] = [];
@@ -341,20 +349,7 @@ export function createParticipantHandler(
           tracker,
         });
         try {
-          await bridge.bridgeEventsToStream(
-            {
-              stream: (async function* normalizedToLegacy() {
-                for await (const event of events.stream) {
-                  const legacy = denormalizeAcpEvent(event);
-                  if (legacy) {
-                    yield legacy;
-                  }
-                }
-              })(),
-            },
-            stream,
-            token,
-          );
+          await bridge.run(events.stream, stream, token);
         } finally {
           cancelDisposable.dispose();
         }
@@ -402,164 +397,4 @@ export function createParticipantHandler(
   };
 }
 
-export function denormalizeAcpEvent(event: AcpEvent): import('../types/events').OpenCodeEvent | null {
-  switch (event.type) {
-    case 'part.updated':
-      return {
-        type: 'message.part.updated',
-        properties: {
-          part: denormalizePart(event.part),
-          delta: event.delta,
-        },
-      };
-    case 'part.delta':
-      return {
-        type: 'message.part.delta',
-        properties: {
-          partID: event.partId,
-          delta: event.delta,
-          field: event.field,
-        },
-      };
-    case 'session.idle':
-      return {
-        type: 'session.idle',
-        properties: {
-          sessionID: event.sessionId,
-        },
-      };
-    case 'session.diff':
-      return {
-        type: 'session.diff',
-        properties: {
-          sessionID: event.sessionId,
-          diff: event.diffs,
-        },
-      };
-    case 'permission.asked':
-      return {
-        type: 'permission.asked',
-        properties: {
-          id: event.permissionId,
-          sessionID: event.sessionId,
-          permission: event.permission,
-          patterns: event.patterns,
-          metadata: event.metadata,
-          always: event.always,
-          tool: event.tool
-            ? { messageID: event.tool.messageId, callID: event.tool.callId }
-            : undefined,
-        },
-      };
-    case 'permission.replied':
-      return {
-        type: 'permission.replied',
-        properties: {
-          sessionID: event.sessionId,
-          permissionID: event.permissionId,
-          response: event.response,
-        },
-      };
-    case 'session.created':
-    case 'session.updated':
-    case 'session.deleted':
-    case 'session.error':
-    case 'server.connected':
-    case 'server.heartbeat':
-      return null;
-    default:
-      return null;
-  }
-}
 
-function denormalizePart(part: AcpStreamPart): import('../types/events').StreamPart {
-  switch (part.type) {
-    case 'text':
-      return {
-        id: part.id,
-        type: 'text',
-        messageID: part.messageId ?? '',
-        sessionID: part.sessionId,
-        text: part.text,
-        synthetic: part.synthetic,
-      };
-    case 'reasoning':
-      return {
-        id: part.id,
-        type: 'reasoning',
-        messageID: part.messageId ?? '',
-        sessionID: part.sessionId,
-        text: part.text,
-      };
-    case 'tool':
-      return {
-        id: part.id,
-        type: 'tool',
-        messageID: part.messageId,
-        sessionID: part.sessionId,
-        callID: part.callId,
-        tool: part.toolName,
-        state: denormalizeToolState(part.state),
-      };
-    case 'step-start':
-      return {
-        id: part.id,
-        type: 'step-start',
-        messageID: part.messageId,
-        sessionID: part.sessionId,
-        snapshot: part.snapshot,
-      };
-    case 'step-finish':
-      return {
-        id: part.id,
-        type: 'step-finish',
-        messageID: part.messageId,
-        sessionID: part.sessionId,
-        reason: part.reason,
-        snapshot: part.snapshot,
-        cost: part.cost,
-        tokens: part.tokens,
-      };
-  }
-}
-
-function denormalizeToolState(
-  state: import('../acp/types').AcpToolState,
-): import('../types/events').StreamToolState {
-  const time = state.startTime || state.endTime
-    ? { start: state.startTime, end: state.endTime }
-    : undefined;
-
-  switch (state.status) {
-    case 'pending':
-      return {
-        status: 'pending',
-        input: state.input,
-      };
-    case 'running':
-      return {
-        status: 'running',
-        input: state.input,
-        title: state.title,
-        metadata: state.metadata,
-        time,
-      };
-    case 'completed':
-      return {
-        status: 'completed',
-        input: state.input,
-        output: state.output,
-        title: state.title,
-        metadata: state.metadata,
-        time,
-      };
-    case 'error':
-      return {
-        status: 'error',
-        input: state.input,
-        error: state.error,
-        metadata: state.metadata,
-        time,
-      };
-  }
-}

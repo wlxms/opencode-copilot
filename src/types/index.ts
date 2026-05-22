@@ -6,8 +6,7 @@ import type {
   SessionPromptResponse,
   SessionRevertResponse,
 } from '@opencode-ai/sdk';
-import type { OpenCodeEventStream } from './events';
-import type { GlobalEventBroker } from '../participant/event-broker';
+import type { OpenCodeEventStream } from '../backends/opencode/sdk-events';
 import type { AcpBackend } from '../acp/backend';
 
 export interface OpenCodeApiResponse<T, E = unknown> {
@@ -91,18 +90,8 @@ export interface SessionState {
 export interface ExtensionState {
   /** ACP-compatible backend abstraction used by all surfaces */
   backend: AcpBackend;
-  /** The OpenCode server manager instance */
-  serverManager: OpenCodeServerController;
-  /** SDK OpencodeClient from createOpencode() (null until started) */
-  client: OpenCodeClient | null;
-  /** Currently active session ID (convenience, for the most recent session) */
-  activeSessionId: string | null;
-  /** Server status */
-  serverStatus: 'stopped' | 'starting' | 'running' | 'error';
   /** Output channel for logging */
   outputChannel: vscode.OutputChannel;
-  /** Shared global SSE broker for multiplexing OpenCode session events */
-  eventBroker: GlobalEventBroker;
   /**
    * Maps VSCode chat sessionId → session state (OpenCode ID + per-session turnMap).
    * Same VSCode chat panel = same sessionId → reuse OpenCode session.

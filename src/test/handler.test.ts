@@ -1,4 +1,3 @@
-import { GlobalEventBroker } from '../participant/event-broker';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AcpBackend } from '../acp/backend';
 
@@ -31,12 +30,10 @@ const mockSdkClient = {
 // ---------------------------------------------------------------------------
 
 import * as vscode from 'vscode';
-import { createParticipantHandler, denormalizeAcpEvent } from '../participant/handler';
-import type { OpenCodeEvent } from '../types/events';
-import type { AcpEvent, AcpPermissionRequestEvent, AcpStreamPart } from '../acp/types';
+import { createParticipantHandler } from '../participant/handler';
+import type { OpenCodeEvent } from '../backends/opencode/sdk-events';
 import type { AcpServerStatus } from '../acp/types';
-import type { PermissionAskedEvent } from '../types/events';
-import type { ExtensionState, OpenCodeClient, OpenCodeServerController } from '../types';
+import type { ExtensionState } from '../types';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -75,28 +72,10 @@ describe('createParticipantHandler', () => {
   let stream: vscode.ChatResponseStream;
   let token: vscode.CancellationToken;
   let backendStatus: AcpServerStatus;
-  let mockServerManager: {
-    start: ReturnType<typeof vi.fn>;
-    stop: ReturnType<typeof vi.fn>;
-    isRunning: ReturnType<typeof vi.fn>;
-    getUrl: ReturnType<typeof vi.fn>;
-    getStatus: ReturnType<typeof vi.fn>;
-    getClient: ReturnType<typeof vi.fn>;
-  };
 
   beforeEach(() => {
     vi.resetAllMocks();
     backendStatus = 'stopped';
-
-    // Mock server manager
-    mockServerManager = {
-      start: vi.fn(),
-      stop: vi.fn(),
-      isRunning: vi.fn().mockReturnValue(false),
-      getUrl: vi.fn().mockReturnValue('http://127.0.0.1:51777'),
-      getStatus: vi.fn().mockReturnValue('stopped'),
-      getClient: vi.fn(),
-    };
 
     const backend: AcpBackend = {
       name: 'opencode',
@@ -159,15 +138,15 @@ describe('createParticipantHandler', () => {
               }
               const payload = event.payload;
               const payloadSession = payload.type === 'session.idle'
-                ? payload.properties?.sessionID
-                : payload.type === 'message.part.updated'
-                  ? payload.properties?.part?.sessionID
-                  : payload.type === 'message.part.delta'
+                ? payload.sessionId
+                : payload.type === 'part.updated'
+                  ? payload.part?.sessionId
+                  : payload.type === 'part.delta'
                     ? undefined
                     : payload.type === 'session.diff'
-                      ? payload.properties?.sessionID
+                      ? payload.sessionId
                       : payload.type === 'permission.asked'
-                        ? payload.properties?.sessionID
+                        ? payload.sessionId
                         : undefined;
               if (!payloadSession || payloadSession === sessionId) {
                 yield event;
@@ -186,10 +165,6 @@ describe('createParticipantHandler', () => {
 
     state = {
       backend,
-      serverManager: mockServerManager as unknown as OpenCodeServerController,
-      client: null,
-      activeSessionId: null,
-      serverStatus: 'stopped',
       outputChannel: {
         name: 'test',
         lines: [] as string[],
@@ -200,7 +175,6 @@ describe('createParticipantHandler', () => {
         hide: vi.fn(),
         dispose: vi.fn(),
       } as unknown as vscode.OutputChannel,
-      eventBroker: new GlobalEventBroker(),
       sessionMap: new Map(),
     };
 
@@ -913,251 +887,4 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
       expect.stringContaining('Prompt error'),
     );
   });
-
-  // -----------------------------------------------------------------------
-  // ACP → legacy event denormalization (compatibility layer)
-  // -----------------------------------------------------------------------
-
-  describe('denormalizeAcpEvent', () => {
-    // -- permission.asked --
-    it('should convert permission.asked to legacy format', () => {
-      const acp: AcpEvent = {
-        type: 'permission.asked',
-        permissionId: 'perm_1',
-        sessionId: 'ses_test',
-        permission: 'file:write',
-        patterns: ['/src/**'],
-        metadata: { filepath: '/src/app.ts', diff: '...' },
-        always: ['once'],
-        tool: { messageId: 'msg_1', callId: 'call_1' },
-      };
-      const result = denormalizeAcpEvent(acp);
-      expect(result).not.toBeNull();
-      expect(result!.type).toBe('permission.asked');
-      const p = (result as PermissionAskedEvent).properties;
-      expect(p.id).toBe('perm_1');
-      expect(p.sessionID).toBe('ses_test');
-      expect(p.permission).toBe('file:write');
-      expect(p.patterns).toEqual(['/src/**']);
-      expect(p.metadata).toEqual({ filepath: '/src/app.ts', diff: '...' });
-      expect(p.always).toEqual(['once']);
-      expect(p.tool).toEqual({ messageID: 'msg_1', callID: 'call_1' });
-    });
-
-    it('should convert permission.asked without tool metadata', () => {
-      const acp: AcpEvent = {
-        type: 'permission.asked',
-        permissionId: 'perm_2',
-        sessionId: 'ses_test',
-        permission: 'command:bash',
-        patterns: [],
-        metadata: {},
-        always: [],
-      };
-      const result = denormalizeAcpEvent(acp);
-      expect(result).not.toBeNull();
-      expect(result!.type).toBe('permission.asked');
-      const p = (result as PermissionAskedEvent).properties;
-      expect(p.id).toBe('perm_2');
-      expect(p.tool).toBeUndefined();
-    });
-
-    // -- permission.replied --
-    it('should convert permission.replied to legacy format', () => {
-      const acp: AcpEvent = {
-        type: 'permission.replied',
-        sessionId: 'ses_test',
-        permissionId: 'perm_1',
-        response: 'once',
-      };
-      const result = denormalizeAcpEvent(acp);
-      expect(result).not.toBeNull();
-      expect(result!.type).toBe('permission.replied');
-      expect((result as { properties: Record<string, unknown> }).properties).toMatchObject({
-        sessionID: 'ses_test',
-        permissionID: 'perm_1',
-        response: 'once',
-      });
-    });
-
-    // -- part.updated → message.part.updated --
-    it('should convert part.updated (text) to message.part.updated', () => {
-      const acp: AcpEvent = {
-        type: 'part.updated',
-        part: {
-          id: 'prt_txt',
-          type: 'text',
-          messageId: 'msg_ai_1',
-          sessionId: 'ses_test',
-          text: 'Hello world',
-          synthetic: false,
-        } as AcpStreamPart,
-        delta: 'Hello',
-      };
-      const result = denormalizeAcpEvent(acp);
-      expect(result).not.toBeNull();
-      expect(result!.type).toBe('message.part.updated');
-      const props = (result as { properties: Record<string, unknown> }).properties as Record<string, unknown>;
-      const part = props.part as Record<string, unknown>;
-      expect(part.type).toBe('text');
-      expect(part.id).toBe('prt_txt');
-      expect(part.messageID).toBe('msg_ai_1');
-      expect(part.sessionID).toBe('ses_test');
-      expect(part.text).toBe('Hello world');
-      expect(part.synthetic).toBe(false);
-      expect(props.delta).toBe('Hello');
-    });
-
-    it('should convert part.updated (reasoning) to message.part.updated', () => {
-      const acp: AcpEvent = {
-        type: 'part.updated',
-        part: {
-          id: 'prt_reason',
-          type: 'reasoning',
-          messageId: 'msg_ai_1',
-          sessionId: 'ses_test',
-          text: 'thinking...',
-        } as AcpStreamPart,
-      };
-      const result = denormalizeAcpEvent(acp);
-      expect(result).not.toBeNull();
-      expect(result!.type).toBe('message.part.updated');
-      const part = ((result as { properties: Record<string, unknown> }).properties as Record<string, unknown>).part as Record<string, unknown>;
-      expect(part.type).toBe('reasoning');
-      expect(part.id).toBe('prt_reason');
-      expect(part.text).toBe('thinking...');
-    });
-
-    it('should convert part.updated (tool) to message.part.updated', () => {
-      const acp: AcpEvent = {
-        type: 'part.updated',
-        part: {
-          id: 'prt_tool',
-          type: 'tool',
-          messageId: 'msg_ai_1',
-          sessionId: 'ses_test',
-          toolName: 'read',
-          callId: 'call_read',
-          state: {
-            status: 'completed',
-            input: { filePath: '/a.txt' },
-            output: 'file content',
-            title: 'Read file',
-          },
-        } as AcpStreamPart,
-      };
-      const result = denormalizeAcpEvent(acp);
-      expect(result).not.toBeNull();
-      expect(result!.type).toBe('message.part.updated');
-      const part = ((result as { properties: Record<string, unknown> }).properties as Record<string, unknown>).part as Record<string, unknown>;
-      expect(part.type).toBe('tool');
-      expect(part.tool).toBe('read');
-      expect(part.callID).toBe('call_read');
-      expect((part.state as Record<string, unknown>).status).toBe('completed');
-      expect((part.state as Record<string, unknown>).output).toBe('file content');
-    });
-
-    // -- part.delta → message.part.delta --
-    it('should convert part.delta to message.part.delta', () => {
-      const acp: AcpEvent = {
-        type: 'part.delta',
-        partId: 'prt_ai_1',
-        delta: 'Hello world',
-        field: 'text',
-      };
-      const result = denormalizeAcpEvent(acp);
-      expect(result).not.toBeNull();
-      expect(result!.type).toBe('message.part.delta');
-      const props = (result as { properties: Record<string, unknown> }).properties;
-      expect(props.partID).toBe('prt_ai_1');
-      expect(props.delta).toBe('Hello world');
-      expect(props.field).toBe('text');
-    });
-
-    it('should convert part.delta without field', () => {
-      const acp: AcpEvent = {
-        type: 'part.delta',
-        partId: 'prt_ai_2',
-        delta: 'more text',
-      };
-      const result = denormalizeAcpEvent(acp);
-      expect(result).not.toBeNull();
-      expect(result!.type).toBe('message.part.delta');
-      const props = (result as { properties: Record<string, unknown> }).properties;
-      expect(props.partID).toBe('prt_ai_2');
-      expect(props.delta).toBe('more text');
-      expect(props.field).toBeUndefined();
-    });
-
-    // -- session.diff --
-    it('should convert session.diff to legacy format', () => {
-      const acp: AcpEvent = {
-        type: 'session.diff',
-        sessionId: 'ses_test',
-        diffs: [
-          { file: '/src/app.ts', patch: '...', additions: 5, deletions: 2, status: 'modified' },
-          { file: '/src/new.ts', patch: '', additions: 10, deletions: 0, status: 'added' },
-        ],
-      };
-      const result = denormalizeAcpEvent(acp);
-      expect(result).not.toBeNull();
-      expect(result!.type).toBe('session.diff');
-      const props = (result as { properties: Record<string, unknown> }).properties;
-      expect(props.sessionID).toBe('ses_test');
-      expect(props.diff).toHaveLength(2);
-      expect((props.diff as Array<Record<string, unknown>>)[0]).toMatchObject({
-        file: '/src/app.ts',
-        additions: 5,
-        deletions: 2,
-        status: 'modified',
-      });
-    });
-
-    // -- session.idle --
-    it('should convert session.idle to legacy format', () => {
-      const acp: AcpEvent = {
-        type: 'session.idle',
-        sessionId: 'ses_test',
-      };
-      const result = denormalizeAcpEvent(acp);
-      expect(result).not.toBeNull();
-      expect(result!.type).toBe('session.idle');
-      const props = (result as { properties: Record<string, unknown> }).properties;
-      expect(props.sessionID).toBe('ses_test');
-    });
-
-    it('should convert session.idle without sessionId', () => {
-      const acp: AcpEvent = {
-        type: 'session.idle',
-      };
-      const result = denormalizeAcpEvent(acp);
-      expect(result).not.toBeNull();
-      expect(result!.type).toBe('session.idle');
-    });
-
-    // -- lifecycle events → null (filtered out) --
-    it('should return null for session.created', () => {
-      expect(denormalizeAcpEvent({ type: 'session.created', sessionId: 'ses_test' })).toBeNull();
-    });
-
-    it('should return null for session.updated', () => {
-      expect(denormalizeAcpEvent({ type: 'session.updated', sessionId: 'ses_test' })).toBeNull();
-    });
-
-    it('should return null for session.deleted', () => {
-      expect(denormalizeAcpEvent({ type: 'session.deleted', sessionId: 'ses_test' })).toBeNull();
-    });
-
-    it('should return null for session.error', () => {
-      expect(denormalizeAcpEvent({ type: 'session.error', sessionId: 'ses_test' })).toBeNull();
-    });
-
-    it('should return null for server.connected', () => {
-      expect(denormalizeAcpEvent({ type: 'server.connected' })).toBeNull();
-    });
-
-    it('should return null for server.heartbeat', () => {
-      expect(denormalizeAcpEvent({ type: 'server.heartbeat' })).toBeNull();
-  });
-});
 });

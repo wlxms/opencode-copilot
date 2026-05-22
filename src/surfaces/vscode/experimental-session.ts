@@ -41,7 +41,7 @@
  */
 import * as vscode from 'vscode';
 import type { ExtensionState } from '../../types';
-import type { OpenCodeEvent, OpenCodeEventStream } from '../../types/events';
+import type { OpenCodeEvent, OpenCodeEventStream } from '../../backends/opencode/sdk-events';
 
 import {
   AcpRenderer,

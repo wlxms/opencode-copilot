@@ -5,7 +5,7 @@
  * so that consumers (StreamBridge, etc.) never touch SDK types.
  */
 
-import type { OpenCodeEvent, OpenCodeStreamEvent, StreamPart } from '../../types/events';
+import type { OpenCodeEvent, OpenCodeStreamEvent, StreamPart } from './sdk-events';
 import type {
   AcpEvent,
   AcpStreamPart,
@@ -34,7 +34,7 @@ import type {
   StepFinishStreamPart,
   PermissionAskedEvent,
   SessionDiffEvent,
-} from '../../types/events';
+} from './sdk-events';
 
 // ===========================================================================
 // StreamPart → AcpStreamPart

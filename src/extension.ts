@@ -1,9 +1,7 @@
 import * as vscode from 'vscode';
 import type { AcpBackend } from './acp/backend';
 import { OpenCodeBackend } from './backends/opencode/adapter';
-import { OpenCodeServerManager } from './opencode/server';
 import { createParticipantHandler } from './participant/handler';
-import { GlobalEventBroker } from './participant/event-broker';
 import { createSessionContentProvider } from './surfaces/vscode/experimental-session';
 import { hasRegisterChatSessionContentProvider } from './surfaces/vscode/capabilities';
 import type { ExtensionState } from './types';
@@ -25,16 +23,10 @@ export function activate(context: vscode.ExtensionContext) {
   outputChannel.appendLine('[extension] OpenCode Copilot activating...');
 
   const backend = createBackend();
-  const serverManager = new OpenCodeServerManager();
 
   state = {
     backend,
-    serverManager,
-    client: null,
-    activeSessionId: null,
-    serverStatus: 'stopped',
     outputChannel,
-    eventBroker: new GlobalEventBroker(),
     sessionMap: new Map(),
   };
 
