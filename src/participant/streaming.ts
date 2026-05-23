@@ -30,6 +30,7 @@ import type {
 } from '../types/vscode-proposed-additions';
 import { ExternalEditTracker } from './external-edit-tracker';
 import type { AcpEventStream } from '../acp/backend';
+import { SubagentScope, formatSubagentProgress } from './subagent';
 
 /** Extended stream with proposed API methods */
 type Stream = vscode.ChatResponseStream & {
@@ -87,6 +88,8 @@ interface StreamBridgeOptions {
   ) => Promise<unknown>;
   /** Workspace directory for API calls */
   directory?: string;
+  /** Check if any child sessions are still running (busy). Returns true if at least one child is busy. */
+  checkChildSessionsRunning?: () => Promise<boolean>;
 }
 
 // =======================================================================
@@ -103,9 +106,10 @@ interface StreamBridgeOptions {
  * - stream.markdown()                   → AI text token streaming
  *
  * toolSpecificData mapping (OpenCode tool → VSCode type):
- *   read          → ChatSimpleToolResultData (collapsible input/output)
+ *   read          → ChatToolResourcesInvocationData (clickable file reference)
  *   bash          → ChatTerminalToolInvocationData (terminal UI with exit code)
- *   write         → ChatToolResourcesInvocationData (file reference list)
+ *   write         → ChatToolResourcesInvocationData (clickable file reference)
+ *   edit          → ChatToolResourcesInvocationData (clickable file reference)
  *   list / grep   → ChatSimpleToolResultData (collapsible listing)
  *   task          → ChatSubagentToolInvocationData (click to expand subagent)
  *   (other)       → ChatSimpleToolResultData (generic fallback)
@@ -124,6 +128,18 @@ export class StreamBridge {
   private progressivePushed: Set<string> = new Set();
   /** Timestamp of last processed delta (for inter-delta gap measurement) */
   private lastDeltaTime: number = 0;
+  /** Active subagent scopes — filters child events from rendering as independent cards */
+  private activeSubagentScopes: Map<string, SubagentScope> = new Map();
+  /** Whether at least one subagent (task) tool completed during this bridge session */
+  private hadSubagentTasks = false;
+  /** Whether a session.idle event was received (and deferred due to active subagents) */
+  private deferredIdle = false;
+  /** Safety timer: after deferred idle, stop waiting after this many ms of no events */
+  private static readonly DEFERRED_IDLE_TIMEOUT_MS = 120_000;
+  /** Timer handle for the deferred-idle safety timeout */
+  private deferredIdleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Resolves when forceStop is triggered (deferred-idle timeout or external abort) */
+  private forceStopResolve: (() => void) | null = null;
   private readonly logger?: StreamBridgeLogger;
   private readonly sessionId?: string;
   /** URIs of files that existed before the turn started (proactive baseline) */
@@ -131,6 +147,7 @@ export class StreamBridge {
   private readonly tracker?: ExternalEditTracker;
   private readonly replyToPermission?: StreamBridgeOptions['replyToPermission'];
   private readonly directory?: string;
+  private readonly checkChildSessionsRunning?: StreamBridgeOptions['checkChildSessionsRunning'];
 
   constructor(options: StreamBridgeOptions = {}) {
     this.logger = options.logger;
@@ -139,11 +156,19 @@ export class StreamBridge {
     this.tracker = options.tracker;
     this.replyToPermission = options.replyToPermission;
     this.directory = options.directory;
+    this.checkChildSessionsRunning = options.checkChildSessionsRunning;
   }
 
   /** Get the OpenCode message ID of the user message in this turn, if captured */
   getUserMessageId(): string | null {
     return this.userMessageId;
+  }
+
+  /** Whether at least one subagent (task) tool completed during this session.
+   *  Set to true after a background task finishes; used by the handler to decide
+   *  whether to send a continuation prompt after bridge stop. */
+  getHadSubagentTasks(): boolean {
+    return this.hadSubagentTasks;
   }
 
   /**
@@ -154,7 +179,7 @@ export class StreamBridge {
    * @param token Cancellation token
    * @returns true if the stream completed without cancellation
    */
-  async run(
+   async run(
     events: AsyncIterable<AcpEvent>,
     stream: vscode.ChatResponseStream,
     token: vscode.CancellationToken,
@@ -168,35 +193,72 @@ export class StreamBridge {
       `tokenCancelled=${token.isCancellationRequested}, targetSession=${this.sessionId ?? 'any'}`,
     );
 
+    // Set up a force-stop mechanism for the deferred-idle safety timeout.
+    // When the timer fires, it resolves this promise, which breaks the
+    // for-await loop via Promise.race.
+    let forceStopResolve: (() => void) | null = null;
+    const forceStopPromise = new Promise<void>((resolve) => { forceStopResolve = resolve; });
+    this.forceStopResolve = () => forceStopResolve?.();
+
+    const iter = events[Symbol.asyncIterator]();
+
     try {
-      for await (const event of events) {
+      while (true) {
         if (token.isCancellationRequested) {
           const msg = 'Operation cancelled';
           this.log('bridge stop: cancellation requested');
           stream.markdown(`\n⚠️ ${msg}\n`);
           break;
         }
-        const tEnter = Date.now();
-        // Handle permission.asked as sync barrier (async, blocks loop until baseline captured + auto-reply)
-        if (event.type === 'permission.asked') {
-          await this.handlePermissionAsked(event, stream);
-          const tPerm = Date.now();
-          this.log(`[timing] permission.asked took ${tPerm - tEnter}ms`);
-          continue;
+
+        // Race between next event and force-stop signal
+        const nextP = iter.next();
+        const result = await Promise.race([
+          nextP.then((r) => ({ event: r, stopped: false })),
+          forceStopPromise.then(() => ({ event: null, stopped: true })),
+        ]);
+
+        if (result.stopped) {
+          this.log('bridge stop: deferred idle timeout');
+          break;
         }
-        const result = this.processEvent(event, s);
-        const tProcessed = Date.now();
-        this.log(`[timing] processEvent: type=${event.type}, rendered=${result.rendered}, took ${tProcessed - tEnter}ms`);
-        if (result.rendered) {
-          await yieldToEventLoop();
-          this.log(`[timing] yieldToEventLoop resolved, total=${Date.now() - tEnter}ms`);
-        }
-        if (result.stop) {
-          this.log('bridge stop: session.idle received');
+
+        if (result.event) {
+          const { value: event, done } = result.event;
+          if (done) break;
+          if (!event) break;
+
+          const tEnter = Date.now();
+          // Handle permission.asked as sync barrier (async, blocks loop until baseline captured + auto-reply)
+          if (event.type === 'permission.asked') {
+            await this.handlePermissionAsked(event, stream);
+            const tPerm = Date.now();
+            this.log(`[timing] permission.asked took ${tPerm - tEnter}ms`);
+            continue;
+          }
+          const dispatched = this.processEvent(event, s);
+          const tProcessed = Date.now();
+          this.log(`[timing] processEvent: type=${event.type}, rendered=${dispatched.rendered}, took ${tProcessed - tEnter}ms`);
+          if (dispatched.rendered) {
+            await yieldToEventLoop();
+            this.log(`[timing] yieldToEventLoop resolved, total=${Date.now() - tEnter}ms`);
+          }
+          if (dispatched.stop) {
+            if (this.activeSubagentScopes.size > 0) {
+              // Event stream ended while subagents were still active — log warning
+              // but don't continue looping (the stream is exhausted).
+              this.log(
+                `bridge stop with ${this.activeSubagentScopes.size} leaked subagent scope(s): ` +
+                [...this.activeSubagentScopes.keys()].join(', '),
+              );
+            } else {
+              this.log('bridge stop: session.idle received');
+            }
           break;
         }
       }
       this.log('bridge loop completed');
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Connection lost';
       this.log(`bridge error: ${msg}`);
@@ -204,7 +266,8 @@ export class StreamBridge {
     } finally {
       this.log(
         `bridge reset: userMessageId=${this.userMessageId ?? 'null'}, ` +
-        `partKinds=${this.partKinds.size}, toolMetas=${this.toolMetas.size}`,
+        `partKinds=${this.partKinds.size}, toolMetas=${this.toolMetas.size}, ` +
+        `subagentScopes=${this.activeSubagentScopes.size}`,
       );
       this.reset();
     }
@@ -238,12 +301,98 @@ export class StreamBridge {
       return { stop: false, rendered: false };
     }
 
+    // Handle forwarded child session events
+    const eventSessionId = getEventSessionId(event);
+    if (eventSessionId && eventSessionId !== this.sessionId) {
+      // This event is from a child session (forwarded by event-broker)
+      if (event.type === 'session.idle') {
+        // Child session went idle — mark scope as truly complete
+        for (const scope of this.activeSubagentScopes.values()) {
+          if (scope.childSessionId === eventSessionId && !scope.childIdle) {
+            scope.childIdle = true;
+            this.log(`child session idle: childSessionId=${eventSessionId}, callID=${scope.callId}`);
+            // If we were in deferred idle, check if ALL children are now idle
+            if (this.deferredIdle) {
+              const allChildrenIdle = [...this.activeSubagentScopes.values()]
+                .filter(s => s.childSessionId)
+                .every(s => s.childIdle);
+              if (allChildrenIdle) {
+                this.deferredIdle = false;
+                this.clearDeferredIdleTimer();
+                // Clean up child scopes to avoid "leaked scope" warning
+                for (const [callId, s] of this.activeSubagentScopes) {
+                  if (s.childIdle) this.activeSubagentScopes.delete(callId);
+                }
+                this.log('all child sessions idle — waiting for parent orchestrator to continue');
+                return { stop: false, rendered: false };
+              }
+            }
+            break;
+          }
+        }
+      } else if (event.type === 'session.status') {
+        // Child session status update — log but don't stop
+        const statusEvent = event as any;
+        this.log(`child session status: childSessionId=${eventSessionId}, status=${statusEvent.status?.type}`);
+      } else if (event.type === 'part.updated' && event.part?.type === 'tool') {
+        // Capture child/grandchild tool call for subagent progress display.
+        // Push to ALL active scopes (matching by sessionId is unreliable because
+        // childSessionId is set at task:completed, but child events arrive earlier).
+        const childToolName = (event.part as any).toolName ?? 'unknown';
+        const childState = (event.part as any).state;
+        const childStatus = childState?.status ?? 'running';
+        const childTitle = childState?.title;
+        for (const scope of this.activeSubagentScopes.values()) {
+          scope.toolCalls.push({
+            name: childToolName,
+            title: childTitle ?? undefined,
+            status: childStatus,
+          });
+          // Update parent task tool card in real-time so subagent activity
+          // appears inside the subagent card in VSCode chat.
+          this.updateSubagentCard(stream, scope, childToolName, childTitle, childStatus);
+        }
+      }
+      // Don't render child session events as parent events
+      return { stop: false, rendered: false };
+    }
+
+    // Filter subagent-internal events: suppress rendering, capture for progress summary
+    if (this.isSubagentInternalEvent(event)) {
+      // Any subagent-internal event means the subagent is still active — reset safety timer
+      if (this.deferredIdle) {
+        this.resetDeferredIdleTimer();
+      }
+      this.captureSubagentEvent(event, stream);
+      return { stop: false, rendered: false };
+    }
+
     switch (event.type) {
       case 'part.updated':
         return { stop: false, rendered: this.handlePartUpdated(event, stream) };
       case 'part.delta':
         return { stop: false, rendered: this.handlePartDelta(event, stream) };
       case 'session.idle':
+        // Don't stop while subagents are active — their completion events
+        // haven't arrived yet and a premature break would lose them.
+        if (this.activeSubagentScopes.size > 0) {
+          const hasUncompleted = [...this.activeSubagentScopes.values()].some(s => !s.completed);
+          if (!hasUncompleted) {
+            // All subagent scopes are completed (parent dispatched all tasks).
+            // But background child sessions may still be running — poll them.
+            this.checkChildSessionsAndMaybeStop();
+            return { stop: false, rendered: false };
+          }
+          // At least one subagent is still running — defer idle
+          this.deferredIdle = true;
+          this.startDeferredIdleTimer();
+          this.log(
+            `session.idle deferred: ${this.activeSubagentScopes.size} subagent(s), ` +
+            `${[...this.activeSubagentScopes.values()].filter(s => !s.completed).length} still running, ` +
+            `timeout=${StreamBridge.DEFERRED_IDLE_TIMEOUT_MS / 1000}s`,
+          );
+          return { stop: false, rendered: false };
+        }
         return { stop: true, rendered: false };
       case 'session.diff':
         return { stop: false, rendered: this.handleSessionDiff(event, stream) };
@@ -259,10 +408,18 @@ export class StreamBridge {
 
     switch (evt.type) {
       case 'part.updated':
-      case 'session.idle': {
+      case 'part.delta': {
         const eventSessionId = getEventSessionId(evt);
-        return !eventSessionId || eventSessionId === this.sessionId;
+        if (!eventSessionId || eventSessionId === this.sessionId) return true;
+        // Allow child session events if they belong to an active subagent scope
+        if (this.isChildSessionEvent(eventSessionId)) return true;
+        return false;
       }
+      // session.idle and session.status from child sessions should be processed
+      // (they're forwarded by the broker for completion detection)
+      case 'session.idle':
+      case 'session.status':
+        return true;
       default:
         return true;
     }
@@ -479,6 +636,15 @@ export class StreamBridge {
         meta.title = getToolTitle(state);
         meta.timeStart = getToolTime(state)?.start;
       }
+      // Track subagent scope so child events get filtered instead of leaking
+      if (toolName === 'task' || toolName === 'subagent') {
+        this.activeSubagentScopes.set(callID, {
+          callId: callID,
+          toolCalls: [],
+          completed: false,
+        });
+        this.log(`subagent scope opened: callID=${callID}`);
+      }
       if (this.hasToolUI && stream.updateToolInvocation) {
         stream.updateToolInvocation(callID, {
           partialInput: state.input ?? {},
@@ -515,6 +681,30 @@ export class StreamBridge {
         meta.output = getToolOutput(state) ?? '';
         meta.timeEnd = getToolTime(state)?.end;
         meta.title = getToolTitle(state) ?? meta.title;
+      }
+
+      // For subagent tools: inject aggregated progress into output before rendering.
+      // IMPORTANT: do NOT delete the scope here. For background tasks, the parent
+      // session marks the tool call "completed" as soon as the task is *dispatched*,
+      // but the subagent continues running asynchronously.  The scope must stay open
+      // so that deferredIdle keeps the bridge alive and late-arriving subagent
+      // events are still captured for progress.
+      const subagentScope = this.activeSubagentScopes.get(callID);
+      if ((toolName === 'task' || toolName === 'subagent') && subagentScope) {
+        // Extract child session ID from tool metadata (OpenCode task tool puts it there)
+        const childSessionId = (state.metadata?.sessionId ??
+          (typeof state.output === 'string' ? state.output.match(/task_id:\s*(\S+)/)?.[1] : undefined)) as string | undefined;
+        if (childSessionId) {
+          subagentScope.childSessionId = childSessionId;
+          this.log(`child session ID captured: callID=${callID}, childSessionId=${childSessionId}`);
+        }
+        const progress = formatSubagentProgress(subagentScope);
+        if (progress && meta) {
+          meta.output = [progress, meta.output].filter(Boolean).join('\n');
+        }
+        subagentScope.completed = true;
+        this.hadSubagentTasks = true;
+        this.log(`subagent scope completed (kept open): callID=${callID}, progress="${progress}"`);
       }
 
       // Build and push ChatToolInvocationPart
@@ -573,6 +763,10 @@ export class StreamBridge {
     }
 
     if (status === 'error') {
+      // Clean up subagent scope on error
+      if (toolName === 'task' || toolName === 'subagent') {
+        this.activeSubagentScopes.delete(callID);
+      }
       // Try to push ChatToolInvocationPart with isError=true
       if (this.hasToolUI && VS.ChatToolInvocationPart) {
         this.pushToolInvocation(stream, callID, toolName, state, true);
@@ -643,12 +837,7 @@ export class StreamBridge {
         );
       }
 
-      // Set subAgentInvocationId for task/subagent tools
-      if (toolName === 'task' || toolName === 'subagent') {
-        part.subAgentInvocationId = callID;
-      }
-
-      // Set presentation for internal/structural tools
+      // Hide internal/structural tools after completion
       if (toolName === 'internal' || toolName === 'step-start' || toolName === 'step-finish') {
         part.presentation = 'hiddenAfterComplete';
       }
@@ -696,9 +885,14 @@ export class StreamBridge {
         } satisfies ChatTerminalToolInvocationData;
         }
 
-      case 'read':
-      case 'list':
-      case 'grep': {
+      case 'read': {
+        // Show as file reference so the chat panel displays a clickable file URI
+        const filePath = input.filePath as string | undefined;
+        if (filePath) {
+          return {
+            values: [vscode.Uri.file(filePath)],
+          } satisfies ChatToolResourcesInvocationData;
+        }
         return {
           input: formatInput(input, title),
           output: truncate(output, 2000),
@@ -714,6 +908,14 @@ export class StreamBridge {
             values: [vscode.Uri.file(filePath)],
           } satisfies ChatToolResourcesInvocationData;
         }
+        return {
+          input: formatInput(input, title),
+          output: truncate(output, 2000),
+        } satisfies ChatSimpleToolResultData;
+      }
+
+      case 'list':
+      case 'grep': {
         return {
           input: formatInput(input, title),
           output: truncate(output, 2000),
@@ -818,13 +1020,224 @@ export class StreamBridge {
     stream.markdown('\n');
   }
 
+  // -------------------------------------------------------------------
+  // Subagent scope filtering
+  // -------------------------------------------------------------------
+
+  /**
+   * Check whether an event belongs to an active subagent's internal stream.
+   *
+   * Strategy: `partKinds` acts as a whitelist of known parent parts. Any
+   * `part.updated` or `part.delta` referencing an unregistered partId while
+   * a subagent scope is active is treated as a subagent-internal event.
+   *
+   * Exception: top-level structural part types (text, reasoning, step-start,
+   * step-finish) are NEVER subagent-internal — they belong to the parent turn
+   * and may arrive after the subagent scope opens (e.g. a second step that
+   * starts while the subagent is still running).
+   */
+  private isSubagentInternalEvent(event: AcpEvent): boolean {
+    if (this.activeSubagentScopes.size === 0) return false;
+
+    if (event.type === 'part.updated') {
+      const part = event.part;
+      if (!part) return false;
+      // Structural parent parts are never subagent-internal
+      if (part.type === 'text' || part.type === 'reasoning' ||
+          part.type === 'step-start' || part.type === 'step-finish') {
+        return false;
+      }
+      // Parent-level task/subagent tool invocations are NOT subagent-internal.
+      // Without this, a second parallel task tool would be captured instead of rendered.
+      if (part.type === 'tool') {
+        const toolName = (part as AcpToolPart).toolName;
+        if (toolName === 'task' || toolName === 'subagent') return false;
+      }
+      // Already-known parent part → not subagent
+      if (this.partKinds.has(part.id)) return false;
+      // New part during active subagent → subagent internal
+      return true;
+    }
+
+    if (event.type === 'part.delta') {
+      // Unregistered part during active subagent → subagent delta
+      return !this.partKinds.has(event.partId);
+    }
+
+    return false;
+  }
+
+  /** Returns true if the given sessionId matches any active subagent scope's childSessionId. */
+  private isChildSessionEvent(sessionId: string): boolean {
+    for (const scope of this.activeSubagentScopes.values()) {
+      if (scope.childSessionId === sessionId) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Push a real-time invocation message update to the parent task tool card
+   * so subagent activity (reads, edits, bash commands) is visible inside the
+   * subagent card in VSCode chat while the subagent runs.
+   */
+  private updateSubagentCard(
+    stream: Stream,
+    scope: SubagentScope,
+    toolName: string,
+    title: string | undefined,
+    status: string,
+  ): void {
+    if (!this.hasToolUI || !stream.updateToolInvocation) return;
+
+    const label = title ?? toolName;
+    const verb = status === 'completed' ? '✓' : status === 'error' ? '✗' : '⋯';
+    const msg = `${verb} ${toolName}: ${label}`;
+    try {
+      stream.updateToolInvocation(scope.callId, { invocationMessage: msg });
+    } catch {
+      // updateToolInvocation is best-effort; the progress summary on completion is the fallback
+    }
+  }
+
+  /**
+   * Capture a subagent-internal event for progress aggregation.
+   * Only tool events are tracked (for the summary like "3 reads, 2 edits").
+   * Also pushes real-time invocation message updates to the parent task tool card.
+   */
+  private captureSubagentEvent(event: AcpEvent, stream?: Stream): void {
+    if (event.type !== 'part.updated' || !event.part) return;
+    if (event.part.type !== 'tool') return;
+
+    const toolPart = event.part as AcpToolPart;
+    const state = toolPart.state;
+    if (!state) return;
+
+    const toolName = toolPart.toolName ?? 'unknown';
+    const title = state.title;
+
+    // Record into all active scopes (typically just one)
+    for (const scope of this.activeSubagentScopes.values()) {
+      scope.toolCalls.push({
+        name: toolName,
+        title: title ?? undefined,
+        status: state.status,
+      });
+      // Update parent task tool card so subagent activity is visible in chat
+      if (stream) {
+        this.updateSubagentCard(stream, scope, toolName, title, state.status);
+      }
+    }
+
+    this.log(
+      `subagent capture: tool=${toolName}, status=${state.status}, ` +
+      `activeScopes=${this.activeSubagentScopes.size}`,
+    );
+  }
+
   private reset(): void {
     // userMessageId intentionally NOT reset — caller reads it after bridging
     this.partKinds.clear();
     this.toolCallIds.clear();
     this.toolMetas.clear();
     this.progressivePushed.clear();
+    this.activeSubagentScopes.clear();
+    this.deferredIdle = false;
+    this.clearDeferredIdleTimer();
+    this.forceStopResolve = null;
     this.assistantPhaseStarted = false;
+  }
+
+  // -------------------------------------------------------------------
+  // Deferred idle safety timer
+  // -------------------------------------------------------------------
+
+  /**
+   * Start a safety timeout. If no subagent events arrive before it fires,
+   * the bridge stops to avoid hanging indefinitely.
+   */
+  private startDeferredIdleTimer(): void {
+    this.clearDeferredIdleTimer();
+    this.deferredIdleTimer = setTimeout(() => {
+      this.log(
+        `deferred idle timeout fired (${StreamBridge.DEFERRED_IDLE_TIMEOUT_MS / 1000}s) — ` +
+        `closing ${this.activeSubagentScopes.size} remaining subagent scope(s)`,
+      );
+      this.activeSubagentScopes.clear();
+      this.deferredIdleTimer = null;
+      // Break the while-loop in run() by resolving the force-stop promise
+      this.forceStopResolve?.();
+    }, StreamBridge.DEFERRED_IDLE_TIMEOUT_MS);
+  }
+
+  /** Reset the timer (called when a subagent-internal event arrives after deferred idle). */
+  private resetDeferredIdleTimer(): void {
+    if (this.deferredIdle && this.deferredIdleTimer) {
+      this.startDeferredIdleTimer();
+    }
+  }
+
+  private clearDeferredIdleTimer(): void {
+    if (this.deferredIdleTimer) {
+      clearTimeout(this.deferredIdleTimer);
+      this.deferredIdleTimer = null;
+    }
+  }
+
+  /** Break the while-loop in run() by resolving the force-stop promise. */
+  private requestStop(): void {
+    if (this.forceStopResolve) {
+      this.forceStopResolve();
+      this.forceStopResolve = null;
+    }
+  }
+
+  /**
+   * When parent session.idle arrives and all subagent scopes are completed
+   * (i.e. the parent dispatched all tasks), we need to verify that the
+   * background child sessions are actually done before stopping the bridge.
+   *
+   * Uses the `checkChildSessionsRunning` callback (which polls the SDK
+   * session.children + session.status APIs) to detect busy children.
+   */
+  private checkChildSessionsAndMaybeStop(): void {
+    if (!this.checkChildSessionsRunning) {
+      // No polling callback available — fall back to immediate stop
+      this.clearDeferredIdleTimer();
+      this.log('bridge stop: all subagents completed (no child polling callback)');
+      this.requestStop();
+      return;
+    }
+
+    this.deferredIdle = true;
+    this.startDeferredIdleTimer();
+    this.log('session.idle deferred: checking child sessions in 2s');
+
+    // Poll child sessions after a short delay
+    const pollTimer = setTimeout(async () => {
+      try {
+        const childrenRunning = await this.checkChildSessionsRunning();
+        if (!childrenRunning) {
+          this.deferredIdle = false;
+          this.clearDeferredIdleTimer();
+          this.log('all child sessions idle (via poll) — waiting for parent orchestrator to continue');
+        } else {
+          this.log('child sessions still running, polling again in 3s');
+          // Schedule another poll — replace the safety timer
+          this.checkChildSessionsAndMaybeStop();
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log(`child session poll error: ${msg}, stopping bridge`);
+        this.clearDeferredIdleTimer();
+        this.requestStop();
+      }
+    }, 2000);
+
+    // Track timer so clearDeferredIdleTimer can cancel it
+    if (this.deferredIdleTimer !== null) {
+      clearTimeout(this.deferredIdleTimer);
+    }
+    this.deferredIdleTimer = pollTimer;
   }
 
   private log(message: string): void {
@@ -899,6 +1312,11 @@ function getEventSessionId(evt: AcpEvent): string | undefined {
     case 'part.updated':
       return evt.part?.sessionId;
     case 'session.idle':
+    case 'session.status':
+      return evt.sessionId;
+    case 'session.created':
+    case 'session.updated':
+    case 'session.deleted':
       return evt.sessionId;
     default:
       return undefined;

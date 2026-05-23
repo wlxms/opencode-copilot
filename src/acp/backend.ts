@@ -6,13 +6,9 @@
  */
 
 import type {
-  AcpServerInfo,
-  AcpServerStatus,
+  AcpChildSessionInfo,
   AcpSessionInfo,
-  AcpModel,
-  AcpResult,
-  AcpEvent,
-  AcpPermissionResponse,
+  AcpSessionStatus,
 } from './types';
 
 // ===========================================================================
@@ -58,6 +54,12 @@ export interface AcpSessionOperations {
   ): Promise<AcpResult<boolean>>;
 
   list(directory?: string): Promise<AcpResult<AcpSessionInfo[]>>;
+
+  /** Get child sessions of a given parent session */
+  children(id: string, directory?: string): Promise<AcpResult<AcpChildSessionInfo[]>>;
+
+  /** Get status of all sessions: { [sessionId]: SessionStatus } */
+  status(directory?: string): Promise<AcpResult<Record<string, AcpSessionStatus>>>;
 }
 
 // ===========================================================================

@@ -193,6 +193,145 @@ describe('StreamBridge', () => {
     expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_tsk', 'task');
   });
 
+  // --- Subagent event filtering ---
+
+  it('should filter subagent-internal tool events and aggregate progress', async () => {
+    const stream = mockStream();
+    const taskId = 'prt_task001';
+    const taskCallId = 'call_sub1';
+    // Subagent internal tool part (different partId — will be filtered)
+    const subPartId = 'prt_sub_read001';
+    const subDeltaPartId = 'prt_sub_text001';
+
+    const events = eventStream([
+      // User message
+      { type: 'part.updated', part: { type: 'text', text: 'do it', messageId: 'msg_u1', id: 'prt_u1' } },
+      // Parent step-start
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      // Task tool: pending
+      { type: 'part.updated', part: { type: 'tool', toolName: 'task', id: taskId, callId: taskCallId, state: { status: 'pending', input: {} } } },
+      // Task tool: running → opens subagent scope
+      { type: 'part.updated', part: { type: 'tool', toolName: 'task', id: taskId, callId: taskCallId, state: { status: 'running', input: { description: 'fix bug' }, title: 'fix-bug' } } },
+      // Subagent internal: read tool (different partId — should be filtered)
+      { type: 'part.updated', part: { type: 'tool', toolName: 'read', id: subPartId, callId: 'call_sub_read', state: { status: 'completed', input: { filePath: '/src/main.ts' }, output: 'line1', title: 'main.ts' } } },
+      // Subagent internal: text delta (different partId — should be filtered)
+      { type: 'part.delta', partId: subDeltaPartId, delta: 'subagent thinking...' },
+      // Another subagent tool: bash (different partId — should be filtered)
+      { type: 'part.updated', part: { type: 'tool', toolName: 'bash', id: 'prt_sub_bash001', callId: 'call_sub_bash', state: { status: 'completed', input: { command: 'npm test' }, output: 'all pass' } } },
+      // Task tool: completed → closes subagent scope
+      { type: 'part.updated', part: { type: 'tool', toolName: 'task', id: taskId, callId: taskCallId, state: { status: 'completed', input: { description: 'fix bug' }, output: 'bug fixed', title: 'fix-bug', startTime: 1000, endTime: 3000 } } },
+      // AI response
+      { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
+      ...['Done'].map((d: string) => deltaEvent(d)),
+      idleEvent(),
+    ]);
+    await bridge.bridgeEventsToStream(events, stream, mockToken());
+
+    // Task tool should be invoked (begin + completed push)
+    expect(stream.beginToolInvocation).toHaveBeenCalledWith(taskCallId, 'task');
+
+    // The completed push should include a ChatToolInvocationPart with progress in result
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
+    // Should have at least the task's completed part pushed
+    const taskPart = pushed.find((call: unknown[]) => {
+      const p = call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean };
+      return p?.toolName === 'task' && p?.toolCallId === taskCallId && p?.isComplete === true;
+    });
+    expect(taskPart).toBeDefined();
+
+    // Verify subagent internal tools were NOT pushed as independent cards
+    const readPart = pushed.find((call: unknown[]) => {
+      const p = call[0] as { toolName?: string };
+      return p?.toolName === 'read';
+    });
+    expect(readPart).toBeUndefined();
+
+    const bashPart = pushed.find((call: unknown[]) => {
+      const p = call[0] as { toolName?: string };
+      return p?.toolName === 'bash';
+    });
+    expect(bashPart).toBeUndefined();
+
+    // AI text should still be rendered
+    expect(stream.markdown).toHaveBeenCalledWith('Done');
+  });
+
+  it('should not filter events when no subagent is active', async () => {
+    const stream = mockStream();
+    const events = eventStream(fullTurnEvents({
+      tools: toolEvents({ toolName: 'read', callId: 'call_rd', input: { filePath: '/f.txt' }, output: 'hello', title: 'f.txt' }),
+    }));
+    await bridge.bridgeEventsToStream(events, stream, mockToken());
+
+    // Read tool should be pushed normally
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
+    const readPart = pushed.find((call: unknown[]) => {
+      const p = call[0] as { toolName?: string };
+      return p?.toolName === 'read';
+    });
+    expect(readPart).toBeDefined();
+  });
+
+  it('should clean up subagent scope on task error', async () => {
+    const stream = mockStream();
+    const taskId = 'prt_task_err';
+    const taskCallId = 'call_err';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'go', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      { type: 'part.updated', part: { type: 'tool', toolName: 'task', id: taskId, callId: taskCallId, state: { status: 'pending', input: {} } } },
+      { type: 'part.updated', part: { type: 'tool', toolName: 'task', id: taskId, callId: taskCallId, state: { status: 'running', input: { description: 'fail task' } } } },
+      { type: 'part.updated', part: { type: 'tool', toolName: 'task', id: taskId, callId: taskCallId, state: { status: 'error', input: { description: 'fail task' }, error: 'timeout' } } },
+      idleEvent(),
+    ]);
+    await bridge.bridgeEventsToStream(events, stream, mockToken());
+
+    // After error, scope should be cleaned — subsequent tools should not be filtered
+    // Just verify no crash and error part was pushed
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
+    const errorPart = pushed.find((call: unknown[]) => {
+      const p = call[0] as { toolName?: string; isError?: boolean };
+      return p?.toolName === 'task' && p?.isError === true;
+    });
+    expect(errorPart).toBeDefined();
+  });
+
+  it('should NOT stop on session.idle while subagent is active', async () => {
+    const stream = mockStream();
+    const taskId = 'prt_task_idle';
+    const taskCallId = 'call_idle_test';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'go', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      // Task: pending
+      { type: 'part.updated', part: { type: 'tool', toolName: 'task', id: taskId, callId: taskCallId, state: { status: 'pending', input: {} } } },
+      // Task: running → opens subagent scope
+      { type: 'part.updated', part: { type: 'tool', toolName: 'task', id: taskId, callId: taskCallId, state: { status: 'running', input: { description: 'slow task' } } } },
+      // session.idle arrives WHILE subagent is active → should NOT stop
+      idleEvent(),
+      // Subagent still produces events after idle
+      { type: 'part.updated', part: { type: 'tool', toolName: 'read', id: 'prt_sub_r1', callId: 'call_sub_r1', state: { status: 'completed', input: { filePath: '/a.ts' }, output: 'content' } } },
+      // Task: completed → closes scope
+      { type: 'part.updated', part: { type: 'tool', toolName: 'task', id: taskId, callId: taskCallId, state: { status: 'completed', input: { description: 'slow task' }, output: 'done', title: 'slow-task' } } },
+      // Final idle (no active subagents) → should stop
+      idleEvent(),
+    ]);
+    const result = await bridge.bridgeEventsToStream(events, stream, mockToken());
+
+    // Bridge should complete successfully (not cancel)
+    expect(result).toBe(true);
+
+    // Task completed part should have been pushed
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
+    const taskPart = pushed.find((call: unknown[]) => {
+      const p = call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean };
+      return p?.toolName === 'task' && p?.isComplete === true;
+    });
+    expect(taskPart).toBeDefined();
+  });
+
   // --- Tool: other → SimpleToolResultData fallback ---
 
   it('should push unknown tool as ChatSimpleToolResultData', async () => {

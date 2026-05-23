@@ -46,6 +46,7 @@ import {
   hasChatResponseMultiDiffPart,
   hasChatSubagentToolInvocationData,
 } from './capabilities';
+import { SubagentScope, formatSubagentProgress } from '../../participant/subagent';
 
 // ---------------------------------------------------------------------------
 // Extended stream type for proposed API methods
@@ -140,6 +141,8 @@ export class AcpRenderer {
   private toolMetas: Map<string, ToolMeta> = new Map();
   private assistantPhaseStarted = false;
   private progressivePushed: Set<string> = new Set();
+  /** Active subagent scopes — filters child events from rendering as independent cards */
+  private activeSubagentScopes: Map<string, SubagentScope> = new Map();
 
   // Capabilities (cached per render cycle)
   private _hasThinking = false;
@@ -174,6 +177,12 @@ export class AcpRenderer {
    */
   renderEvent(evt: OpenCodeEvent, stream: vscode.ChatResponseStream): RenderResult {
     const s = stream as Stream;
+
+    // Filter subagent-internal events: suppress rendering, capture for progress summary
+    if (this.isSubagentInternalEvent(evt)) {
+      this.captureSubagentEvent(evt, s);
+      return { rendered: false, eventType: evt.type };
+    }
 
     switch (evt.type) {
       case 'message.part.updated':
@@ -225,6 +234,7 @@ export class AcpRenderer {
     this.toolCallIds.clear();
     this.toolMetas.clear();
     this.progressivePushed.clear();
+    this.activeSubagentScopes.clear();
     this.assistantPhaseStarted = false;
     // Keep capability cache — it's per-stream, not per-turn
   }
@@ -426,6 +436,11 @@ export class AcpRenderer {
       meta.title = getToolTitle(state);
       meta.timeStart = getToolTime(state)?.start;
     }
+    // Track subagent scope so child events get filtered instead of leaking
+    if (toolName === 'task' || toolName === 'subagent') {
+      this.activeSubagentScopes.set(callID, { callId: callID, toolCalls: [], completed: false });
+      this.log(`subagent scope opened: callID=${callID}`);
+    }
 
     if (!this._hasToolUI || !stream.updateToolInvocation) {
       return false;
@@ -478,6 +493,29 @@ export class AcpRenderer {
       meta.title = getToolTitle(state) ?? meta.title;
     }
 
+    // For subagent tools: inject aggregated progress into output before rendering.
+    // IMPORTANT: do NOT delete the scope here. For background tasks, the parent
+    // session marks the tool call "completed" as soon as the task is *dispatched*,
+    // but the subagent continues running asynchronously.
+    const subagentScope = this.activeSubagentScopes.get(callID);
+    if ((toolName === 'task' || toolName === 'subagent') && subagentScope) {
+      // Extract child session ID from tool metadata (OpenCode task tool puts it there)
+      // StreamToolState is a discriminated union — narrow via 'in' checks
+      const sdkState = state as { metadata?: Record<string, unknown>; output?: string };
+      const childSessionId = (sdkState.metadata?.sessionId ??
+        (typeof sdkState.output === 'string' ? sdkState.output.match(/task_id:\s*(\S+)/)?.[1] : undefined)) as string | undefined;
+      if (childSessionId) {
+        subagentScope.childSessionId = childSessionId;
+        this.log(`child session ID captured: callID=${callID}, childSessionId=${childSessionId}`);
+      }
+      const progress = formatSubagentProgress(subagentScope);
+      if (progress && meta) {
+        meta.output = [progress, meta.output].filter(Boolean).join('\n');
+      }
+      subagentScope.completed = true;
+      this.log(`subagent scope completed (kept open): callID=${callID}, progress="${progress}"`);
+    }
+
     if (this._hasToolUI && hasChatToolInvocationPart()) {
       this.pushToolInvocation(stream, callID, toolName, state);
     } else {
@@ -496,6 +534,10 @@ export class AcpRenderer {
     state: StreamToolState,
     stream: Stream,
   ): boolean {
+    // Clean up subagent scope on error
+    if (toolName === 'task' || toolName === 'subagent') {
+      this.activeSubagentScopes.delete(callID);
+    }
     if (this._hasToolUI && hasChatToolInvocationPart()) {
       this.pushToolInvocation(stream, callID, toolName, state, true);
     } else {
@@ -555,11 +597,6 @@ export class AcpRenderer {
         part.toolSpecificData = buildToolSpecificData(toolName, title, input, output, timeStart, timeEnd);
       }
 
-      // Link subagent tools
-      if (toolName === 'task' || toolName === 'subagent') {
-        part.subAgentInvocationId = callID;
-      }
-
       // Hide internal/structural tools after completion
       if (toolName === 'internal' || toolName === 'step-start' || toolName === 'step-finish') {
         part.presentation = 'hiddenAfterComplete';
@@ -569,6 +606,84 @@ export class AcpRenderer {
     } catch {
       renderToolFallback(stream, toolName, state.input, getToolOutput(state), getToolTitle(state));
     }
+  }
+
+  // -------------------------------------------------------------------
+  // Subagent scope filtering
+  // -------------------------------------------------------------------
+
+  /**
+   * Check whether an OpenCode event belongs to an active subagent's internal stream.
+   *
+   * Works with OpenCodeEvent (SDK-level), where part data is at `evt.properties.part`.
+   * Uses the same `partKinds` whitelist strategy as StreamBridge.
+   */
+  private isSubagentInternalEvent(evt: OpenCodeEvent): boolean {
+    if (this.activeSubagentScopes.size === 0) return false;
+
+    if (evt.type === 'message.part.updated') {
+      const part = (evt as MessagePartUpdatedEvent).properties?.part;
+      if (!part) return false;
+      // Structural parent parts are never subagent-internal
+      if (part.type === 'text' || part.type === 'reasoning' ||
+          part.type === 'step-start' || part.type === 'step-finish') {
+        return false;
+      }
+      // Parent-level task/subagent tool invocations are NOT subagent-internal.
+      // Without this, a second parallel task tool would be captured instead of rendered.
+      if (part.type === 'tool') {
+        const toolName = (part as StreamToolPart).tool;
+        if (toolName === 'task' || toolName === 'subagent') return false;
+      }
+      if (this.partKinds.has(part.id)) return false;
+      return true;
+    }
+
+    if (evt.type === 'message.part.delta') {
+      const partId = (evt as { properties?: { partID?: string } }).properties?.partID;
+      if (partId && this.partKinds.has(partId)) return false;
+      return !!partId;
+    }
+
+    return false;
+  }
+
+  /**
+   * Capture a subagent-internal event for progress aggregation.
+   * Also pushes real-time invocation message updates to the parent task tool card.
+   */
+  private captureSubagentEvent(evt: OpenCodeEvent, stream?: Stream): void {
+    if (evt.type !== 'message.part.updated') return;
+    const part = (evt as MessagePartUpdatedEvent).properties?.part;
+    if (!part || part.type !== 'tool') return;
+
+    const toolPart = part as StreamToolPart;
+    const state = toolPart.state;
+    if (!state) return;
+
+    const toolName = toolPart.tool ?? 'unknown';
+    const title = getToolTitle(state);
+
+    for (const scope of this.activeSubagentScopes.values()) {
+      scope.toolCalls.push({
+        name: toolName,
+        title: title ?? undefined,
+        status: state.status,
+      });
+      // Push real-time update so subagent activity is visible inside the card
+      if (stream && this._hasToolUI && stream.updateToolInvocation) {
+        const label = title ?? toolName;
+        const verb = state.status === 'completed' ? '✓' : state.status === 'error' ? '✗' : '⋯';
+        try {
+          stream.updateToolInvocation(scope.callId, { invocationMessage: `${verb} ${toolName}: ${label}` });
+        } catch { /* best-effort */ }
+      }
+    }
+
+    this.log(
+      `subagent capture: tool=${toolPart.tool}, status=${state.status}, ` +
+      `activeScopes=${this.activeSubagentScopes.size}`,
+    );
   }
 
   // -------------------------------------------------------------------
@@ -614,9 +729,14 @@ export function buildToolSpecificData(
       } satisfies ChatTerminalToolInvocationData;
     }
 
-    case 'read':
-    case 'list':
-    case 'grep': {
+    case 'read': {
+      // Show as file reference so the chat panel displays a clickable file URI
+      const filePath = input.filePath as string | undefined;
+      if (filePath) {
+        return {
+          values: [vscode.Uri.file(filePath)],
+        } satisfies ChatToolResourcesInvocationData;
+      }
       return {
         input: formatInput(input, title),
         output: truncate(output, 2000),
@@ -631,6 +751,14 @@ export function buildToolSpecificData(
           values: [vscode.Uri.file(filePath)],
         } satisfies ChatToolResourcesInvocationData;
       }
+      return {
+        input: formatInput(input, title),
+        output: truncate(output, 2000),
+      } satisfies ChatSimpleToolResultData;
+    }
+
+    case 'list':
+    case 'grep': {
       return {
         input: formatInput(input, title),
         output: truncate(output, 2000),
@@ -809,3 +937,4 @@ function getToolTime(
 ): { start?: number; end?: number } | undefined {
   return 'time' in state ? state.time : undefined;
 }
+
