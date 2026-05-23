@@ -18,6 +18,16 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "OpenCode",
+      "properties": {
+        "opencode.experimental.sessionProvider": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable the experimental ACP-compatible VS Code chat session provider surface when the runtime exposes the required proposed API."
+        }
+      }
+    },
     "chatParticipants": [
       {
         "id": "opencode-copilot.opencode",
@@ -59,7 +69,8 @@
     "watch": "npm run compile -- --sourcemap --watch",
     "lint": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:integration": "vitest run -c vitest.integration.config.ts"
   },
   "devDependencies": {
     "@types/node": "^20.19.40",

@@ -1,0 +1,214 @@
+/**
+ * ACP (Agent Communication Protocol) domain types.
+ *
+ * These are protocol-agnostic abstractions that any backend adapter
+ * must map to/from. No VSCode or SDK imports allowed.
+ */
+
+// ===========================================================================
+// Server lifecycle
+// ===========================================================================
+
+export type AcpServerStatus = 'stopped' | 'starting' | 'running' | 'error';
+
+export interface AcpServerInfo {
+  url: string | null;
+  status: AcpServerStatus;
+}
+
+// ===========================================================================
+// Models / providers
+// ===========================================================================
+
+export interface AcpModel {
+  id: string;
+  name?: string;
+  provider?: string;
+  capabilities?: string[];
+}
+
+export interface AcpProvider {
+  id: string;
+  name: string;
+  models: AcpModel[];
+}
+
+// ===========================================================================
+// Sessions
+// ===========================================================================
+
+export interface AcpSessionInfo {
+  id: string;
+  title: string;
+  createdAt: Date;
+}
+
+export interface AcpTurnMapping {
+  turnIndex: number;
+  messageId: string;
+}
+
+// ===========================================================================
+// Stream parts (normalised semantic parts from events)
+// ===========================================================================
+
+export type AcpPartType =
+  | 'text'
+  | 'reasoning'
+  | 'tool'
+  | 'file'
+  | 'agent'
+  | 'step-start'
+  | 'step-finish';
+
+export type AcpToolStatus = 'pending' | 'running' | 'completed' | 'error';
+
+export interface AcpToolState {
+  status: AcpToolStatus;
+  input: Record<string, unknown>;
+  output?: string;
+  title?: string;
+  error?: string;
+  metadata?: Record<string, unknown>;
+  startTime?: number;
+  endTime?: number;
+}
+
+export interface AcpBasePart {
+  id: string;
+  type: AcpPartType;
+  messageId?: string;
+  sessionId?: string;
+}
+
+export interface AcpTextPart extends AcpBasePart {
+  type: 'text';
+  text: string;
+  synthetic?: boolean;
+}
+
+export interface AcpReasoningPart extends AcpBasePart {
+  type: 'reasoning';
+  text: string;
+}
+
+export interface AcpToolPart extends AcpBasePart {
+  type: 'tool';
+  toolName: string;
+  callId?: string;
+  state: AcpToolState;
+}
+
+export interface AcpStepPart extends AcpBasePart {
+  type: 'step-start' | 'step-finish';
+  reason?: string;
+  snapshot?: string;
+  cost?: number;
+  tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } };
+}
+
+export type AcpStreamPart = AcpTextPart | AcpReasoningPart | AcpToolPart | AcpStepPart;
+
+// ===========================================================================
+// Normalised semantic events
+// ===========================================================================
+
+export type AcpEventType =
+  | 'part.updated'
+  | 'part.delta'
+  | 'session.idle'
+  | 'session.diff'
+  | 'session.created'
+  | 'session.updated'
+  | 'session.deleted'
+  | 'session.error'
+  | 'permission.asked'
+  | 'permission.replied'
+  | 'server.connected'
+  | 'server.heartbeat';
+
+export interface AcpPartUpdatedEvent {
+  type: 'part.updated';
+  part: AcpStreamPart;
+  delta?: string;
+}
+
+export interface AcpPartDeltaEvent {
+  type: 'part.delta';
+  partId: string;
+  delta: string;
+  field?: string;
+}
+
+export interface AcpSessionIdleEvent {
+  type: 'session.idle';
+  sessionId?: string;
+}
+
+export interface AcpFileDiff {
+  file: string;
+  patch: string;
+  additions: number;
+  deletions: number;
+  status?: 'added' | 'deleted' | 'modified';
+}
+
+export interface AcpSessionDiffEvent {
+  type: 'session.diff';
+  sessionId: string;
+  diffs: AcpFileDiff[];
+}
+
+export interface AcpSessionLifecycleEvent {
+  type: 'session.created' | 'session.updated' | 'session.deleted' | 'session.error';
+  sessionId: string;
+  title?: string;
+  error?: string;
+}
+
+export interface AcpPermissionRequestEvent {
+  type: 'permission.asked';
+  permissionId: string;
+  sessionId: string;
+  permission: string;
+  patterns: string[];
+  metadata: Record<string, unknown>;
+  always: string[];
+  tool?: { messageId: string; callId: string };
+}
+
+export interface AcpPermissionReplyEvent {
+  type: 'permission.replied';
+  sessionId: string;
+  permissionId: string;
+  response: string;
+}
+
+export interface AcpServerLifecycleEvent {
+  type: 'server.connected' | 'server.heartbeat';
+}
+
+export type AcpEvent =
+  | AcpPartUpdatedEvent
+  | AcpPartDeltaEvent
+  | AcpSessionIdleEvent
+  | AcpSessionDiffEvent
+  | AcpSessionLifecycleEvent
+  | AcpPermissionRequestEvent
+  | AcpPermissionReplyEvent
+  | AcpServerLifecycleEvent;
+
+// ===========================================================================
+// Result wrapper
+// ===========================================================================
+
+export interface AcpResult<T, E = string> {
+  data?: T;
+  error?: E;
+}
+
+// ===========================================================================
+// Permission responses
+// ===========================================================================
+
+export type AcpPermissionResponse = 'once' | 'always' | 'reject';

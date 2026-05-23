@@ -12,6 +12,8 @@
 - **子代理支持**: 子代理/子任务自动以可展开卡片展示
 - **流式输出**: AI 回复 token-by-token 实时显示
 - **斜杠命令**: `/new` 新会话, `/help` 帮助, `/model` 模型列表
+- **ACP-first 架构**: 以 ACP 语义层解耦 backend 与 VS Code surface，OpenCode 只是一个 backend 实现
+- **实验性 Session Provider 开关**: 可在入口层按运行时能力切换是否启用实验性 surface
 
 ## 工具调用 UI 展示
 
@@ -69,10 +71,50 @@ npm test
 | 构建 | esbuild (ESM→CJS) |
 | 测试 | vitest + 自定义 vscode mock |
 
+### ACP-first 架构
+
+当前代码库已引入 ACP-compatible 分层：
+
+```txt
+src/
+├── acp/                  # 协议语义层（不依赖 vscode / SDK）
+├── backends/opencode/    # OpenCode → ACP backend 适配
+├── surfaces/vscode/      # VS Code stable / experimental surface
+├── participant/          # 兼容层，逐步迁移中的 participant 入口
+└── extension.ts          # 入口分流：backend + surface 装配
+```
+
+- `src/acp/*`：定义统一语义事件、会话、权限、模型接口
+- `src/backends/opencode/*`：把 OpenCode SDK 与事件流归一化到 ACP
+- `src/surfaces/vscode/*`：把 ACP 事件渲染到 VS Code Chat UI
+
+这意味着未来可以保留同一套 VS Code surface，同时接入别的 ACP backend，而不把 OpenCode 细节泄漏到 UI 层。
+
+### 实验性 Session Provider
+
+默认仍然使用稳定的 chat participant 路径。
+
+如果想实验性启用 session provider surface，可在 VS Code 设置中打开：
+
+```json
+{
+  "opencode.experimental.sessionProvider": true
+}
+```
+
+说明：
+
+- 该开关**只在运行时存在对应 proposed API 时生效**
+- 如果运行环境不支持，扩展会自动回退到稳定 participant 路径
+- 当前实验 surface 主要用于架构隔离和未来扩展点预留
+
 ### 项目结构
 
 ```
 src/
+├── acp/                  # ACP 语义层
+├── backends/opencode/    # OpenCode ACP backend
+├── surfaces/vscode/      # VS Code surfaces
 ├── extension.ts          # 入口: activate/deactivate
 ├── opencode/
 │   └── server.ts         # SDK 封装 (createOpencode)

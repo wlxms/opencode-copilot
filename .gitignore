@@ -5,3 +5,5 @@ dist
 .vscode-test
 *.tsbuildinfo
 .sisyphus
+tmp/
+120

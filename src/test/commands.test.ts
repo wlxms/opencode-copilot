@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as vscode from 'vscode';
-import type { ExtensionState, OpenCodeClient, OpenCodeServerController } from '../types';
-import { GlobalEventBroker } from '../participant/event-broker';
+import type { AcpBackend } from '../acp/backend';
+import type { AcpServerStatus } from '../acp/types';
+import type { ExtensionState } from '../types';
 import { routeCommand } from '../participant/commands';
 
 // ---------------------------------------------------------------------------
@@ -27,6 +28,7 @@ function createMockClient() {
     event: {
       subscribe: vi.fn(),
     },
+    postSessionIdPermissionsPermissionId: vi.fn(),
   };
 }
 
@@ -38,21 +40,44 @@ describe('routeCommand', () => {
   let state: ExtensionState;
   let stream: vscode.ChatResponseStream;
   let token: vscode.CancellationToken;
+  let backendStatus: AcpServerStatus;
 
   beforeEach(() => {
     vi.resetAllMocks();
+    backendStatus = 'stopped';
+    const backend: AcpBackend = {
+      name: 'opencode',
+      start: vi.fn(async () => {
+        backendStatus = 'running';
+        return { data: { url: 'http://127.0.0.1:51777', status: 'running' as const } };
+      }),
+      stop: vi.fn(async () => undefined),
+      getStatus: vi.fn((): AcpServerStatus => backendStatus),
+      getUrl: vi.fn(() => null),
+      isRunning: vi.fn(() => backendStatus === 'running'),
+      sessions: {
+        create: vi.fn(),
+        get: vi.fn(),
+        prompt: vi.fn(),
+        revert: vi.fn(),
+        abort: vi.fn(),
+        list: vi.fn(),
+      },
+      config: {
+        models: vi.fn(async () => ({ data: [] })),
+      },
+      events: {
+        openSessionStream: vi.fn(),
+        openGlobalStream: vi.fn(),
+        closeSessionStream: vi.fn(),
+        ensureStarted: vi.fn(async () => undefined),
+      },
+      permissions: {
+        reply: vi.fn(async () => undefined),
+      },
+    };
     state = {
-      serverManager: {
-        start: vi.fn().mockRejectedValue(new Error('Server not available')),
-        stop: vi.fn().mockResolvedValue(undefined),
-        getStatus: vi.fn().mockReturnValue('error'),
-        isRunning: vi.fn().mockReturnValue(false),
-        getUrl: vi.fn().mockReturnValue(null),
-        getClient: vi.fn().mockReturnValue(null),
-      } as unknown as OpenCodeServerController,
-      client: null,
-      activeSessionId: null,
-      serverStatus: 'stopped',
+      backend,
       outputChannel: {
         name: 'test',
         lines: [] as string[],
@@ -63,7 +88,6 @@ describe('routeCommand', () => {
         hide: vi.fn(),
         dispose: vi.fn(),
       } as unknown as vscode.OutputChannel,
-      eventBroker: new GlobalEventBroker(),
       sessionMap: new Map(),
     };
     stream = {
@@ -82,45 +106,39 @@ describe('routeCommand', () => {
   // -----------------------------------------------------------------------
 
   it('should create a new session and update state for /new command', async () => {
-    const mockClient = createMockClient();
-    mockClient.session.create.mockResolvedValue({
-      data: { id: 'session-new' },
+    vi.mocked(state.backend.sessions.create).mockResolvedValue({
+      data: { id: 'session-new', title: '', createdAt: new Date() },
     });
-    state.client = mockClient as OpenCodeClient;
 
     await routeCommand('new', state, stream, token);
 
-    expect(mockClient.session.create).toHaveBeenCalledWith({ body: {} });
-    expect(state.activeSessionId).toBe('session-new');
+    expect(state.backend.start).toHaveBeenCalledOnce();
+    expect(state.backend.sessions.create).toHaveBeenCalledWith();
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('Started a new conversation session'),
     );
   });
 
   it('should show error when /new is called without a connected client', async () => {
-    state.client = null;
+    vi.mocked(state.backend.start).mockResolvedValue({ error: 'Server not available' });
 
     await routeCommand('new', state, stream, token);
 
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('Failed to start OpenCode'),
     );
-    expect(state.activeSessionId).toBeNull();
   });
 
   it('should show error on /new when session creation fails', async () => {
-    const mockClient = createMockClient();
-    mockClient.session.create.mockRejectedValue(
+    vi.mocked(state.backend.sessions.create).mockRejectedValue(
       new Error('Session limit reached'),
     );
-    state.client = mockClient as OpenCodeClient;
 
     await routeCommand('new', state, stream, token);
 
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('Session error'),
     );
-    expect(state.activeSessionId).toBeNull();
   });
 
   // -----------------------------------------------------------------------
@@ -144,37 +162,13 @@ describe('routeCommand', () => {
   // -----------------------------------------------------------------------
 
   it('should show providers and models for /model command', async () => {
-    const mockClient = createMockClient();
-    mockClient.config.providers.mockResolvedValue({
-      data: {
-        providers: [
-          {
-            name: 'OpenAI',
-            id: 'openai',
-            models: {
-              'gpt-4o': { id: 'gpt-4o', name: 'GPT-4o', status: 'active' },
-              'gpt-3.5': {
-                id: 'gpt-3.5-turbo',
-                name: 'GPT-3.5 Turbo',
-                status: 'inactive',
-              },
-            },
-          },
-          {
-            name: 'Anthropic',
-            id: 'anthropic',
-            models: {
-              'claude-3': {
-                id: 'claude-3-opus',
-                name: 'Claude 3 Opus',
-                status: 'active',
-              },
-            },
-          },
-        ],
-      },
+    backendStatus = 'running';
+    vi.mocked(state.backend.config.models).mockResolvedValue({
+      data: [
+        { id: 'gpt-4o', name: 'GPT-4o', provider: 'OpenAI' },
+        { id: 'claude-3-opus', name: 'Claude 3 Opus', provider: 'Anthropic' },
+      ],
     });
-    state.client = mockClient as OpenCodeClient;
 
     await routeCommand('model', state, stream, token);
 
@@ -192,7 +186,7 @@ describe('routeCommand', () => {
   });
 
   it('should show error when /model is called without a connected client', async () => {
-    state.client = null;
+    vi.mocked(state.backend.start).mockResolvedValue({ error: 'Server not available' });
 
     await routeCommand('model', state, stream, token);
 
@@ -202,11 +196,8 @@ describe('routeCommand', () => {
   });
 
   it('should show error when providers call fails', async () => {
-    const mockClient = createMockClient();
-    mockClient.config.providers.mockRejectedValue(
-      new Error('API error'),
-    );
-    state.client = mockClient as OpenCodeClient;
+    backendStatus = 'running';
+    vi.mocked(state.backend.config.models).mockRejectedValue(new Error('API error'));
 
     await routeCommand('model', state, stream, token);
 
@@ -216,11 +207,8 @@ describe('routeCommand', () => {
   });
 
   it('should show message when no providers configured', async () => {
-    const mockClient = createMockClient();
-    mockClient.config.providers.mockResolvedValue({
-      data: { providers: [] },
-    });
-    state.client = mockClient as OpenCodeClient;
+    backendStatus = 'running';
+    vi.mocked(state.backend.config.models).mockResolvedValue({ data: [] });
 
     await routeCommand('model', state, stream, token);
 
@@ -242,16 +230,13 @@ describe('routeCommand', () => {
   });
 
   it('should be case-insensitive for command names', async () => {
-    const mockClient = createMockClient();
-    mockClient.session.create.mockResolvedValue({
-      data: { id: 'session-case' },
+    vi.mocked(state.backend.sessions.create).mockResolvedValue({
+      data: { id: 'session-case', title: '', createdAt: new Date() },
     });
-    state.client = mockClient as OpenCodeClient;
 
     await routeCommand('New', state, stream, token);
 
-    expect(mockClient.session.create).toHaveBeenCalledOnce();
-    expect(state.activeSessionId).toBe('session-case');
+    expect(state.backend.sessions.create).toHaveBeenCalledOnce();
   });
 
   // -----------------------------------------------------------------------
@@ -259,25 +244,8 @@ describe('routeCommand', () => {
   // -----------------------------------------------------------------------
 
   it('should skip providers with no active models in /model output', async () => {
-    const mockClient = createMockClient();
-    mockClient.config.providers.mockResolvedValue({
-      data: {
-        providers: [
-          {
-            name: 'TestAI',
-            id: 'testai',
-            models: {
-              'test-model': {
-                id: 'test-model',
-                name: 'Test Model',
-                status: 'inactive',
-              },
-            },
-          },
-        ],
-      },
-    });
-    state.client = mockClient as OpenCodeClient;
+    backendStatus = 'running';
+    vi.mocked(state.backend.config.models).mockResolvedValue({ data: [] });
 
     await routeCommand('model', state, stream, token);
 

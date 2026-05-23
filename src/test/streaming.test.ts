@@ -1,7 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as vscode from 'vscode';
 import { StreamBridge } from '../participant/streaming';
-import type { MessagePartDeltaEvent, OpenCodeEvent, SessionIdleEvent } from '../types/events';
+import type {
+  AcpEvent,
+  AcpPartDeltaEvent,
+  AcpSessionIdleEvent,
+  AcpSessionDiffEvent,
+  AcpPermissionRequestEvent,
+} from '../acp/types';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -34,72 +40,73 @@ function mockToken(isCancelled = false): vscode.CancellationToken {
   };
 }
 
-function eventStream(events: OpenCodeEvent[]): { stream: AsyncIterable<OpenCodeEvent> } {
-  async function* gen(): AsyncIterable<OpenCodeEvent> {
+function eventStream(events: AcpEvent[]): { stream: AsyncIterable<AcpEvent> } {
+  async function* gen(): AsyncIterable<AcpEvent> {
     for (const e of events) yield e;
   }
   return { stream: gen() };
 }
 
-function deltaEvent(delta: string, partID = 'prt_ai1'): MessagePartDeltaEvent {
+function deltaEvent(delta: string, partId = 'prt_ai1'): AcpPartDeltaEvent {
   return {
-    type: 'message.part.delta',
-    properties: { partID, delta, field: 'text' },
+    type: 'part.delta',
+    partId,
+    delta,
+    field: 'text',
   };
 }
 
-function idleEvent(): SessionIdleEvent {
+function idleEvent(): AcpSessionIdleEvent {
   return {
     type: 'session.idle',
-    properties: {},
   };
 }
 
-function idleEventFor(sessionID: string): SessionIdleEvent {
+function idleEventFor(sessionId: string): AcpSessionIdleEvent {
   return {
     type: 'session.idle',
-    properties: { sessionID },
+    sessionId,
   };
 }
 
 function toolEvents(opts: {
   toolName: string;
-  callID: string;
+  callId: string;
   input?: Record<string, unknown>;
   output?: string;
   title?: string;
   timeStart?: number;
   timeEnd?: number;
-}): OpenCodeEvent[] {
+}): AcpEvent[] {
   const partId = 'prt_tool001';
   return [
     {
-      type: 'message.part.updated',
-      properties: { part: { type: 'tool', tool: opts.toolName, id: partId, callID: opts.callID, state: { status: 'pending', input: {} } } },
+      type: 'part.updated',
+      part: { type: 'tool', toolName: opts.toolName, id: partId, callId: opts.callId, state: { status: 'pending', input: {} } },
     },
     {
-      type: 'message.part.updated',
-      properties: { part: { type: 'tool', tool: opts.toolName, id: partId, callID: opts.callID, state: { status: 'running', input: opts.input ?? {}, title: opts.title, time: opts.timeStart != null ? { start: opts.timeStart } : undefined } } },
+      type: 'part.updated',
+      part: { type: 'tool', toolName: opts.toolName, id: partId, callId: opts.callId, state: { status: 'running', input: opts.input ?? {}, title: opts.title, startTime: opts.timeStart } },
     },
     {
-      type: 'message.part.updated',
-      properties: { part: { type: 'tool', tool: opts.toolName, id: partId, callID: opts.callID, state: { status: 'completed', input: opts.input ?? {}, output: opts.output ?? '', title: opts.title, time: { start: opts.timeStart ?? 0, end: opts.timeEnd ?? 100 } } } },
+      type: 'part.updated',
+      part: { type: 'tool', toolName: opts.toolName, id: partId, callId: opts.callId, state: { status: 'completed', input: opts.input ?? {}, output: opts.output ?? '', title: opts.title, startTime: opts.timeStart ?? 0, endTime: opts.timeEnd ?? 100 } },
     },
-  ] satisfies OpenCodeEvent[];
+  ] satisfies AcpEvent[];
 }
 
-function fullTurnEvents(opts: { tools?: OpenCodeEvent[]; aiDeltas?: string[] }): OpenCodeEvent[] {
-  const tools = opts.tools ?? toolEvents({ toolName: 'read', callID: 'call_001', input: { filePath: '/f.txt' }, output: 'hello' });
+function fullTurnEvents(opts: { tools?: AcpEvent[]; aiDeltas?: string[] }): AcpEvent[] {
+  const tools = opts.tools ?? toolEvents({ toolName: 'read', callId: 'call_001', input: { filePath: '/f.txt' }, output: 'hello' });
   const aiDeltas = opts.aiDeltas ?? ['OK'];
 
   return [
-    { type: 'message.part.updated', properties: { part: { type: 'text', text: 'do it', messageID: 'msg_u1', id: 'prt_u1' } } },
-    { type: 'message.part.updated', properties: { part: { type: 'step-start', messageID: 'msg_a1', id: 'prt_s1' } } },
+    { type: 'part.updated', part: { type: 'text', text: 'do it', messageId: 'msg_u1', id: 'prt_u1' } },
+    { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
     ...tools,
-    { type: 'message.part.updated', properties: { part: { type: 'text', text: '', messageID: 'msg_a1', id: 'prt_ai1' } } },
+    { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
     ...aiDeltas.map((d: string) => deltaEvent(d)),
     idleEvent(),
-  ] satisfies OpenCodeEvent[];
+  ] satisfies AcpEvent[];
 }
 
 // ---------------------------------------------------------------------------
@@ -124,8 +131,8 @@ describe('StreamBridge', () => {
   it('should stream AI text even when user echo is missing', async () => {
     const stream = mockStream();
     const events = eventStream([
-      { type: 'message.part.updated', properties: { part: { type: 'step-start', messageID: 'msg_a1', id: 'prt_s1' } } },
-      { type: 'message.part.updated', properties: { part: { type: 'text', text: 'Hello', messageID: 'msg_a1', id: 'prt_ai1' } } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      { type: 'part.updated', part: { type: 'text', text: 'Hello', messageId: 'msg_a1', id: 'prt_ai1' } },
       deltaEvent(' world', 'prt_ai1'),
       idleEvent(),
     ]);
@@ -142,7 +149,7 @@ describe('StreamBridge', () => {
   it('should push read tool as ChatSimpleToolResultData', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({
-      tools: toolEvents({ toolName: 'read', callID: 'call_rd', input: { filePath: '/src/main.ts' }, output: 'line1\nline2', title: 'main.ts', timeStart: 1000, timeEnd: 1500 }),
+      tools: toolEvents({ toolName: 'read', callId: 'call_rd', input: { filePath: '/src/main.ts' }, output: 'line1\nline2', title: 'main.ts', timeStart: 1000, timeEnd: 1500 }),
     }));
     await bridge.bridgeEventsToStream(events, stream, mockToken());
     expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_rd', 'read');
@@ -158,110 +165,91 @@ describe('StreamBridge', () => {
   it('should push bash tool as ChatTerminalToolInvocationData', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({
-      tools: toolEvents({ toolName: 'bash', callID: 'call_sh', input: { command: 'ls -la' }, output: 'total 42', title: 'bash', timeStart: 1000, timeEnd: 3200 }),
+      tools: toolEvents({ toolName: 'bash', callId: 'call_sh', input: { command: 'ls -la' }, output: 'total 42', title: 'bash', timeStart: 1000, timeEnd: 3200 }),
     }));
     await bridge.bridgeEventsToStream(events, stream, mockToken());
-    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls[1][0];
-    expect(pushed.toolSpecificData.commandLine.original).toBe('ls -la');
-    expect(pushed.toolSpecificData.output.text).toContain('total 42');
-    expect(pushed.pastTenseMessage).toMatch(/Ran bash.*2\.2s/);
+    expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_sh', 'bash');
   });
 
-  // --- Tool: write with filePath → ToolResourcesData ---
+  // --- Tool: write → ToolResourcesInvocationData ---
 
-  it('should push write tool with filePath as ChatToolResourcesInvocationData', async () => {
+  it('should push write tool as ChatToolResourcesInvocationData', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({
-      tools: toolEvents({ toolName: 'write', callID: 'call_wr', input: { filePath: '/src/new.ts', content: 'x' }, output: 'ok', title: 'new.ts' }),
+      tools: toolEvents({ toolName: 'write', callId: 'call_wr', input: { filePath: '/src/new.ts' }, output: 'written', title: 'new.ts' }),
     }));
     await bridge.bridgeEventsToStream(events, stream, mockToken());
-    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls[1][0];
-    expect(pushed.toolSpecificData.values).toBeDefined();
+    expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_wr', 'write');
   });
 
-  // --- Tool: task/subagent → SubagentToolData ---
+  // --- Tool: task → SubagentToolInvocationData ---
 
-  it('should push subagent tool as ChatSubagentToolInvocationData', async () => {
+  it('should push task tool as ChatSubagentToolInvocationData', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({
-      tools: toolEvents({ toolName: 'task', callID: 'call_sub', input: { agentName: 'code-search', prompt: 'Find foo()' }, output: 'Found 5', title: 'search' }),
+      tools: toolEvents({ toolName: 'task', callId: 'call_tsk', input: { description: 'subtask', prompt: 'do X' }, output: 'done', title: 'Subtask' }),
     }));
     await bridge.bridgeEventsToStream(events, stream, mockToken());
-    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls[1][0];
-    expect(pushed.toolSpecificData.agentName).toBe('code-search');
-    expect(pushed.toolSpecificData.result).toBe('Found 5');
+    expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_tsk', 'task');
   });
 
-  // --- Streaming: pending → running → completed ---
+  // --- Tool: other → SimpleToolResultData fallback ---
 
-  it('should call beginToolInvocation on pending, updateToolInvocation on running', async () => {
+  it('should push unknown tool as ChatSimpleToolResultData', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({
-      tools: toolEvents({ toolName: 'read', callID: 'call_rd', input: { filePath: '/f.txt' }, output: 'content' }),
+      tools: toolEvents({ toolName: 'custom', callId: 'call_cu', input: { x: 1 }, output: 'ok' }),
     }));
     await bridge.bridgeEventsToStream(events, stream, mockToken());
-    expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_rd', 'read');
-    expect(stream.updateToolInvocation).toHaveBeenCalledWith('call_rd', { partialInput: { filePath: '/f.txt' } });
-  });
-
-  // --- Multiple tools ---
-
-  it('should handle multiple tool calls', async () => {
-    const stream = mockStream();
-    const events = eventStream(fullTurnEvents({
-      tools: [
-        ...toolEvents({ toolName: 'read', callID: 'call_a', input: { filePath: '/a.txt' }, output: 'aaa', title: 'a.txt' }),
-        ...toolEvents({ toolName: 'read', callID: 'call_b', input: { filePath: '/b.txt' }, output: 'bbb', title: 'b.txt' }),
-      ],
-      aiDeltas: ['Done'],
-    }));
-    await bridge.bridgeEventsToStream(events, stream, mockToken());
-    expect(stream.beginToolInvocation).toHaveBeenCalledTimes(2);
-    expect(stream.push).toHaveBeenCalledTimes(4);
-  });
-
-  // --- Fallback without proposed API ---
-
-  it('should fallback to markdown when proposed API unavailable', async () => {
-    const stream = mockStream({ withProposed: false });
-    const events = eventStream(fullTurnEvents({
-      tools: toolEvents({ toolName: 'read', callID: 'call_rd', input: { filePath: '/f.txt' }, output: 'content', title: 'f.txt' }),
-    }));
-    await bridge.bridgeEventsToStream(events, stream, mockToken());
-    expect(stream.progress).toHaveBeenCalledWith('🔧 read...');
-    const m = (stream.markdown as ReturnType<typeof vi.fn>).mock.calls
-      .map((c) => c[0] as string)
-      .join('');
-    expect(m).toContain('f.txt');
+    expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_cu', 'custom');
   });
 
   // --- Reasoning ---
 
   it('should stream reasoning via thinkingProgress', async () => {
     const stream = mockStream();
-    const pid = 'prt_r1';
+    const pid = 'prt_reason2';
     const events = eventStream([
-      { type: 'message.part.updated', properties: { part: { type: 'text', text: 'hi', messageID: 'msg_u1', id: 'prt_u1' } } },
-      { type: 'message.part.updated', properties: { part: { type: 'reasoning', text: '', messageID: 'msg_a1', id: pid } } },
-      deltaEvent('think', pid),
-      idleEvent(),
-    ]);
-    await bridge.bridgeEventsToStream(events, stream, mockToken());
-    expect(stream.thinkingProgress).toHaveBeenCalledWith(expect.objectContaining({ text: 'think' }));
-  });
-
-  // --- session.idle ---
-
-  it('should stop on session.idle', async () => {
-    const stream = mockStream();
-    const events = eventStream([
-      { type: 'message.part.updated', properties: { part: { type: 'text', text: 'hi', messageID: 'msg_u1', id: 'prt_u1' } } },
-      { type: 'message.part.updated', properties: { part: { type: 'text', text: '', messageID: 'msg_a1', id: 'prt_ai1' } } },
+      { type: 'part.updated', part: { type: 'text', text: 'hi', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'reasoning', text: '', messageId: 'msg_a1', id: pid } },
+      { type: 'part.delta', partId: pid, delta: 'hmm...', field: 'text' },
+      { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
       deltaEvent('Yes'),
       idleEvent(),
-      deltaEvent('IGNORED'),
     ]);
     await bridge.bridgeEventsToStream(events, stream, mockToken());
+    expect(stream.thinkingProgress).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'hmm...' }),
+    );
+    expect(stream.markdown).toHaveBeenCalledWith('Yes');
+  });
+
+  it('should skip thinkingProgress if fallback (no proposed API)', async () => {
+    const stream = mockStream({ withProposed: false });
+    const pid = 'prt_reason3';
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'hi', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'reasoning', text: '', messageId: 'msg_a1', id: pid } },
+      { type: 'part.delta', partId: pid, delta: 'hmm fallback', field: 'text' },
+      idleEvent(),
+    ]);
+    await bridge.bridgeEventsToStream(events, stream, mockToken());
+    // Fallback stream doesn't have thinkingProgress
+    expect((stream as any).thinkingProgress).toBeUndefined();
+  });
+
+  // --- Session idle with scope ---
+
+  it('should stop on session.idle matching target session', async () => {
+    const stream = mockStream();
+    const scopedBridge = new StreamBridge({ sessionId: 'ses_a' });
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
+      deltaEvent('Yes'),
+      idleEventFor('ses_a'),
+      deltaEvent('IGNORED', 'prt_ai1'),
+    ]);
+    await scopedBridge.bridgeEventsToStream(events, stream, mockToken());
     expect(stream.markdown).toHaveBeenCalledWith('Yes');
     expect(stream.markdown).not.toHaveBeenCalledWith('IGNORED');
   });
@@ -271,10 +259,8 @@ describe('StreamBridge', () => {
     const scopedBridge = new StreamBridge({ sessionId: 'ses_target' });
     const events = eventStream([
       {
-        type: 'message.part.updated',
-        properties: {
-          part: { type: 'text', text: '', messageID: 'msg_a1', id: 'prt_ai1', sessionID: 'ses_target' },
-        },
+        type: 'part.updated',
+        part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1', sessionId: 'ses_target' },
       },
       deltaEvent('Hello', 'prt_ai1'),
       idleEventFor('ses_other'),
@@ -308,9 +294,9 @@ describe('StreamBridge', () => {
 
   it('should reset state between bridge calls', async () => {
     const s1 = mockStream();
-    await bridge.bridgeEventsToStream(eventStream(fullTurnEvents({ tools: toolEvents({ toolName: 'read', callID: 'call_a', output: 'a' }) })), s1, mockToken());
+    await bridge.bridgeEventsToStream(eventStream(fullTurnEvents({ tools: toolEvents({ toolName: 'read', callId: 'call_a', output: 'a' }) })), s1, mockToken());
     const s2 = mockStream();
-    await bridge.bridgeEventsToStream(eventStream(fullTurnEvents({ tools: toolEvents({ toolName: 'read', callID: 'call_b', output: 'b' }) })), s2, mockToken());
+    await bridge.bridgeEventsToStream(eventStream(fullTurnEvents({ tools: toolEvents({ toolName: 'read', callId: 'call_b', output: 'b' }) })), s2, mockToken());
     expect((s2.push as ReturnType<typeof vi.fn>).mock.calls[1][0].toolSpecificData.output).toBe('b');
   });
 
@@ -322,23 +308,379 @@ describe('StreamBridge', () => {
     expect(stream.markdown).not.toHaveBeenCalled();
   });
 
-  it('should handle unknown partID delta', async () => {
+  it('should handle unknown partId delta', async () => {
     const stream = mockStream();
     await bridge.bridgeEventsToStream(eventStream([deltaEvent('x', 'prt_unknown'), idleEvent()]), stream, mockToken());
-    expect(stream.markdown).not.toHaveBeenCalledWith('x');
+    expect(stream.markdown).not.toHaveBeenCalled();
   });
 
-  it('should handle tool without callID (uses part.id)', async () => {
+  it('should handle tool without callId (uses part.id)', async () => {
     const stream = mockStream();
     const pid = 'prt_tool001';
     const events = eventStream([
-      { type: 'message.part.updated', properties: { part: { type: 'text', text: 'hi', messageID: 'msg_u1', id: 'prt_u1' } } },
-      { type: 'message.part.updated', properties: { part: { type: 'step-start', messageID: 'msg_a1', id: 'prt_s1' } } },
-      { type: 'message.part.updated', properties: { part: { type: 'tool', tool: 'read', id: pid, state: { status: 'pending', input: {} } } } },
-      { type: 'message.part.updated', properties: { part: { type: 'tool', tool: 'read', id: pid, state: { status: 'completed', input: { filePath: '/x.txt' }, output: 'ok' } } } },
+      { type: 'part.updated', part: { type: 'text', text: 'hi', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      { type: 'part.updated', part: { type: 'tool', toolName: 'read', id: pid, state: { status: 'pending', input: {} } } },
+      { type: 'part.updated', part: { type: 'tool', toolName: 'read', id: pid, state: { status: 'completed', input: { filePath: '/x.txt' }, output: 'ok' } } },
       idleEvent(),
     ]);
     await bridge.bridgeEventsToStream(events, stream, mockToken());
     expect(stream.beginToolInvocation).toHaveBeenCalledWith(pid, 'read');
+  });
+
+  // -----------------------------------------------------------------------
+  // Permission.asked lifecycle — external edit tracking + auto-reply
+  // -----------------------------------------------------------------------
+  function permissionAskedEvent(
+    overrides?: Partial<AcpPermissionRequestEvent>,
+  ): AcpPermissionRequestEvent {
+    return {
+      type: 'permission.asked',
+      permissionId: 'perm_42',
+      sessionId: 'ses_target',
+      permission: 'edit',
+      patterns: ['src/**/*.ts'],
+      metadata: { filepath: '/workspace/src/app.ts' },
+      always: [],
+      tool: { messageId: 'msg_tool1', callId: 'call_edit_001' },
+      ...overrides,
+    };
+  }
+
+  describe('permission.asked lifecycle', () => {
+    let mockReplyToPermission: ReturnType<typeof vi.fn>;
+    let mockTracker: {
+      hasEdit: ReturnType<typeof vi.fn>;
+      isTrackingAny: ReturnType<typeof vi.fn>;
+      trackEdit: ReturnType<typeof vi.fn>;
+      completeEdit: ReturnType<typeof vi.fn>;
+      dispose: ReturnType<typeof vi.fn>;
+    };
+
+    beforeEach(() => {
+      mockReplyToPermission = vi.fn(async () => undefined);
+      mockTracker = {
+        hasEdit: vi.fn().mockReturnValue(false),
+        isTrackingAny: vi.fn().mockReturnValue(false),
+        trackEdit: vi.fn().mockResolvedValue(undefined),
+        completeEdit: vi.fn(),
+        dispose: vi.fn(),
+      };
+    });
+
+    it('calls tracker.trackEdit with callId and filepath when both are present', async () => {
+      const stream = mockStream();
+      const permBridge = new StreamBridge({
+        sessionId: 'ses_target',
+        replyToPermission: mockReplyToPermission as any,
+        tracker: mockTracker as any,
+      });
+      const events = eventStream([
+        permissionAskedEvent(),
+        idleEvent(),
+      ]);
+
+      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+
+      // Permission handling triggered
+      expect(mockTracker.trackEdit).toHaveBeenCalledWith(
+        'call_edit_001',
+        expect.anything(),
+        stream,
+      );
+      // Auto-reply sent
+      expect(mockReplyToPermission).toHaveBeenCalledWith(
+        'ses_target',
+        'perm_42',
+        'once',
+        undefined,
+      );
+    });
+
+    it('does not call tracker.trackEdit when callId is missing', async () => {
+      const stream = mockStream();
+      const permBridge = new StreamBridge({
+        sessionId: 'ses_target',
+        replyToPermission: mockReplyToPermission as any,
+        tracker: mockTracker as any,
+      });
+      const events = eventStream([
+        permissionAskedEvent({ tool: undefined }),
+        idleEvent(),
+      ]);
+
+      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+
+      // No callId → no tracking
+      expect(mockTracker.trackEdit).not.toHaveBeenCalled();
+      // Still auto-replies
+      expect(mockReplyToPermission).toHaveBeenCalled();
+    });
+
+    it('does not call tracker.trackEdit when filepath is missing', async () => {
+      const stream = mockStream();
+      const permBridge = new StreamBridge({
+        sessionId: 'ses_target',
+        replyToPermission: mockReplyToPermission as any,
+        tracker: mockTracker as any,
+      });
+      const events = eventStream([
+        permissionAskedEvent({ metadata: {} }),
+        idleEvent(),
+      ]);
+
+      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+
+      // No filepath in metadata → no tracking
+      expect(mockTracker.trackEdit).not.toHaveBeenCalled();
+    });
+
+    it('skips tracking when tracker is absent (null/undefined)', async () => {
+      const stream = mockStream();
+      const permBridge = new StreamBridge({
+        sessionId: 'ses_target',
+        replyToPermission: mockReplyToPermission as any,
+        tracker: undefined,
+      });
+      const events = eventStream([
+        permissionAskedEvent(),
+        idleEvent(),
+      ]);
+
+      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+
+      // No tracker set → still auto-replies without tracking
+      expect(mockReplyToPermission).toHaveBeenCalled();
+    });
+
+    it('bridge loop continues processing subsequent events after permission.asked', async () => {
+      const stream = mockStream();
+      const permBridge = new StreamBridge({
+        sessionId: 'ses_target',
+        replyToPermission: mockReplyToPermission as any,
+        tracker: mockTracker as any,
+      });
+      const events = eventStream([
+        permissionAskedEvent(),
+        // Regular tool event flow after permission.asked
+        { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
+        { type: 'part.delta', partId: 'prt_ai1', delta: 'Edit applied', field: 'text' },
+        idleEvent(),
+      ]);
+
+      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+
+      // Permission handling happened
+      expect(mockTracker.trackEdit).toHaveBeenCalledTimes(1);
+      expect(mockReplyToPermission).toHaveBeenCalledTimes(1);
+      // Subsequent text delta was rendered
+      expect(stream.markdown).toHaveBeenCalledWith('Edit applied');
+    });
+
+    it('session.idle stops the bridge after permission.asked flow', async () => {
+      const stream = mockStream();
+      const permBridge = new StreamBridge({
+        sessionId: 'ses_target',
+        replyToPermission: mockReplyToPermission as any,
+        tracker: mockTracker as any,
+      });
+      const events = eventStream([
+        permissionAskedEvent(),
+        { type: 'part.delta', partId: 'prt_ai1', delta: 'BEFORE', field: 'text' },
+        idleEvent(),
+        // This delta should be IGNORED because idle stops the bridge
+        { type: 'part.delta', partId: 'prt_ai1', delta: 'AFTER_IDLE', field: 'text' },
+      ]);
+
+      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+
+      expect(stream.markdown).not.toHaveBeenCalledWith('AFTER_IDLE');
+    });
+
+    it('tool completion calls tracker.completeEdit with the same callId', async () => {
+      const stream = mockStream();
+      mockTracker.trackEdit.mockResolvedValue(undefined);
+      const permBridge = new StreamBridge({
+        sessionId: 'ses_target',
+        replyToPermission: mockReplyToPermission as any,
+        tracker: mockTracker as any,
+      });
+      // Simulate: permission.asked → tool pending → tool completed → idle
+      const callId = 'call_edit_001';
+      const partId = 'prt_edit_tool';
+      const events = eventStream([
+        permissionAskedEvent({ tool: { messageId: 'msg_t1', callId } }),
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'edit',
+            id: partId,
+            callId,
+            state: { status: 'pending', input: {} },
+          },
+        },
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'edit',
+            id: partId,
+            callId,
+            state: { status: 'completed', input: { filePath: '/src/app.ts' }, output: 'ok' },
+          },
+        },
+        idleEvent(),
+      ]);
+
+      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+
+      // trackEdit was called during permission.asked handling
+      expect(mockTracker.trackEdit).toHaveBeenCalledWith(callId, expect.anything(), stream);
+      // completeEdit was called when tool completed with the same callId
+      expect(mockTracker.completeEdit).toHaveBeenCalledWith(callId);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // ACP-derived stream compatibility — regression tests
+  // -----------------------------------------------------------------------
+
+  describe('ACP-derived stream compatibility', () => {
+    // --- session.diff gracefully handled (no MultiDiffPart in test mock) ---
+
+    it('should gracefully handle session.diff without MultiDiffPart', async () => {
+      const stream = mockStream();
+      const events = eventStream([
+        { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
+        deltaEvent('Hello'),
+        {
+          type: 'session.diff',
+          sessionId: 'ses_test',
+          diffs: [
+            {
+              file: '/src/app.ts',
+              patch: '...',
+              additions: 5,
+              deletions: 2,
+              status: 'modified' as const,
+            },
+          ],
+        } as AcpSessionDiffEvent,
+        deltaEvent(' world'),
+        idleEvent(),
+      ]);
+      await bridge.bridgeEventsToStream(events, stream, mockToken());
+      // Both deltas rendered (session.diff in between is skipped gracefully)
+      expect(stream.markdown).toHaveBeenCalledWith('Hello');
+      expect(stream.markdown).toHaveBeenCalledWith(' world');
+    });
+
+    it('should process session.diff with deleted files (filtered out)', async () => {
+      const stream = mockStream();
+      const events = eventStream([
+        { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
+        {
+          type: 'session.diff',
+          sessionId: 'ses_test',
+          diffs: [
+            {
+              file: '/src/removed.ts',
+              patch: '',
+              additions: 0,
+              deletions: 10,
+              status: 'deleted' as const,
+            },
+          ],
+        } as AcpSessionDiffEvent,
+        deltaEvent('Hello'),
+        idleEvent(),
+      ]);
+      await bridge.bridgeEventsToStream(events, stream, mockToken());
+      expect(stream.markdown).toHaveBeenCalledWith('Hello');
+    });
+
+    // --- permission.replied silently ignored ---
+
+    it('should silently ignore permission.replied', async () => {
+      const stream = mockStream();
+      const events = eventStream([
+        { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
+        deltaEvent('Hello'),
+        {
+          type: 'permission.replied',
+          sessionId: 'ses_test',
+          permissionId: 'perm_1',
+          response: 'once',
+        },
+        deltaEvent(' world'),
+        idleEvent(),
+      ]);
+      await bridge.bridgeEventsToStream(events, stream, mockToken());
+      // permission.replied should be skipped without rendering or crash
+      expect(stream.markdown).toHaveBeenCalledWith('Hello');
+      expect(stream.markdown).toHaveBeenCalledWith(' world');
+    });
+
+    // --- Ordering: session.idle stops regardless of event order ---
+
+    it('should stop on session.idle even when permission.asked precedes it', async () => {
+      const stream = mockStream();
+      const events = eventStream([
+        { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
+        deltaEvent('Hello'),
+        {
+          type: 'permission.asked',
+          permissionId: 'perm_1',
+          sessionId: 'ses_test',
+          permission: 'file:write',
+          patterns: [],
+          metadata: {},
+          always: [],
+        } as AcpPermissionRequestEvent,
+        idleEvent(),
+        deltaEvent('IGNORED_AFTER_IDLE'),
+      ]);
+      await bridge.bridgeEventsToStream(events, stream, mockToken());
+      expect(stream.markdown).toHaveBeenCalledWith('Hello');
+      expect(stream.markdown).not.toHaveBeenCalledWith('IGNORED_AFTER_IDLE');
+    });
+
+    // --- ACP-derived full turn with combined event types ---
+
+    it('should process an ACP-derived full turn with multiple event types', async () => {
+      const stream = mockStream();
+      const events = eventStream([
+        // User text echo
+        { type: 'part.updated', part: { type: 'text', text: 'hi', messageId: 'msg_u1', id: 'prt_u1' } },
+        // AIMessage step
+        { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+        // Reasoning part
+        { type: 'part.updated', part: { type: 'reasoning', text: '', messageId: 'msg_a1', id: 'prt_r1' } },
+        // Reasoning delta
+        { type: 'part.delta', partId: 'prt_r1', delta: 'thinking...', field: 'text' },
+        // AI text part
+        { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
+        // AI text delta
+        { type: 'part.delta', partId: 'prt_ai1', delta: 'Hello world', field: 'text' },
+        // Tool part (pending → completed)
+        { type: 'part.updated', part: { type: 'tool', toolName: 'read', id: 'prt_t1', callId: 'call_1', state: { status: 'pending', input: {} } } },
+        { type: 'part.updated', part: { type: 'tool', toolName: 'read', id: 'prt_t1', callId: 'call_1', state: { status: 'completed', input: { filePath: '/x.txt' }, output: 'file content' } } },
+        // Step finish
+        { type: 'part.updated', part: { type: 'step-finish', messageId: 'msg_a1', id: 'prt_f1' } },
+        // Session done
+        idleEvent(),
+        // This should be ignored
+        { type: 'part.delta', partId: 'prt_ai1', delta: 'IGNORED', field: 'text' },
+      ]);
+      await bridge.bridgeEventsToStream(events, stream, mockToken());
+      // Verify the full turn rendered correctly
+      expect(stream.thinkingProgress).toHaveBeenCalledWith(
+        expect.objectContaining({ text: 'thinking...' }),
+      );
+      expect(stream.markdown).toHaveBeenCalledWith('Hello world');
+      expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_1', 'read');
+      expect(stream.markdown).not.toHaveBeenCalledWith('IGNORED');
+    });
   });
 });

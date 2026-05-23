@@ -258,6 +258,9 @@ export class ChatRequestTurn {
     constructor(
         public readonly prompt: string,
         public readonly command: string | undefined,
+        public readonly references: Array<{ id: string; name: string }> = [],
+        public readonly participant: string = 'opencode',
+        public readonly toolReferences: readonly unknown[] = [],
     ) {}
 }
 
