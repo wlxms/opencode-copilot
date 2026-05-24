@@ -30,6 +30,7 @@ import type {
  */
 export interface ChatToolInvocationStreamData {
   readonly partialInput?: unknown;
+  readonly invocationMessage?: string | MarkdownString;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,12 +111,25 @@ export interface ChatMcpToolInvocationData {
 }
 
 /**
- * Todo tool invocation data.
- * Placeholder — exact interface TBD from VSCode API.
+ * Status of a single todo item.
+ * Source: vscode.proposed.chatParticipantAdditions.d.ts v3
+ */
+export enum ChatTodoStatus {
+  NotStarted = 1,
+  InProgress = 2,
+  Completed = 3,
+}
+
+/**
+ * Todo tool invocation data — renders an interactive todo list in chat.
  * Source: vscode.proposed.chatParticipantAdditions.d.ts v3
  */
 export interface ChatTodoToolInvocationData {
-  [key: string]: unknown;
+  todoList: Array<{
+    id: number;
+    title: string;
+    status: ChatTodoStatus;
+  }>;
 }
 
 /**
