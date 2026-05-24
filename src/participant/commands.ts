@@ -3,6 +3,11 @@ import { writeFileSync, unlinkSync, existsSync } from 'fs';
 import { execSync, exec } from 'child_process';
 import type { Model, Provider } from '@opencode-ai/sdk';
 import type { ExtensionState } from '../types';
+import type {
+  ChatToolResourcesInvocationData,
+  ChatTerminalToolInvocationData,
+  ChatSimpleToolResultData,
+} from '../types/vscode-proposed-additions';
 import { ErrorMessages } from './errors';
 import { ensureServer } from './handler';
 import { ExternalEditTracker } from './external-edit-tracker';
@@ -31,6 +36,18 @@ export async function routeCommand(
       break;
     case 'test-external-edit-e2e':
       await handleTestExternalEditE2ECommand(state, stream, _token);
+      break;
+    case 'test-subagent-single-blocking':
+      await handleTestSubagentSingleBlockingCommand(stream, _token);
+      break;
+    case 'test-subagent-multi-blocking':
+      await handleTestSubagentMultiBlockingCommand(stream, _token);
+      break;
+    case 'test-subagent-single-parallel':
+      await handleTestSubagentSingleParallelCommand(stream, _token);
+      break;
+    case 'test-subagent-multi-parallel':
+      await handleTestSubagentMultiParallelCommand(stream, _token);
       break;
     default:
       stream.markdown(
@@ -70,6 +87,10 @@ function handleHelpCommand(stream: vscode.ChatResponseStream): void {
       '- **/test-external-edit** — Test externalEdit bubble push (VSCode API)',
       '- **/test-external-edit-real** — Test externalEdit with direct disk write (simulates server)',
       '- **/test-external-edit-e2e** — End-to-end test via real OpenCode prompt',
+      '- **/test-subagent-single-blocking** — Single subagent, blocking',
+      '- **/test-subagent-multi-blocking** — Multi subagent, sequential blocking',
+      '- **/test-subagent-single-parallel** — Single subagent, parallel/callback',
+      '- **/test-subagent-multi-parallel** — Multi subagent, all parallel',
       '',
       'Just type your message to chat with OpenCode!',
     ].join('\n'),
@@ -702,5 +723,523 @@ async function handleTestExternalEditE2ECommand(
   state.outputChannel.appendLine('[commands] test-external-edit-e2e completed');
 }
 
+// ---------------------------------------------------------------------------
+// Test-subagent helpers
+// ---------------------------------------------------------------------------
 
+type Stream = vscode.ChatResponseStream & {
+  beginToolInvocation?(callId: string, name: string, data?: Record<string, unknown>): void;
+  updateToolInvocation?(callId: string, data: Record<string, unknown>): void;
+};
 
+type ProposedVscode = typeof vscode & {
+  ChatToolInvocationPart?: new (toolName: string, toolCallId: string, errorMessage?: string) => ChatToolInvocationPart;
+  ChatSubagentToolInvocationData?: new (description?: string, agentName?: string, prompt?: string, result?: string) => ChatSubagentToolInvocationData;
+};
+
+const VS = vscode as ProposedVscode;
+let _uid = 0;
+const uid = () => `t_${++_uid}_${Date.now().toString(36)}`;
+const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+function checkSubagentApi(stream: vscode.ChatResponseStream): Stream | null {
+  const s = stream as Stream;
+  if (!VS.ChatToolInvocationPart) {
+    stream.markdown('⚠️ `ChatToolInvocationPart` API not available.\n');
+    return null;
+  }
+  if (!s.beginToolInvocation) {
+    stream.markdown('⚠️ `beginToolInvocation` not available on stream.\n');
+    return null;
+  }
+  return s;
+}
+
+function pushProgressiveCard(
+  stream: Stream, callId: string, toolName: string, invocationMessage: string,
+): void {
+  if (VS.ChatToolInvocationPart && (stream as any).push) {
+    const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callId);
+    (part as any).enablePartialUpdate = true;
+    part.isComplete = false;
+    part.invocationMessage = invocationMessage;
+    (stream as any).push(part as unknown as vscode.ChatResponsePart);
+  }
+}
+
+function pushSubagentCard(
+  stream: Stream,
+  callId: string,
+  agentName: string,
+  description: string,
+  prompt: string,
+  result: string,
+  subAgentInvocationId: string,
+  invocationMessage: string,
+  pastTenseMessage: string,
+): void {
+  if (VS.ChatToolInvocationPart && (stream as any).push) {
+    const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart('task', callId);
+    (part as any).enablePartialUpdate = true;
+    (part as any).subAgentInvocationId = subAgentInvocationId;
+    part.isComplete = true;
+    part.isError = false;
+    part.invocationMessage = invocationMessage;
+    part.pastTenseMessage = pastTenseMessage;
+    if (VS.ChatSubagentToolInvocationData) {
+      part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt, result);
+    }
+    (stream as any).push(part as unknown as vscode.ChatResponsePart);
+  }
+}
+
+function pushChildTool(
+  stream: Stream,
+  callId: string,
+  toolName: string,
+  subagentInvocationId: string,
+  title: string,
+  toolSpecificData?: Record<string, unknown>,
+): void {
+  if (stream.beginToolInvocation) {
+    stream.beginToolInvocation(callId, toolName, { subagentInvocationId } as any);
+  }
+  if (VS.ChatToolInvocationPart && (stream as any).push) {
+    const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callId);
+    (part as any).subAgentInvocationId = subagentInvocationId;
+    part.isComplete = true;
+    part.isError = false;
+    part.invocationMessage = title;
+    if (toolSpecificData) {
+      (part as any).toolSpecificData = toolSpecificData;
+    }
+    (stream as any).push(part as unknown as vscode.ChatResponsePart);
+  }
+}
+
+function updateSubagentProgress(stream: Stream, callId: string, message: string): void {
+  if (stream.updateToolInvocation) {
+    try { stream.updateToolInvocation(callId, { invocationMessage: message }); } catch { /* best-effort */ }
+  }
+}
+
+/**
+ * Push a "result" tool card INSIDE the subagent card (with subAgentInvocationId).
+ * This simulates how Copilot shows the agent's final result as a tool inside the expandable card.
+ */
+function pushResultTool(
+  stream: Stream,
+  subagentInvocationId: string,
+  resultText: string,
+): void {
+  const resultCallId = `result_${uid()}`;
+  const toolName = 'result';
+
+  // Register as child of subagent
+  if (stream.beginToolInvocation) {
+    stream.beginToolInvocation(resultCallId, toolName, {
+      subagentInvocationId,
+    } as any);
+  }
+
+  // Push completed result card grouped under the subagent
+  if (VS.ChatToolInvocationPart && (stream as any).push) {
+    const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, resultCallId);
+    (part as any).subAgentInvocationId = subagentInvocationId;
+    part.isComplete = true;
+    part.isError = false;
+    part.invocationMessage = resultText;
+    // Render as collapsible input/output block (ChatSimpleToolResultData)
+    (part as any).toolSpecificData = {
+      input: 'subagent execution',
+      output: resultText,
+    } satisfies ChatSimpleToolResultData;
+    (stream as any).push(part as unknown as vscode.ChatResponsePart);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /test-subagent-single-blocking
+// ---------------------------------------------------------------------------
+// Follows Copilot Chat's official pattern from copilotCLITools.ts:
+//   1. beginToolInvocation(callId, 'task')
+//   2. push ChatToolInvocationPart with ChatSubagentToolInvocationData(description, agentName, prompt)
+//      — result is undefined at this point
+//   3. push child tools with subAgentInvocationId for VSCode grouping
+//   4. update toolSpecificData.result directly on the existing ChatSubagentToolInvocationData
+//   5. push final ChatToolInvocationPart (enablePartialUpdate replaces the card in-place)
+//      with pastTenseMessage + completed result
+// ---------------------------------------------------------------------------
+
+async function handleTestSubagentSingleBlockingCommand(
+  stream: vscode.ChatResponseStream,
+  token: vscode.CancellationToken,
+): Promise<void> {
+  const s = checkSubagentApi(stream);
+  if (!s) return;
+
+  const callId = uid();
+  const description = 'Explore codebase structure';
+  const agentName = 'explore';
+  const prompt = 'List all TypeScript source files in the project, identify the main entry points, and report the total count of .ts files across all directories.';
+  stream.markdown('# 🔵 Single Subagent (Blocking)\n\n');
+
+  try {
+    // Phase 1: Begin — register the tool invocation
+    if (s.beginToolInvocation) {
+      s.beginToolInvocation(callId, 'task');
+    }
+
+    // Phase 2: Push running card with ChatSubagentToolInvocationData (result = undefined)
+    // Matches copilotCLITools.ts formatTaskInvocation:
+    //   new ChatSubagentToolInvocationData(description, agentName, prompt)
+    if (VS.ChatToolInvocationPart && (stream as any).push) {
+      const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart('task', callId);
+      (part as any).enablePartialUpdate = true;
+      part.isComplete = false;
+      part.invocationMessage = description;
+      if (VS.ChatSubagentToolInvocationData) {
+        part.toolSpecificData = new VS.ChatSubagentToolInvocationData(
+          description,
+          agentName,
+          prompt,
+        );
+      }
+      (stream as any).push(part as unknown as vscode.ChatResponsePart);
+    }
+    await delay(500);
+    if (token.isCancellationRequested) return;
+
+    // Phase 3: Push child tools with subAgentInvocationId = parent task callId.
+    // VSCode groups child tools under the parent subagent by matching
+    // child.subAgentInvocationId === parent.toolCallId.
+    pushChildTool(s, uid(), 'read', callId, 'package.json', {
+      values: [vscode.Uri.file('package.json')],
+    } satisfies ChatToolResourcesInvocationData);
+    await delay(300);
+    if (token.isCancellationRequested) return;
+
+    pushChildTool(s, uid(), 'bash', callId, 'npm test', {
+      commandLine: { original: 'npm test' },
+      language: 'bash',
+      output: { text: '✓ 67 tests passed' },
+      state: { exitCode: 0, duration: 1200 },
+    } satisfies ChatTerminalToolInvocationData);
+    await delay(300);
+    if (token.isCancellationRequested) return;
+
+    // Public-API-friendly plain text output: render a generic child tool
+    // with ChatSimpleToolResultData instead of relying on subagent result page.
+    pushChildTool(s, uid(), 'summary', callId, 'Found 42 TypeScript files', {
+      input: 'subagent summary',
+      output: 'Found 42 TypeScript files across 8 directories. Key entry points: src/extension.ts, src/participant/handler.ts, src/participant/streaming.ts.',
+    } satisfies ChatSimpleToolResultData);
+
+    // Phase 4: Push completed card (enablePartialUpdate replaces in-place)
+    // Keep the subagent card + child tools + completion summary.
+    if (VS.ChatToolInvocationPart && (stream as any).push) {
+      const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart('task', callId);
+      (part as any).enablePartialUpdate = true;
+      part.isComplete = true;
+      part.invocationMessage = description;
+      part.pastTenseMessage = 'Found 42 TypeScript files';
+      if (VS.ChatSubagentToolInvocationData) {
+        part.toolSpecificData = new VS.ChatSubagentToolInvocationData(
+          description,
+          agentName,
+          prompt,
+        );
+      }
+      (stream as any).push(part as unknown as vscode.ChatResponsePart);
+    }
+  } catch (err) {
+    stream.markdown(`\n❌ **Error:** ${err instanceof Error ? err.message : String(err)}\n`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /test-subagent-multi-blocking
+// ---------------------------------------------------------------------------
+
+async function handleTestSubagentMultiBlockingCommand(
+  stream: vscode.ChatResponseStream,
+  token: vscode.CancellationToken,
+): Promise<void> {
+  const s = checkSubagentApi(stream);
+  if (!s) return;
+
+  stream.markdown('# 🟢 Multi Subagent (Sequential Blocking)\n\n');
+
+  try {
+    // First subagent
+    {
+      const callId = uid();
+      const description = 'Analyze database schema';
+      const agentName = 'explore';
+      const prompt = 'Analyze the database schema in src/models/. Find all model definitions and map their relationships (foreign keys, associations, indexes).';
+
+      if (s.beginToolInvocation) {
+        s.beginToolInvocation(callId, 'task');
+      }
+      if (VS.ChatToolInvocationPart && (stream as any).push) {
+        const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart('task', callId);
+        (part as any).enablePartialUpdate = true;
+        part.isComplete = false;
+        part.invocationMessage = description;
+        if (VS.ChatSubagentToolInvocationData) {
+          part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt);
+        }
+        (stream as any).push(part as unknown as vscode.ChatResponsePart);
+      }
+      await delay(400);
+      if (token.isCancellationRequested) return;
+
+      pushChildTool(s, uid(), 'read', callId, 'src/models/user.ts');
+      pushChildTool(s, uid(), 'read', callId, 'src/models/post.ts');
+      await delay(300);
+      if (token.isCancellationRequested) return;
+
+      pushChildTool(s, uid(), 'summary', callId, '5 models found, relationships mapped', {
+        input: 'subagent summary',
+        output: 'Found 5 models: User, Post, Comment, Tag, Session.\nUser → has many Posts, Post → has many Comments.',
+      } satisfies ChatSimpleToolResultData);
+
+      if (VS.ChatToolInvocationPart && (stream as any).push) {
+        const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart('task', callId);
+        (part as any).enablePartialUpdate = true;
+        part.isComplete = true;
+        part.invocationMessage = description;
+        part.pastTenseMessage = '5 models found, relationships mapped';
+        if (VS.ChatSubagentToolInvocationData) {
+          part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt);
+        }
+        (stream as any).push(part as unknown as vscode.ChatResponsePart);
+      }
+    }
+
+    await delay(200);
+    if (token.isCancellationRequested) return;
+
+    // Second subagent
+    {
+      const callId = uid();
+      const description = 'Create API endpoints';
+      const agentName = 'build';
+      const prompt = 'Based on the database models found (User, Post, Comment, Tag, Session), generate REST API endpoint files with CRUD operations for each model. Run lint after to verify.';
+
+      if (s.beginToolInvocation) {
+        s.beginToolInvocation(callId, 'task');
+      }
+      if (VS.ChatToolInvocationPart && (stream as any).push) {
+        const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart('task', callId);
+        (part as any).enablePartialUpdate = true;
+        part.isComplete = false;
+        part.invocationMessage = description;
+        if (VS.ChatSubagentToolInvocationData) {
+          part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt);
+        }
+        (stream as any).push(part as unknown as vscode.ChatResponsePart);
+      }
+      await delay(400);
+      if (token.isCancellationRequested) return;
+
+      pushChildTool(s, uid(), 'write', callId, 'src/api/users.ts');
+      pushChildTool(s, uid(), 'write', callId, 'src/api/posts.ts');
+      pushChildTool(s, uid(), 'bash', callId, 'npm run lint');
+      await delay(300);
+      if (token.isCancellationRequested) return;
+
+      pushChildTool(s, uid(), 'summary', callId, '15 API endpoints created', {
+        input: 'subagent summary',
+        output: 'Created 15 endpoints across 5 resource files. All endpoints pass lint checks.',
+      } satisfies ChatSimpleToolResultData);
+
+      if (VS.ChatToolInvocationPart && (stream as any).push) {
+        const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart('task', callId);
+        (part as any).enablePartialUpdate = true;
+        part.isComplete = true;
+        part.invocationMessage = description;
+        part.pastTenseMessage = '15 API endpoints created';
+        if (VS.ChatSubagentToolInvocationData) {
+          part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt);
+        }
+        (stream as any).push(part as unknown as vscode.ChatResponsePart);
+      }
+    }
+  } catch (err) {
+    stream.markdown(`\n❌ **Error:** ${err instanceof Error ? err.message : String(err)}\n`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /test-subagent-single-parallel
+// ---------------------------------------------------------------------------
+
+async function handleTestSubagentSingleParallelCommand(
+  stream: vscode.ChatResponseStream,
+  token: vscode.CancellationToken,
+): Promise<void> {
+  const s = checkSubagentApi(stream);
+  if (!s) return;
+
+  const callId = uid();
+  const description = 'Search for TODO patterns';
+  const agentName = 'explore';
+  const prompt = 'Search the codebase for all TODO comments. List each TODO with its file path, line number, and surrounding context. Categorize by urgency if possible.';
+
+  stream.markdown('# 🟡 Single Subagent (Parallel/Callback)\n\n');
+
+  try {
+    // Start subagent
+    if (s.beginToolInvocation) {
+      s.beginToolInvocation(callId, 'task');
+    }
+    if (VS.ChatToolInvocationPart && (stream as any).push) {
+      const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart('task', callId);
+      (part as any).enablePartialUpdate = true;
+      part.isComplete = false;
+      part.invocationMessage = description;
+      if (VS.ChatSubagentToolInvocationData) {
+        part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt);
+      }
+      (stream as any).push(part as unknown as vscode.ChatResponsePart);
+    }
+
+    // Main agent continues — output text while subagent runs
+    stream.markdown('I\'ll search for TODO patterns in the background while I continue analyzing the project structure.\n\n');
+    await delay(200);
+
+    // Subagent completes asynchronously (ACP callback pattern)
+    const asyncComplete = (async () => {
+      await delay(800);
+      if (token.isCancellationRequested) return;
+
+      pushChildTool(s, uid(), 'grep', callId, 'TODO comments');
+
+      await delay(400);
+      if (token.isCancellationRequested) return;
+
+      pushChildTool(s, uid(), 'summary', callId, '5 TODOs found', {
+        input: 'subagent summary',
+        output: 'Found 5 TODO comments across 3 files:\n- src/auth/middleware.ts (2 TODOs: token refresh, error mapping)\n- src/api/routes.ts (1 TODO: input validation)\n- src/utils/helpers.ts (2 TODOs: caching, type narrowing)',
+      } satisfies ChatSimpleToolResultData);
+
+      if (VS.ChatToolInvocationPart && (stream as any).push) {
+        const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart('task', callId);
+        (part as any).enablePartialUpdate = true;
+        part.isComplete = true;
+        part.invocationMessage = description;
+        part.pastTenseMessage = '5 TODOs found';
+        if (VS.ChatSubagentToolInvocationData) {
+          part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt);
+        }
+        (stream as any).push(part as unknown as vscode.ChatResponsePart);
+      }
+    })();
+
+    // Main agent keeps producing output while subagent runs
+    await delay(300);
+    stream.markdown('The project follows a layered architecture with ACP protocol abstraction...\n');
+    await delay(300);
+    stream.markdown('Entry points are well-separated between extension, participant, and surface layers.\n\n');
+
+    await asyncComplete;
+  } catch (err) {
+    stream.markdown(`\n❌ **Error:** ${err instanceof Error ? err.message : String(err)}\n`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /test-subagent-multi-parallel
+// ---------------------------------------------------------------------------
+
+async function handleTestSubagentMultiParallelCommand(
+  stream: vscode.ChatResponseStream,
+  token: vscode.CancellationToken,
+): Promise<void> {
+  const s = checkSubagentApi(stream);
+  if (!s) return;
+
+  stream.markdown('# 🔴 Multi Subagent (All Parallel)\n\n');
+
+  const agents = [
+    {
+      name: 'explore',
+      desc: 'Analyze project structure',
+      prompt: 'Scan the src/ directory, list all TypeScript modules grouped by layer (acp/, backends/, participant/, surfaces/), and identify the main entry points and their dependencies.',
+      resultText: 'Found 12 modules in src/, 3 entry points.\nMain layers: acp/, backends/, participant/, surfaces/.',
+      summary: '12 modules found',
+      childTools: [{ name: 'list', title: 'src/' }, { name: 'read', title: 'package.json' }],
+    },
+    {
+      name: 'build',
+      desc: 'Fix TypeScript errors',
+      prompt: 'Run the TypeScript compiler in check mode, find all type errors, fix them by adding missing interfaces and type annotations, then verify the fix with a clean compile.',
+      resultText: 'Fixed 3 type errors:\n- src/auth/types.ts: added missing Session interface\n- src/auth/middleware.ts: fixed string→enum cast\n- src/auth/jwt.ts: added return type annotation',
+      summary: '3 type errors fixed',
+      childTools: [{ name: 'grep', title: 'error TS' }, { name: 'edit', title: 'src/auth/types.ts' }, { name: 'bash', title: 'npx tsc --noEmit' }],
+    },
+    {
+      name: 'test',
+      desc: 'Run test suite',
+      prompt: 'Run the full test suite with coverage reporting. Identify files or modules with less than 50% branch coverage and list them as coverage gaps to address.',
+      resultText: 'Coverage: 78% statements, 65% branches.\n42 of 54 tests passing.\nGaps: surfaces/vscode/ (12%), backends/opencode/ (34%).',
+      summary: '78% coverage, 42/54 tests passing',
+      childTools: [{ name: 'bash', title: 'npm test -- --coverage' }, { name: 'read', title: 'coverage/summary.json' }],
+    },
+  ];
+
+  try {
+    const tasks = agents.map(async (agent, i) => {
+      const callId = uid();
+
+      if (s.beginToolInvocation) {
+        s.beginToolInvocation(callId, 'task');
+      }
+      if (VS.ChatToolInvocationPart && (stream as any).push) {
+        const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart('task', callId);
+        (part as any).enablePartialUpdate = true;
+        part.isComplete = false;
+        part.invocationMessage = agent.desc;
+        if (VS.ChatSubagentToolInvocationData) {
+          part.toolSpecificData = new VS.ChatSubagentToolInvocationData(agent.desc, agent.name, agent.prompt);
+        }
+        (stream as any).push(part as unknown as vscode.ChatResponsePart);
+      }
+
+      const delayMs = 600 + i * 400;
+      await delay(delayMs);
+      if (token.isCancellationRequested) return;
+
+      for (const child of agent.childTools) {
+        pushChildTool(s, uid(), child.name, callId, child.title);
+      }
+
+      await delay(300);
+      if (token.isCancellationRequested) return;
+
+      pushChildTool(s, uid(), 'summary', callId, agent.summary, {
+        input: 'subagent summary',
+        output: agent.resultText,
+      } satisfies ChatSimpleToolResultData);
+
+      if (VS.ChatToolInvocationPart && (stream as any).push) {
+        const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart('task', callId);
+        (part as any).enablePartialUpdate = true;
+        part.isComplete = true;
+        part.invocationMessage = agent.desc;
+        part.pastTenseMessage = agent.summary;
+        if (VS.ChatSubagentToolInvocationData) {
+          part.toolSpecificData = new VS.ChatSubagentToolInvocationData(agent.desc, agent.name, agent.prompt);
+        }
+        (stream as any).push(part as unknown as vscode.ChatResponsePart);
+      }
+    });
+
+    // Main agent output while subagents run
+    stream.markdown('Dispatching 3 parallel subagents to analyze the project...\n\n');
+    await Promise.all(tasks);
+  } catch (err) {
+    stream.markdown(`\n❌ **Error:** ${err instanceof Error ? err.message : String(err)}\n`);
+  }
+}

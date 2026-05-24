@@ -59,6 +59,22 @@
           {
             "name": "test-external-edit-e2e",
             "description": "End-to-end test via real OpenCode prompt"
+          },
+          {
+            "name": "test-subagent-single-blocking",
+            "description": "Diagnostic: single subagent, blocking (pending→running→completed)"
+          },
+          {
+            "name": "test-subagent-multi-blocking",
+            "description": "Diagnostic: multiple subagents, sequential blocking"
+          },
+          {
+            "name": "test-subagent-single-parallel",
+            "description": "Diagnostic: single subagent, parallel/callback pattern"
+          },
+          {
+            "name": "test-subagent-multi-parallel",
+            "description": "Diagnostic: multiple subagents, all parallel"
           }
         ]
       }
