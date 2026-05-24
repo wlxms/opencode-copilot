@@ -199,6 +199,7 @@ describe('StreamBridge', () => {
     const stream = mockStream();
     const taskId = 'prt_task001';
     const taskCallId = 'call_sub1';
+    const childSessionId = 'ses_child001';
     // Subagent internal tool part (different partId — will be filtered)
     const subPartId = 'prt_sub_read001';
     const subDeltaPartId = 'prt_sub_text001';
@@ -218,39 +219,49 @@ describe('StreamBridge', () => {
       { type: 'part.delta', partId: subDeltaPartId, delta: 'subagent thinking...' },
       // Another subagent tool: bash (different partId — should be filtered)
       { type: 'part.updated', part: { type: 'tool', toolName: 'bash', id: 'prt_sub_bash001', callId: 'call_sub_bash', state: { status: 'completed', input: { command: 'npm test' }, output: 'all pass' } } },
-      // Task tool: completed → closes subagent scope
-      { type: 'part.updated', part: { type: 'tool', toolName: 'task', id: taskId, callId: taskCallId, state: { status: 'completed', input: { description: 'fix bug' }, output: 'bug fixed', title: 'fix-bug', startTime: 1000, endTime: 3000 } } },
+      // Task tool: completed → subagent created, childSessionId set, scope kept open
+      { type: 'part.updated', part: { type: 'tool', toolName: 'task', id: taskId, callId: taskCallId, state: { status: 'completed', input: { description: 'fix bug' }, output: 'bug fixed', title: 'fix-bug', metadata: { sessionId: childSessionId }, startTime: 1000, endTime: 3000 } } },
       // AI response
       { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
       ...['Done'].map((d: string) => deltaEvent(d)),
+      // Child session goes idle → triggers final subagent card push
+      idleEventFor(childSessionId),
+      // Parent session idle → bridge stops
       idleEvent(),
     ]);
     await bridge.bridgeEventsToStream(events, stream, mockToken());
 
-    // Task tool should be invoked (begin + completed push)
+    // Task tool should be invoked (begin + running push)
     expect(stream.beginToolInvocation).toHaveBeenCalledWith(taskCallId, 'task');
 
-    // The completed push should include a ChatToolInvocationPart with progress in result
+    // The final card should be pushed when child session goes idle
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
-    // Should have at least the task's completed part pushed
+    // Should have the task's final completed part pushed (from child session.idle)
     const taskPart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean };
       return p?.toolName === 'task' && p?.toolCallId === taskCallId && p?.isComplete === true;
     });
     expect(taskPart).toBeDefined();
 
-    // Verify subagent internal tools were NOT pushed as independent cards
+    // Verify subagent internal tools were pushed as child tool cards
+    // (with subAgentInvocationId for VSCode scope grouping), not as
+    // independent top-level cards.
     const readPart = pushed.find((call: unknown[]) => {
-      const p = call[0] as { toolName?: string };
+      const p = call[0] as { toolName?: string; subAgentInvocationId?: string };
       return p?.toolName === 'read';
     });
-    expect(readPart).toBeUndefined();
+    expect(readPart).toBeDefined();
+    // Child tools should carry the subAgentInvocationId for grouping
+    const readObj = readPart![0] as any;
+    expect(readObj.subAgentInvocationId).toBeDefined();
 
     const bashPart = pushed.find((call: unknown[]) => {
-      const p = call[0] as { toolName?: string };
+      const p = call[0] as { toolName?: string; subAgentInvocationId?: string };
       return p?.toolName === 'bash';
     });
-    expect(bashPart).toBeUndefined();
+    expect(bashPart).toBeDefined();
+    const bashObj = bashPart![0] as any;
+    expect(bashObj.subAgentInvocationId).toBeDefined();
 
     // AI text should still be rendered
     expect(stream.markdown).toHaveBeenCalledWith('Done');
@@ -301,6 +312,7 @@ describe('StreamBridge', () => {
     const stream = mockStream();
     const taskId = 'prt_task_idle';
     const taskCallId = 'call_idle_test';
+    const childSessionId = 'ses_child_idle';
 
     const events = eventStream([
       { type: 'part.updated', part: { type: 'text', text: 'go', messageId: 'msg_u1', id: 'prt_u1' } },
@@ -313,8 +325,10 @@ describe('StreamBridge', () => {
       idleEvent(),
       // Subagent still produces events after idle
       { type: 'part.updated', part: { type: 'tool', toolName: 'read', id: 'prt_sub_r1', callId: 'call_sub_r1', state: { status: 'completed', input: { filePath: '/a.ts' }, output: 'content' } } },
-      // Task: completed → closes scope
-      { type: 'part.updated', part: { type: 'tool', toolName: 'task', id: taskId, callId: taskCallId, state: { status: 'completed', input: { description: 'slow task' }, output: 'done', title: 'slow-task' } } },
+      // Task: completed → scope kept open, childSessionId set
+      { type: 'part.updated', part: { type: 'tool', toolName: 'task', id: taskId, callId: taskCallId, state: { status: 'completed', input: { description: 'slow task' }, output: 'done', title: 'slow-task', metadata: { sessionId: childSessionId } } } },
+      // Child session idle → triggers final subagent card push
+      idleEventFor(childSessionId),
       // Final idle (no active subagents) → should stop
       idleEvent(),
     ]);
@@ -323,7 +337,7 @@ describe('StreamBridge', () => {
     // Bridge should complete successfully (not cancel)
     expect(result).toBe(true);
 
-    // Task completed part should have been pushed
+    // Task completed part should have been pushed (via child session.idle)
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
     const taskPart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean };
