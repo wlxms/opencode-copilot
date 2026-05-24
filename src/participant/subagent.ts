@@ -19,6 +19,23 @@ export interface SubagentScope {
   childSessionId?: string;
   /** True once the child session has emitted session.idle */
   childIdle?: boolean;
+  /**
+   * Unique ID for this subagent invocation — set at task:completed when the
+   * subagent is truly created. Passed to beginToolInvocation for child tools
+   * so VSCode groups them under the parent subagent card.
+   */
+  subAgentInvocationId?: string;
+  /** Task tool metadata captured at task:running — used to build final card at session.idle */
+  toolMeta?: {
+    toolName: string;
+    title: string;
+    input: Record<string, unknown>;
+    timeStart?: number;
+  };
+  /** Task tool output captured at task:completed */
+  output?: string;
+  /** Wall-clock time when the subagent truly finished (child session.idle) */
+  timeEnd?: number;
 }
 
 // ---------------------------------------------------------------------------
