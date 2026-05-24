@@ -195,8 +195,27 @@ export class AcpRenderer {
           rendered: this.handlePartDelta(evt, s),
           eventType: 'message.part.delta',
         };
-      case 'session.idle':
+      case 'session.idle': {
+        // Check if this is a child session becoming idle.
+        // Child session.idle events are forwarded by the event-broker to the
+        // parent channel (via childToParent mapping). We match by childSessionId
+        // and push the FINAL completed subagent card with aggregated progress.
+        const idleEvent = evt as { properties?: { sessionID?: string } };
+        const idleSessionId = idleEvent.properties?.sessionID;
+        if (idleSessionId) {
+          for (const scope of this.activeSubagentScopes.values()) {
+            if (scope.childSessionId === idleSessionId) {
+              scope.childIdle = true;
+              // Record the true end time — this is when the subagent truly finished
+              scope.timeEnd = Date.now();
+              this.log(`child session idle: childSessionId=${idleSessionId}, callID=${scope.callId}, toolCalls=${scope.toolCalls.length}`);
+              this.pushFinalSubagentCard(s, scope);
+              break;
+            }
+          }
+        }
         return { rendered: false, eventType: 'session.idle' };
+      }
       case 'session.diff':
         return {
           rendered: this.handleSessionDiff(evt as SessionDiffEvent, s),
@@ -437,9 +456,25 @@ export class AcpRenderer {
       meta.timeStart = getToolTime(state)?.start;
     }
     // Track subagent scope so child events get filtered instead of leaking
+    // Generate subAgentInvocationId at scope creation so child tools that
+    // arrive before task:completed already have the grouping ID.
     if (toolName === 'task' || toolName === 'subagent') {
-      this.activeSubagentScopes.set(callID, { callId: callID, toolCalls: [], completed: false });
-      this.log(`subagent scope opened: callID=${callID}`);
+      this.activeSubagentScopes.set(callID, {
+        callId: callID,
+        toolCalls: [],
+        completed: false,
+        // VSCode groups child tools under the parent subagent card by matching
+        // child.subAgentInvocationId === parent.toolCallId. Therefore the scope's
+        // subAgentInvocationId must be the parent task's own callID.
+        subAgentInvocationId: callID,
+        toolMeta: {
+          toolName,
+          title: getToolTitle(state) ?? toolName,
+          input: state.input ?? {},
+          timeStart: getToolTime(state)?.start,
+        },
+      });
+      this.log(`subagent scope opened: callID=${callID}, subAgentInvocationId=${callID}`);
     }
 
     if (!this._hasToolUI || !stream.updateToolInvocation) {
@@ -450,7 +485,9 @@ export class AcpRenderer {
       partialInput: state.input ?? {},
     });
 
-    // Progressive push: show a "tool running" spinner in the UI
+    // Progressive push: show a "tool running" spinner in the UI.
+    // For subagent tools, attach ChatSubagentToolInvocationData so VSCode
+    // renders it as an expandable subagent card from the start.
     if (
       hasChatToolInvocationPart() &&
       stream.push &&
@@ -463,11 +500,20 @@ export class AcpRenderer {
           part.isComplete = false;
           part.isError = false;
           part.enablePartialUpdate = true;
-          part.invocationMessage = formatInvocationMsg(
-            toolName,
-            state.input ?? {},
-            getToolTitle(state) ?? toolName,
-          );
+          const input = state.input ?? {};
+          const title = getToolTitle(state) ?? toolName;
+          part.invocationMessage = title;
+          // For subagent tools, show as expandable subagent card (matches demo pattern)
+          if ((toolName === 'task' || toolName === 'subagent') && hasChatSubagentToolInvocationData() && Proposed.ChatSubagentToolInvocationData) {
+            const description = (input.description as string) ?? title;
+            const agentName = (input.agentName as string) ?? (input.agent_type as string) ?? toolName;
+            const prompt = (input.prompt as string) ?? '';
+            part.toolSpecificData = new Proposed.ChatSubagentToolInvocationData(
+              description,
+              agentName,
+              prompt,
+            ) as ChatSubagentToolInvocationData;
+          }
           stream.push(part as unknown as vscode.ChatResponsePart);
           this.progressivePushed.add(callID);
         } catch {
@@ -493,33 +539,44 @@ export class AcpRenderer {
       meta.title = getToolTitle(state) ?? meta.title;
     }
 
-    // For subagent tools: inject aggregated progress into output before rendering.
-    // IMPORTANT: do NOT delete the scope here. For background tasks, the parent
-    // session marks the tool call "completed" as soon as the task is *dispatched*,
-    // but the subagent continues running asynchronously.
+    // For subagent tools: the subagent was just created and starts running.
+    // At task:completed, pushToolInvocation creates the subagent card with
+    // ChatSubagentToolInvocationData. The card shows task tool duration.
+    // At child session.idle, pushFinalSubagentCard updates with full duration.
     const subagentScope = this.activeSubagentScopes.get(callID);
     if ((toolName === 'task' || toolName === 'subagent') && subagentScope) {
-      // Extract child session ID from tool metadata (OpenCode task tool puts it there)
-      // StreamToolState is a discriminated union — narrow via 'in' checks
       const sdkState = state as { metadata?: Record<string, unknown>; output?: string };
       const childSessionId = (sdkState.metadata?.sessionId ??
         (typeof sdkState.output === 'string' ? sdkState.output.match(/task_id:\s*(\S+)/)?.[1] : undefined)) as string | undefined;
-      if (childSessionId) {
+      if (childSessionId && !subagentScope.childSessionId) {
         subagentScope.childSessionId = childSessionId;
         this.log(`child session ID captured: callID=${callID}, childSessionId=${childSessionId}`);
       }
-      const progress = formatSubagentProgress(subagentScope);
-      if (progress && meta) {
-        meta.output = [progress, meta.output].filter(Boolean).join('\n');
-      }
-      subagentScope.completed = true;
-      this.log(`subagent scope completed (kept open): callID=${callID}, progress="${progress}"`);
-    }
+      // subAgentInvocationId already generated at task:running (scope creation)
 
-    if (this._hasToolUI && hasChatToolInvocationPart()) {
-      this.pushToolInvocation(stream, callID, toolName, state);
+      subagentScope.output = getToolOutput(state) ?? '';
+      subagentScope.completed = true;
+
+      this.log(`subagent scope activated (subagent spawned): callID=${callID}, childSessionId=${childSessionId || subagentScope.childSessionId}, subAgentInvocationId=${subagentScope.subAgentInvocationId}`);
+      // DON'T push completed card — the subagent is still running!
+      // Just update the running card to show it's active.
+      // The final completed card will be pushed at child session.idle.
+      if (stream.updateToolInvocation) {
+        try {
+          const input = state.input ?? {};
+          const title = (input.description as string) ?? getToolTitle(state) ?? toolName;
+          stream.updateToolInvocation(callID, {
+            invocationMessage: `Running ${title}...`,
+          });
+        } catch { /* best-effort */ }
+      }
     } else {
-      renderToolFallback(stream, toolName, state.input, getToolOutput(state), getToolTitle(state));
+      // Non-subagent tools: push completed card as usual
+      if (this._hasToolUI && hasChatToolInvocationPart()) {
+        this.pushToolInvocation(stream, callID, toolName, state, false);
+      } else {
+        renderToolFallback(stream, toolName, state.input, getToolOutput(state), getToolTitle(state));
+      }
     }
 
     this.toolMetas.delete(callID);
@@ -595,6 +652,11 @@ export class AcpRenderer {
         part.invocationMessage = formatInvocationMsg(toolName, input, title);
         part.pastTenseMessage = formatPastTenseMsg(toolName, title, timeStart, timeEnd);
         part.toolSpecificData = buildToolSpecificData(toolName, title, input, output, timeStart, timeEnd);
+
+        // NOTE: Parent subagent cards must NOT have subAgentInvocationId set.
+        // VSCode groups child tools under the parent by matching
+        // child.subAgentInvocationId === parent.toolCallId.
+        // Only child tool cards should carry subAgentInvocationId.
       }
 
       // Hide internal/structural tools after completion
@@ -614,6 +676,17 @@ export class AcpRenderer {
 
   /**
    * Check whether an OpenCode event belongs to an active subagent's internal stream.
+   *
+   * Event ordering (SDK-level):
+   *   1. parent task:pending / task:running → scope created
+   *   2. parent task:completed → childSessionId captured from metadata
+   *   3. child tool events (read:pending, edit:completed, ...) arrive
+   *   4. child session.idle → final progress update
+   *
+   * Strategy: Any `message.part.updated` whose part type is NOT `text`/`reasoning`
+   * /`step-start`/`step-finish` (structural parts) and NOT a parent-level
+   * `task`/`subagent` tool is treated as subagent-internal IF the part isn't
+   * already tracked as a parent-level part-kind (checked via `partKinds`).
    *
    * Works with OpenCodeEvent (SDK-level), where part data is at `evt.properties.part`.
    * Uses the same `partKinds` whitelist strategy as StreamBridge.
@@ -649,8 +722,106 @@ export class AcpRenderer {
   }
 
   /**
-   * Capture a subagent-internal event for progress aggregation.
-   * Also pushes real-time invocation message updates to the parent task tool card.
+   * Push the final completed ChatToolInvocationPart for a subagent when its
+   * child session goes idle. This is the ONLY place a completed card is pushed
+   * for task/subagent tools — handleToolCompleted only keeps the spinner alive.
+   */
+  private pushFinalSubagentCard(stream: Stream, scope: SubagentScope): void {
+    const meta = scope.toolMeta;
+    const toolName = meta?.toolName ?? 'task';
+    const title = meta?.title ?? toolName;
+    const input = meta?.input ?? {};
+    const output = scope.output ?? '';
+    const timeStart = meta?.timeStart;
+    const timeEnd = scope.timeEnd;
+    const progress = formatSubagentProgress(scope);
+    const result = progress ? [progress, output].filter(Boolean).join('\n') : output;
+
+    // Update invocationMessage with completion status
+    if (this._hasToolUI && stream.updateToolInvocation) {
+      const completedCount = scope.toolCalls.filter(tc => tc.status === 'completed').length;
+      let msg = `Subagent finished — ${completedCount} tool${completedCount !== 1 ? 's' : ''}`;
+      if (progress) msg += ` (${progress})`;
+      try {
+        stream.updateToolInvocation(scope.callId, { invocationMessage: msg });
+      } catch { /* best-effort */ }
+    }
+
+    // Push final completed tool card
+    if (this._hasToolUI && hasChatToolInvocationPart() && stream.push) {
+      const Ctor = Proposed.ChatToolInvocationPart;
+      if (Ctor) {
+        try {
+          const part = new Ctor(toolName, scope.callId);
+          part.enablePartialUpdate = true;
+          part.isComplete = true;
+          // Parent subagent card must NOT have subAgentInvocationId.
+          // VSCode groups child tools under the parent by matching
+          // child.subAgentInvocationId === parent.toolCallId (= scope.callId).
+          part.invocationMessage = formatInvocationMsg(toolName, input, title);
+          // timeStart = when task:running fired, timeEnd = when child session.idle fired
+          part.pastTenseMessage = formatPastTenseMsg(toolName, title, timeStart, timeEnd);
+
+          // Build ChatSubagentToolInvocationData with full result
+          const description = (input.description as string) ?? title;
+          const agentName = (input.agentName as string) ?? (input.agent_type as string) ?? toolName;
+          const prompt = (input.prompt as string) ?? '';
+          if (hasChatSubagentToolInvocationData() && Proposed.ChatSubagentToolInvocationData) {
+            part.toolSpecificData = new Proposed.ChatSubagentToolInvocationData(
+              description,
+              agentName,
+              prompt,
+              result,
+            ) as ChatSubagentToolInvocationData;
+          } else {
+            part.toolSpecificData = {
+              description,
+              agentName,
+              prompt,
+              result,
+            } satisfies ChatSubagentToolInvocationData;
+          }
+
+          stream.push(part as unknown as vscode.ChatResponsePart);
+          this.log(`final subagent card pushed: callID=${scope.callId}, toolCalls=${scope.toolCalls.length}, progress="${progress}"`);
+
+          // Push summary child card (grouped under parent via subAgentInvocationId = parent.callId)
+          // This gives the subagent card visible content matching the demo pattern.
+          if (progress && stream.beginToolInvocation) {
+            try {
+              const summaryCallId = `summary_${scope.callId}`;
+              stream.beginToolInvocation(summaryCallId, 'summary', {
+                subagentInvocationId: scope.subAgentInvocationId,
+              } as any);
+              const summaryPart = new Ctor('summary', summaryCallId);
+              (summaryPart as any).subAgentInvocationId = scope.subAgentInvocationId;
+              summaryPart.isComplete = true;
+              summaryPart.isError = false;
+              summaryPart.invocationMessage = progress;
+              summaryPart.toolSpecificData = {
+                input: 'subagent execution',
+                output: truncate(output, 2000),
+              } satisfies ChatSimpleToolResultData;
+              stream.push(summaryPart as unknown as vscode.ChatResponsePart);
+            } catch {
+              // Best-effort summary child card
+            }
+          }
+        } catch {
+          // Best-effort; invocationMessage update above is sufficient
+        }
+      }
+    }
+  }
+
+  /**
+   *
+   * Event ordering (corrected):
+   *   1. parent task:completed → childSessionId is set in scope metadata
+   *   2. child tool events arrive (AFTER childSessionId is already available)
+   *   3. child session.idle  → final progress update
+   *
+   * Matches events to scope by childSessionId to correctly handle parallel subagents.
    */
   private captureSubagentEvent(evt: OpenCodeEvent, stream?: Stream): void {
     if (evt.type !== 'message.part.updated') return;
@@ -664,25 +835,137 @@ export class AcpRenderer {
     const toolName = toolPart.tool ?? 'unknown';
     const title = getToolTitle(state);
 
-    for (const scope of this.activeSubagentScopes.values()) {
-      scope.toolCalls.push({
-        name: toolName,
-        title: title ?? undefined,
-        status: state.status,
-      });
-      // Push real-time update so subagent activity is visible inside the card
-      if (stream && this._hasToolUI && stream.updateToolInvocation) {
-        const label = title ?? toolName;
-        const verb = state.status === 'completed' ? '✓' : state.status === 'error' ? '✗' : '⋯';
-        try {
-          stream.updateToolInvocation(scope.callId, { invocationMessage: `${verb} ${toolName}: ${label}` });
-        } catch { /* best-effort */ }
+    // -- Match the event to exactly one subagent scope (using childSessionId) --
+    const childSessionId = part.sessionID;
+    let matchedScope: SubagentScope | undefined;
+
+    if (childSessionId) {
+      for (const scope of this.activeSubagentScopes.values()) {
+        if (scope.childSessionId === childSessionId) {
+          matchedScope = scope;
+          break;
+        }
+      }
+      if (!matchedScope) {
+        this.log(`subagent capture: no scope for childSessionId=${childSessionId}, skipping (tool=${toolName}, status=${state.status})`);
+        return;
+      }
+    } else {
+      // Graceful fallback: if sessionID is missing from the event,
+      // try single-scope match (handles edge cases / race conditions).
+      const scopes = [...this.activeSubagentScopes.values()];
+      if (scopes.length === 1) {
+        matchedScope = scopes[0];
+      } else {
+        this.log(`subagent capture: event missing sessionID, ${scopes.length} active scopes — skipping (tool=${toolName}, status=${state.status})`);
+        return;
+      }
+    }
+
+    matchedScope.toolCalls.push({
+      name: toolName,
+      title: title ?? undefined,
+      status: state.status,
+    });
+
+    // Push real-time update so subagent activity is visible inside the card
+    if (stream && this._hasToolUI && stream.updateToolInvocation) {
+      const label = title ?? toolName;
+      const verb = state.status === 'completed' ? '✓' : state.status === 'error' ? '✗' : '⋯';
+      try {
+        stream.updateToolInvocation(matchedScope.callId, { invocationMessage: `${verb} ${toolName}: ${label}` });
+      } catch { /* best-effort */ }
+    }
+
+    // Forward child tool invocation to VSCode with subAgentInvocationId
+    // so VSCode groups it under the parent subagent card (scope mechanism).
+    // Match the demo pattern: beginToolInvocation + push ChatToolInvocationPart
+    // with subAgentInvocationId set, so VSCode renders child tools inside the
+    // expandable subagent card.
+    if (matchedScope.subAgentInvocationId && stream) {
+      if (state.status === 'completed' || state.status === 'error') {
+        // Push completed child tool card (grouped under parent subagent)
+        if (this._hasToolUI && hasChatToolInvocationPart() && stream.push) {
+          const Ctor = Proposed.ChatToolInvocationPart;
+          if (Ctor) {
+            try {
+              const childCallId = toolPart.callID ?? toolPart.id ?? '';
+              // Register first
+              if (stream.beginToolInvocation) {
+                stream.beginToolInvocation(childCallId, toolName, {
+                  subagentInvocationId: matchedScope.subAgentInvocationId,
+                } as any);
+              }
+              const childPart = new Ctor(toolName, childCallId);
+              (childPart as any).subAgentInvocationId = matchedScope.subAgentInvocationId;
+              childPart.isComplete = true;
+              childPart.isError = state.status === 'error';
+              childPart.invocationMessage = state.status === 'error'
+                ? `✗ ${toolName}`
+                : `✓ ${toolName}: ${title ?? ''}`;
+              stream.push(childPart as unknown as vscode.ChatResponsePart);
+            } catch { /* best-effort */ }
+          }
+        }
+      } else {
+        // Pending/running: just register via beginToolInvocation
+        if (this._hasToolUI && stream.beginToolInvocation) {
+          const childCallId = toolPart.callID ?? toolPart.id ?? '';
+          try {
+            stream.beginToolInvocation(childCallId, toolName, {
+              subagentInvocationId: matchedScope.subAgentInvocationId,
+            } as any);
+          } catch { /* best-effort */ }
+        }
+      }
+    }
+
+    // Forward child tool invocation to VSCode with subAgentInvocationId
+    // so VSCode groups it under the parent subagent card (scope mechanism).
+    // Match the demo pattern: beginToolInvocation + push ChatToolInvocationPart
+    // with subAgentInvocationId set, so VSCode renders child tools inside the
+    // expandable subagent card.
+    if (matchedScope.subAgentInvocationId && stream) {
+      if (state.status === 'completed' || state.status === 'error') {
+        // Push completed child tool card (grouped under parent subagent)
+        if (this._hasToolUI && hasChatToolInvocationPart() && stream.push) {
+          const Ctor = Proposed.ChatToolInvocationPart;
+          if (Ctor) {
+            try {
+              const childCallId = toolPart.callID ?? toolPart.id ?? '';
+              // Register first
+              if (stream.beginToolInvocation) {
+                stream.beginToolInvocation(childCallId, toolName, {
+                  subagentInvocationId: matchedScope.subAgentInvocationId,
+                } as any);
+              }
+              const childPart = new Ctor(toolName, childCallId);
+              (childPart as any).subAgentInvocationId = matchedScope.subAgentInvocationId;
+              childPart.isComplete = true;
+              childPart.isError = state.status === 'error';
+              childPart.invocationMessage = state.status === 'error'
+                ? `✗ ${toolName}`
+                : `✓ ${toolName}: ${title ?? ''}`;
+              stream.push(childPart as unknown as vscode.ChatResponsePart);
+            } catch { /* best-effort */ }
+          }
+        }
+      } else if (state.status === 'pending') {
+        // Pending: just register via beginToolInvocation
+        if (this._hasToolUI && stream.beginToolInvocation) {
+          const childCallId = toolPart.callID ?? toolPart.id ?? '';
+          try {
+            stream.beginToolInvocation(childCallId, toolName, {
+              subagentInvocationId: matchedScope.subAgentInvocationId,
+            } as any);
+          } catch { /* best-effort */ }
+        }
       }
     }
 
     this.log(
       `subagent capture: tool=${toolPart.tool}, status=${state.status}, ` +
-      `activeScopes=${this.activeSubagentScopes.size}`,
+      `childSessionId=${childSessionId ?? '<none>'}, callID=${matchedScope.callId}`,
     );
   }
 
@@ -768,7 +1051,7 @@ export function buildToolSpecificData(
     case 'task':
     case 'subagent': {
       const description = (input.description as string) ?? title;
-      const agentName = (input.agentName as string) ?? toolName;
+      const agentName = (input.agentName as string) ?? (input.agent_type as string) ?? title ?? toolName;
       const prompt = (input.prompt as string) ?? formatInput(input, '');
       const result = truncate(output, 4000);
 
