@@ -647,7 +647,7 @@ export class AcpRenderer {
         part.enablePartialUpdate = true;
         part.isComplete = true;
         part.invocationMessage = formatInvocationMsg(toolName, input, title);
-        part.pastTenseMessage = formatPastTenseMsg(toolName, title, timeStart, timeEnd);
+        part.pastTenseMessage = formatPastTenseMsg(toolName, title, timeStart, timeEnd, input);
         part.toolSpecificData = buildToolSpecificData(toolName, title, input, output, timeStart, timeEnd, !!subAgentInvocationId);
 
         // NOTE: Parent subagent cards must NOT have subAgentInvocationId set.
@@ -773,7 +773,7 @@ export class AcpRenderer {
           // child.subAgentInvocationId === parent.toolCallId (= scope.callId).
           part.invocationMessage = formatInvocationMsg(toolName, input, title);
           // timeStart = when task:running fired, timeEnd = when child session.idle fired
-          part.pastTenseMessage = formatPastTenseMsg(toolName, title, timeStart, timeEnd);
+        part.pastTenseMessage = formatPastTenseMsg(toolName, title, timeStart, timeEnd, input);
 
           // Build ChatSubagentToolInvocationData with full result
           const description = (input.description as string) ?? title;
@@ -1260,16 +1260,14 @@ export function formatInvocationMsg(
 
 /**
  * Format a human-readable "past tense message" shown after a tool completes.
- * read → `Read [fileName](file://path)` markdown link
- * grep → `Searched pattern`
- * grep_app_searchGitHub → `Github Searched query`
- * websearch/websearch_web_search_exa → `Web Searched query`
+ * Shows search parameters in title for grep/websearch tools.
  */
 export function formatPastTenseMsg(
   toolName: string,
   title: string,
   timeStart?: number,
   timeEnd?: number,
+  input?: Record<string, unknown>,
 ): string | vscode.MarkdownString {
   const duration = (timeStart != null && timeEnd != null)
     ? ` (${((timeEnd - timeStart) / 1000).toFixed(1)}s)`
@@ -1283,7 +1281,25 @@ export function formatPastTenseMsg(
       const uri = match[2];
       return new vscode.MarkdownString(`[${fileName}](${uri})${duration}`);
     }
-    return `Read ${title}${duration}`;
+    return `${title}${duration}`;
+  }
+
+  // --- grep: Searched `pattern` ---
+  if (toolName === 'grep') {
+    const pattern = input ? (input.pattern as string) ?? (input.query as string) ?? title : title;
+    return `Searched \`${pattern}\`${duration}`;
+  }
+
+  // --- grep_app_searchGitHub: Github Searched `query` ---
+  if (toolName === 'grep_app_searchGitHub') {
+    const query = input ? (input.query as string) ?? title : title;
+    return `Github Searched \`${query}\`${duration}`;
+  }
+
+  // --- websearch / websearch_web_search_exa: Web Searched `query` ---
+  if (toolName === 'websearch' || toolName === 'websearch_web_search_exa') {
+    const query = input ? (input.query as string) ?? title : title;
+    return `Web Searched \`${query}\`${duration}`;
   }
 
   const pastVerb =
