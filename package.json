@@ -18,6 +18,13 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "commands": [
+      {
+        "command": "opencode.openSettings",
+        "title": "ACP: Open Settings",
+        "category": "ACP"
+      }
+    ],
     "configuration": {
       "title": "OpenCode",
       "properties": {

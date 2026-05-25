@@ -8,6 +8,8 @@ import type {
 } from '@opencode-ai/sdk';
 import type { OpenCodeEventStream } from '../backends/opencode/sdk-events';
 import type { AcpBackend } from '../acp/backend';
+import type { StatusBarManager } from '../statusbar';
+import type { AcpModelSelection } from '../acp/types';
 
 export interface OpenCodeApiResponse<T, E = unknown> {
   data?: T;
@@ -99,4 +101,16 @@ export interface ExtensionState {
    * Each chat has its own turnMap, so switching chats doesn't lose rewind context.
    */
   sessionMap: Map<string, SessionState>;
+  /** Status bar controller (shows backend / agent / model) */
+  statusBar: StatusBarManager;
+  /** Current agent selection for next prompt */
+  currentAgent?: string;
+  /** Current model selection for next prompt */
+  currentModel?: AcpModelSelection;
+  /** Current model display name for status bar / UI */
+  currentModelDisplayName?: string;
+  /** Explicit agent override chosen by user for prompt calls */
+  selectedAgentOverride?: string;
+  /** Explicit model override chosen by user for prompt calls */
+  selectedModelOverride?: AcpModelSelection;
 }
