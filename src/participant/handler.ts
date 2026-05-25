@@ -4,6 +4,7 @@ import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
 
 import type { ExtensionState, TurnMapping } from '../types';
+import type { AcpChildSessionInfo, AcpSessionStatus } from '../acp/types';
 import { ExternalEditTracker } from './external-edit-tracker';
 import { collectOpenFileUris } from './checkpoint';
 
@@ -278,15 +279,9 @@ export function createParticipantHandler(
 
       const executeTurnWithBridge = async (): Promise<void> => {
         stream.progress('Connecting to event stream...');
-        const events = state.backend.events.openSessionStream(sessionId);
-        try {
-          await state.backend.events.ensureStarted();
-        } catch (err) {
-          state.backend.events.closeSessionStream(sessionId);
-          throw err;
-        }
+        await state.backend.events.ensureStarted();
 
-        // 7. Fire the prompt WITHOUT awaiting
+        // 7. Fire the user prompt WITHOUT awaiting (only once per turn)
         stream.progress('Sending message...');
         state.outputChannel.appendLine(
           `[handler] Prompting session ${sessionId} with: ${request.prompt.substring(0, 50)}`,
@@ -304,7 +299,7 @@ export function createParticipantHandler(
           state.outputChannel.appendLine(`[handler] Prompt error: ${msg}`);
         });
 
-        // 7b. Cancel → abort OpenCode session
+        // 7b. Cancel → abort OpenCode session (shared across all bridge runs)
         let aborted = false;
         const cancelDisposable = token.onCancellationRequested(() => {
           if (aborted) return;
@@ -322,10 +317,7 @@ export function createParticipantHandler(
           });
         });
 
-        state.outputChannel.appendLine(`[handler] bridge run start for session ${sessionId}`);
-        stream.progress('Waiting for response...');
-
-        // Collect known file URIs for new-file detection in per-edit externalEdit flow
+        // Collect known file URIs for new-file detection (once per turn)
         let knownFileUris: string[] = [];
         try {
           knownFileUris = collectOpenFileUris().map(u => u.toString());
@@ -333,35 +325,73 @@ export function createParticipantHandler(
           // vscode.workspace.textDocuments may not be available (e.g., test mock)
         }
 
-        const bridge = new StreamBridge({
-          logger: state.outputChannel,
-          sessionId,
-          knownFileUris: new Set(knownFileUris),
-          replyToPermission: (permissionSessionId, permissionId, response, permissionDirectory) => (
-            state.backend.permissions.reply(
-              permissionSessionId,
-              permissionId,
-              response,
-              permissionDirectory,
-            )
-          ),
-          directory,
-          tracker,
-        });
+        // Continuation loop: after subagent tasks complete, the orchestrator needs
+        // additional prompts to continue. We reopen the event stream and run the
+        // bridge again until no more subagent tasks are detected.
+        let userMessageId: string | null = null;
+        let needsContinue = true;
+
         try {
-          await bridge.run(events.stream, stream, token);
+          while (needsContinue && !token.isCancellationRequested) {
+            state.outputChannel.appendLine(`[handler] bridge run start for session ${sessionId}`);
+            stream.progress('Waiting for response...');
+
+            const events = state.backend.events.openSessionStream(sessionId);
+
+            const bridge = new StreamBridge({
+              logger: state.outputChannel,
+              sessionId,
+              knownFileUris: new Set(knownFileUris),
+              replyToPermission: (permissionSessionId, permissionId, response, permissionDirectory) => (
+                state.backend.permissions.reply(
+                  permissionSessionId,
+                  permissionId,
+                  response,
+                  permissionDirectory,
+                )
+              ),
+              directory,
+              tracker,
+              checkChildSessionsRunning: async () => {
+                try {
+                  const statusResult = await state.backend.sessions.status(directory);
+                  if (statusResult.error || !statusResult.data) return false;
+                  return await hasBusyDescendant(
+                    sessionId, directory, new Set(), statusResult.data,
+                  );
+                } catch {
+                  return false;
+                }
+              },
+            });
+
+            await bridge.run(events.stream, stream, token);
+
+            state.backend.events.closeSessionStream(sessionId);
+
+            // Capture userMessageId from the first bridge run
+            if (!userMessageId) {
+              userMessageId = bridge.getUserMessageId();
+            }
+
+            // After subagent tasks completed, send continuation prompt and loop
+            if (bridge.getHadSubagentTasks() && !token.isCancellationRequested) {
+              state.outputChannel.appendLine('[handler] Subagent tasks completed — sending continuation prompt');
+              await state.backend.sessions.prompt(sessionId, '', directory);
+            } else {
+              needsContinue = false;
+            }
+          }
         } finally {
           cancelDisposable.dispose();
+          state.backend.events.closeSessionStream(sessionId);
         }
-
-        state.backend.events.closeSessionStream(sessionId);
 
         // 9. Ensure prompt promise settles
         await promptPromise;
 
         // 10. Record user message ID
         const chatState = state.sessionMap.get(vscodeSessionId);
-        const userMessageId = bridge.getUserMessageId();
         state.outputChannel.appendLine(
           `[handler] User message ID for turn: ${!!chatState && !!userMessageId} (${userMessageId})`,
         );
@@ -395,6 +425,37 @@ export function createParticipantHandler(
       tracker.dispose();
     }
   };
+}
+
+/**
+ * Recursively check if any descendant session (child, grandchild, etc.)
+ * of `parentId` is still busy. Used by the bridge's polling callback
+ * to prevent premature stop when nested background tasks exist.
+ */
+async function hasBusyDescendant(
+  parentId: string,
+  directory: string | undefined,
+  visited: Set<string>,
+  statuses: Record<string, AcpSessionStatus>,
+  childrenFn: (id: string, dir?: string) => Promise<import('../acp/backend').AcpResult<import('../acp/types').AcpChildSessionInfo[]>>,
+): Promise<boolean> {
+  if (visited.has(parentId)) return false;
+  visited.add(parentId);
+
+  const childrenResult = await childrenFn(parentId, directory);
+  if (childrenResult.error || !childrenResult.data) return false;
+
+  for (const child of childrenResult.data) {
+    if (visited.has(child.id)) continue;
+
+    const status = statuses[child.id];
+    if (status?.type === 'busy') return true;
+
+    if (await hasBusyDescendant(child.id, directory, visited, statuses, childrenFn)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 

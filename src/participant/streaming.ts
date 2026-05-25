@@ -19,6 +19,7 @@ import type {
   ChatSimpleToolResultData,
   ChatToolResourcesInvocationData,
   ChatSubagentToolInvocationData,
+  ChatTodoToolInvocationData,
   ChatToolSpecificData,
   ChatToolInvocationPart,
   ChatToolInvocationStreamData,
@@ -28,8 +29,10 @@ import type {
   ChatResponseMultiDiffPart,
   ChatResponseWorkspaceEditPart,
 } from '../types/vscode-proposed-additions';
+import { ChatTodoStatus } from '../types/vscode-proposed-additions';
 import { ExternalEditTracker } from './external-edit-tracker';
 import type { AcpEventStream } from '../acp/backend';
+import { SubagentScope, formatSubagentProgress } from './subagent';
 
 /** Extended stream with proposed API methods */
 type Stream = vscode.ChatResponseStream & {
@@ -87,6 +90,19 @@ interface StreamBridgeOptions {
   ) => Promise<unknown>;
   /** Workspace directory for API calls */
   directory?: string;
+  /** Check if any child sessions are still running (busy). Returns true if at least one child is busy. */
+  checkChildSessionsRunning?: () => Promise<boolean>;
+  /**
+   * Walk up the parent chain from `sessionId` and return the first session ID
+   * that appears in `candidateChildSessionIds`. Returns undefined if no ancestor matches.
+   * Used to route grandchild events to the correct subagent scope.
+   */
+  findAncestorScope?: (sessionId: string, candidateChildSessionIds: Set<string>) => string | undefined;
+  /**
+   * Get the parent session ID for a given session, or undefined.
+   * Used to track grandchild→child relationships in the session hierarchy.
+   */
+  getParentSession?: (sessionId: string) => string | undefined;
 }
 
 // =======================================================================
@@ -103,9 +119,10 @@ interface StreamBridgeOptions {
  * - stream.markdown()                   → AI text token streaming
  *
  * toolSpecificData mapping (OpenCode tool → VSCode type):
- *   read          → ChatSimpleToolResultData (collapsible input/output)
+ *   read          → ChatToolResourcesInvocationData (clickable file reference)
  *   bash          → ChatTerminalToolInvocationData (terminal UI with exit code)
- *   write         → ChatToolResourcesInvocationData (file reference list)
+ *   write         → ChatToolResourcesInvocationData (clickable file reference)
+ *   edit          → ChatToolResourcesInvocationData (clickable file reference)
  *   list / grep   → ChatSimpleToolResultData (collapsible listing)
  *   task          → ChatSubagentToolInvocationData (click to expand subagent)
  *   (other)       → ChatSimpleToolResultData (generic fallback)
@@ -124,6 +141,18 @@ export class StreamBridge {
   private progressivePushed: Set<string> = new Set();
   /** Timestamp of last processed delta (for inter-delta gap measurement) */
   private lastDeltaTime: number = 0;
+  /** Active subagent scopes — filters child events from rendering as independent cards */
+  private activeSubagentScopes: Map<string, SubagentScope> = new Map();
+  /** Whether at least one subagent (task) tool completed during this bridge session */
+  private hadSubagentTasks = false;
+  /** Whether a session.idle event was received (and deferred due to active subagents) */
+  private deferredIdle = false;
+  /** Safety timer: after deferred idle, stop waiting after this many ms of no events */
+  private static readonly DEFERRED_IDLE_TIMEOUT_MS = 120_000;
+  /** Timer handle for the deferred-idle safety timeout */
+  private deferredIdleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Resolves when forceStop is triggered (deferred-idle timeout or external abort) */
+  private forceStopResolve: (() => void) | null = null;
   private readonly logger?: StreamBridgeLogger;
   private readonly sessionId?: string;
   /** URIs of files that existed before the turn started (proactive baseline) */
@@ -131,6 +160,9 @@ export class StreamBridge {
   private readonly tracker?: ExternalEditTracker;
   private readonly replyToPermission?: StreamBridgeOptions['replyToPermission'];
   private readonly directory?: string;
+  private readonly checkChildSessionsRunning?: StreamBridgeOptions['checkChildSessionsRunning'];
+  private readonly findAncestorScope?: StreamBridgeOptions['findAncestorScope'];
+  private readonly getParentSession?: StreamBridgeOptions['getParentSession'];
 
   constructor(options: StreamBridgeOptions = {}) {
     this.logger = options.logger;
@@ -139,11 +171,21 @@ export class StreamBridge {
     this.tracker = options.tracker;
     this.replyToPermission = options.replyToPermission;
     this.directory = options.directory;
+    this.checkChildSessionsRunning = options.checkChildSessionsRunning;
+    this.findAncestorScope = options.findAncestorScope;
+    this.getParentSession = options.getParentSession;
   }
 
   /** Get the OpenCode message ID of the user message in this turn, if captured */
   getUserMessageId(): string | null {
     return this.userMessageId;
+  }
+
+  /** Whether at least one subagent (task) tool completed during this session.
+   *  Set to true after a background task finishes; used by the handler to decide
+   *  whether to send a continuation prompt after bridge stop. */
+  getHadSubagentTasks(): boolean {
+    return this.hadSubagentTasks;
   }
 
   /**
@@ -154,7 +196,7 @@ export class StreamBridge {
    * @param token Cancellation token
    * @returns true if the stream completed without cancellation
    */
-  async run(
+   async run(
     events: AsyncIterable<AcpEvent>,
     stream: vscode.ChatResponseStream,
     token: vscode.CancellationToken,
@@ -168,35 +210,72 @@ export class StreamBridge {
       `tokenCancelled=${token.isCancellationRequested}, targetSession=${this.sessionId ?? 'any'}`,
     );
 
+    // Set up a force-stop mechanism for the deferred-idle safety timeout.
+    // When the timer fires, it resolves this promise, which breaks the
+    // for-await loop via Promise.race.
+    let forceStopResolve: (() => void) | null = null;
+    const forceStopPromise = new Promise<void>((resolve) => { forceStopResolve = resolve; });
+    this.forceStopResolve = () => forceStopResolve?.();
+
+    const iter = events[Symbol.asyncIterator]();
+
     try {
-      for await (const event of events) {
+      while (true) {
         if (token.isCancellationRequested) {
           const msg = 'Operation cancelled';
           this.log('bridge stop: cancellation requested');
           stream.markdown(`\n⚠️ ${msg}\n`);
           break;
         }
-        const tEnter = Date.now();
-        // Handle permission.asked as sync barrier (async, blocks loop until baseline captured + auto-reply)
-        if (event.type === 'permission.asked') {
-          await this.handlePermissionAsked(event, stream);
-          const tPerm = Date.now();
-          this.log(`[timing] permission.asked took ${tPerm - tEnter}ms`);
-          continue;
+
+        // Race between next event and force-stop signal
+        const nextP = iter.next();
+        const result = await Promise.race([
+          nextP.then((r) => ({ event: r, stopped: false })),
+          forceStopPromise.then(() => ({ event: null, stopped: true })),
+        ]);
+
+        if (result.stopped) {
+          this.log('bridge stop: deferred idle timeout');
+          break;
         }
-        const result = this.processEvent(event, s);
-        const tProcessed = Date.now();
-        this.log(`[timing] processEvent: type=${event.type}, rendered=${result.rendered}, took ${tProcessed - tEnter}ms`);
-        if (result.rendered) {
-          await yieldToEventLoop();
-          this.log(`[timing] yieldToEventLoop resolved, total=${Date.now() - tEnter}ms`);
-        }
-        if (result.stop) {
-          this.log('bridge stop: session.idle received');
+
+        if (result.event) {
+          const { value: event, done } = result.event;
+          if (done) break;
+          if (!event) break;
+
+          const tEnter = Date.now();
+          // Handle permission.asked as sync barrier (async, blocks loop until baseline captured + auto-reply)
+          if (event.type === 'permission.asked') {
+            await this.handlePermissionAsked(event, stream);
+            this.logTag('timing', `permission.asked took ${Date.now() - tEnter}ms`);
+            continue;
+          }
+          const dispatched = this.processEvent(event, s);
+
+          const tProcessed = Date.now();
+          this.logTag('timing', `processEvent: type=${event.type}, rendered=${dispatched.rendered}, took ${tProcessed - tEnter}ms`);
+          if (dispatched.rendered) {
+            await yieldToEventLoop();
+            this.logTag('timing', `yieldToEventLoop resolved, total=${Date.now() - tEnter}ms`);
+          }
+          if (dispatched.stop) {
+            if (this.activeSubagentScopes.size > 0) {
+              // Event stream ended while subagents were still active — log warning
+              // but don't continue looping (the stream is exhausted).
+              this.log(
+                `bridge stop with ${this.activeSubagentScopes.size} leaked subagent scope(s): ` +
+                [...this.activeSubagentScopes.keys()].join(', '),
+              );
+            } else {
+              this.log('bridge stop: session.idle received');
+            }
           break;
         }
       }
-      this.log('bridge loop completed');
+      this.logTag('lifecycle', 'bridge loop completed');
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Connection lost';
       this.log(`bridge error: ${msg}`);
@@ -204,7 +283,8 @@ export class StreamBridge {
     } finally {
       this.log(
         `bridge reset: userMessageId=${this.userMessageId ?? 'null'}, ` +
-        `partKinds=${this.partKinds.size}, toolMetas=${this.toolMetas.size}`,
+        `partKinds=${this.partKinds.size}, toolMetas=${this.toolMetas.size}, ` +
+        `subagentScopes=${this.activeSubagentScopes.size}`,
       );
       this.reset();
     }
@@ -227,14 +307,165 @@ export class StreamBridge {
   // -------------------------------------------------------------------
 
   private processEvent(event: AcpEvent, stream: Stream): EventDispatchResult {
-    this.log(`processEvent enter: type=${event.type}`);
+    this.logTag('event', `processEvent: type=${event.type}`);
 
     if (!this.shouldProcessEvent(event)) {
       const eventSessionId = getEventSessionId(event);
-      this.log(
-        `skip event: type=${event.type}, sessionID=${eventSessionId ?? 'unknown'}, ` +
-        `target=${this.sessionId ?? 'any'}`,
-      );
+      this.logTag('event', `skip: type=${event.type}, sessionID=${eventSessionId ?? 'unknown'}, target=${this.sessionId ?? 'any'}`);
+      return { stop: false, rendered: false };
+    }
+
+    // Handle forwarded child/descendant session events
+    const eventSessionId = getEventSessionId(event);
+    if (eventSessionId && eventSessionId !== this.sessionId) {
+      // This event is from a child or descendant session (forwarded by event-broker)
+
+      // Find which subagent scope owns this session (direct child or descendant)
+      const owningScope = this.findScopeForSession(eventSessionId);
+
+      if (event.type === 'session.idle') {
+        // A descendant session went idle.
+        // Track it in the scope's descendant set.
+        if (owningScope) {
+          owningScope.descendantSessionIds.add(eventSessionId);
+        }
+
+        // Check if this is the direct child session going idle
+        if (owningScope?.childSessionId === eventSessionId && !owningScope.childIdle) {
+          // The direct child is idle, but its descendants may still be running.
+          // Only mark as truly complete if ALL descendant sessions are idle.
+          // For now, record the event and check completion below.
+          this.logTag('subagent', `direct child session idle: childSessionId=${eventSessionId}, callID=${owningScope.callId}`);
+        } else {
+          this.logTag('subagent', `descendant session idle: sessionId=${eventSessionId}, scope=${owningScope?.callId ?? 'none'}`);
+        }
+
+        // Check if the owning scope's entire session tree is idle
+        if (owningScope) {
+          // If the direct child session hasn't gone idle yet, don't complete the scope
+          if (owningScope.childSessionId === eventSessionId || owningScope.childIdle) {
+            // Direct child is idle (or this IS the direct child going idle) —
+            // check if all known descendants are accounted for.
+            // A scope is complete when its direct child has gone idle.
+            // For nested subagents, the child session will only go idle
+            // after ALL its own descendants complete (the event-broker
+            // forwards descendant idle events, but the child session.idle
+            // itself only fires when the SDK session is truly done).
+            if (owningScope.childSessionId === eventSessionId && !owningScope.childIdle) {
+              owningScope.childIdle = true;
+              owningScope.timeEnd = Date.now();
+              // Push final completed subagent card
+              this.pushFinalSubagentUpdate(stream, owningScope);
+              // If we were in deferred idle, check if ALL children are now idle
+              if (this.deferredIdle) {
+                const allChildrenIdle = [...this.activeSubagentScopes.values()]
+                  .filter(s => s.childSessionId)
+                  .every(s => s.childIdle);
+                if (allChildrenIdle) {
+                  this.deferredIdle = false;
+                  this.clearDeferredIdleTimer();
+                  // Clean up child scopes to avoid "leaked scope" warning
+                  for (const [callId, s] of this.activeSubagentScopes) {
+                    if (s.childIdle) this.activeSubagentScopes.delete(callId);
+                  }
+                  this.logTag('subagent', 'all child sessions idle — waiting for parent orchestrator to continue');
+                  return { stop: false, rendered: false };
+                }
+              }
+            }
+          }
+        }
+      } else if (event.type === 'session.status') {
+        // Child/descendant session status update — log but don't stop
+        const statusEvent = event as any;
+        this.logTag('subagent', `descendant session status: sessionId=${eventSessionId}, status=${statusEvent.status?.type}`);
+      } else if (event.type === 'part.updated') {
+        if (event.part?.type === 'tool') {
+          // Capture child/descendant tool call for subagent progress display.
+          const childToolName = (event.part as any).toolName ?? 'unknown';
+          const childPartId = (event.part as any).id ?? '';
+          const childCallId = (event.part as any).callId ?? childPartId;
+          const childState = (event.part as any).state;
+          const childStatus = childState?.status ?? 'running';
+          const childTitle = childState?.title;
+
+          let matchingScope = owningScope;
+          if (!matchingScope) {
+            // Lazy bind: first scope without a childSessionId gets this session
+            matchingScope = [...this.activeSubagentScopes.values()]
+              .find(s => !s.childSessionId);
+            if (matchingScope) {
+              matchingScope.childSessionId = eventSessionId;
+              this.logTag('subagent', `lazy-bound childSessionId=${eventSessionId} to callID=${matchingScope.callId}`);
+            }
+          }
+          if (matchingScope) {
+            matchingScope.descendantSessionIds.add(eventSessionId);
+            matchingScope.toolCalls.push({
+              name: childToolName,
+              title: childTitle ?? undefined,
+              status: childStatus,
+            });
+            // Update parent task tool card in real-time so subagent activity
+            // appears inside the subagent card in VSCode chat.
+            this.updateSubagentCard(stream, matchingScope, childToolName, childTitle, childStatus);
+            // Forward child tool invocation to VSCode with subAgentInvocationId
+            // so VSCode groups it under the parent subagent card.
+            // Uses pushToolInvocation() for full toolSpecificData rendering.
+            if (matchingScope.subAgentInvocationId) {
+              if (childStatus === 'completed' || childStatus === 'error') {
+                if (this.hasToolUI && VS.ChatToolInvocationPart && stream.push) {
+                  try {
+                    if (stream.beginToolInvocation) {
+                      stream.beginToolInvocation(childCallId, childToolName, {
+                        subagentInvocationId: matchingScope.subAgentInvocationId,
+                      } as any);
+                    }
+                    this.pushToolInvocation(
+                      stream, childCallId, childToolName, childState as AcpToolState,
+                      childStatus === 'error',
+                      matchingScope.subAgentInvocationId,
+                    );
+                  } catch { /* best-effort */ }
+                }
+              } else {
+                if (this.hasToolUI && stream.beginToolInvocation) {
+                  try {
+                    stream.beginToolInvocation(childCallId, childToolName, {
+                      subagentInvocationId: matchingScope.subAgentInvocationId,
+                    } as any);
+                  } catch { /* best-effort */ }
+                }
+              }
+            }
+          } else {
+            this.logTag('subagent',
+              `descendant tool event with no matching scope: sessionID=${eventSessionId}, ` +
+              `tool=${childToolName}, activeScopes=[${[...this.activeSubagentScopes.values()]
+                .map(s => s.childSessionId ?? '?').join(', ')}]`,
+            );
+          }
+        } else if (event.part?.type === 'text') {
+          // Collect text output from child/descendant sessions
+          if (owningScope) {
+            const text = (event.part as any).text;
+            if (text && text.trim().length > 0) {
+              owningScope.lastText = text;
+            }
+          }
+        }
+      }
+      // Don't render child session events as parent events
+      return { stop: false, rendered: false };
+    }
+
+    // Filter subagent-internal events: suppress rendering, capture for progress summary
+    if (this.isSubagentInternalEvent(event)) {
+      // Any subagent-internal event means the subagent is still active — reset safety timer
+      if (this.deferredIdle) {
+        this.resetDeferredIdleTimer();
+      }
+      this.captureSubagentEvent(event, stream);
       return { stop: false, rendered: false };
     }
 
@@ -244,6 +475,26 @@ export class StreamBridge {
       case 'part.delta':
         return { stop: false, rendered: this.handlePartDelta(event, stream) };
       case 'session.idle':
+        // Don't stop while subagents are active — their completion events
+        // haven't arrived yet and a premature break would lose them.
+        if (this.activeSubagentScopes.size > 0) {
+          const hasUncompleted = [...this.activeSubagentScopes.values()].some(s => !s.completed);
+          if (!hasUncompleted) {
+            // All subagent scopes are completed (parent dispatched all tasks).
+            // But background child sessions may still be running — poll them.
+            this.checkChildSessionsAndMaybeStop();
+            return { stop: false, rendered: false };
+          }
+          // At least one subagent is still running — defer idle
+          this.deferredIdle = true;
+          this.startDeferredIdleTimer();
+          this.log(
+            `session.idle deferred: ${this.activeSubagentScopes.size} subagent(s), ` +
+            `${[...this.activeSubagentScopes.values()].filter(s => !s.completed).length} still running, ` +
+            `timeout=${StreamBridge.DEFERRED_IDLE_TIMEOUT_MS / 1000}s`,
+          );
+          return { stop: false, rendered: false };
+        }
         return { stop: true, rendered: false };
       case 'session.diff':
         return { stop: false, rendered: this.handleSessionDiff(event, stream) };
@@ -259,10 +510,20 @@ export class StreamBridge {
 
     switch (evt.type) {
       case 'part.updated':
-      case 'session.idle': {
+      case 'part.delta': {
         const eventSessionId = getEventSessionId(evt);
-        return !eventSessionId || eventSessionId === this.sessionId;
+        // Allow parent session events and all child session events.
+        // Child routing block (processEvent) handles matching/scoping;
+        // filtering here would drop child tool events that arrive before
+        // task:completed (when childSessionId is not yet on the scope).
+        if (!eventSessionId || eventSessionId === this.sessionId) return true;
+        return true;
       }
+      // session.idle and session.status from child sessions should be processed
+      // (they're forwarded by the broker for completion detection)
+      case 'session.idle':
+      case 'session.status':
+        return true;
       default:
         return true;
     }
@@ -295,15 +556,15 @@ export class StreamBridge {
       // Skip if this callID is already tracked, or if the file already has an active
       // ExternalEditPart (VSCode only supports one per file at a time).
       if (this.tracker.hasEdit(callID)) {
-        this.log(`trackEdit skipped — callID=${callID} already tracked`);
+        this.logTag('edit', `trackEdit skipped — callID=${callID} already tracked`);
       } else if (this.tracker.isTrackingAny([fileUri])) {
-        this.log(`trackEdit skipped — file ${filepath} already has an active edit, callID=${callID}`);
+        this.logTag('edit', `trackEdit skipped — file ${filepath} already has an active edit, callID=${callID}`);
       } else {
         try {
           await this.tracker.trackEdit(callID, [fileUri], stream);
-          this.log(`trackEdit resolved for callID=${callID} — baseline captured`);
+          this.logTag('edit', `trackEdit resolved for callID=${callID} — baseline captured`);
         } catch (err) {
-          this.log(`trackEdit failed for callID=${callID}: ${err}`);
+          this.logTag('edit', `trackEdit failed for callID=${callID}: ${err}`);
         }
       }
     }
@@ -312,9 +573,9 @@ export class StreamBridge {
     if (this.replyToPermission && sessionId && permissionId) {
       try {
         await this.replyToPermission(sessionId, permissionId, 'once', this.directory);
-        this.log(`auto-replied 'once' for permission ${permissionId}`);
+        this.logTag('permission', `auto-replied 'once' for permission ${permissionId}`);
       } catch (err) {
-        this.log(`auto-reply failed for permission ${permissionId}: ${err}`);
+        this.logTag('permission', `auto-reply failed for permission ${permissionId}: ${err}`);
       }
     }
 
@@ -328,8 +589,6 @@ export class StreamBridge {
   private handlePartUpdated(event: AcpPartUpdatedEvent, stream: Stream): boolean {
     const part = event.part;
     if (!part) return false;
-
-    this.log(`part.updated: partType=${part.type} id=${part.id} messageId=${part.messageId ?? 'unknown'}`);
 
     switch (part.type) {
       case 'text': {
@@ -384,7 +643,7 @@ export class StreamBridge {
     const now = Date.now();
     const gap = this.lastDeltaTime ? now - this.lastDeltaTime : 0;
     this.lastDeltaTime = now;
-    this.log(`part.delta: partID=${partID}, kind=${kind ?? 'unknown'}, len=${delta.length}, gap=${gap}ms`);
+    this.logTag('delta', `partID=${partID}, kind=${kind ?? 'unknown'}, len=${delta.length}, gap=${gap}ms`);
 
     if (kind === 'reasoning') {
       if (this.hasThinking && stream.thinkingProgress) {
@@ -449,7 +708,7 @@ export class StreamBridge {
     const toolName = part.toolName ?? 'unknown';
     const callID = part.callId ?? part.id;
     const status = state.status;
-    this.log(`tool.state: tool=${toolName}, callID=${callID}, status=${status}`);
+    this.logTag('tool', `tool=${toolName}, callID=${callID}, status=${status}`);
 
     if (status === 'pending') {
       // --- TOOL STARTED ---
@@ -479,24 +738,56 @@ export class StreamBridge {
         meta.title = getToolTitle(state);
         meta.timeStart = getToolTime(state)?.start;
       }
+      // Track subagent scope so child events get filtered instead of leaking
+      // Generate subAgentInvocationId at scope creation (task:running) so child
+      // tool events that arrive BEFORE task:completed already have the ID.
+      if (toolName === 'task' || toolName === 'subagent') {
+        this.activeSubagentScopes.set(callID, {
+          callId: callID,
+          toolCalls: [],
+          completed: false,
+          // VSCode groups child tools under the parent subagent card by matching
+          // child.subAgentInvocationId === parent.toolCallId. Therefore the scope's
+          // subAgentInvocationId must be the parent task's own callID.
+          subAgentInvocationId: callID,
+          toolMeta: {
+            toolName,
+            title: getToolTitle(state) ?? toolName,
+            input: state.input ?? {},
+            timeStart: getToolTime(state)?.start,
+          },
+          descendantSessionIds: new Set(),
+        });
+        this.logTag('subagent', `scope opened: callID=${callID}, subAgentInvocationId=${callID}`);
+      }
       if (this.hasToolUI && stream.updateToolInvocation) {
         stream.updateToolInvocation(callID, {
           partialInput: state.input ?? {},
         });
         // Progressive push: push ChatToolInvocationPart with isComplete=false
         // to show the "tool running" spinner in VSCode UI.
-        // The part will be updated/overwritten when completed status arrives.
+        // For subagent tools, attach ChatSubagentToolInvocationData so VSCode
+        // renders it as an expandable subagent card from the start.
         if (VS.ChatToolInvocationPart && stream.push && !this.progressivePushed.has(callID)) {
           try {
             const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callID);
             part.isComplete = false;
             part.isError = false;
             part.enablePartialUpdate = true;
-            part.invocationMessage = this.formatInvocationMsg(
-              toolName,
-              state.input ?? {},
-              getToolTitle(state) ?? toolName,
-            );
+            const input = state.input ?? {};
+            const title = getToolTitle(state) ?? toolName;
+            part.invocationMessage = title;
+            // For subagent tools, show as expandable subagent card (matches demo pattern)
+            if ((toolName === 'task' || toolName === 'subagent') && VS.ChatSubagentToolInvocationData) {
+              const description = (input.description as string) ?? title;
+              const agentName = (input.agentName as string) ?? (input.agent_type as string) ?? toolName;
+              const prompt = (input.prompt as string) ?? '';
+              part.toolSpecificData = new VS.ChatSubagentToolInvocationData(
+                description,
+                agentName,
+                prompt,
+              ) as ChatSubagentToolInvocationData;
+            }
             stream.push(part as unknown as vscode.ChatResponsePart);
             this.progressivePushed.add(callID);
           } catch {
@@ -517,17 +808,58 @@ export class StreamBridge {
         meta.title = getToolTitle(state) ?? meta.title;
       }
 
-      // Build and push ChatToolInvocationPart
-      if (this.hasToolUI && VS.ChatToolInvocationPart) {
-        this.pushToolInvocation(stream, callID, toolName, state);
+      // For subagent tools: the subagent was just created and starts running.
+      // At task:completed, pushToolInvocation creates the subagent card with
+      // ChatSubagentToolInvocationData. The card shows task tool duration.
+      // At child session.idle, pushFinalSubagentUpdate updates with full duration.
+      const subagentScope = this.activeSubagentScopes.get(callID);
+      if ((toolName === 'task' || toolName === 'subagent') && subagentScope) {
+        // Extract child session ID from tool metadata (OpenCode task tool puts it there)
+        // Note: childSessionId may already be set via lazy binding if child events arrived first
+        const childSessionId = (state.metadata?.sessionId ??
+          (typeof state.output === 'string' ? state.output.match(/task_id:\s*(\S+)/)?.[1] : undefined)) as string | undefined;
+        if (childSessionId && !subagentScope.childSessionId) {
+          subagentScope.childSessionId = childSessionId;
+          this.logTag('subagent', `child session ID captured: callID=${callID}, childSessionId=${childSessionId}`);
+        }
+        // subAgentInvocationId was already generated at task:running (scope creation)
+        // so child tool events arriving before task:completed have it available.
+
+        // Save output for the final card push at child session.idle.
+        // NOTE: timeEnd is NOT set here — it will be set to Date.now() when the
+        // child session goes idle, giving the true creation→completion duration.
+        subagentScope.output = getToolOutput(state) ?? '';
+        subagentScope.completed = true;
+        this.hadSubagentTasks = true;
+
+        this.logTag('subagent', `scope activated (subagent spawned): callID=${callID}, childSessionId=${childSessionId || subagentScope.childSessionId}, subAgentInvocationId=${subagentScope.subAgentInvocationId}`);
+        // DON'T push completed card — the subagent is still running!
+        // Just update the running card to show it's active.
+        // The final completed card will be pushed at child session.idle.
+        if (stream.updateToolInvocation) {
+          try {
+            const input = state.input ?? {};
+            const title = (input.description as string) ?? getToolTitle(state) ?? toolName;
+            stream.updateToolInvocation(callID, {
+              invocationMessage: `Running ${title}...`,
+            });
+          } catch { /* best-effort */ }
+        }
+        // Skip the normal pushToolInvocation for subagent tools —
+        // the card stays as isComplete=false until child session.idle.
       } else {
-        this.renderToolFallback(
-          stream,
-          toolName,
-          state.input,
-          getToolOutput(state),
-          getToolTitle(state),
-        );
+        // Non-subagent tools: push completed card as usual
+        if (this.hasToolUI && VS.ChatToolInvocationPart) {
+          this.pushToolInvocation(stream, callID, toolName, state, false);
+        } else {
+          this.renderToolFallback(
+            stream,
+            toolName,
+            state.input,
+            getToolOutput(state),
+            getToolTitle(state),
+          );
+        }
       }
       // Track new file creation via ChatResponseWorkspaceEditPart
       if (toolName === 'write' && VS.ChatResponseWorkspaceEditPart && stream.push) {
@@ -573,6 +905,10 @@ export class StreamBridge {
     }
 
     if (status === 'error') {
+      // Clean up subagent scope on error
+      if (toolName === 'task' || toolName === 'subagent') {
+        this.activeSubagentScopes.delete(callID);
+      }
       // Try to push ChatToolInvocationPart with isError=true
       if (this.hasToolUI && VS.ChatToolInvocationPart) {
         this.pushToolInvocation(stream, callID, toolName, state, true);
@@ -603,6 +939,7 @@ export class StreamBridge {
     toolName: string,
     state: AcpToolState,
     isError?: boolean,
+    subAgentInvocationId?: string,
   ): void {
     try {
       const meta = this.toolMetas.get(callID);
@@ -635,22 +972,37 @@ export class StreamBridge {
         part.enablePartialUpdate = true;
         part.isComplete = true;
         part.invocationMessage = this.formatInvocationMsg(toolName, input, title);
-        part.pastTenseMessage = this.formatPastTenseMsg(toolName, title, timeStart, timeEnd);
+        part.pastTenseMessage = this.formatPastTenseMsg(toolName, title, timeStart, timeEnd, input);
 
         // Select and attach the appropriate toolSpecificData
         part.toolSpecificData = this.buildToolSpecificData(
-          toolName, title, input, output, timeStart, timeEnd,
+          toolName, title, input, output, timeStart, timeEnd, !!subAgentInvocationId,
         );
+
+        // NOTE: Parent subagent cards must NOT have subAgentInvocationId set.
+        // VSCode groups child tools under the parent by matching
+        // child.subAgentInvocationId === parent.toolCallId.
+        // Only child tool cards should carry subAgentInvocationId.
       }
 
-      // Set subAgentInvocationId for task/subagent tools
-      if (toolName === 'task' || toolName === 'subagent') {
-        part.subAgentInvocationId = callID;
-      }
-
-      // Set presentation for internal/structural tools
-      if (toolName === 'internal' || toolName === 'step-start' || toolName === 'step-finish') {
+      // Hide transient tool cards after completion when a stronger/final UI exists elsewhere.
+      // read/edit/write use bubble-style messages while active; edit/write also produce an
+      // externalEdit checkpoint/diff that should become the primary post-completion artifact.
+      if (
+        toolName === 'read'
+        || toolName === 'write'
+        || toolName === 'edit'
+        || toolName === 'internal'
+        || toolName === 'step-start'
+        || toolName === 'step-finish'
+      ) {
         part.presentation = 'hiddenAfterComplete';
+      }
+
+      // Child tool cards carry subAgentInvocationId so VSCode groups them
+      // under the parent subagent card. Parent cards must NOT have this set.
+      if (subAgentInvocationId) {
+        (part as any).subAgentInvocationId = subAgentInvocationId;
       }
 
       stream.push(part as unknown as vscode.ChatResponsePart);
@@ -676,6 +1028,7 @@ export class StreamBridge {
     output: string,
     timeStart?: number,
     timeEnd?: number,
+    isSubagentTool?: boolean,
   ): ChatToolSpecificData | undefined {
     switch (toolName) {
       case 'bash':
@@ -696,9 +1049,64 @@ export class StreamBridge {
         } satisfies ChatTerminalToolInvocationData;
         }
 
-      case 'read':
+      case 'read': {
+        // No expandable result — just a clickable file link in invocationMessage
+        return undefined;
+      }
+
       case 'list':
-      case 'grep': {
+      case 'grep':
+      case 'grep_app_searchGitHub': {
+        // Show as collapsible file references list (matches VSCode Copilot search pattern)
+        const values: Array<vscode.Uri | vscode.Location> = [];
+        const path = input.path as string | undefined;
+        if (path) {
+          values.push(vscode.Uri.file(path));
+        }
+        if (output) {
+          const lines = output.split('\n');
+          for (const line of lines) {
+            const fileMatch = line.match(/^[A-Za-z]:\\(?:[^\\]+\\)*[^:]+|^\/(?:[^\/]+\/)*[^:]+/);
+            if (fileMatch) {
+              try { values.push(vscode.Uri.file(fileMatch[0])); } catch { /* skip */ }
+            }
+          }
+        }
+        if (values.length > 0) {
+          return { values } satisfies ChatToolResourcesInvocationData;
+        }
+        return {
+          input: formatInput(input, title),
+          output: truncate(output, 2000),
+        } satisfies ChatSimpleToolResultData;
+      }
+
+      case 'fetch':
+      case 'webfetch': {
+        return {
+          input: formatInput(input, title),
+          output: truncate(output, 2000),
+        } satisfies ChatSimpleToolResultData;
+      }
+
+      case 'websearch':
+      case 'websearch_web_search_exa': {
+        // Show as clickable web URL references
+        const values: Array<vscode.Uri | vscode.Location> = [];
+        const query = input.query as string | undefined;
+        if (query) {
+          values.push(vscode.Uri.parse(`https://www.bing.com/search?q=${encodeURIComponent(query)}`));
+        }
+        if (output) {
+          const urlRegex = /https?:\/\/[^\s"')>]+/g;
+          let match;
+          while ((match = urlRegex.exec(output)) !== null) {
+            try { values.push(vscode.Uri.parse(match[0])); } catch { /* skip */ }
+          }
+        }
+        if (values.length > 0) {
+          return { values } satisfies ChatToolResourcesInvocationData;
+        }
         return {
           input: formatInput(input, title),
           output: truncate(output, 2000),
@@ -707,12 +1115,64 @@ export class StreamBridge {
 
       case 'write':
       case 'edit': {
-        // Show as file reference if filePath is available
-        const filePath = input.filePath as string | undefined;
-        if (filePath) {
-          return {
-            values: [vscode.Uri.file(filePath)],
-          } satisfies ChatToolResourcesInvocationData;
+        // For edit/write we intentionally avoid resources cards here.
+        // Running/completed messages already use file bubbles, and the final edit UI should
+        // be represented by ChatResponseExternalEditPart instead of a duplicate resources list.
+        return undefined;
+      }
+
+      case 'list':
+      case 'grep':
+      case 'grep_app_searchGitHub': {
+        return {
+          input: formatInput(input, title),
+          output: truncate(output, 2000),
+        } satisfies ChatSimpleToolResultData;
+      }
+
+      case 'fetch':
+      case 'webfetch': {
+        return {
+          input: formatInput(input, title),
+          output: truncate(output, 2000),
+        } satisfies ChatSimpleToolResultData;
+      }
+
+      case 'websearch':
+      case 'websearch_web_search_exa': {
+        return {
+          input: formatInput(input, title),
+          output: truncate(output, 2000),
+        } satisfies ChatSimpleToolResultData;
+      }
+
+      case 'todowrite':
+      case 'todo': {
+        // Parse todo items from tool input (todos array)
+        const todos = input.todos as Array<{ content: string; status: string }> | undefined;
+        if (todos && Array.isArray(todos)) {
+          if (isSubagentTool) {
+            // Subagent: use formatted text fallback
+            const formatted = todos.map((item, idx) => {
+              const check = item.status === 'completed' ? 'x' : ' ';
+              return `[${check}] ${idx + 1}. ${item.content}`;
+            }).join('\n');
+            return {
+              input: formatted,
+              output: truncate(output, 2000),
+            } satisfies ChatSimpleToolResultData;
+          }
+          // Root session: use proper ChatTodoToolInvocationData
+          const todoList = todos.map((item, idx) => ({
+            id: idx,
+            title: item.content,
+            status: item.status === 'completed'
+              ? ChatTodoStatus.Completed
+              : item.status === 'in_progress'
+                ? ChatTodoStatus.InProgress
+                : ChatTodoStatus.NotStarted,
+          }));
+          return { todoList } satisfies ChatTodoToolInvocationData;
         }
         return {
           input: formatInput(input, title),
@@ -723,7 +1183,7 @@ export class StreamBridge {
       case 'task':
       case 'subagent': {
         const description = (input.description as string) ?? title;
-        const agentName = (input.agentName as string) ?? toolName;
+        const agentName = (input.agentName as string) ?? (input.agent_type as string) ?? title ?? toolName;
         const prompt = (input.prompt as string) ?? formatInput(input, '');
         const result = truncate(output, 4000);
         // Use ChatSubagentToolInvocationData constructor if available at runtime
@@ -763,7 +1223,106 @@ export class StreamBridge {
     toolName: string,
     input: Record<string, unknown>,
     title: string,
-  ): string {
+  ): string | vscode.MarkdownString {
+    const formatFileBubbleMessage = (
+      verb: 'Read' | 'Editing' | 'Writing',
+      filePath: string,
+      offset?: number,
+      limit?: number,
+      suffix = '',
+    ): vscode.MarkdownString => {
+      const uri = vscode.Uri.file(filePath).toString().toLowerCase();
+      const range = offset != null || limit != null
+        ? (() => {
+            const start = offset ?? 1;
+            const end = limit != null ? start + limit - 1 : start;
+            return `#${start}-${end}`;
+          })()
+        : '';
+      let lineInfo = '';
+      if (offset != null || limit != null) {
+        const start = offset ?? 1;
+        const end = limit != null ? start + limit - 1 : undefined;
+        lineInfo = end != null ? ` line ${start}-${end}` : ` line ${start}`;
+      }
+      return new vscode.MarkdownString(`${verb} [](${uri}${range})${lineInfo}${suffix}`);
+    };
+
+    // --- read: official-style file bubble ---
+    //
+    // Research note (2026-05): VSCode/Copilot-style read bubbles are lifecycle-sensitive.
+    // We verified with the local experiment matrix that:
+    //   A. Initial MarkdownString `Read [](${uri}#start-end)` renders as a file bubble.
+    //   B. `updateToolInvocation(...)` alone does NOT necessarily destroy the bubble.
+    //   C. The bubble disappears when completed state switches to a plain-string
+    //      `pastTenseMessage`.
+    //   D/E/F. Keeping the completed-state message in the same MarkdownString bubble
+    //      format preserves the bubble.
+    //
+    // Practical rule:
+    //   - For read tools, invocationMessage and pastTenseMessage must both stay in the
+    //     same `Read [](${uri}#range)` style.
+    //   - Do NOT downgrade completed-state read messages to plain text like
+    //     `Read file.ts`, otherwise VSCode re-renders the card and the bubble is lost.
+    //   - URI is lowercased to match the experimentally stable file-bubble form on Windows.
+    if (toolName === 'read') {
+      const filePath = input.filePath as string | undefined;
+      if (filePath) {
+        const offset = input.offset as number | undefined;
+        const limit = input.limit as number | undefined;
+        return formatFileBubbleMessage('Read', filePath, offset, limit);
+      }
+    }
+
+    // edit/write: use the same file-bubble style during pending/running/completed so the
+    // tool card stays visually consistent with read. The final authoritative edit result
+    // is still surfaced separately through ChatResponseExternalEditPart via ExternalEditTracker.
+    if (toolName === 'edit' || toolName === 'write') {
+      const filePath = input.filePath as string | undefined;
+      if (filePath) {
+        const offset = input.offset as number | undefined;
+        const limit = input.limit as number | undefined;
+        const lineCount = limit ?? 1;
+        const verb = toolName === 'edit' ? 'Editing' : 'Writing';
+        return formatFileBubbleMessage(verb, filePath, offset, limit, ` (${lineCount} lines)`);
+      }
+    }
+
+    // --- grep: Searching `pattern` ---
+    if (toolName === 'grep') {
+      const pattern = (input.pattern as string) ?? (input.query as string) ?? title;
+      if (pattern) {
+        const short = pattern.length > 80 ? pattern.substring(0, 77) + '...' : pattern;
+        return new vscode.MarkdownString(`Searching \`${short}\``);
+      }
+    }
+
+    // --- grep_app_searchGitHub: Github Searching `query` ---
+    if (toolName === 'grep_app_searchGitHub') {
+      const query = (input.query as string) ?? title;
+      if (query) {
+        const short = query.length > 80 ? query.substring(0, 77) + '...' : query;
+        return new vscode.MarkdownString(`Github Searching \`${short}\``);
+      }
+    }
+
+    // --- fetch / webfetch: url ---
+    if (toolName === 'fetch' || toolName === 'webfetch') {
+      const url = (input.url as string) ?? title;
+      if (url) {
+        return `Fetching \`${url}\``;
+      }
+    }
+
+    // --- websearch / websearch_web_search_exa: Web Searching `query` ---
+    if (toolName === 'websearch' || toolName === 'websearch_web_search_exa') {
+      const query = (input.query as string) ?? title;
+      if (query) {
+        const short = query.length > 80 ? query.substring(0, 77) + '...' : query;
+        return new vscode.MarkdownString(`Web Searching \`${short}\``);
+      }
+    }
+
     const display = title || toolName;
     if (!input || Object.keys(input).length === 0) {
       return `Running ${display}`;
@@ -781,15 +1340,92 @@ export class StreamBridge {
     title: string,
     timeStart?: number,
     timeEnd?: number,
-  ): string {
-    const display = title || toolName;
-    const pastVerb = { read: 'Read', bash: 'Ran', write: 'Wrote', list: 'Listed', grep: 'Searched', edit: 'Edited', task: 'Completed subagent' }[toolName] ?? 'Executed';
-    let msg = `${pastVerb} ${display}`;
-    if (timeStart != null && timeEnd != null) {
-      const dur = ((timeEnd - timeStart) / 1000).toFixed(1);
-      msg += ` (${dur}s)`;
+    input?: Record<string, unknown>,
+  ): string | vscode.MarkdownString {
+    const duration = (timeStart != null && timeEnd != null)
+      ? ` (${((timeEnd - timeStart) / 1000).toFixed(1)}s)`
+      : '';
+
+    const formatFileBubbleMessage = (
+      verb: 'Read' | 'Edited' | 'Wrote',
+      filePath: string,
+      offset?: number,
+      limit?: number,
+      suffix = '',
+    ): vscode.MarkdownString => {
+      const uri = vscode.Uri.file(filePath).toString().toLowerCase();
+      const range = offset != null || limit != null
+        ? (() => {
+            const start = offset ?? 1;
+            const end = limit != null ? start + limit - 1 : start;
+            return `#${start}-${end}`;
+          })()
+        : '';
+      let lineInfo = '';
+      if (offset != null || limit != null) {
+        const start = offset ?? 1;
+        const end = limit != null ? start + limit - 1 : undefined;
+        lineInfo = end != null ? ` line ${start}-${end}` : ` line ${start}`;
+      }
+      return new vscode.MarkdownString(`${verb} [](${uri}${range})${lineInfo}${suffix}${duration}`);
+    };
+
+    // --- read: keep official-style file bubble in completed state ---
+    // IMPORTANT: completed-state `pastTenseMessage` is the critical preservation point.
+    // If this returns plain text, the bubble may render briefly during the running state
+    // and then disappear as soon as the tool completes.
+    if (toolName === 'read') {
+      const filePath = input?.filePath as string | undefined;
+      if (filePath) {
+        const offset = input?.offset as number | undefined;
+        const limit = input?.limit as number | undefined;
+        return formatFileBubbleMessage('Read', filePath, offset, limit);
+      }
+      return `${title}${duration}`;
     }
-    return msg;
+
+    // Keep completed-state edit/write messages in bubble form as well.
+    // Do NOT downgrade these to plain text, otherwise the running-state bubble is replaced
+    // before/while the externalEdit checkpoint bubble is shown.
+    if (toolName === 'edit' || toolName === 'write') {
+      const filePath = input?.filePath as string | undefined;
+      if (filePath) {
+        const offset = input?.offset as number | undefined;
+        const limit = input?.limit as number | undefined;
+        const lineCount = limit ?? 1;
+        const verb = toolName === 'edit' ? 'Edited' : 'Wrote';
+        return formatFileBubbleMessage(verb, filePath, offset, limit, ` (${lineCount} lines)`);
+      }
+    }
+
+    // --- grep: Searched `pattern` ---
+    if (toolName === 'grep') {
+      const pattern = input ? (input.pattern as string) ?? (input.query as string) ?? title : title;
+      return `Searched \`${pattern}\`${duration}`;
+    }
+
+    // --- grep_app_searchGitHub: Github Searched `query` ---
+    if (toolName === 'grep_app_searchGitHub') {
+      const query = input ? (input.query as string) ?? title : title;
+      return `Github Searched \`${query}\`${duration}`;
+    }
+
+    // --- websearch / websearch_web_search_exa: Web Searched `query` ---
+    if (toolName === 'websearch' || toolName === 'websearch_web_search_exa') {
+      const query = input ? (input.query as string) ?? title : title;
+      return `Web Searched \`${query}\`${duration}`;
+    }
+
+    const pastVerb = ({
+      read: 'Read', bash: 'Ran', write: 'Wrote', list: 'Listed',
+      grep: 'Searched', grep_app_searchGitHub: 'Github Searched',
+      edit: 'Edited', task: 'Completed subagent', subagent: 'Completed subagent',
+      fetch: 'Fetched', webfetch: 'Fetched',
+      websearch: 'Web Searched', websearch_web_search_exa: 'Web Searched',
+      todowrite: 'Updated todos', todo: 'Updated todos',
+    } as Record<string, string>)[toolName] ?? 'Executed';
+
+    return `${pastVerb} ${title}${duration}`;
   }
 
   // -------------------------------------------------------------------
@@ -818,17 +1454,417 @@ export class StreamBridge {
     stream.markdown('\n');
   }
 
+  // -------------------------------------------------------------------
+  // Subagent scope filtering
+  // -------------------------------------------------------------------
+
+  /**
+   * Find the subagent scope that owns the given session ID.
+   * Supports nested subagents: if sessionId is a grandchild, walks up
+   * the parent chain (via event-broker) to find the direct child session
+   * that matches a scope's childSessionId.
+   */
+  private findScopeForSession(sessionId: string): SubagentScope | undefined {
+    // 1. Direct match: this session is a known childSessionId
+    for (const scope of this.activeSubagentScopes.values()) {
+      if (scope.childSessionId === sessionId) return scope;
+    }
+
+    // 2. Descendant match: walk up parent chain to find which scope owns this session
+    if (this.findAncestorScope) {
+      const childSessionIds = new Set<string>();
+      for (const scope of this.activeSubagentScopes.values()) {
+        if (scope.childSessionId) childSessionIds.add(scope.childSessionId);
+      }
+      if (childSessionIds.size > 0) {
+        const ancestorId = this.findAncestorScope(sessionId, childSessionIds);
+        if (ancestorId) {
+          for (const scope of this.activeSubagentScopes.values()) {
+            if (scope.childSessionId === ancestorId) return scope;
+          }
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Check whether an event belongs to an active subagent's internal stream.
+   *
+   * Strategy: `partKinds` acts as a whitelist of known parent parts. Any
+   * `part.updated` or `part.delta` referencing an unregistered partId while
+   * a subagent scope is active is treated as a subagent-internal event.
+   *
+   * Exception: top-level structural part types (text, reasoning, step-start,
+   * step-finish) are NEVER subagent-internal — they belong to the parent turn
+   * and may arrive after the subagent scope opens (e.g. a second step that
+   * starts while the subagent is still running).
+   */
+  private isSubagentInternalEvent(event: AcpEvent): boolean {
+    if (this.activeSubagentScopes.size === 0) return false;
+
+    if (event.type === 'part.updated') {
+      const part = event.part;
+      if (!part) return false;
+      // Structural parent parts are never subagent-internal
+      if (part.type === 'reasoning' ||
+          part.type === 'step-start' || part.type === 'step-finish') {
+        return false;
+      }
+      // Text: subagent-internal if not already tracked as a parent part.
+      // This prevents subagent LLM text from being rendered inline;
+      // instead it's collected as scope.lastText for the completion summary.
+      if (part.type === 'text') {
+        return !this.partKinds.has(part.id);
+      }
+      // Parent-level task/subagent tool invocations are NOT subagent-internal.
+      // Without this, a second parallel task tool would be captured instead of rendered.
+      if (part.type === 'tool') {
+        const toolName = (part as AcpToolPart).toolName;
+        if (toolName === 'task' || toolName === 'subagent') return false;
+      }
+      // Already-known parent part → not subagent
+      if (this.partKinds.has(part.id)) return false;
+      // New part during active subagent → subagent internal
+      return true;
+    }
+
+    if (event.type === 'part.delta') {
+      // Unregistered part during active subagent → subagent delta
+      return !this.partKinds.has(event.partId);
+    }
+
+    return false;
+  }
+
+  /** Returns true if the given sessionId matches any active subagent scope's childSessionId. */
+  private isChildSessionEvent(sessionId: string): boolean {
+    for (const scope of this.activeSubagentScopes.values()) {
+      if (scope.childSessionId === sessionId) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Push a real-time invocation message update to the parent task tool card
+   * so subagent activity (reads, edits, bash commands) is visible inside the
+   * subagent card in VSCode chat while the subagent runs.
+   */
+  private updateSubagentCard(
+    stream: Stream,
+    scope: SubagentScope,
+    toolName: string,
+    title: string | undefined,
+    status: string,
+  ): void {
+    if (!this.hasToolUI || !stream.updateToolInvocation) return;
+
+    const label = title ?? toolName;
+    const verb = status === 'completed' ? '✓' : status === 'error' ? '✗' : '⋯';
+    const msg = `${verb} ${toolName}: ${label}`;
+    try {
+      stream.updateToolInvocation(scope.callId, { invocationMessage: msg });
+    } catch {
+      // updateToolInvocation is best-effort; the progress summary on completion is the fallback
+    }
+  }
+
+  /**
+   * Push a final updated ChatToolInvocationPart when a child subagent session
+   * goes idle. This is the ONLY place a completed card is pushed for subagent
+   * tools — task:completed only keeps the spinner alive.
+   *
+   * Uses the toolMeta captured at task:running + toolCalls accumulated during
+   * the child session to build a complete ChatSubagentToolInvocationData.
+   */
+   private pushFinalSubagentUpdate(stream: Stream, scope: SubagentScope): void {
+    if (!this.hasToolUI || !VS.ChatToolInvocationPart || !stream.push) return;
+
+    const meta = scope.toolMeta;
+    const toolName = meta?.toolName ?? 'task';
+    const title = meta?.title ?? toolName;
+    const input = meta?.input ?? {};
+    const output = scope.output ?? '';
+    const timeStart = meta?.timeStart;
+    const timeEnd = scope.timeEnd;
+    const progress = formatSubagentProgress(scope);
+    // Use lastText as summary if available, otherwise fall back to progress + output
+    const lastText = scope.lastText?.trim();
+    const result = lastText
+      ? lastText
+      : (progress ? [progress, output].filter(Boolean).join('\n') : output);
+
+    try {
+      const ChatToolInvocationPartCtor = VS.ChatToolInvocationPart;
+      const part: ChatToolInvocationPart = new ChatToolInvocationPartCtor(
+        toolName,
+        scope.callId,
+      );
+      part.enablePartialUpdate = true;
+      part.isComplete = true;
+      // Parent subagent card must NOT have subAgentInvocationId.
+      // VSCode groups child tools under the parent by matching
+      // child.subAgentInvocationId === parent.toolCallId (= scope.callId).
+      part.invocationMessage = this.formatInvocationMsg(toolName, input, title);
+      // timeStart = when task:running fired, timeEnd = when child session.idle fired
+      part.pastTenseMessage = this.formatPastTenseMsg(toolName, title, timeStart, timeEnd, input);
+
+      // Attach ChatSubagentToolInvocationData with the complete result
+      const description = (input.description as string) ?? title;
+      const agentName = (input.agentName as string) ?? (input.agent_type as string) ?? toolName;
+      const prompt = (input.prompt as string) ?? formatInput(input, '');
+
+      if (VS.ChatSubagentToolInvocationData) {
+        part.toolSpecificData = new VS.ChatSubagentToolInvocationData(
+          description,
+          agentName,
+          prompt,
+          truncate(result, 4000),
+        ) as ChatSubagentToolInvocationData;
+      } else {
+        part.toolSpecificData = {
+          description,
+          agentName,
+          prompt,
+          result: truncate(result, 4000),
+        } satisfies ChatSubagentToolInvocationData;
+      }
+
+      stream.push(part as unknown as vscode.ChatResponsePart);
+      this.logTag('subagent',
+        `final subagent card pushed: callID=${scope.callId}, toolCalls=${scope.toolCalls.length}, progress="${progress}"`,
+      );
+    } catch {
+      // Best-effort fallback: update invocationMessage only
+      if (stream.updateToolInvocation) {
+        try {
+          stream.updateToolInvocation(scope.callId, {
+            invocationMessage: progress ? `Completed: ${progress}` : `Subagent finished`,
+          });
+        } catch { /* ignore */ }
+      }
+    }
+  }
+
+  /**
+   * Capture a subagent-internal event for progress aggregation.
+   * Tool events are tracked (for the summary like "3 reads, 2 edits").
+   * Text events are collected (lastText) for the subagent summary.
+   * Also pushes real-time invocation message updates to the parent task tool card.
+   */
+  private captureSubagentEvent(event: AcpEvent, stream?: Stream): void {
+    // Handle text delta events from subagent — stream text into the subagent card
+    if (event.type === 'part.delta') {
+      const deltaEvent = event as AcpPartDeltaEvent;
+      const delta = deltaEvent.delta;
+      if (delta) {
+        for (const scope of this.activeSubagentScopes.values()) {
+          const currentText = (scope.lastText ?? '') + delta;
+          scope.lastText = currentText;
+          if (stream && this.hasToolUI && stream.updateToolInvocation) {
+            try {
+              stream.updateToolInvocation(scope.callId, {
+                invocationMessage: truncate(currentText, 200),
+              });
+            } catch { /* best-effort */ }
+          }
+        }
+      }
+      return;
+    }
+
+    if (event.type !== 'part.updated' || !event.part) return;
+
+    // Collect text output from subagent and push to subagent card
+    if (event.part.type === 'text') {
+      const text = (event.part as any).text;
+      if (text && text.trim().length > 0) {
+        for (const scope of this.activeSubagentScopes.values()) {
+          scope.lastText = text;
+          if (stream && this.hasToolUI && stream.updateToolInvocation) {
+            try {
+              stream.updateToolInvocation(scope.callId, {
+                invocationMessage: truncate(text, 200),
+              });
+            } catch { /* best-effort */ }
+          }
+        }
+      }
+      return;
+    }
+
+    if (event.part.type !== 'tool') return;
+
+    const toolPart = event.part as AcpToolPart;
+    const state = toolPart.state;
+    if (!state) return;
+
+    const toolName = toolPart.toolName ?? 'unknown';
+    const title = state.title;
+    const callId = toolPart.callId ?? toolPart.id;
+    const status = state.status;
+
+    // Record into all active scopes (typically just one)
+    for (const scope of this.activeSubagentScopes.values()) {
+      const isNew = !scope.toolCalls.some(t => t.name === toolName);
+      scope.toolCalls.push({
+        name: toolName,
+        title: title ?? undefined,
+        status,
+      });
+      // Update parent task tool card so subagent activity is visible in chat
+      if (stream) {
+        this.updateSubagentCard(stream, scope, toolName, title, status);
+      }
+      // Forward to VSCode with subAgentInvocationId so VSCode groups child tools
+      // under the parent subagent card (scope mechanism).
+      // Forward ALL first-seen child tools (not just 'pending') because child events
+      // often arrive already completed by the time the parent processes them.
+      if (isNew && scope.subAgentInvocationId && stream) {
+        // Tell VSCode this tool belongs to the subagent
+        if (this.hasToolUI && stream.beginToolInvocation) {
+          try {
+            stream.beginToolInvocation(callId, toolName, {
+              subagentInvocationId: scope.subAgentInvocationId,
+            } as any);
+          } catch { /* best-effort */ }
+        }
+        // If the tool is already done, push its completion state
+        if (status === 'completed' || status === 'error') {
+          if (this.hasToolUI && stream.push && VS.ChatToolInvocationPart) {
+            try {
+              const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callId);
+              part.subAgentInvocationId = scope.subAgentInvocationId as any;
+              part.isComplete = true;
+              part.isError = status === 'error';
+              part.invocationMessage = status === 'error' ? `✗ ${toolName}` : `✓ ${toolName}: ${title ?? ''}`;
+              stream.push(part as unknown as vscode.ChatResponsePart);
+            } catch { /* best-effort */ }
+          }
+        }
+      }
+    }
+
+    this.logTag('subagent',
+      `capture: tool=${toolName}, status=${state.status}, ` +
+      `activeScopes=${this.activeSubagentScopes.size}`,
+    );
+  }
+
   private reset(): void {
     // userMessageId intentionally NOT reset — caller reads it after bridging
     this.partKinds.clear();
     this.toolCallIds.clear();
     this.toolMetas.clear();
     this.progressivePushed.clear();
+    this.activeSubagentScopes.clear();
+    this.deferredIdle = false;
+    this.clearDeferredIdleTimer();
+    this.forceStopResolve = null;
     this.assistantPhaseStarted = false;
+  }
+
+  // -------------------------------------------------------------------
+  // Deferred idle safety timer
+  // -------------------------------------------------------------------
+
+  /**
+   * Start a safety timeout. If no subagent events arrive before it fires,
+   * the bridge stops to avoid hanging indefinitely.
+   */
+  private startDeferredIdleTimer(): void {
+    this.clearDeferredIdleTimer();
+    this.deferredIdleTimer = setTimeout(() => {
+      this.log(
+        `deferred idle timeout fired (${StreamBridge.DEFERRED_IDLE_TIMEOUT_MS / 1000}s) — ` +
+        `closing ${this.activeSubagentScopes.size} remaining subagent scope(s)`,
+      );
+      this.activeSubagentScopes.clear();
+      this.deferredIdleTimer = null;
+      // Break the while-loop in run() by resolving the force-stop promise
+      this.forceStopResolve?.();
+    }, StreamBridge.DEFERRED_IDLE_TIMEOUT_MS);
+  }
+
+  /** Reset the timer (called when a subagent-internal event arrives after deferred idle). */
+  private resetDeferredIdleTimer(): void {
+    if (this.deferredIdle && this.deferredIdleTimer) {
+      this.startDeferredIdleTimer();
+    }
+  }
+
+  private clearDeferredIdleTimer(): void {
+    if (this.deferredIdleTimer) {
+      clearTimeout(this.deferredIdleTimer);
+      this.deferredIdleTimer = null;
+    }
+  }
+
+  /** Break the while-loop in run() by resolving the force-stop promise. */
+  private requestStop(): void {
+    if (this.forceStopResolve) {
+      this.forceStopResolve();
+      this.forceStopResolve = null;
+    }
+  }
+
+  /**
+   * When parent session.idle arrives and all subagent scopes are completed
+   * (i.e. the parent dispatched all tasks), we need to verify that the
+   * background child sessions are actually done before stopping the bridge.
+   *
+   * Uses the `checkChildSessionsRunning` callback (which polls the SDK
+   * session.children + session.status APIs) to detect busy children.
+   */
+  private checkChildSessionsAndMaybeStop(): void {
+    if (!this.checkChildSessionsRunning) {
+      // No polling callback available — fall back to immediate stop
+      this.clearDeferredIdleTimer();
+      this.logTag('subagent', 'bridge stop: all subagents completed (no child polling callback)');
+      this.requestStop();
+      return;
+    }
+
+    this.deferredIdle = true;
+    this.startDeferredIdleTimer();
+    this.logTag('subagent', 'session.idle deferred: checking child sessions in 2s');
+
+    // Poll child sessions after a short delay
+    const pollTimer = setTimeout(async () => {
+      try {
+        const childrenRunning = await this.checkChildSessionsRunning();
+        if (!childrenRunning) {
+          this.deferredIdle = false;
+          this.clearDeferredIdleTimer();
+          this.logTag('subagent', 'all child sessions idle (via poll) — waiting for parent orchestrator to continue');
+        } else {
+          this.logTag('subagent', 'child sessions still running, polling again in 3s');
+          // Schedule another poll — replace the safety timer
+          this.checkChildSessionsAndMaybeStop();
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.logTag('subagent', `child session poll error: ${msg}, stopping bridge`);
+        this.clearDeferredIdleTimer();
+        this.requestStop();
+      }
+    }, 2000);
+
+    // Track timer so clearDeferredIdleTimer can cancel it
+    if (this.deferredIdleTimer !== null) {
+      clearTimeout(this.deferredIdleTimer);
+    }
+    this.deferredIdleTimer = pollTimer;
   }
 
   private log(message: string): void {
     this.logger?.appendLine(`[streaming] ${message}`);
+  }
+
+  /** Tagged log — prefixes message with [tag] for filtering (e.g. [tool], [delta], [subagent]). */
+  private logTag(tag: string, message: string): void {
+    this.logger?.appendLine(`[streaming] [${tag}] ${message}`);
   }
 }
 
@@ -899,6 +1935,11 @@ function getEventSessionId(evt: AcpEvent): string | undefined {
     case 'part.updated':
       return evt.part?.sessionId;
     case 'session.idle':
+    case 'session.status':
+      return evt.sessionId;
+    case 'session.created':
+    case 'session.updated':
+    case 'session.deleted':
       return evt.sessionId;
     default:
       return undefined;

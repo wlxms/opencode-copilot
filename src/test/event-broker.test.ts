@@ -24,10 +24,15 @@ function mockClient(events: OpenCodeGlobalEventEnvelope[]) {
   };
 }
 
-async function collectTypes(stream: AsyncIterable<OpenCodeGlobalEventEnvelope>): Promise<string[]> {
+async function collectTypes(stream: AsyncIterable<OpenCodeGlobalEventEnvelope>, timeoutMs = 1000): Promise<string[]> {
   const types: string[] = [];
-  for await (const event of stream) {
-    types.push(event.payload.type);
+  const timer = setTimeout(() => stream[Symbol.asyncIterator]().return?.(), timeoutMs);
+  try {
+    for await (const event of stream) {
+      types.push(event.payload.type);
+    }
+  } finally {
+    clearTimeout(timer);
   }
   return types;
 }
@@ -56,16 +61,26 @@ describe('GlobalEventBroker', () => {
         type: 'session.idle',
         properties: { sessionID: 'ses_a' },
       }),
+      // Events after idle should still be delivered (channel stays open)
+      globalEvent('dir', {
+        type: 'message.part.updated',
+        properties: {
+          part: { type: 'tool', id: 'prt_tool', tool: 'bash', callID: 'call_1', state: { status: 'completed', input: { command: 'ls' }, output: 'ok' }, messageID: 'msg_c', sessionID: 'ses_a' },
+        },
+      }),
     ]);
 
     const sessionStream = broker.openSessionStream('ses_a');
     await broker.ensureStarted(client as never);
     const types = await collectTypes(sessionStream.stream as AsyncIterable<OpenCodeGlobalEventEnvelope>);
 
+    // session.idle is delivered but does NOT close the stream
+    // Subsequent tool event should also be delivered
     expect(types).toEqual([
       'message.part.updated',
       'message.part.delta',
       'session.idle',
+      'message.part.updated',
     ]);
   });
 

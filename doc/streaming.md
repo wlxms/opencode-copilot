@@ -26,6 +26,65 @@ OpenCode 服务端通过 `/event` SSE 端点推送两种粒度的实时事件：
 
 ## SSE 事件处理流程
 
+## 文件气泡（read/view）渲染研究结论
+
+### 背景
+
+在 VSCode / Copilot Chat 中，`read` / `view` 工具的文件引用有时会显示为“文件气泡”。
+本仓库对该行为做过专门实验，目标不是复刻一个近似 UI，而是找出**什么生命周期阶段会保留或破坏气泡**。
+
+### 关键结论
+
+1. **初始 `MarkdownString` 文件气泡格式是可行的**
+
+   运行态的 `read` 消息使用如下格式时，可以渲染为文件气泡：
+
+   ```ts
+   new vscode.MarkdownString(`Read [](${uri}#${start}-${end})`)
+   ```
+
+2. **`updateToolInvocation(...)` 不是主要破坏点**
+
+   在目标环境中，单独加入 `updateToolInvocation` 并不会必然让气泡消失。
+
+3. **completed state 的 plain-string `pastTenseMessage` 才是关键破坏点**
+
+   如果工具完成后切换成：
+
+   ```ts
+   part.pastTenseMessage = `Read file.ts`
+   ```
+
+   那么之前的文件气泡会被普通文本覆盖掉。
+
+4. **completed state 只要继续保持 Markdown bubble，气泡就能保留**
+
+   也就是说，`invocationMessage` 和 `pastTenseMessage` 都要保持同一套 bubble markdown。
+
+### 实际规则
+
+对 `read` 工具：
+
+- 运行态：使用 `Read [](${uri}#range)`
+- 完成态：`pastTenseMessage` 也必须继续使用同样的 `Read [](${uri}#range)` 风格
+- 不要在完成态退回普通字符串
+
+### Windows URI 说明
+
+实验里对 `file:///...` URI 使用了 `.toLowerCase()` 处理，以匹配在 Windows 上更稳定的文件气泡形式。
+
+### 稳定兜底方案
+
+如果目标是“稳定可点击跳转”，而不是强依赖 Copilot 风格的单气泡视觉效果，则公开 API 下最稳的方式仍然是：
+
+```ts
+toolSpecificData = {
+  values: [new vscode.Location(uri, range)]
+} satisfies ChatToolResourcesInvocationData;
+```
+
+这会渲染为稳定的资源条目/文件引用列表。
+
 ### 端点选择：使用 `/global/event`，不再为每个请求单独订阅 `/event`
 
 当前 SDK/服务端组合里，`client.event.subscribe()` 对应 `/event`，真实运行时只稳定产出服务级事件，例如 `server.connected`，不足以承载会话内的 `message.part.*` 流式事件。

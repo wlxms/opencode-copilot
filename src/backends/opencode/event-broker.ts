@@ -8,6 +8,7 @@ interface LoggerLike {
 interface SessionChannel {
   push(event: OpenCodeStreamEvent): void;
   close(): void;
+  isIdle(): void;
   stream(): AsyncIterable<OpenCodeStreamEvent>;
 }
 
@@ -15,6 +16,12 @@ class BufferedSessionChannel implements SessionChannel {
   private queue: OpenCodeStreamEvent[] = [];
   private waiters: Array<(result: IteratorResult<OpenCodeStreamEvent>) => void> = [];
   private closed = false;
+  /**
+   * Set to true when `session.idle` is received. The channel stays open
+   * so consumers can continue receiving events (e.g. from subagents),
+   * but `idle` flag lets consumers know the parent turn is logically done.
+   */
+  private idle = false;
 
   push(event: OpenCodeStreamEvent): void {
     if (this.closed) return;
@@ -33,6 +40,10 @@ class BufferedSessionChannel implements SessionChannel {
       const waiter = this.waiters.shift();
       waiter?.({ value: undefined, done: true });
     }
+  }
+
+  isIdle(): boolean {
+    return this.idle;
   }
 
   async *stream(): AsyncIterable<OpenCodeStreamEvent> {
@@ -64,6 +75,7 @@ export class GlobalEventBroker {
   private sessionChannels: Map<string, SessionChannel> = new Map();
   private partSessions: Map<string, string> = new Map();
   private sessionParts: Map<string, Set<string>> = new Map();
+  private childToParent: Map<string, string> = new Map();
 
   async ensureStarted(client: OpenCodeClient, logger?: LoggerLike): Promise<void> {
     if (logger) {
@@ -101,6 +113,12 @@ export class GlobalEventBroker {
     channel.close();
     this.sessionChannels.delete(sessionId);
     this.clearSessionParts(sessionId);
+    // Clean up child→parent mappings for this parent
+    for (const [childId, parentId] of this.childToParent.entries()) {
+      if (parentId === sessionId) {
+        this.childToParent.delete(childId);
+      }
+    }
     this.log(`close session stream: sessionID=${sessionId}`);
   }
 
@@ -137,17 +155,37 @@ export class GlobalEventBroker {
       return;
     }
 
-    const channel = this.sessionChannels.get(sessionId);
+    let channel = this.sessionChannels.get(sessionId);
     if (!channel) {
-      return;
+      // No direct channel — trace the parent chain upward (child → parent → grandparent)
+      // to find a channel that's listening. This handles nested background tasks
+      // where grandchildren events need to reach the root parent's channel.
+      let currentId = sessionId;
+      const visited = new Set<string>();
+      while (currentId && !visited.has(currentId)) {
+        visited.add(currentId);
+        const parentId = this.childToParent.get(currentId);
+        if (!parentId) break;
+        channel = this.sessionChannels.get(parentId);
+        if (channel) {
+          this.log(`forwarding descendant event: childSessionId=${sessionId} → parentId=${parentId}, type=${event.type}`);
+          break;
+        }
+        currentId = parentId;
+      }
+    }
+    if (!channel) {
+      return; // truly no channel, drop event
     }
 
     channel.push(rawEvent);
     if (event.type === 'session.idle') {
-      channel.close();
-      this.sessionChannels.delete(sessionId);
-      this.clearSessionParts(sessionId);
-      this.log(`session idle: sessionID=${sessionId}`);
+      // Mark the channel as idle but do NOT close it. The consumer
+      // (StreamBridge) decides when to actually close the stream —
+      // e.g. after all active subagent scopes are resolved.
+      // This prevents losing events from still-running subagents.
+      channel.isIdle();
+      this.log(`session idle (channel kept open): sessionID=${sessionId}`);
     }
   }
 
@@ -168,6 +206,21 @@ export class GlobalEventBroker {
         return event.properties?.sessionID;
       case 'permission.replied':
         return event.properties?.sessionID;
+      case 'session.created':
+      case 'session.updated':
+      case 'session.deleted': {
+        // properties.info.id contains the session ID (from SDK Session type)
+        const info = (event as any).properties?.info;
+        const id = info?.id as string | undefined;
+        if (id && event.type === 'session.created' && info?.parentID) {
+          // Auto-detect child sessions from parentID field
+          this.childToParent.set(id, info.parentID);
+          this.log(`child session detected: childId=${id}, parentId=${info.parentID}`);
+        }
+        return id;
+      }
+      case 'session.status':
+        return (event as any).properties?.sessionID;
       default:
         return getEventSessionIdFromProperties(event);
     }

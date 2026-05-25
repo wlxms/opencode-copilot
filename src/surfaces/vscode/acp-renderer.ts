@@ -32,12 +32,14 @@ import type {
   ChatSimpleToolResultData,
   ChatToolResourcesInvocationData,
   ChatSubagentToolInvocationData,
+  ChatTodoToolInvocationData,
   ChatToolSpecificData,
   ChatToolInvocationPart,
   ChatToolInvocationStreamData,
   ChatResponseDiffEntry,
   ChatResponseMultiDiffPart,
 } from '../../types/vscode-proposed-additions';
+import { ChatTodoStatus } from '../../types/vscode-proposed-additions';
 
 import {
   hasThinkingProgress,
@@ -46,6 +48,7 @@ import {
   hasChatResponseMultiDiffPart,
   hasChatSubagentToolInvocationData,
 } from './capabilities';
+import { SubagentScope, formatSubagentProgress } from '../../participant/subagent';
 
 // ---------------------------------------------------------------------------
 // Extended stream type for proposed API methods
@@ -140,6 +143,8 @@ export class AcpRenderer {
   private toolMetas: Map<string, ToolMeta> = new Map();
   private assistantPhaseStarted = false;
   private progressivePushed: Set<string> = new Set();
+  /** Active subagent scopes — filters child events from rendering as independent cards */
+  private activeSubagentScopes: Map<string, SubagentScope> = new Map();
 
   // Capabilities (cached per render cycle)
   private _hasThinking = false;
@@ -175,6 +180,12 @@ export class AcpRenderer {
   renderEvent(evt: OpenCodeEvent, stream: vscode.ChatResponseStream): RenderResult {
     const s = stream as Stream;
 
+    // Filter subagent-internal events: suppress rendering, capture for progress summary
+    if (this.isSubagentInternalEvent(evt)) {
+      this.captureSubagentEvent(evt, s);
+      return { rendered: false, eventType: evt.type };
+    }
+
     switch (evt.type) {
       case 'message.part.updated':
         return {
@@ -186,8 +197,27 @@ export class AcpRenderer {
           rendered: this.handlePartDelta(evt, s),
           eventType: 'message.part.delta',
         };
-      case 'session.idle':
+      case 'session.idle': {
+        // Check if this is a child session becoming idle.
+        // Child session.idle events are forwarded by the event-broker to the
+        // parent channel (via childToParent mapping). We match by childSessionId
+        // and push the FINAL completed subagent card with aggregated progress.
+        const idleEvent = evt as { properties?: { sessionID?: string } };
+        const idleSessionId = idleEvent.properties?.sessionID;
+        if (idleSessionId) {
+          for (const scope of this.activeSubagentScopes.values()) {
+            if (scope.childSessionId === idleSessionId) {
+              scope.childIdle = true;
+              // Record the true end time — this is when the subagent truly finished
+              scope.timeEnd = Date.now();
+              this.log(`child session idle: childSessionId=${idleSessionId}, callID=${scope.callId}, toolCalls=${scope.toolCalls.length}`);
+              this.pushFinalSubagentCard(s, scope);
+              break;
+            }
+          }
+        }
         return { rendered: false, eventType: 'session.idle' };
+      }
       case 'session.diff':
         return {
           rendered: this.handleSessionDiff(evt as SessionDiffEvent, s),
@@ -205,15 +235,8 @@ export class AcpRenderer {
    * Return the captured user message ID, if any.
    * This is the OpenCode message ID of the user's prompt.
    */
-  getUserMessageId(): string | null {
+   getUserMessageId(): string | null {
     return this.userMessageId;
-  }
-
-  /**
-   * Whether the assistant phase has started (first reasoning/tool/step event seen).
-   */
-  isAssistantPhaseStarted(): boolean {
-    return this.assistantPhaseStarted;
   }
 
   /**
@@ -225,6 +248,7 @@ export class AcpRenderer {
     this.toolCallIds.clear();
     this.toolMetas.clear();
     this.progressivePushed.clear();
+    this.activeSubagentScopes.clear();
     this.assistantPhaseStarted = false;
     // Keep capability cache — it's per-stream, not per-turn
   }
@@ -426,6 +450,28 @@ export class AcpRenderer {
       meta.title = getToolTitle(state);
       meta.timeStart = getToolTime(state)?.start;
     }
+    // Track subagent scope so child events get filtered instead of leaking
+    // Generate subAgentInvocationId at scope creation so child tools that
+    // arrive before task:completed already have the grouping ID.
+    if (toolName === 'task' || toolName === 'subagent') {
+      this.activeSubagentScopes.set(callID, {
+        callId: callID,
+        toolCalls: [],
+        completed: false,
+        // VSCode groups child tools under the parent subagent card by matching
+        // child.subAgentInvocationId === parent.toolCallId. Therefore the scope's
+        // subAgentInvocationId must be the parent task's own callID.
+        subAgentInvocationId: callID,
+        toolMeta: {
+          toolName,
+          title: getToolTitle(state) ?? toolName,
+          input: state.input ?? {},
+          timeStart: getToolTime(state)?.start,
+        },
+        descendantSessionIds: new Set(),
+      });
+      this.log(`subagent scope opened: callID=${callID}, subAgentInvocationId=${callID}`);
+    }
 
     if (!this._hasToolUI || !stream.updateToolInvocation) {
       return false;
@@ -435,7 +481,9 @@ export class AcpRenderer {
       partialInput: state.input ?? {},
     });
 
-    // Progressive push: show a "tool running" spinner in the UI
+    // Progressive push: show a "tool running" spinner in the UI.
+    // For subagent tools, attach ChatSubagentToolInvocationData so VSCode
+    // renders it as an expandable subagent card from the start.
     if (
       hasChatToolInvocationPart() &&
       stream.push &&
@@ -448,11 +496,20 @@ export class AcpRenderer {
           part.isComplete = false;
           part.isError = false;
           part.enablePartialUpdate = true;
-          part.invocationMessage = formatInvocationMsg(
-            toolName,
-            state.input ?? {},
-            getToolTitle(state) ?? toolName,
-          );
+          const input = state.input ?? {};
+          const title = getToolTitle(state) ?? toolName;
+          part.invocationMessage = title;
+          // For subagent tools, show as expandable subagent card (matches demo pattern)
+          if ((toolName === 'task' || toolName === 'subagent') && hasChatSubagentToolInvocationData() && Proposed.ChatSubagentToolInvocationData) {
+            const description = (input.description as string) ?? title;
+            const agentName = (input.agentName as string) ?? (input.agent_type as string) ?? toolName;
+            const prompt = (input.prompt as string) ?? '';
+            part.toolSpecificData = new Proposed.ChatSubagentToolInvocationData(
+              description,
+              agentName,
+              prompt,
+            ) as ChatSubagentToolInvocationData;
+          }
           stream.push(part as unknown as vscode.ChatResponsePart);
           this.progressivePushed.add(callID);
         } catch {
@@ -478,10 +535,44 @@ export class AcpRenderer {
       meta.title = getToolTitle(state) ?? meta.title;
     }
 
-    if (this._hasToolUI && hasChatToolInvocationPart()) {
-      this.pushToolInvocation(stream, callID, toolName, state);
+    // For subagent tools: the subagent was just created and starts running.
+    // At task:completed, pushToolInvocation creates the subagent card with
+    // ChatSubagentToolInvocationData. The card shows task tool duration.
+    // At child session.idle, pushFinalSubagentCard updates with full duration.
+    const subagentScope = this.activeSubagentScopes.get(callID);
+    if ((toolName === 'task' || toolName === 'subagent') && subagentScope) {
+      const sdkState = state as { metadata?: Record<string, unknown>; output?: string };
+      const childSessionId = (sdkState.metadata?.sessionId ??
+        (typeof sdkState.output === 'string' ? sdkState.output.match(/task_id:\s*(\S+)/)?.[1] : undefined)) as string | undefined;
+      if (childSessionId && !subagentScope.childSessionId) {
+        subagentScope.childSessionId = childSessionId;
+        this.log(`child session ID captured: callID=${callID}, childSessionId=${childSessionId}`);
+      }
+      // subAgentInvocationId already generated at task:running (scope creation)
+
+      subagentScope.output = getToolOutput(state) ?? '';
+      subagentScope.completed = true;
+
+      this.log(`subagent scope activated (subagent spawned): callID=${callID}, childSessionId=${childSessionId || subagentScope.childSessionId}, subAgentInvocationId=${subagentScope.subAgentInvocationId}`);
+      // DON'T push completed card — the subagent is still running!
+      // Just update the running card to show it's active.
+      // The final completed card will be pushed at child session.idle.
+      if (stream.updateToolInvocation) {
+        try {
+          const input = state.input ?? {};
+          const title = (input.description as string) ?? getToolTitle(state) ?? toolName;
+          stream.updateToolInvocation(callID, {
+            invocationMessage: `Running ${title}...`,
+          });
+        } catch { /* best-effort */ }
+      }
     } else {
-      renderToolFallback(stream, toolName, state.input, getToolOutput(state), getToolTitle(state));
+      // Non-subagent tools: push completed card as usual
+      if (this._hasToolUI && hasChatToolInvocationPart()) {
+        this.pushToolInvocation(stream, callID, toolName, state, false);
+      } else {
+        renderToolFallback(stream, toolName, state.input, getToolOutput(state), getToolTitle(state));
+      }
     }
 
     this.toolMetas.delete(callID);
@@ -496,6 +587,10 @@ export class AcpRenderer {
     state: StreamToolState,
     stream: Stream,
   ): boolean {
+    // Clean up subagent scope on error
+    if (toolName === 'task' || toolName === 'subagent') {
+      this.activeSubagentScopes.delete(callID);
+    }
     if (this._hasToolUI && hasChatToolInvocationPart()) {
       this.pushToolInvocation(stream, callID, toolName, state, true);
     } else {
@@ -523,6 +618,7 @@ export class AcpRenderer {
     toolName: string,
     state: StreamToolState,
     isError?: boolean,
+    subAgentInvocationId?: string,
   ): void {
     const Ctor = Proposed.ChatToolInvocationPart;
     if (!Ctor) {
@@ -551,24 +647,315 @@ export class AcpRenderer {
         part.enablePartialUpdate = true;
         part.isComplete = true;
         part.invocationMessage = formatInvocationMsg(toolName, input, title);
-        part.pastTenseMessage = formatPastTenseMsg(toolName, title, timeStart, timeEnd);
-        part.toolSpecificData = buildToolSpecificData(toolName, title, input, output, timeStart, timeEnd);
+        part.pastTenseMessage = formatPastTenseMsg(toolName, title, timeStart, timeEnd, input);
+        part.toolSpecificData = buildToolSpecificData(toolName, title, input, output, timeStart, timeEnd, !!subAgentInvocationId);
+
+        // NOTE: Parent subagent cards must NOT have subAgentInvocationId set.
+        // VSCode groups child tools under the parent by matching
+        // child.subAgentInvocationId === parent.toolCallId.
+        // Only child tool cards should carry subAgentInvocationId.
       }
 
-      // Link subagent tools
-      if (toolName === 'task' || toolName === 'subagent') {
-        part.subAgentInvocationId = callID;
-      }
-
-      // Hide internal/structural tools after completion
-      if (toolName === 'internal' || toolName === 'step-start' || toolName === 'step-finish') {
+      // Hide transient tool cards after completion when a stronger/final UI exists elsewhere.
+      // read/edit/write use bubble-style messages while active; edit/write also produce an
+      // externalEdit checkpoint/diff that should become the primary post-completion artifact.
+      if (
+        toolName === 'read'
+        || toolName === 'write'
+        || toolName === 'edit'
+        || toolName === 'internal'
+        || toolName === 'step-start'
+        || toolName === 'step-finish'
+      ) {
         part.presentation = 'hiddenAfterComplete';
+      }
+
+      // Child tool cards carry subAgentInvocationId so VSCode groups them
+      // under the parent subagent card. Parent cards must NOT have this set.
+      if (subAgentInvocationId) {
+        (part as any).subAgentInvocationId = subAgentInvocationId;
       }
 
       stream.push(part as unknown as vscode.ChatResponsePart);
     } catch {
       renderToolFallback(stream, toolName, state.input, getToolOutput(state), getToolTitle(state));
     }
+  }
+
+  // -------------------------------------------------------------------
+  // Subagent scope filtering
+  // -------------------------------------------------------------------
+
+  /**
+   * Check whether an OpenCode event belongs to an active subagent's internal stream.
+   *
+   * Event ordering (SDK-level):
+   *   1. parent task:pending / task:running → scope created
+   *   2. parent task:completed → childSessionId captured from metadata
+   *   3. child tool events (read:pending, edit:completed, ...) arrive
+   *   4. child session.idle → final progress update
+   *
+   * Strategy: Any `message.part.updated` whose part type is NOT `text`/`reasoning`
+   * /`step-start`/`step-finish` (structural parts) and NOT a parent-level
+   * `task`/`subagent` tool is treated as subagent-internal IF the part isn't
+   * already tracked as a parent-level part-kind (checked via `partKinds`).
+   *
+   * Works with OpenCodeEvent (SDK-level), where part data is at `evt.properties.part`.
+   * Uses the same `partKinds` whitelist strategy as StreamBridge.
+   */
+  private isSubagentInternalEvent(evt: OpenCodeEvent): boolean {
+    if (this.activeSubagentScopes.size === 0) return false;
+
+    if (evt.type === 'message.part.updated') {
+      const part = (evt as MessagePartUpdatedEvent).properties?.part;
+      if (!part) return false;
+      // Structural parent parts are never subagent-internal
+      if (part.type === 'reasoning' ||
+          part.type === 'step-start' || part.type === 'step-finish') {
+        return false;
+      }
+      // Text: subagent-internal if not already tracked as a parent part.
+      // This prevents subagent LLM text from being rendered inline;
+      // instead it's collected as scope.lastText for the completion summary.
+      if (part.type === 'text') {
+        return !this.partKinds.has(part.id);
+      }
+      // Parent-level task/subagent tool invocations are NOT subagent-internal.
+      // Without this, a second parallel task tool would be captured instead of rendered.
+      if (part.type === 'tool') {
+        const toolName = (part as StreamToolPart).tool;
+        if (toolName === 'task' || toolName === 'subagent') return false;
+      }
+      if (this.partKinds.has(part.id)) return false;
+      return true;
+    }
+
+    if (evt.type === 'message.part.delta') {
+      const partId = (evt as { properties?: { partID?: string } }).properties?.partID;
+      if (partId && this.partKinds.has(partId)) return false;
+      return !!partId;
+    }
+
+    return false;
+  }
+
+  /**
+   * Push the final completed ChatToolInvocationPart for a subagent when its
+   * child session goes idle. This is the ONLY place a completed card is pushed
+   * for task/subagent tools — handleToolCompleted only keeps the spinner alive.
+   */
+  private pushFinalSubagentCard(stream: Stream, scope: SubagentScope): void {
+    const meta = scope.toolMeta;
+    const toolName = meta?.toolName ?? 'task';
+    const title = meta?.title ?? toolName;
+    const input = meta?.input ?? {};
+    const output = scope.output ?? '';
+    const timeStart = meta?.timeStart;
+    const timeEnd = scope.timeEnd;
+    const progress = formatSubagentProgress(scope);
+    // Use lastText as summary if available, otherwise fall back to progress + output
+    const lastText = scope.lastText?.trim();
+    const result = lastText
+      ? lastText
+      : (progress ? [progress, output].filter(Boolean).join('\n') : output);
+
+    // Update invocationMessage with completion status
+    if (this._hasToolUI && stream.updateToolInvocation) {
+      const completedCount = scope.toolCalls.filter(tc => tc.status === 'completed').length;
+      let msg = `Subagent finished — ${completedCount} tool${completedCount !== 1 ? 's' : ''}`;
+      if (progress) msg += ` (${progress})`;
+      try {
+        stream.updateToolInvocation(scope.callId, { invocationMessage: msg });
+      } catch { /* best-effort */ }
+    }
+
+    // Push final completed tool card
+    if (this._hasToolUI && hasChatToolInvocationPart() && stream.push) {
+      const Ctor = Proposed.ChatToolInvocationPart;
+      if (Ctor) {
+        try {
+          const part = new Ctor(toolName, scope.callId);
+          part.enablePartialUpdate = true;
+          part.isComplete = true;
+          // Parent subagent card must NOT have subAgentInvocationId.
+          // VSCode groups child tools under the parent by matching
+          // child.subAgentInvocationId === parent.toolCallId (= scope.callId).
+          part.invocationMessage = formatInvocationMsg(toolName, input, title);
+          // timeStart = when task:running fired, timeEnd = when child session.idle fired
+        part.pastTenseMessage = formatPastTenseMsg(toolName, title, timeStart, timeEnd, input);
+
+          // Build ChatSubagentToolInvocationData with full result
+          const description = (input.description as string) ?? title;
+          const agentName = (input.agentName as string) ?? (input.agent_type as string) ?? toolName;
+          const prompt = (input.prompt as string) ?? '';
+          if (hasChatSubagentToolInvocationData() && Proposed.ChatSubagentToolInvocationData) {
+            part.toolSpecificData = new Proposed.ChatSubagentToolInvocationData(
+              description,
+              agentName,
+              prompt,
+              result,
+            ) as ChatSubagentToolInvocationData;
+          } else {
+            part.toolSpecificData = {
+              description,
+              agentName,
+              prompt,
+              result,
+            } satisfies ChatSubagentToolInvocationData;
+          }
+
+          stream.push(part as unknown as vscode.ChatResponsePart);
+          this.log(`final subagent card pushed: callID=${scope.callId}, toolCalls=${scope.toolCalls.length}, progress="${progress}"`);
+        } catch {
+          // Best-effort; invocationMessage update above is sufficient
+        }
+      }
+    }
+  }
+
+  /**
+   *
+   * Event ordering (corrected):
+   *   1. parent task:completed → childSessionId is set in scope metadata
+   *   2. child tool events arrive (AFTER childSessionId is already available)
+   *   3. child session.idle  → final progress update
+   *
+   * Matches events to scope by childSessionId to correctly handle parallel subagents.
+   */
+  private captureSubagentEvent(evt: OpenCodeEvent, stream?: Stream): void {
+    // Handle text delta events from subagent — stream text into the subagent card
+    if (evt.type === 'message.part.delta') {
+      const deltaEvt = evt as { properties?: { partID?: string; delta?: string } };
+      const delta = deltaEvt.properties?.delta;
+      if (delta) {
+        for (const scope of this.activeSubagentScopes.values()) {
+          const currentText = (scope.lastText ?? '') + delta;
+          scope.lastText = currentText;
+          if (stream && this._hasToolUI && stream.updateToolInvocation) {
+            try {
+              stream.updateToolInvocation(scope.callId, {
+                invocationMessage: truncate(currentText, 200),
+              });
+            } catch { /* best-effort */ }
+          }
+        }
+      }
+      return;
+    }
+
+    if (evt.type !== 'message.part.updated') return;
+    const part = (evt as MessagePartUpdatedEvent).properties?.part;
+    if (!part) return;
+
+    // Collect text output from subagent and push to subagent card
+    if (part.type === 'text') {
+      const text = (part as any).text;
+      if (text && text.trim().length > 0) {
+        for (const scope of this.activeSubagentScopes.values()) {
+          scope.lastText = text;
+          if (stream && this._hasToolUI && stream.updateToolInvocation) {
+            try {
+              stream.updateToolInvocation(scope.callId, {
+                invocationMessage: truncate(text, 200),
+              });
+            } catch { /* best-effort */ }
+          }
+        }
+      }
+      return;
+    }
+
+    if (part.type !== 'tool') return;
+
+    const toolPart = part as StreamToolPart;
+    const state = toolPart.state;
+    if (!state) return;
+
+    const toolName = toolPart.tool ?? 'unknown';
+    const title = getToolTitle(state);
+
+    // -- Match the event to exactly one subagent scope (using childSessionId) --
+    const childSessionId = part.sessionID;
+    let matchedScope: SubagentScope | undefined;
+
+    if (childSessionId) {
+      for (const scope of this.activeSubagentScopes.values()) {
+        if (scope.childSessionId === childSessionId) {
+          matchedScope = scope;
+          break;
+        }
+      }
+      if (!matchedScope) {
+        this.log(`subagent capture: no scope for childSessionId=${childSessionId}, skipping (tool=${toolName}, status=${state.status})`);
+        return;
+      }
+    } else {
+      // Graceful fallback: if sessionID is missing from the event,
+      // try single-scope match (handles edge cases / race conditions).
+      const scopes = [...this.activeSubagentScopes.values()];
+      if (scopes.length === 1) {
+        matchedScope = scopes[0];
+      } else {
+        this.log(`subagent capture: event missing sessionID, ${scopes.length} active scopes — skipping (tool=${toolName}, status=${state.status})`);
+        return;
+      }
+    }
+
+    matchedScope.toolCalls.push({
+      name: toolName,
+      title: title ?? undefined,
+      status: state.status,
+    });
+
+    // Push real-time update so subagent activity is visible inside the card
+    if (stream && this._hasToolUI && stream.updateToolInvocation) {
+      const label = title ?? toolName;
+      const verb = state.status === 'completed' ? '✓' : state.status === 'error' ? '✗' : '⋯';
+      try {
+        stream.updateToolInvocation(matchedScope.callId, { invocationMessage: `${verb} ${toolName}: ${label}` });
+      } catch { /* best-effort */ }
+    }
+
+    // Forward child tool invocation to VSCode with subAgentInvocationId
+    // so VSCode groups it under the parent subagent card.
+    // Uses pushToolInvocation() for full toolSpecificData rendering
+    // (terminal UI, file references, collapsible lists, etc.).
+    if (matchedScope.subAgentInvocationId && stream) {
+      const childCallId = toolPart.callID ?? toolPart.id ?? '';
+      if (state.status === 'completed' || state.status === 'error') {
+        // Push completed child tool card with full rendering
+        if (this._hasToolUI && hasChatToolInvocationPart() && stream.push) {
+          try {
+            // Register first with subAgentInvocationId
+            if (stream.beginToolInvocation) {
+              stream.beginToolInvocation(childCallId, toolName, {
+                subagentInvocationId: matchedScope.subAgentInvocationId,
+              } as any);
+            }
+            // Use pushToolInvocation for proper toolSpecificData
+            this.pushToolInvocation(
+              stream, childCallId, toolName, state,
+              state.status === 'error',
+              matchedScope.subAgentInvocationId,
+            );
+          } catch { /* best-effort */ }
+        }
+      } else {
+        // Running/pending: just register via beginToolInvocation
+        if (this._hasToolUI && stream.beginToolInvocation) {
+          try {
+            stream.beginToolInvocation(childCallId, toolName, {
+              subagentInvocationId: matchedScope.subAgentInvocationId,
+            } as any);
+          } catch { /* best-effort */ }
+        }
+      }
+    }
+
+    this.log(
+      `subagent capture: tool=${toolPart.tool}, status=${state.status}, ` +
+      `childSessionId=${childSessionId ?? '<none>'}, callID=${matchedScope.callId}`,
+    );
   }
 
   // -------------------------------------------------------------------
@@ -595,6 +982,7 @@ export function buildToolSpecificData(
   output: string,
   timeStart?: number,
   timeEnd?: number,
+  isSubagentTool?: boolean,
 ): ChatToolSpecificData | undefined {
   switch (toolName) {
     case 'bash':
@@ -614,22 +1002,140 @@ export function buildToolSpecificData(
       } satisfies ChatTerminalToolInvocationData;
     }
 
-    case 'read':
+      case 'read': {
+        // No expandable result — just a clickable file link in invocationMessage
+        return undefined;
+      }
+
+      case 'list':
+      case 'grep':
+      case 'grep_app_searchGitHub': {
+        // Show as collapsible file references list (matches VSCode Copilot search pattern)
+        const values: Array<vscode.Uri | vscode.Location> = [];
+        const path = input.path as string | undefined;
+        if (path) {
+          values.push(vscode.Uri.file(path));
+        }
+        // If output has file paths, try to extract them as Location objects
+        if (output) {
+          const lines = output.split('\n');
+          for (const line of lines) {
+            const fileMatch = line.match(/^[A-Za-z]:\\(?:[^\\]+\\)*[^:]+|^\/(?:[^\/]+\/)*[^:]+/);
+            if (fileMatch) {
+              try {
+                values.push(vscode.Uri.file(fileMatch[0]));
+              } catch {
+                // skip invalid paths
+              }
+            }
+          }
+        }
+        if (values.length > 0) {
+          return { values } satisfies ChatToolResourcesInvocationData;
+        }
+        return {
+          input: formatInput(input, title),
+          output: truncate(output, 2000),
+        } satisfies ChatSimpleToolResultData;
+      }
+
+      case 'fetch':
+      case 'webfetch': {
+        return {
+          input: formatInput(input, title),
+          output: truncate(output, 2000),
+        } satisfies ChatSimpleToolResultData;
+      }
+
+      case 'websearch':
+      case 'websearch_web_search_exa': {
+        // Show as clickable web URL references
+        const values: Array<vscode.Uri | vscode.Location> = [];
+        const query = input.query as string | undefined;
+        if (query) {
+          // Add a web search URL as reference
+          values.push(vscode.Uri.parse(`https://www.bing.com/search?q=${encodeURIComponent(query)}`));
+        }
+        // Parse output for URLs
+        if (output) {
+          const urlRegex = /https?:\/\/[^\s"')>]+/g;
+          let match;
+          while ((match = urlRegex.exec(output)) !== null) {
+            try {
+              values.push(vscode.Uri.parse(match[0]));
+            } catch {
+              // skip invalid URLs
+            }
+          }
+        }
+        if (values.length > 0) {
+          return { values } satisfies ChatToolResourcesInvocationData;
+        }
+        return {
+          input: formatInput(input, title),
+          output: truncate(output, 2000),
+        } satisfies ChatSimpleToolResultData;
+      }
+
+      case 'write':
+      case 'edit': {
+        // For edit/write we intentionally avoid resources cards here.
+        // Running/completed messages already use file bubbles, and the final edit UI should
+        // be represented by ChatResponseExternalEditPart instead of a duplicate resources list.
+        return undefined;
+      }
+
     case 'list':
-    case 'grep': {
+    case 'grep':
+    case 'grep_app_searchGitHub': {
       return {
         input: formatInput(input, title),
         output: truncate(output, 2000),
       } satisfies ChatSimpleToolResultData;
     }
 
-    case 'write':
-    case 'edit': {
-      const filePath = input.filePath as string | undefined;
-      if (filePath) {
-        return {
-          values: [vscode.Uri.file(filePath)],
-        } satisfies ChatToolResourcesInvocationData;
+    case 'fetch':
+    case 'webfetch': {
+      return {
+        input: formatInput(input, title),
+        output: truncate(output, 2000),
+      } satisfies ChatSimpleToolResultData;
+    }
+
+    case 'websearch':
+    case 'websearch_web_search_exa': {
+      return {
+        input: formatInput(input, title),
+        output: truncate(output, 2000),
+      } satisfies ChatSimpleToolResultData;
+    }
+
+    case 'todowrite':
+    case 'todo': {
+      const todos = input.todos as Array<{ content: string; status: string }> | undefined;
+      if (todos && Array.isArray(todos)) {
+        if (isSubagentTool) {
+          // Subagent: use formatted text fallback like "[x] 1. done\n[ ] 2. pending"
+          const formatted = todos.map((item, idx) => {
+            const check = item.status === 'completed' ? 'x' : ' ';
+            return `[${check}] ${idx + 1}. ${item.content}`;
+          }).join('\n');
+          return {
+            input: formatted,
+            output: truncate(output, 2000),
+          } satisfies ChatSimpleToolResultData;
+        }
+        // Root session: use proper ChatTodoToolInvocationData
+        const todoList = todos.map((item, idx) => ({
+          id: idx,
+          title: item.content,
+          status: item.status === 'completed'
+            ? ChatTodoStatus.Completed
+            : item.status === 'in_progress'
+              ? ChatTodoStatus.InProgress
+              : ChatTodoStatus.NotStarted,
+        }));
+        return { todoList } satisfies ChatTodoToolInvocationData;
       }
       return {
         input: formatInput(input, title),
@@ -640,7 +1146,7 @@ export function buildToolSpecificData(
     case 'task':
     case 'subagent': {
       const description = (input.description as string) ?? title;
-      const agentName = (input.agentName as string) ?? toolName;
+      const agentName = (input.agentName as string) ?? (input.agent_type as string) ?? title ?? toolName;
       const prompt = (input.prompt as string) ?? formatInput(input, '');
       const result = truncate(output, 4000);
 
@@ -675,12 +1181,114 @@ export function buildToolSpecificData(
 
 /**
  * Format a human-readable "invocation message" shown while a tool is running.
+ * read → `[fileName](file://path)` markdown link
+ * grep → `` Searching `pattern` ``
+ * grep_app_searchGitHub → `` Github Searching `query` ``
+ * websearch/websearch_web_search_exa → `` Web Searching `query` ``
  */
 export function formatInvocationMsg(
   toolName: string,
   input: Record<string, unknown>,
   title: string,
-): string {
+): string | vscode.MarkdownString {
+  const formatFileBubbleMessage = (
+    verb: 'Read' | 'Editing' | 'Writing',
+    filePath: string,
+    offset?: number,
+    limit?: number,
+    suffix = '',
+  ): vscode.MarkdownString => {
+    const uri = vscode.Uri.file(filePath).toString().toLowerCase();
+    const range = offset != null || limit != null
+      ? (() => {
+          const start = offset ?? 1;
+          const end = limit != null ? start + limit - 1 : start;
+          return `#${start}-${end}`;
+        })()
+      : '';
+    let lineInfo = '';
+    if (offset != null || limit != null) {
+      const start = offset ?? 1;
+      const end = limit != null ? start + limit - 1 : undefined;
+      lineInfo = end != null ? ` line ${start}-${end}` : ` line ${start}`;
+    }
+    return new vscode.MarkdownString(`${verb} [](${uri}${range})${lineInfo}${suffix}`);
+  };
+
+  // --- read: official-style file bubble ---
+  //
+  // Keep this logic in sync with participant/streaming.ts.
+  // Research outcome:
+  // - Initial MarkdownString `Read [](${uri}#range)` can render as the same style of
+  //   file bubble seen in Copilot-like read/view cards.
+  // - The fragile part is NOT the initial push; it is the completed-state rewrite.
+  // - If completed-state `pastTenseMessage` falls back to plain text, the bubble is
+  //   replaced by normal text.
+  // Therefore both running and completed read messages must stay in bubble Markdown.
+  if (toolName === 'read') {
+    const filePath = input.filePath as string | undefined;
+    if (filePath) {
+      let lineInfo = '';
+      const offset = input.offset as number | undefined;
+      const limit = input.limit as number | undefined;
+      if (offset != null || limit != null) {
+        const start = offset ?? 1;
+        const end = limit != null ? start + limit - 1 : undefined;
+        lineInfo = end != null ? ` line ${start}-${end}` : ` line ${start}`;
+      }
+      return formatFileBubbleMessage('Read', filePath, offset, limit);
+    }
+  }
+
+  // edit/write keep the same bubble style while running. The actual file-change checkpoint
+  // still comes from externalEdit, so this message is descriptive UI, not the diff payload.
+  if (toolName === 'edit' || toolName === 'write') {
+    const filePath = input.filePath as string | undefined;
+    if (filePath) {
+      const offset = input.offset as number | undefined;
+      const limit = input.limit as number | undefined;
+      const lineCount = limit ?? 1;
+      const verb = toolName === 'edit' ? 'Editing' : 'Writing';
+      return formatFileBubbleMessage(verb, filePath, offset, limit, ` (${lineCount} lines)`);
+    }
+  }
+
+  // --- grep: Searching `pattern` ---
+  if (toolName === 'grep') {
+    const pattern = (input.pattern as string) ?? (input.query as string) ?? title;
+    if (pattern) {
+      const short = pattern.length > 80 ? pattern.substring(0, 77) + '...' : pattern;
+      return new vscode.MarkdownString(`Searching \`${short}\``);
+    }
+  }
+
+  // --- grep_app_searchGitHub: Github Searching `query` ---
+  if (toolName === 'grep_app_searchGitHub') {
+    const query = (input.query as string) ?? title;
+    if (query) {
+      const short = query.length > 80 ? query.substring(0, 77) + '...' : query;
+      return new vscode.MarkdownString(`Github Searching \`${short}\``);
+    }
+  }
+
+  // --- fetch / webfetch: show URL ---
+  if (toolName === 'fetch' || toolName === 'webfetch') {
+    const url = (input.url as string) ?? title;
+    if (url) {
+      const short = url.length > 80 ? url.substring(0, 77) + '...' : url;
+      return new vscode.MarkdownString(`Fetching [${short}](${short})`);
+    }
+  }
+
+  // --- websearch_web_search_exa: Web Searching `query` ---
+  if (toolName === 'websearch' || toolName === 'websearch_web_search_exa') {
+    const query = (input.query as string) ?? title;
+    if (query) {
+      const short = query.length > 80 ? query.substring(0, 77) + '...' : query;
+      return new vscode.MarkdownString(`Web Searching \`${short}\``);
+    }
+  }
+
   const display = title || toolName;
   if (!input || Object.keys(input).length === 0) {
     return `Running ${display}`;
@@ -698,14 +1306,86 @@ export function formatInvocationMsg(
 
 /**
  * Format a human-readable "past tense message" shown after a tool completes.
+ * Shows search parameters in title for grep/websearch tools.
  */
 export function formatPastTenseMsg(
   toolName: string,
   title: string,
   timeStart?: number,
   timeEnd?: number,
-): string {
-  const display = title || toolName;
+  input?: Record<string, unknown>,
+): string | vscode.MarkdownString {
+  const duration = (timeStart != null && timeEnd != null)
+    ? ` (${((timeEnd - timeStart) / 1000).toFixed(1)}s)`
+    : '';
+
+  const formatFileBubbleMessage = (
+    verb: 'Read' | 'Edited' | 'Wrote',
+    filePath: string,
+    offset?: number,
+    limit?: number,
+    suffix = '',
+  ): vscode.MarkdownString => {
+    const uri = vscode.Uri.file(filePath).toString().toLowerCase();
+    const range = offset != null || limit != null
+      ? (() => {
+          const start = offset ?? 1;
+          const end = limit != null ? start + limit - 1 : start;
+          return `#${start}-${end}`;
+        })()
+      : '';
+    let lineInfo = '';
+    if (offset != null || limit != null) {
+      const start = offset ?? 1;
+      const end = limit != null ? start + limit - 1 : undefined;
+      lineInfo = end != null ? ` line ${start}-${end}` : ` line ${start}`;
+    }
+    return new vscode.MarkdownString(`${verb} [](${uri}${range})${lineInfo}${suffix}${duration}`);
+  };
+
+  // --- read: keep official-style file bubble in completed state ---
+  // This is required to preserve the bubble after the tool transitions to `isComplete`.
+  if (toolName === 'read') {
+    const filePath = input?.filePath as string | undefined;
+    if (filePath) {
+      const offset = input?.offset as number | undefined;
+      const limit = input?.limit as number | undefined;
+      return formatFileBubbleMessage('Read', filePath, offset, limit);
+    }
+    return `${title}${duration}`;
+  }
+
+  // Preserve bubble styling after completion too; otherwise completed-state text can replace
+  // the running bubble before the externalEdit visualization becomes the primary output.
+  if (toolName === 'edit' || toolName === 'write') {
+    const filePath = input?.filePath as string | undefined;
+    if (filePath) {
+      const offset = input?.offset as number | undefined;
+      const limit = input?.limit as number | undefined;
+      const lineCount = limit ?? 1;
+      const verb = toolName === 'edit' ? 'Edited' : 'Wrote';
+      return formatFileBubbleMessage(verb, filePath, offset, limit, ` (${lineCount} lines)`);
+    }
+  }
+
+  // --- grep: Searched `pattern` ---
+  if (toolName === 'grep') {
+    const pattern = input ? (input.pattern as string) ?? (input.query as string) ?? title : title;
+    return `Searched \`${pattern}\`${duration}`;
+  }
+
+  // --- grep_app_searchGitHub: Github Searched `query` ---
+  if (toolName === 'grep_app_searchGitHub') {
+    const query = input ? (input.query as string) ?? title : title;
+    return `Github Searched \`${query}\`${duration}`;
+  }
+
+  // --- websearch / websearch_web_search_exa: Web Searched `query` ---
+  if (toolName === 'websearch' || toolName === 'websearch_web_search_exa') {
+    const query = input ? (input.query as string) ?? title : title;
+    return `Web Searched \`${query}\`${duration}`;
+  }
+
   const pastVerb =
     ({
       read: 'Read',
@@ -713,15 +1393,19 @@ export function formatPastTenseMsg(
       write: 'Wrote',
       list: 'Listed',
       grep: 'Searched',
+      grep_app_searchGitHub: 'Github Searched',
       edit: 'Edited',
       task: 'Completed subagent',
+      subagent: 'Completed subagent',
+      fetch: 'Fetched',
+      webfetch: 'Fetched',
+      websearch: 'Web Searched',
+      websearch_web_search_exa: 'Web Searched',
+      todowrite: 'Updated todos',
+      todo: 'Updated todos',
     } as Record<string, string>)[toolName] ?? 'Executed';
-  let msg = `${pastVerb} ${display}`;
-  if (timeStart != null && timeEnd != null) {
-    const dur = ((timeEnd - timeStart) / 1000).toFixed(1);
-    msg += ` (${dur}s)`;
-  }
-  return msg;
+
+  return `${pastVerb} ${title}${duration}`;
 }
 
 /**
@@ -809,3 +1493,4 @@ function getToolTime(
 ): { start?: number; end?: number } | undefined {
   return 'time' in state ? state.time : undefined;
 }
+

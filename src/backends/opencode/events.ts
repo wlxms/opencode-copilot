@@ -22,6 +22,7 @@ import type {
   AcpPermissionRequestEvent,
   AcpPermissionReplyEvent,
   AcpSessionLifecycleEvent,
+  AcpSessionStatusEvent,
 } from '../../acp/types';
 
 import type {
@@ -207,15 +208,20 @@ export function normalizeEvent(event: OpenCodeEvent): AcpEvent[] {
 
     // ---- Session lifecycle ----
     case 'session.created':
-    case 'session.updated':
+    case 'session.updated': {
+      const props = event.properties as { info?: { id?: string; title?: string; parentID?: string } };
+      return [{
+        type: event.type as 'session.created' | 'session.updated',
+        sessionId: props?.info?.id ?? '',
+        title: props?.info?.title,
+      }];
+    }
     case 'session.deleted': {
-      const props = event.properties as { [key: string]: unknown } | undefined;
-      const lc: AcpSessionLifecycleEvent = {
-        type: event.type,
-        sessionId: props?.sessionID as string ?? '',
-        title: props?.title as string | undefined,
-      };
-      return [lc];
+      const props = event.properties as { info?: { id?: string } };
+      return [{
+        type: event.type as 'session.deleted',
+        sessionId: props?.info?.id ?? '',
+      }];
     }
     case 'session.error': {
       const props = event.properties as { [key: string]: unknown } | undefined;
@@ -280,6 +286,17 @@ export function normalizeEvent(event: OpenCodeEvent): AcpEvent[] {
         response: props.reply,
       };
       return [replied];
+    }
+
+    // ---- Session status ----
+    case 'session.status': {
+      const props = event.properties as { sessionID: string; status: { type: string; [key: string]: unknown } };
+      const statusEvent: AcpSessionStatusEvent = {
+        type: 'session.status',
+        sessionId: props.sessionID,
+        status: props.status as AcpSessionStatusEvent['status'],
+      };
+      return [statusEvent];
     }
 
     default:

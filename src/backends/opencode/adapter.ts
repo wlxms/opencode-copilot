@@ -251,6 +251,39 @@ export class OpenCodeBackend implements AcpBackend {
       }
     },
 
+    children: async (id: string, directory?: string) => {
+      try {
+        const result = await this.sdk.session.children({
+          path: { id },
+          query: directory ? { directory } : undefined,
+        });
+        const error = getResultError(result);
+        if (error !== undefined) {
+          return { error: extractErrorMessage(error, 'Failed to get children') };
+        }
+        return {
+          data: (result.data ?? []).map(s => ({ id: s.id, parentID: s.parentID })),
+        };
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+
+    status: async (directory?: string) => {
+      try {
+        const result = await this.sdk.session.status({
+          query: directory ? { directory } : undefined,
+        });
+        const error = getResultError(result);
+        if (error !== undefined) {
+          return { error: extractErrorMessage(error, 'Failed to get session status') };
+        }
+        return { data: result.data ?? {} };
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+
     prompt: async (id: string, text: string, directory?: string): Promise<AcpResult<unknown>> => {
       try {
         const result = await this.sdk.session.prompt({

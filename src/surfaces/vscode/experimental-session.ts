@@ -256,7 +256,13 @@ export class ExperimentalChatSession {
         toolCallId: callID,
         isError: status === 'error',
         invocationMessage: formatInvocationMsg(toolName, state.input ?? {}, getTitle(state) ?? toolName),
-        pastTenseMessage: formatPastTenseMsg(toolName, getTitle(state) ?? toolName),
+        pastTenseMessage: formatPastTenseMsg(
+          toolName,
+          getTitle(state) ?? toolName,
+          state.startTime,
+          state.endTime,
+          state.input ?? {},
+        ),
         isComplete: true,
       };
 

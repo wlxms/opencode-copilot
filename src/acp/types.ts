@@ -43,6 +43,13 @@ export interface AcpSessionInfo {
   createdAt: Date;
 }
 
+export type AcpSessionStatus = { type: 'idle' } | { type: 'busy' } | { type: 'retry'; attempt: number; message: string; next: number };
+
+export interface AcpChildSessionInfo {
+  id: string;
+  parentID?: string;
+}
+
 export interface AcpTurnMapping {
   turnIndex: number;
   messageId: string;
@@ -117,6 +124,7 @@ export type AcpEventType =
   | 'part.updated'
   | 'part.delta'
   | 'session.idle'
+  | 'session.status'
   | 'session.diff'
   | 'session.created'
   | 'session.updated'
@@ -188,12 +196,19 @@ export interface AcpServerLifecycleEvent {
   type: 'server.connected' | 'server.heartbeat';
 }
 
+export interface AcpSessionStatusEvent {
+  type: 'session.status';
+  sessionId: string;
+  status: AcpSessionStatus;
+}
+
 export type AcpEvent =
   | AcpPartUpdatedEvent
   | AcpPartDeltaEvent
   | AcpSessionIdleEvent
   | AcpSessionDiffEvent
   | AcpSessionLifecycleEvent
+  | AcpSessionStatusEvent
   | AcpPermissionRequestEvent
   | AcpPermissionReplyEvent
   | AcpServerLifecycleEvent;
