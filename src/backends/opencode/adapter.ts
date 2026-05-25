@@ -21,6 +21,8 @@ import type {
   AcpServerStatus,
   AcpSessionInfo,
   AcpModel,
+  AcpAgent,
+  AcpConfig,
   AcpResult,
   AcpPermissionResponse,
   AcpEvent,
@@ -100,6 +102,14 @@ function getResultError(value: unknown): unknown {
   }
 
   return (value as Record<string, unknown>).error;
+}
+
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 // ===========================================================================
@@ -284,20 +294,36 @@ export class OpenCodeBackend implements AcpBackend {
       }
     },
 
-    prompt: async (id: string, text: string, directory?: string): Promise<AcpResult<unknown>> => {
+    prompt: async (
+      id: string,
+      text: string,
+      directory?: string,
+      options?: {
+        model?: { providerID: string; modelID: string };
+        agent?: string;
+      },
+    ): Promise<AcpResult<unknown>> => {
       try {
         const result = await this.sdk.session.prompt({
           path: { id },
-          body: { parts: [{ type: 'text', text }] },
           query: directory ? { directory } : undefined,
-        });
+          body: {
+            parts: [{ type: 'text', text }],
+            model: options?.model,
+            agent: options?.agent,
+          },
+        } as any);
         const error = getResultError(result);
         if (error !== undefined) {
-          return { error: extractErrorMessage(error, 'Prompt failed') };
+          return {
+            error: `${extractErrorMessage(error, 'Prompt failed')} | raw=${safeStringify(error)}`,
+          };
         }
         return { data: result };
       } catch (err) {
-        return { error: err instanceof Error ? err.message : String(err) };
+        return {
+          error: `${err instanceof Error ? err.message : String(err)} | raw=${safeStringify(err)}`,
+        };
       }
     },
 
@@ -367,12 +393,13 @@ export class OpenCodeBackend implements AcpBackend {
         const providers = result.data?.providers ?? [];
         const models: AcpModel[] = [];
         for (const provider of providers) {
-          for (const m of provider.models ?? []) {
+          for (const m of Object.values(provider.models ?? {})) {
             const capRecord = m.capabilities;
             models.push({
               id: m.id,
               name: m.name ?? m.id,
-              provider: provider.name,
+              provider: provider.id,
+              providerName: provider.name,
               capabilities: capRecord
                 ? Object.keys(capRecord).filter((k) => Boolean(capRecord[k]))
                 : undefined,
@@ -382,6 +409,73 @@ export class OpenCodeBackend implements AcpBackend {
         return { data: models };
       } catch (err) {
         return { error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+
+    agents: async (directory?: string): Promise<AcpResult<AcpAgent[]>> => {
+      try {
+        const rawClient = this.serverManager.getClient() as any;
+        const result = await rawClient.app.agents({
+          query: directory ? { directory } : undefined,
+        });
+        const error = getResultError(result);
+        if (error !== undefined) {
+          return { error: extractErrorMessage(error, 'List agents failed') };
+        }
+        const agents: AcpAgent[] = (result.data ?? []).map((a: any) => ({
+          id: a.id ?? a.name ?? '',
+          name: a.name ?? a.id,
+          description: a.description,
+          model: a.model,
+          mode: a.mode,
+          hidden: a.hidden,
+        }));
+        return { data: agents };
+      } catch (err) {
+        return { error: extractErrorMessage(err, 'List agents failed') };
+      }
+    },
+
+    get: async (directory?: string): Promise<AcpResult<AcpConfig>> => {
+      try {
+        const rawClient = this.serverManager.getClient() as any;
+        const configResult = await rawClient.config.get({
+          query: directory ? { directory } : undefined,
+        });
+        const error = getResultError(configResult);
+        if (error !== undefined) {
+          return { error: extractErrorMessage(error, 'Get config failed') };
+        }
+        const raw = configResult.data ?? {};
+        const config: AcpConfig = {
+          model: raw.model,
+          small_model: raw.small_model,
+          default_agent: raw.default_agent,
+          disabled_providers: raw.disabled_providers,
+          enabled_providers: raw.enabled_providers,
+          agent: raw.agent,
+          provider: raw.provider,
+        };
+        return { data: config };
+      } catch (err) {
+        return { error: extractErrorMessage(err, 'Get config failed') };
+      }
+    },
+
+    update: async (config: Partial<AcpConfig>, directory?: string): Promise<AcpResult<void>> => {
+      try {
+        const rawClient = this.serverManager.getClient() as any;
+        const result = await rawClient.config.update({
+          query: directory ? { directory } : undefined,
+          config,
+        });
+        const error = getResultError(result);
+        if (error !== undefined) {
+          return { error: extractErrorMessage(error, 'Update config failed') };
+        }
+        return { data: undefined };
+      } catch (err) {
+        return { error: extractErrorMessage(err, 'Update config failed') };
       }
     },
   };
@@ -414,6 +508,33 @@ export class OpenCodeBackend implements AcpBackend {
       }
     },
   };
+
+  // =======================================================================
+  // Session hierarchy — delegates to GlobalEventBroker
+  // =======================================================================
+
+  /**
+   * Walk up the parent chain from `sessionId` and return the first session ID
+   * that appears in `candidateIds`. Used by StreamBridge to route grandchild events.
+   */
+  findAncestorScope(sessionId: string, candidateIds: Set<string>): string | undefined {
+    return this.eventBroker.findAncestorIn(sessionId, candidateIds);
+  }
+
+  /**
+   * Get the parent session ID for a given session, or undefined.
+   */
+  getParentSession(sessionId: string): string | undefined {
+    return this.eventBroker.getParentSession(sessionId);
+  }
+
+  /**
+   * Get all descendant session IDs (children, grandchildren, etc.) of the given session.
+   * Used for cascade-abort when the user cancels a parent session.
+   */
+  getDescendantSessions(parentId: string): string[] {
+    return this.eventBroker.getDescendantSessions(parentId);
+  }
 
   // =======================================================================
   // Permissions

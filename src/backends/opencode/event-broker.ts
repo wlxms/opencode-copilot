@@ -256,6 +256,81 @@ export class GlobalEventBroker {
   private log(message: string): void {
     this.logger?.appendLine(`[broker] ${message}`);
   }
+
+  // -------------------------------------------------------------------
+  // Public query methods for session hierarchy
+  // -------------------------------------------------------------------
+
+  /**
+   * Check whether `sessionId` is a descendant of `ancestorId` in the
+   * child→parent session hierarchy.
+   * Walks up the childToParent chain until it finds `ancestorId` or runs out.
+   */
+  isDescendantOf(sessionId: string, ancestorId: string): boolean {
+    let current = sessionId;
+    const visited = new Set<string>();
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      const parent = this.childToParent.get(current);
+      if (!parent) break;
+      if (parent === ancestorId) return true;
+      current = parent;
+    }
+    return false;
+  }
+
+  /**
+   * Find the parent session ID for a given session, or undefined if none.
+   */
+  getParentSession(sessionId: string): string | undefined {
+    return this.childToParent.get(sessionId);
+  }
+
+  /**
+   * Walk up the parent chain from `sessionId` and return the first session ID
+   * that appears in `candidateIds`. Used by StreamBridge to find which scope
+   * a grandchild event belongs to.
+   */
+  findAncestorIn(sessionId: string, candidateIds: Set<string>): string | undefined {
+    let current = sessionId;
+    const visited = new Set<string>();
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      if (candidateIds.has(current)) return current;
+      const parent = this.childToParent.get(current);
+      if (!parent) break;
+      current = parent;
+    }
+    return undefined;
+  }
+
+  /**
+   * Return all session IDs that are descendants of `parentId` in the
+   * child→parent hierarchy (children, grandchildren, etc.).
+   * Used for cascade-abort when the user cancels a parent session.
+   */
+  getDescendantSessions(parentId: string): string[] {
+    const descendants: string[] = [];
+    // Build reverse index: parent → children
+    const parentToChildren = new Map<string, string[]>();
+    for (const [childId, pid] of this.childToParent.entries()) {
+      let children = parentToChildren.get(pid);
+      if (!children) {
+        children = [];
+        parentToChildren.set(pid, children);
+      }
+      children.push(childId);
+    }
+    // BFS from parentId
+    const queue = parentToChildren.get(parentId) ?? [];
+    while (queue.length > 0) {
+      const id = queue.shift()!;
+      descendants.push(id);
+      const kids = parentToChildren.get(id);
+      if (kids) queue.push(...kids);
+    }
+    return descendants;
+  }
 }
 
 function unwrapStreamEvent(event: OpenCodeStreamEvent): OpenCodeEvent {
