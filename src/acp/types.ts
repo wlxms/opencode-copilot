@@ -23,7 +23,10 @@ export interface AcpServerInfo {
 export interface AcpModel {
   id: string;
   name?: string;
+  /** Provider ID (used for API calls) */
   provider?: string;
+  /** Human-readable provider name (used for UI only) */
+  providerName?: string;
   capabilities?: string[];
 }
 
@@ -227,3 +230,62 @@ export interface AcpResult<T, E = string> {
 // ===========================================================================
 
 export type AcpPermissionResponse = 'once' | 'always' | 'reject';
+
+// ===========================================================================
+// Agents
+// ===========================================================================
+
+export interface AcpAgent {
+  id: string;
+  name?: string;
+  description?: string;
+  model?: string;
+  mode?: 'subagent' | 'primary' | 'all';
+  hidden?: boolean;
+}
+
+// ===========================================================================
+// Configuration
+// ===========================================================================
+
+export interface AcpAgentConfig {
+  model?: string;
+  variant?: string;
+  temperature?: number;
+  top_p?: number;
+  prompt?: string;
+  tools?: Record<string, boolean>;
+  disable?: boolean;
+  description?: string;
+  mode?: 'subagent' | 'primary' | 'all';
+  hidden?: boolean;
+  steps?: number;
+  maxSteps?: number;
+}
+
+export interface AcpProviderConfig {
+  api?: string;
+  name?: string;
+  id?: string;
+  options?: {
+    apiKey?: string;
+    baseURL?: string;
+  };
+  models?: Record<string, { name?: string }>;
+}
+
+export interface AcpConfig {
+  model?: string;
+  small_model?: string;
+  default_agent?: string;
+  disabled_providers?: string[];
+  enabled_providers?: string[];
+  agent?: Record<string, AcpAgentConfig>;
+  provider?: Record<string, AcpProviderConfig>;
+}
+
+export interface AcpModelSelection {
+  providerID: string;
+  modelID: string;
+  variant?: string;
+}

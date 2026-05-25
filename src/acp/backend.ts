@@ -9,6 +9,8 @@ import type {
   AcpChildSessionInfo,
   AcpSessionInfo,
   AcpSessionStatus,
+  AcpAgent,
+  AcpConfig,
 } from './types';
 
 // ===========================================================================
@@ -39,6 +41,10 @@ export interface AcpSessionOperations {
     id: string,
     text: string,
     directory?: string,
+    options?: {
+      model?: { providerID: string; modelID: string };
+      agent?: string;
+    },
   ): Promise<AcpResult<unknown>>;
 
   revert(
@@ -68,6 +74,15 @@ export interface AcpSessionOperations {
 
 export interface AcpConfigOperations {
   models(directory?: string): Promise<AcpResult<AcpModel[]>>;
+
+  /** List available agents */
+  agents(directory?: string): Promise<AcpResult<AcpAgent[]>>;
+
+  /** Get full configuration */
+  get(directory?: string): Promise<AcpResult<AcpConfig>>;
+
+  /** Update configuration (partial merge) */
+  update(config: Partial<AcpConfig>, directory?: string): Promise<AcpResult<void>>;
 }
 
 // ===========================================================================
