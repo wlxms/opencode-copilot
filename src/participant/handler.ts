@@ -286,35 +286,69 @@ export function createParticipantHandler(
         state.outputChannel.appendLine(
           `[handler] Prompting session ${sessionId} with: ${request.prompt.substring(0, 50)}`,
         );
+
+        // Build prompt options from current agent/model selection
+        const promptOptions: { model?: { providerID: string; modelID: string }; agent?: string } = {};
+        if (state.selectedAgentOverride) {
+          promptOptions.agent = state.selectedAgentOverride;
+        }
+        if (state.selectedModelOverride) {
+          promptOptions.model = state.selectedModelOverride;
+        }
+        state.outputChannel.appendLine(
+          `[handler] Prompt options: ${JSON.stringify(promptOptions)}`,
+        );
+
         const promptPromise = state.backend.sessions.prompt(
           sessionId,
           request.prompt,
           directory,
+          promptOptions,
         ).then((result) => {
           if (result.error) {
             state.outputChannel.appendLine(`[handler] Prompt error: ${String(result.error)}`);
+          } else {
+            state.outputChannel.appendLine('[handler] Prompt accepted by backend');
           }
         }).catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : 'Prompt failed';
           state.outputChannel.appendLine(`[handler] Prompt error: ${msg}`);
         });
 
-        // 7b. Cancel → abort OpenCode session (shared across all bridge runs)
+        // 7b. Cancel → abort OpenCode session + all descendant sessions
         let aborted = false;
         const cancelDisposable = token.onCancellationRequested(() => {
           if (aborted) return;
           aborted = true;
           state.outputChannel.appendLine(
-            `[handler] Cancellation requested, aborting OpenCode session ${sessionId}`,
+            `[handler] Cancellation requested, aborting OpenCode session ${sessionId} and descendants`,
           );
+          // Abort the parent session
           state.backend.sessions.abort(sessionId, directory).then((result) => {
             state.outputChannel.appendLine(
-              `[handler] Abort result: ${JSON.stringify(result?.data)}`,
+              `[handler] Abort parent result: ${JSON.stringify(result?.data)}`,
             );
           }).catch((err: unknown) => {
             const msg = err instanceof Error ? err.message : String(err);
-            state.outputChannel.appendLine(`[handler] Abort error: ${msg}`);
+            state.outputChannel.appendLine(`[handler] Abort parent error: ${msg}`);
           });
+          // Abort all descendant sessions (children, grandchildren, etc.)
+          const descendants = state.backend.getDescendantSessions(sessionId);
+          for (const childId of descendants) {
+            state.backend.sessions.abort(childId, directory).then((result) => {
+              state.outputChannel.appendLine(
+                `[handler] Abort descendant ${childId} result: ${JSON.stringify(result?.data)}`,
+              );
+            }).catch((err: unknown) => {
+              const msg = err instanceof Error ? err.message : String(err);
+              state.outputChannel.appendLine(`[handler] Abort descendant ${childId} error: ${msg}`);
+            });
+          }
+          if (descendants.length > 0) {
+            state.outputChannel.appendLine(
+              `[handler] Cascade-abort: ${descendants.length} descendant session(s) [${descendants.join(', ')}]`,
+            );
+          }
         });
 
         // Collect known file URIs for new-file detection (once per turn)
@@ -363,6 +397,10 @@ export function createParticipantHandler(
                   return false;
                 }
               },
+              findAncestorScope: (sid: string, candidates: Set<string>) =>
+                state.backend.findAncestorScope(sid, candidates),
+              getParentSession: (sid: string) =>
+                state.backend.getParentSession(sid),
             });
 
             await bridge.run(events.stream, stream, token);

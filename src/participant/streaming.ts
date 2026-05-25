@@ -498,6 +498,14 @@ export class StreamBridge {
         return { stop: true, rendered: false };
       case 'session.diff':
         return { stop: false, rendered: this.handleSessionDiff(event, stream) };
+      case 'session.error': {
+        const message = 'error' in event && typeof event.error === 'string'
+          ? event.error
+          : 'Unknown session error';
+        this.logTag('error', `session.error: ${message}`);
+        stream.markdown(`⚠️ ${message}`);
+        return { stop: false, rendered: true };
+      }
       // permission.asked is handled directly in run() (async)
       case 'permission.asked':
         return { stop: false, rendered: false };
