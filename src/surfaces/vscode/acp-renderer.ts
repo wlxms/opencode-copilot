@@ -656,8 +656,17 @@ export class AcpRenderer {
         // Only child tool cards should carry subAgentInvocationId.
       }
 
-      // Hide read/internal/structural tools after completion
-      if (toolName === 'read' || toolName === 'internal' || toolName === 'step-start' || toolName === 'step-finish') {
+      // Hide transient tool cards after completion when a stronger/final UI exists elsewhere.
+      // read/edit/write use bubble-style messages while active; edit/write also produce an
+      // externalEdit checkpoint/diff that should become the primary post-completion artifact.
+      if (
+        toolName === 'read'
+        || toolName === 'write'
+        || toolName === 'edit'
+        || toolName === 'internal'
+        || toolName === 'step-start'
+        || toolName === 'step-finish'
+      ) {
         part.presentation = 'hiddenAfterComplete';
       }
 
@@ -1070,17 +1079,11 @@ export function buildToolSpecificData(
 
       case 'write':
       case 'edit': {
-      const filePath = input.filePath as string | undefined;
-      if (filePath) {
-        return {
-          values: [vscode.Uri.file(filePath)],
-        } satisfies ChatToolResourcesInvocationData;
+        // For edit/write we intentionally avoid resources cards here.
+        // Running/completed messages already use file bubbles, and the final edit UI should
+        // be represented by ChatResponseExternalEditPart instead of a duplicate resources list.
+        return undefined;
       }
-      return {
-        input: formatInput(input, title),
-        output: truncate(output, 2000),
-      } satisfies ChatSimpleToolResultData;
-    }
 
     case 'list':
     case 'grep':
@@ -1188,13 +1191,43 @@ export function formatInvocationMsg(
   input: Record<string, unknown>,
   title: string,
 ): string | vscode.MarkdownString {
-  // --- read: [fileName](file://path) [line n-m] ---
+  const formatFileBubbleMessage = (
+    verb: 'Read' | 'Editing' | 'Writing',
+    filePath: string,
+    offset?: number,
+    limit?: number,
+    suffix = '',
+  ): vscode.MarkdownString => {
+    const uri = vscode.Uri.file(filePath).toString().toLowerCase();
+    const range = offset != null || limit != null
+      ? (() => {
+          const start = offset ?? 1;
+          const end = limit != null ? start + limit - 1 : start;
+          return `#${start}-${end}`;
+        })()
+      : '';
+    let lineInfo = '';
+    if (offset != null || limit != null) {
+      const start = offset ?? 1;
+      const end = limit != null ? start + limit - 1 : undefined;
+      lineInfo = end != null ? ` line ${start}-${end}` : ` line ${start}`;
+    }
+    return new vscode.MarkdownString(`${verb} [](${uri}${range})${lineInfo}${suffix}`);
+  };
+
+  // --- read: official-style file bubble ---
+  //
+  // Keep this logic in sync with participant/streaming.ts.
+  // Research outcome:
+  // - Initial MarkdownString `Read [](${uri}#range)` can render as the same style of
+  //   file bubble seen in Copilot-like read/view cards.
+  // - The fragile part is NOT the initial push; it is the completed-state rewrite.
+  // - If completed-state `pastTenseMessage` falls back to plain text, the bubble is
+  //   replaced by normal text.
+  // Therefore both running and completed read messages must stay in bubble Markdown.
   if (toolName === 'read') {
     const filePath = input.filePath as string | undefined;
     if (filePath) {
-      const fileName = filePath.split(/[/\\]/).pop() ?? filePath;
-      const uri = vscode.Uri.file(filePath).toString();
-      // Extract line range from title or input
       let lineInfo = '';
       const offset = input.offset as number | undefined;
       const limit = input.limit as number | undefined;
@@ -1203,7 +1236,20 @@ export function formatInvocationMsg(
         const end = limit != null ? start + limit - 1 : undefined;
         lineInfo = end != null ? ` line ${start}-${end}` : ` line ${start}`;
       }
-      return new vscode.MarkdownString(`[${fileName}](${uri})${lineInfo}`);
+      return formatFileBubbleMessage('Read', filePath, offset, limit);
+    }
+  }
+
+  // edit/write keep the same bubble style while running. The actual file-change checkpoint
+  // still comes from externalEdit, so this message is descriptive UI, not the diff payload.
+  if (toolName === 'edit' || toolName === 'write') {
+    const filePath = input.filePath as string | undefined;
+    if (filePath) {
+      const offset = input.offset as number | undefined;
+      const limit = input.limit as number | undefined;
+      const lineCount = limit ?? 1;
+      const verb = toolName === 'edit' ? 'Editing' : 'Writing';
+      return formatFileBubbleMessage(verb, filePath, offset, limit, ` (${lineCount} lines)`);
     }
   }
 
@@ -1273,15 +1319,53 @@ export function formatPastTenseMsg(
     ? ` (${((timeEnd - timeStart) / 1000).toFixed(1)}s)`
     : '';
 
-  // --- read: [fileName](file://path) ---
+  const formatFileBubbleMessage = (
+    verb: 'Read' | 'Edited' | 'Wrote',
+    filePath: string,
+    offset?: number,
+    limit?: number,
+    suffix = '',
+  ): vscode.MarkdownString => {
+    const uri = vscode.Uri.file(filePath).toString().toLowerCase();
+    const range = offset != null || limit != null
+      ? (() => {
+          const start = offset ?? 1;
+          const end = limit != null ? start + limit - 1 : start;
+          return `#${start}-${end}`;
+        })()
+      : '';
+    let lineInfo = '';
+    if (offset != null || limit != null) {
+      const start = offset ?? 1;
+      const end = limit != null ? start + limit - 1 : undefined;
+      lineInfo = end != null ? ` line ${start}-${end}` : ` line ${start}`;
+    }
+    return new vscode.MarkdownString(`${verb} [](${uri}${range})${lineInfo}${suffix}${duration}`);
+  };
+
+  // --- read: keep official-style file bubble in completed state ---
+  // This is required to preserve the bubble after the tool transitions to `isComplete`.
   if (toolName === 'read') {
-    const match = title.match(/\[([^\]]+)\]\(([^)]+)\)/);
-    if (match) {
-      const fileName = match[1];
-      const uri = match[2];
-      return new vscode.MarkdownString(`[${fileName}](${uri})${duration}`);
+    const filePath = input?.filePath as string | undefined;
+    if (filePath) {
+      const offset = input?.offset as number | undefined;
+      const limit = input?.limit as number | undefined;
+      return formatFileBubbleMessage('Read', filePath, offset, limit);
     }
     return `${title}${duration}`;
+  }
+
+  // Preserve bubble styling after completion too; otherwise completed-state text can replace
+  // the running bubble before the externalEdit visualization becomes the primary output.
+  if (toolName === 'edit' || toolName === 'write') {
+    const filePath = input?.filePath as string | undefined;
+    if (filePath) {
+      const offset = input?.offset as number | undefined;
+      const limit = input?.limit as number | undefined;
+      const lineCount = limit ?? 1;
+      const verb = toolName === 'edit' ? 'Edited' : 'Wrote';
+      return formatFileBubbleMessage(verb, filePath, offset, limit, ` (${lineCount} lines)`);
+    }
   }
 
   // --- grep: Searched `pattern` ---

@@ -985,8 +985,17 @@ export class StreamBridge {
         // Only child tool cards should carry subAgentInvocationId.
       }
 
-      // Hide read/internal/structural tools after completion
-      if (toolName === 'read' || toolName === 'internal' || toolName === 'step-start' || toolName === 'step-finish') {
+      // Hide transient tool cards after completion when a stronger/final UI exists elsewhere.
+      // read/edit/write use bubble-style messages while active; edit/write also produce an
+      // externalEdit checkpoint/diff that should become the primary post-completion artifact.
+      if (
+        toolName === 'read'
+        || toolName === 'write'
+        || toolName === 'edit'
+        || toolName === 'internal'
+        || toolName === 'step-start'
+        || toolName === 'step-finish'
+      ) {
         part.presentation = 'hiddenAfterComplete';
       }
 
@@ -1106,17 +1115,10 @@ export class StreamBridge {
 
       case 'write':
       case 'edit': {
-        // Show as file reference if filePath is available
-        const filePath = input.filePath as string | undefined;
-        if (filePath) {
-          return {
-            values: [vscode.Uri.file(filePath)],
-          } satisfies ChatToolResourcesInvocationData;
-        }
-        return {
-          input: formatInput(input, title),
-          output: truncate(output, 2000),
-        } satisfies ChatSimpleToolResultData;
+        // For edit/write we intentionally avoid resources cards here.
+        // Running/completed messages already use file bubbles, and the final edit UI should
+        // be represented by ChatResponseExternalEditPart instead of a duplicate resources list.
+        return undefined;
       }
 
       case 'list':
@@ -1222,21 +1224,67 @@ export class StreamBridge {
     input: Record<string, unknown>,
     title: string,
   ): string | vscode.MarkdownString {
-    // --- read: [fileName](file://path) [line n-m] ---
+    const formatFileBubbleMessage = (
+      verb: 'Read' | 'Editing' | 'Writing',
+      filePath: string,
+      offset?: number,
+      limit?: number,
+      suffix = '',
+    ): vscode.MarkdownString => {
+      const uri = vscode.Uri.file(filePath).toString().toLowerCase();
+      const range = offset != null || limit != null
+        ? (() => {
+            const start = offset ?? 1;
+            const end = limit != null ? start + limit - 1 : start;
+            return `#${start}-${end}`;
+          })()
+        : '';
+      let lineInfo = '';
+      if (offset != null || limit != null) {
+        const start = offset ?? 1;
+        const end = limit != null ? start + limit - 1 : undefined;
+        lineInfo = end != null ? ` line ${start}-${end}` : ` line ${start}`;
+      }
+      return new vscode.MarkdownString(`${verb} [](${uri}${range})${lineInfo}${suffix}`);
+    };
+
+    // --- read: official-style file bubble ---
+    //
+    // Research note (2026-05): VSCode/Copilot-style read bubbles are lifecycle-sensitive.
+    // We verified with the local experiment matrix that:
+    //   A. Initial MarkdownString `Read [](${uri}#start-end)` renders as a file bubble.
+    //   B. `updateToolInvocation(...)` alone does NOT necessarily destroy the bubble.
+    //   C. The bubble disappears when completed state switches to a plain-string
+    //      `pastTenseMessage`.
+    //   D/E/F. Keeping the completed-state message in the same MarkdownString bubble
+    //      format preserves the bubble.
+    //
+    // Practical rule:
+    //   - For read tools, invocationMessage and pastTenseMessage must both stay in the
+    //     same `Read [](${uri}#range)` style.
+    //   - Do NOT downgrade completed-state read messages to plain text like
+    //     `Read file.ts`, otherwise VSCode re-renders the card and the bubble is lost.
+    //   - URI is lowercased to match the experimentally stable file-bubble form on Windows.
     if (toolName === 'read') {
       const filePath = input.filePath as string | undefined;
       if (filePath) {
-        const fileName = filePath.split(/[/\\]/).pop() ?? filePath;
-        const uri = vscode.Uri.file(filePath).toString();
-        let lineInfo = '';
         const offset = input.offset as number | undefined;
         const limit = input.limit as number | undefined;
-        if (offset != null || limit != null) {
-          const start = offset ?? 1;
-          const end = limit != null ? start + limit - 1 : undefined;
-          lineInfo = end != null ? ` line ${start}-${end}` : ` line ${start}`;
-        }
-        return new vscode.MarkdownString(`[${fileName}](${uri})${lineInfo}`);
+        return formatFileBubbleMessage('Read', filePath, offset, limit);
+      }
+    }
+
+    // edit/write: use the same file-bubble style during pending/running/completed so the
+    // tool card stays visually consistent with read. The final authoritative edit result
+    // is still surfaced separately through ChatResponseExternalEditPart via ExternalEditTracker.
+    if (toolName === 'edit' || toolName === 'write') {
+      const filePath = input.filePath as string | undefined;
+      if (filePath) {
+        const offset = input.offset as number | undefined;
+        const limit = input.limit as number | undefined;
+        const lineCount = limit ?? 1;
+        const verb = toolName === 'edit' ? 'Editing' : 'Writing';
+        return formatFileBubbleMessage(verb, filePath, offset, limit, ` (${lineCount} lines)`);
       }
     }
 
@@ -1298,15 +1346,56 @@ export class StreamBridge {
       ? ` (${((timeEnd - timeStart) / 1000).toFixed(1)}s)`
       : '';
 
-    // --- read: [fileName](file://path) ---
+    const formatFileBubbleMessage = (
+      verb: 'Read' | 'Edited' | 'Wrote',
+      filePath: string,
+      offset?: number,
+      limit?: number,
+      suffix = '',
+    ): vscode.MarkdownString => {
+      const uri = vscode.Uri.file(filePath).toString().toLowerCase();
+      const range = offset != null || limit != null
+        ? (() => {
+            const start = offset ?? 1;
+            const end = limit != null ? start + limit - 1 : start;
+            return `#${start}-${end}`;
+          })()
+        : '';
+      let lineInfo = '';
+      if (offset != null || limit != null) {
+        const start = offset ?? 1;
+        const end = limit != null ? start + limit - 1 : undefined;
+        lineInfo = end != null ? ` line ${start}-${end}` : ` line ${start}`;
+      }
+      return new vscode.MarkdownString(`${verb} [](${uri}${range})${lineInfo}${suffix}${duration}`);
+    };
+
+    // --- read: keep official-style file bubble in completed state ---
+    // IMPORTANT: completed-state `pastTenseMessage` is the critical preservation point.
+    // If this returns plain text, the bubble may render briefly during the running state
+    // and then disappear as soon as the tool completes.
     if (toolName === 'read') {
-      const match = title.match(/\[([^\]]+)\]\(([^)]+)\)/);
-      if (match) {
-        const fileName = match[1];
-        const uri = match[2];
-        return new vscode.MarkdownString(`[${fileName}](${uri})${duration}`);
+      const filePath = input?.filePath as string | undefined;
+      if (filePath) {
+        const offset = input?.offset as number | undefined;
+        const limit = input?.limit as number | undefined;
+        return formatFileBubbleMessage('Read', filePath, offset, limit);
       }
       return `${title}${duration}`;
+    }
+
+    // Keep completed-state edit/write messages in bubble form as well.
+    // Do NOT downgrade these to plain text, otherwise the running-state bubble is replaced
+    // before/while the externalEdit checkpoint bubble is shown.
+    if (toolName === 'edit' || toolName === 'write') {
+      const filePath = input?.filePath as string | undefined;
+      if (filePath) {
+        const offset = input?.offset as number | undefined;
+        const limit = input?.limit as number | undefined;
+        const lineCount = limit ?? 1;
+        const verb = toolName === 'edit' ? 'Edited' : 'Wrote';
+        return formatFileBubbleMessage(verb, filePath, offset, limit, ` (${lineCount} lines)`);
+      }
     }
 
     // --- grep: Searched `pattern` ---
