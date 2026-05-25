@@ -75,6 +75,18 @@
           {
             "name": "test-subagent-multi-parallel",
             "description": "Diagnostic: multiple subagents, all parallel"
+          },
+          {
+            "name": "test-file-read-stream",
+            "description": "Run file-bubble lifecycle experiment matrix"
+          },
+          {
+            "name": "test-stream-latency",
+            "description": "Diagnostic: measure streaming event latency from backend (delta timing + batch detection)"
+          },
+          {
+            "name": "test-thinking",
+            "description": "Diagnostic: verify thinkingProgress API and reasoning/text boundary rendering"
           }
         ]
       }
@@ -96,6 +108,6 @@
     "vitest": "^4.1.5"
   },
   "dependencies": {
-    "@opencode-ai/sdk": "^1.14.41"
+    "@opencode-ai/sdk": "^1.15.10"
   }
 }
