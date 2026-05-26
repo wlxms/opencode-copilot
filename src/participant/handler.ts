@@ -4,7 +4,7 @@ import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
 
 import type { ExtensionState, TurnMapping } from '../types';
-import type { AcpChildSessionInfo, AcpSessionStatus } from '../acp/types';
+import type { AcpChildSessionInfo, AcpSessionStatus, AcpResult } from '../acp/types';
 import { ExternalEditTracker } from './external-edit-tracker';
 import { collectOpenFileUris } from './checkpoint';
 
@@ -76,7 +76,7 @@ function recoverFromHistory(context: vscode.ChatContext): RecoveredHistory {
     const turn = history[i];
     // ChatResponseTurn is a proposed API — access metadata via type assertion
     const metadata = (turn as unknown as { metadata?: Record<string, unknown> })?.metadata;
-    if (!metadata) continue;
+    if (!metadata) {continue;}
 
     const sessionId = metadata.sessionId as string | undefined;
     const turnMapRaw = metadata.turnMap as Array<{ vscodeTurn: number; opencodeMessageId: string }> | undefined;
@@ -266,7 +266,7 @@ export function createParticipantHandler(
 
       // 4. Start server if needed
       const ready = await ensureServer(state, stream);
-      if (!ready) return { metadata: {} };
+      if (!ready) {return { metadata: {} };}
 
       // 4b. Compute workspace directory for session/prompt API calls
       const directory = getWorkspaceDirectory();
@@ -275,7 +275,7 @@ export function createParticipantHandler(
       // request.sessionId from chatParticipantPrivate identifies the VSCode chat
       const vscodeSessionId = request.sessionId ?? 'unknown';
       const sessionId = await resolveSession(state, context, stream, vscodeSessionId, directory);
-      if (!sessionId) return { metadata: {} };
+      if (!sessionId) {return { metadata: {} };}
 
       const executeTurnWithBridge = async (): Promise<void> => {
         stream.progress('Connecting to event stream...');
@@ -318,7 +318,7 @@ export function createParticipantHandler(
         // 7b. Cancel → abort OpenCode session + all descendant sessions
         let aborted = false;
         const cancelDisposable = token.onCancellationRequested(() => {
-          if (aborted) return;
+          if (aborted) {return;}
           aborted = true;
           state.outputChannel.appendLine(
             `[handler] Cancellation requested, aborting OpenCode session ${sessionId} and descendants`,
@@ -333,7 +333,7 @@ export function createParticipantHandler(
             state.outputChannel.appendLine(`[handler] Abort parent error: ${msg}`);
           });
           // Abort all descendant sessions (children, grandchildren, etc.)
-          const descendants = state.backend.getDescendantSessions(sessionId);
+          const descendants = state.backend.sessions.descendants(sessionId);
           for (const childId of descendants) {
             state.backend.sessions.abort(childId, directory).then((result) => {
               state.outputChannel.appendLine(
@@ -384,26 +384,52 @@ export function createParticipantHandler(
                   permissionDirectory,
                 )
               ),
+              replyToQuestion: (questionSessionId, requestId, answers, questionDirectory) => (
+                state.backend.questions.reply(
+                  questionSessionId,
+                  requestId,
+                  answers,
+                  questionDirectory,
+                ).then((result) => {
+                  state.outputChannel.appendLine(`[handler] question reply result: ${JSON.stringify(result)}`);
+                }).catch((err: unknown) => {
+                  state.outputChannel.appendLine(`[handler] question reply error: ${err instanceof Error ? err.message : String(err)}`);
+                })
+              ),
+              rejectQuestion: (questionSessionId, requestId, questionDirectory) => (
+                state.backend.questions.reject(
+                  questionSessionId,
+                  requestId,
+                  questionDirectory,
+                ).then((result) => {
+                  state.outputChannel.appendLine(`[handler] question reject result: ${JSON.stringify(result)}`);
+                }).catch((err: unknown) => {
+                  state.outputChannel.appendLine(`[handler] question reject error: ${err instanceof Error ? err.message : String(err)}`);
+                })
+              ),
               directory,
               tracker,
               checkChildSessionsRunning: async () => {
                 try {
                   const statusResult = await state.backend.sessions.status(directory);
-                  if (statusResult.error || !statusResult.data) return false;
+                  if (statusResult.error || !statusResult.data) {return false;}
                   return await hasBusyDescendant(
                     sessionId, directory, new Set(), statusResult.data,
+                    state.backend.sessions.children,
                   );
                 } catch {
                   return false;
                 }
               },
               findAncestorScope: (sid: string, candidates: Set<string>) =>
-                state.backend.findAncestorScope(sid, candidates),
+                state.backend.sessions.findAncestor(sid, candidates),
               getParentSession: (sid: string) =>
-                state.backend.getParentSession(sid),
+                state.backend.sessions.parent(sid),
             });
 
+            state.outputChannel.appendLine('[handler] bridge.run() starting...');
             await bridge.run(events.stream, stream, token);
+            state.outputChannel.appendLine(`[handler] bridge.run() completed. hadSubagentTasks=${bridge.getHadSubagentTasks()}, cancellationRequested=${token.isCancellationRequested}`);
 
             state.backend.events.closeSessionStream(sessionId);
 
@@ -475,19 +501,19 @@ async function hasBusyDescendant(
   directory: string | undefined,
   visited: Set<string>,
   statuses: Record<string, AcpSessionStatus>,
-  childrenFn: (id: string, dir?: string) => Promise<import('../acp/backend').AcpResult<import('../acp/types').AcpChildSessionInfo[]>>,
+  childrenFn: (id: string, dir?: string) => Promise<AcpResult<AcpChildSessionInfo[]>>,
 ): Promise<boolean> {
-  if (visited.has(parentId)) return false;
+  if (visited.has(parentId)) {return false;}
   visited.add(parentId);
 
   const childrenResult = await childrenFn(parentId, directory);
-  if (childrenResult.error || !childrenResult.data) return false;
+  if (childrenResult.error || !childrenResult.data) {return false;}
 
   for (const child of childrenResult.data) {
-    if (visited.has(child.id)) continue;
+    if (visited.has(child.id)) {continue;}
 
     const status = statuses[child.id];
-    if (status?.type === 'busy') return true;
+    if (status?.type === 'busy') {return true;}
 
     if (await hasBusyDescendant(child.id, directory, visited, statuses, childrenFn)) {
       return true;

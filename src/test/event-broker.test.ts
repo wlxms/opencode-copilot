@@ -17,9 +17,17 @@ function eventStream(events: OpenCodeGlobalEventEnvelope[]) {
 }
 
 function mockClient(events: OpenCodeGlobalEventEnvelope[]) {
+  let callCount = 0;
   return {
     global: {
-      event: async () => eventStream(events),
+      event: async () => {
+        callCount++;
+        if (callCount === 1) {
+          return eventStream(events);
+        }
+        // On reconnect: throw to stop the pumpWithReconnect loop
+        throw new Error('test: no reconnect');
+      },
     },
   };
 }
@@ -71,7 +79,9 @@ describe('GlobalEventBroker', () => {
     ]);
 
     const sessionStream = broker.openSessionStream('ses_a');
-    await broker.ensureStarted(client as never);
+    const started = broker.ensureStarted(client as never);
+    started.catch(() => {}); // suppress unhandled rejection from reconnect error
+    await started;
     const types = await collectTypes(sessionStream.stream as AsyncIterable<OpenCodeGlobalEventEnvelope>);
 
     // session.idle is delivered but does NOT close the stream
@@ -104,7 +114,9 @@ describe('GlobalEventBroker', () => {
     ]);
 
     const sessionStream = broker.openSessionStream('ses_a');
-    await broker.ensureStarted(client as never);
+    const started = broker.ensureStarted(client as never);
+    started.catch(() => {}); // suppress unhandled rejection from reconnect error
+    await started;
     const types = await collectTypes(sessionStream.stream as AsyncIterable<OpenCodeGlobalEventEnvelope>);
 
     expect(types).toEqual([
