@@ -4,11 +4,12 @@
   "version": "0.1.0",
   "description": "AI coding assistant powered by OpenCode",
   "engines": {
-    "vscode": "^1.95.0"
+    "vscode": "^1.110.0"
   },
   "enabledApiProposals": [
     "chatParticipantAdditions",
-    "chatParticipantPrivate"
+    "chatParticipantPrivate",
+    "chatSessionsProvider"
   ],
   "categories": [
     "Other"
@@ -35,13 +36,19 @@
         }
       }
     },
-    "chatParticipants": [
+    "chatSessions": [
       {
-        "id": "opencode-copilot.opencode",
-        "fullName": "OpenCode",
+        "type": "opencode-copilot.opencode",
         "name": "opencode",
-        "description": "AI coding assistant powered by OpenCode",
-        "isSticky": true,
+        "displayName": "OpenCode",
+        "description": "AI coding agent powered by OpenCode",
+        "icon": "$(terminal)",
+        "inputPlaceholder": "Ask OpenCode anything...",
+        "canDelegate": true,
+        "capabilities": {
+          "supportsFileAttachments": true,
+          "supportsToolAttachments": true
+        },
         "commands": [
           {
             "name": "new",
@@ -81,7 +88,7 @@
           },
           {
             "name": "test-subagent-multi-parallel",
-            "description": "Diagnostic: multiple subagents, all parallel"
+            "description": "Diagnostic: multi subagents, all parallel"
           },
           {
             "name": "test-file-read-stream",
@@ -100,7 +107,7 @@
             "description": "Diagnostic: test questionCarousel UI flow (single-select, multi-select, text input)"
           },
           {
-            "name": "test-question",
+            "name": "test-question-full",
             "description": "Test questionCarousel UI flow (single-select, multi-select, text input)"
           }
         ]

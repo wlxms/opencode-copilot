@@ -1,12 +1,31 @@
 import * as vscode from 'vscode';
 import type { AcpBackend } from './acp/backend';
+import type { AcpAgent, AcpModel, AcpConfig, AcpProviderConfig, BackendSettingsDescriptor } from './acp/types';
 import { OpenCodeBackend } from './backends/opencode/adapter';
 import { createParticipantHandler } from './participant/handler';
-import { createSessionContentProvider } from './surfaces/vscode/experimental-session';
+import { createSessionContentProvider, OPENCODE_SESSION_SCHEME } from './surfaces/vscode/experimental-session';
 import { hasRegisterChatSessionContentProvider } from './surfaces/vscode/capabilities';
 import { StatusBarManager } from './statusbar';
 import { SettingsPanel, type SettingsMessage, type SettingsData } from './settings/panel';
 import type { ExtensionState } from './types';
+
+const KNOWN_PROVIDERS = [
+  { id: 'openai', name: 'OpenAI', description: 'GPT-4o, GPT-4o-mini', requiresBaseURL: false, isOpenAICompatible: false, icon: '\ud83d\udfe2' },
+  { id: 'anthropic', name: 'Anthropic', description: 'Claude 3.5 Sonnet, Opus', requiresBaseURL: false, isOpenAICompatible: false, icon: '\ud83d\udfe0' },
+  { id: 'google', name: 'Google', description: 'Gemini Pro, Flash', requiresBaseURL: false, isOpenAICompatible: false, icon: '\ud83d\udfe1' },
+  { id: 'groq', name: 'Groq', description: 'Fast inference', requiresBaseURL: false, isOpenAICompatible: false, icon: '\u26a1' },
+  { id: 'xai', name: 'xAI', description: 'Grok models', requiresBaseURL: false, isOpenAICompatible: false, icon: '\ud83c\udf11' },
+  { id: 'mistral', name: 'Mistral', description: 'Mistral, Codestral', requiresBaseURL: false, isOpenAICompatible: false, icon: '\ud83d\udd34' },
+  { id: 'deepseek', name: 'DeepSeek', description: 'DeepSeek V3, Coder', requiresBaseURL: false, isOpenAICompatible: false, icon: '\ud83d\udc33' },
+  { id: 'together', name: 'Together AI', description: 'Open model hub', requiresBaseURL: false, isOpenAICompatible: false, icon: '\ud83d\udfe3' },
+  { id: 'fireworks', name: 'Fireworks AI', description: 'Fast inference', requiresBaseURL: false, isOpenAICompatible: false, icon: '\ud83c\udf86' },
+  { id: 'bedrock', name: 'AWS Bedrock', description: 'Managed models', requiresBaseURL: false, isOpenAICompatible: false, icon: '\u2601\ufe0f' },
+  { id: 'azure', name: 'Azure OpenAI', description: 'Azure-hosted OpenAI', requiresBaseURL: true, isOpenAICompatible: false, icon: '\ud83d\udd37' },
+  { id: 'copilot', name: 'GitHub Copilot', description: 'Copilot models', requiresBaseURL: false, isOpenAICompatible: false, icon: '\ud83d\udc19' },
+  { id: 'ollama', name: 'Ollama', description: 'Local models', requiresBaseURL: true, isOpenAICompatible: false, icon: '\ud83e\udd99' },
+  { id: 'openrouter', name: 'OpenRouter', description: 'Multi-model gateway', requiresBaseURL: false, isOpenAICompatible: false, icon: '\ud83c\udf10' },
+  { id: 'openai-compatible', name: 'OpenAI Compatible', description: 'Any OpenAI-compatible endpoint', requiresBaseURL: true, isOpenAICompatible: true, icon: '\ud83d\udd0c' },
+];
 
 function getWorkspaceDirectory(): string | undefined {
   const workspaceFolders = vscode.workspace.workspaceFolders;
@@ -14,12 +33,6 @@ function getWorkspaceDirectory(): string | undefined {
 }
 
 let state: ExtensionState | undefined;
-
-function isExperimentalSessionProviderEnabled(): boolean {
-  return vscode.workspace
-    .getConfiguration('opencode')
-    .get<boolean>('experimental.sessionProvider', false);
-}
 
 function createBackend(): AcpBackend {
   return new OpenCodeBackend();
@@ -90,7 +103,7 @@ async function loadDefaultsFromConfig(s: ExtensionState): Promise<void> {
     // If still no model, try current agent's model or agent config override
     if (!s.currentModel && s.currentAgent) {
       // Try agent's model field (may be string or {modelID, providerID} object)
-      const agentData = (agentsResult.data ?? []).find((a: any) => a.id === s.currentAgent);
+      const agentData = (agentsResult.data ?? []).find((a: AcpAgent) => a.id === s.currentAgent);
       let modelId: string | undefined;
       let providerId: string | undefined;
 
@@ -115,9 +128,9 @@ async function loadDefaultsFromConfig(s: ExtensionState): Promise<void> {
         try {
           const modelsResp = await s.backend.config.models();
           const models = modelsResp.data ?? [];
-          let match = models.find((m: any) => m.id === modelId);
+          let match = models.find((m: AcpModel) => m.id === modelId);
           if (!match) {
-            match = models.find((m: any) => m.id.includes(modelId) || modelId.includes(m.id));
+            match = models.find((m: AcpModel) => m.id.includes(modelId) || modelId.includes(m.id));
           }
           if (match) {
             s.currentModel = { providerID: providerId ?? match.provider ?? '', modelID: match.id };
@@ -207,7 +220,7 @@ export function activate(context: vscode.ExtensionContext) {
                 modelID: message.modelID,
               };
               {
-                const modelsResp = await state.backend.config.models().catch(() => ({ data: [] as any[] }));
+                const modelsResp = await state.backend.config.models().catch(() => ({ data: [] as AcpModel[] }));
                 const match = (modelsResp.data ?? []).find(m => m.id === message.modelID && m.provider === message.providerID);
                 state.currentModelDisplayName = match?.name ?? message.modelID;
               }
@@ -233,8 +246,59 @@ export function activate(context: vscode.ExtensionContext) {
               await pushDataToPanel(state, panel);
               break;
             }
-            case 'updateConfig': {
-              await state.backend.config.update(message.config);
+            case 'saveBackendSettings': {
+              if (state.backend.settingsProvider) {
+                await state.backend.settingsProvider.saveValues(message.values);
+              }
+              await pushDataToPanel(state, panel);
+              break;
+            }
+            case 'connectProvider': {
+              const known = KNOWN_PROVIDERS.find(p => p.id === message.providerId);
+              const apiType = message.providerId === 'openai-compatible' ? 'openai' : message.providerId;
+              const providerConfig: AcpProviderConfig = {
+                api: apiType,
+                id: message.providerId,
+                name: message.displayName || known?.name || message.providerId,
+                options: {
+                  apiKey: message.apiKey,
+                  ...(message.baseURL ? { baseURL: message.baseURL } : {}),
+                },
+              };
+              const configKey = message.providerId === 'openai-compatible'
+                ? (message.displayName?.toLowerCase().replace(/[^a-z0-9]/g, '-') || 'custom-' + Date.now())
+                : message.providerId;
+              await state.backend.config.update({
+                provider: { [configKey]: providerConfig },
+              });
+              await pushDataToPanel(state, panel);
+              break;
+            }
+            case 'disconnectProvider': {
+              const currentConfig = await state.backend.config.get();
+              const currentProviders = { ...(currentConfig.data?.provider ?? {}) };
+              delete currentProviders[message.configKey];
+              await state.backend.config.update({
+                provider: currentProviders,
+              });
+              await pushDataToPanel(state, panel);
+              break;
+            }
+            case 'updateProvider': {
+              const currentCfg = await state.backend.config.get();
+              const existing = currentCfg.data?.provider?.[message.configKey];
+              const updateConfig: AcpProviderConfig = {
+                options: {
+                  apiKey: message.apiKey,
+                  ...(message.baseURL ? { baseURL: message.baseURL } : {}),
+                },
+              };
+              if (existing?.id) { updateConfig.id = existing.id; }
+              if (existing?.name) { updateConfig.name = existing.name; }
+              if (existing?.api) { updateConfig.api = existing.api; }
+              await state.backend.config.update({
+                provider: { [message.configKey]: updateConfig },
+              });
               await pushDataToPanel(state, panel);
               break;
             }
@@ -264,48 +328,96 @@ export function activate(context: vscode.ExtensionContext) {
     );
   });
 
-  if (isExperimentalSessionProviderEnabled()) {
-    if (hasRegisterChatSessionContentProvider()) {
-      const chat = vscode.chat as typeof vscode.chat & {
-        registerChatSessionContentProvider?: (
-          sessionType: string,
-          provider: unknown,
-        ) => vscode.Disposable;
-      };
+  if (hasRegisterChatSessionContentProvider()) {
+    const provider = createSessionContentProvider(state, context);
+    const registration = vscode.chat.registerChatSessionContentProvider(
+      OPENCODE_SESSION_SCHEME,
+      provider,
+      participant,
+      { supportsChangingSessionType: true },
+    );
 
-      const provider = createSessionContentProvider(state, context);
-      const registration = chat.registerChatSessionContentProvider?.(
-        'opencode-copilot.opencode',
-        provider,
-      );
-
-      if (registration) {
-        context.subscriptions.push(registration);
-        outputChannel.appendLine('[extension] Experimental session provider registered');
-      } else {
-        outputChannel.appendLine('[extension] Experimental session provider requested but unavailable at runtime');
-      }
-    } else {
-      outputChannel.appendLine('[extension] Experimental session provider enabled, but VS Code API is unavailable');
-    }
+    context.subscriptions.push(registration);
+    outputChannel.appendLine('[extension] Session content provider registered — OpenCode appears in Session Target dropdown');
+  } else {
+    outputChannel.appendLine('[extension] chatSessionsProvider API unavailable — session target registration skipped');
   }
 
   context.subscriptions.push(outputChannel, participant, statusBar, openSettingsCommand);
   outputChannel.appendLine('[extension] OpenCode Copilot activated');
 }
 
+function maskApiKey(key: string): string {
+  if (key.length <= 8) return '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022';
+  return key.slice(0, 4) + '\u2022\u2022\u2022\u2022' + key.slice(-4);
+}
+
+function computeConnectedProviders(
+  config: { provider?: Record<string, AcpProviderConfig> },
+  models: AcpModel[],
+): SettingsData['connectedProviders'] {
+  const result: SettingsData['connectedProviders'] = [];
+  const seen = new Set<string>();
+
+  // 1) Explicit provider entries from config.provider (user-configured with API keys)
+  const explicitProviders = config.provider ?? {};
+  for (const [key, value] of Object.entries(explicitProviders)) {
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const apiKey = value.options?.apiKey;
+    result.push({
+      configKey: key,
+      id: value.id || value.api || key,
+      name: value.name || key,
+      hasApiKey: Boolean(apiKey),
+      apiKeyPreview: apiKey ? maskApiKey(apiKey) : undefined,
+      baseURL: value.options?.baseURL,
+    });
+  }
+
+  // 2) Providers discovered from models (populated by SDK from env vars / auth)
+  for (const m of models) {
+    const pid = m.provider;
+    if (!pid || seen.has(pid)) continue;
+    seen.add(pid);
+    result.push({
+      configKey: pid,
+      id: pid,
+      name: m.providerName || pid,
+      hasApiKey: true, // If models show up, the provider is authenticated
+      baseURL: undefined,
+    });
+  }
+
+  return result;
+}
+
 /** Push current backend data into the settings webview panel */
 async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise<void> {
   try {
     const [agentsResp, modelsResp, configResp] = await Promise.all([
-      s.backend.config.agents().catch(() => ({ data: [] as any[] })),
-      s.backend.config.models().catch(() => ({ data: [] as any[] })),
-      s.backend.config.get().catch(() => ({ data: undefined as any })),
+      s.backend.config.agents().catch(() => ({ data: [] as AcpAgent[] })),
+      s.backend.config.models().catch(() => ({ data: [] as AcpModel[] })),
+      s.backend.config.get().catch(() => ({ data: undefined })),
     ]);
+
+    const agents = agentsResp.data ?? [];
+    const models = modelsResp.data ?? [];
+    const config = configResp.data ?? {};
+
+    // Get backend settings descriptor if provider exists
+    let backendSettings: BackendSettingsDescriptor | undefined;
+    if (s.backend.settingsProvider) {
+      try {
+        backendSettings = await s.backend.settingsProvider.getDescriptor(agents, models);
+      } catch {
+        // non-critical — backend settings UI will show empty state
+      }
+    }
 
     const data: SettingsData = {
       backendName: getBackendDisplayName(s.backend.name),
-      agents: (agentsResp.data ?? []).map(a => ({
+      agents: agents.map(a => ({
         id: a.id,
         name: a.name,
         description: a.description,
@@ -315,7 +427,7 @@ async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise
         mode: a.mode,
         hidden: a.hidden,
       })),
-      models: (modelsResp.data ?? []).map(m => ({
+      models: models.map(m => ({
         id: m.id,
         name: m.name,
         provider: m.providerName ?? m.provider,
@@ -325,7 +437,11 @@ async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise
       currentAgent: s.currentAgent,
       currentModel: s.currentModel,
       currentModelDisplayName: s.currentModelDisplayName,
-      config: configResp.data ?? {},
+      defaultAgent: config.default_agent,
+      defaultModel: config.model,
+      backendSettings,
+      connectedProviders: computeConnectedProviders(config, models),
+      availableProviders: KNOWN_PROVIDERS,
     };
 
     // Try to resolve currentModel from: 1) state, 2) config.model, 3) agent's model
@@ -334,13 +450,13 @@ async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise
       let resolvedProvider: string | undefined;
 
       // Strategy 2: from config.model
-      if (configResp.data?.model) {
-        resolvedModelId = configResp.data.model;
+      if (config.model) {
+        resolvedModelId = config.model;
       }
 
       // Strategy 3: from current agent's model field (may be string or object)
       if (!resolvedModelId && s.currentAgent) {
-        const agentData = (agentsResp.data ?? []).find((a: any) => a.id === s.currentAgent);
+        const agentData = agents.find((a: AcpAgent) => a.id === s.currentAgent);
         const rawModel = agentData?.model;
         if (typeof rawModel === 'object' && rawModel !== null) {
           resolvedModelId = rawModel.modelID;
@@ -352,18 +468,17 @@ async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise
 
       // Strategy 4: from agent config override
       if (!resolvedModelId && s.currentAgent) {
-        const agentConfig = configResp.data?.agent?.[s.currentAgent];
+        const agentConfig = config.agent?.[s.currentAgent];
         if (agentConfig?.model) {
           resolvedModelId = agentConfig.model;
         }
       }
 
       if (resolvedModelId) {
-        const models = modelsResp.data ?? [];
         // Try exact match first, then contains match
-        let match = models.find((m: any) => m.id === resolvedModelId);
+        let match = models.find((m: AcpModel) => m.id === resolvedModelId);
         if (!match) {
-          match = models.find((m: any) => m.id.includes(resolvedModelId) || resolvedModelId.includes(m.id));
+          match = models.find((m: AcpModel) => m.id.includes(resolvedModelId) || resolvedModelId.includes(m.id));
         }
         if (match) {
           s.currentModel = {
@@ -383,9 +498,9 @@ async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise
       }
     }
 
-    s.outputChannel.appendLine(`[settings] pushDataToPanel: currentModel=${JSON.stringify(s.currentModel)}, currentModelDisplayName=${s.currentModelDisplayName}, configModel=${configResp.data?.model}, currentAgent=${s.currentAgent}`);
-    s.outputChannel.appendLine(`[settings] pushDataToPanel: models count=${data.models.length}, model IDs=${data.models.map((m: any) => m.id + '(' + m.providerId + ')').join(', ')}`);
-    s.outputChannel.appendLine(`[settings] pushDataToPanel: agents=${data.agents.map((a: any) => a.id + ':model=' + (a.model ?? 'none')).join(', ')}`);
+    s.outputChannel.appendLine(`[settings] pushDataToPanel: currentModel=${JSON.stringify(s.currentModel)}, currentModelDisplayName=${s.currentModelDisplayName}, configModel=${config.model}, currentAgent=${s.currentAgent}`);
+    s.outputChannel.appendLine(`[settings] pushDataToPanel: models count=${data.models.length}, model IDs=${data.models.map((m) => m.id + '(' + m.providerId + ')').join(', ')}`);
+    s.outputChannel.appendLine(`[settings] pushDataToPanel: agents=${data.agents.map((a) => a.id + ':model=' + (a.model ?? 'none')).join(', ')}`);
 
     panel.updateData(data);
   } catch {

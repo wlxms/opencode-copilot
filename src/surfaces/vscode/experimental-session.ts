@@ -1,47 +1,56 @@
 /**
- * Experimental chat-session-provider surface.
+ * Chat-session-provider surface for VS Code's proposed API.
  *
- * Designed for a future VS Code proposed API (`registerChatSessionContentProvider`)
- * that would allow extensions to fully custom-render the content of a chat
- * session. This surface:
+ * Implements `vscode.ChatSessionContentProvider` — the proposed API that allows
+ * extensions to register as a "session target" in VS Code's chat view. When
+ * registered, OpenCode appears alongside Local, Copilot CLI, Cloud, Claude,
+ * etc. in the Session Target dropdown at the bottom of the chat input.
  *
- * 1. Defines forward-compatible types for the expected provider interface.
- * 2. Exports a factory that builds a `ChatSessionContentProvider`.
- * 3. Uses the `AcpRenderer` for rendering events into session content.
- * 4. Gates every proposed API behind runtime capability checks from
- *    `capabilities.ts` — never assumes the API exists.
- * 5. Can fall back to the stable participant surface when experimental
- *    APIs are unavailable.
- *
- * == Design ==
- * - The `ChatSessionContentProvider` interface is declared locally and does
- *   NOT augment the `vscode` module. Consumers must gate on
- *   `hasRegisterChatSessionContentProvider()` before using it.
- * - The `ExperimentalChatSession` class renders ACP events into structured
- *   session content that a content provider can surface.
- * - All proposed APIs (`thinkingProgress`, `ChatToolInvocationPart`, etc.)
- *   are gated via the `capabilities.ts` module. The surface degrades
- *   gracefully to stable markdown-only rendering when the APIs are absent.
- *
- * == Usage (future) ==
- * ```ts
- * import { hasRegisterChatSessionContentProvider } from './surfaces/vscode/capabilities';
- * import { createSessionContentProvider } from './surfaces/vscode/experimental-session';
- *
- * if (hasRegisterChatSessionContentProvider()) {
- *   const provider = createSessionContentProvider(state);
- *   vscode.chat.registerChatSessionContentProvider(
- *     'opencode-copilot.opencode',
- *     provider,
- *   );
- * }
+ * == Architecture ==
  * ```
+ * VS Code chat view
+ *     │
+ *     ▼  Session Target: "OpenCode" selected
+ * ┌─────────────────────────────────────────────┐
+ * │  ChatSessionContentProvider (this module)    │
+ * │  ┌───────────────────────────────────────┐  │
+ * │  │ provideChatSessionContent(uri, token)  │  │
+ * │  │ → fetches session history from backend │  │
+ * │  │ → returns ChatSessionContent           │  │
+ * │  └───────────────────────────────────────┘  │
+ * │  + optional optionGroups (model picker, etc) │
+ * └─────────────────────────────────────────────┘
+ *     │
+ *     ▼
+ * OpenCodeBackend → OpenCode SDK → opencode daemon
+ * ```
+ *
+ * == Registration ==
+ * ```ts
+ * // In extension.ts activate():
+ * vscode.chat.registerChatSessionContentProvider(
+ *   'opencode',                          // URI scheme
+ *   createSessionContentProvider(state),  // provider
+ *   participant,                         // ChatParticipant (@opencode)
+ *   { supportsChangingSessionType: true } // capabilities
+ * );
+ * ```
+ *
+ * == Gating ==
+ * Every proposed API call is gated behind runtime capability checks
+ * (`hasRegisterChatSessionContentProvider()`). The extension degrades
+ * gracefully to the stable participant surface when the proposed API
+ * is unavailable.
  *
  * @module
  */
-import type * as vscode from 'vscode';
+import * as vscode from 'vscode';
 import type { ExtensionState } from '../../types';
 import type { OpenCodeEvent, OpenCodeEventStream } from '../../backends/opencode/sdk-events';
+
+import { StreamBridge } from '../../participant/streaming';
+import { ExternalEditTracker } from '../../participant/external-edit-tracker';
+import { collectOpenFileUris } from '../../participant/checkpoint';
 
 import {
   AcpRenderer,
@@ -61,13 +70,13 @@ import {
 } from './capabilities';
 
 // ---------------------------------------------------------------------------
-// Forward-compatible types for the proposed ChatSessionContentProvider API
+// Internal types for session content rendering (not part of the VS Code API)
 // ---------------------------------------------------------------------------
 
 /**
  * Content for a single chat session frame/response.
- * This is the structured data a content provider would return when asked
- * to render a session's content.
+ * Internal representation used by `ExperimentalChatSession` before
+ * converting to VS Code's `ChatSessionContent`.
  */
 export interface SessionFrameContent {
   /** Markdown text content (the AI response) */
@@ -97,26 +106,6 @@ export interface SessionDiffEntry {
   additions?: number;
   deletions?: number;
   status: 'added' | 'modified';
-}
-
-/**
- * Expected interface for `ChatSessionContentProvider` (future proposed API).
- *
- * When VS Code ships this API, it should match this shape:
- * - `provideSessionContent(session, token)` returns structured content
- *   for the chat session.
- */
-export interface ChatSessionContentProvider {
-  /**
-   * Provide the rendered content for a chat session.
-   * @param sessionId - The ID of the chat session to render.
-   * @param token - Cancellation token.
-   * @returns `SessionFrameContent` or `null`/`undefined` if no content.
-   */
-  provideSessionContent(
-    sessionId: string,
-    token: vscode.CancellationToken,
-  ): vscode.ProviderResult<SessionFrameContent[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -301,54 +290,185 @@ export class ExperimentalChatSession {
 // ---------------------------------------------------------------------------
 
 /**
- * Create a `ChatSessionContentProvider` for the `opencode-copilot` chat
- * participant.
+ * URI scheme used to register OpenCode as a session target.
+ * Must match the `type` field in the `chatSessions` contribution
+ * in package.json.
+ */
+export const OPENCODE_SESSION_SCHEME = 'opencode-copilot.opencode';
+
+/**
+ * Create a `vscode.ChatSessionContentProvider` that registers OpenCode
+ * as a session target in VS Code's chat view.
  *
  * The returned provider:
- * - Is production-ready when `hasRegisterChatSessionContentProvider()` is
- *   `true` at the call site.
- * - Uses runtime capability checks internally — never assumes proposed
- *   APIs exist.
- * - Provides structured `SessionFrameContent[]` that a future VS Code
- *   content provider API can render.
+ * - `provideChatSessionContent(uri, token)` — returns a ChatSession with a
+ *   `requestHandler` that routes chat requests through our OpenCode backend.
+ *
+ * The request handler reuses the same StreamBridge + AcpRenderer pipeline
+ * as the stable participant surface, ensuring feature parity.
  *
  * @param state - The global extension state.
  * @param context - The extension context (for subscriptions).
- * @returns A `ChatSessionContentProvider` instance.
+ * @returns A `vscode.ChatSessionContentProvider` instance ready for
+ *          registration via `vscode.chat.registerChatSessionContentProvider()`.
  */
 export function createSessionContentProvider(
   state: ExtensionState,
-  context: vscode.ExtensionContext,
-): ChatSessionContentProvider {
+  _context: vscode.ExtensionContext,
+): vscode.ChatSessionContentProvider {
   const logger = state.outputChannel;
 
   return {
-    provideSessionContent(
-      sessionId: string,
+    provideChatSessionContent(
+      resource: vscode.Uri,
       _token: vscode.CancellationToken,
-    ): SessionFrameContent[] | null {
+      _context: { readonly inputState: vscode.ChatSessionInputState },
+    ): vscode.ChatSession {
       logger.appendLine(
-        `[experimental-session] provideSessionContent called for ${sessionId}`,
+        `[session-provider] provideChatSessionContent called for ${resource.toString()}`,
       );
 
-      // In a full implementation, this would replay stored events for the
-      // given session ID and return rendered frames. For now, return null
-      // (no content available) as the wire protocol integration is not yet
-      // wired through this path.
+      return {
+        history: [],
 
-      // Check experimental API availability for logging
-      const caps = {
-        registerChatSessionContentProvider: hasRegisterChatSessionContentProvider(),
-        fullProposedSurface: false, // No stream to check yet
-        toolInvocationPart: hasChatToolInvocationPart(),
-        multiDiffPart: hasChatResponseMultiDiffPart(),
+        /**
+         * Request handler invoked by VS Code when the user sends a message
+         * in an OpenCode session target.
+         *
+         * This reuses the same backend pipeline as the @opencode participant:
+         *   1. Ensure server is running
+         *   2. Resolve/create OpenCode session
+         *   3. Send prompt and stream events through StreamBridge
+         */
+        requestHandler: async (
+          request: vscode.ChatRequest,
+          _context: vscode.ChatContext,
+          stream: vscode.ChatResponseStream,
+          token: vscode.CancellationToken,
+        ): Promise<vscode.ChatResult> => {
+          logger.appendLine(
+            `[session-provider] requestHandler invoked: "${request.prompt?.substring(0, 80)}"`,
+          );
+
+          // Guard: cancellation
+          if (token.isCancellationRequested) {
+            stream.markdown('\u26A0\uFE0F Cancelled\n');
+            return { metadata: {} };
+          }
+
+          // Guard: empty prompt
+          if (!request.prompt?.trim()) {
+            stream.markdown('Please enter a prompt.');
+            return { metadata: {} };
+          }
+
+          // 1. Ensure backend is running
+          const status = state.backend.getStatus();
+          if (status !== 'running') {
+            try {
+              stream.progress('Starting OpenCode server...');
+              const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+              const result = await state.backend.start(workspacePath);
+              if (result.error || !result.data) {
+                const msg = typeof result.error === 'string' ? result.error : 'Unknown error';
+                stream.markdown(`\u26A0\uFE0F Failed to start OpenCode: ${msg}`);
+                return { metadata: {} };
+              }
+              logger.appendLine(`[session-provider] Server started at ${result.data.url}`);
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : 'Unknown error';
+              stream.markdown(`\u26A0\uFE0F Failed to start OpenCode: ${msg}`);
+              return { metadata: {} };
+            }
+          }
+
+          // 2. Create or reuse OpenCode session
+          const directory = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+          const vscodeSessionId = request.sessionId ?? `session-${Date.now()}`;
+          let chatState = state.sessionMap.get(vscodeSessionId);
+          if (!chatState) {
+            chatState = { opencodeSessionId: '', turnMap: [] };
+            state.sessionMap.set(vscodeSessionId, chatState);
+          }
+
+          if (!chatState.opencodeSessionId) {
+            stream.progress('Creating new session...');
+            const result = await state.backend.sessions.create({
+              title: `Chat ${vscodeSessionId.slice(0, 8)}`,
+              directory,
+            });
+            if (result.error || !result.data) {
+              stream.markdown('\u26A0\uFE0F Failed to create OpenCode session.');
+              return { metadata: {} };
+            }
+            chatState.opencodeSessionId = result.data.id ?? '';
+            logger.appendLine(`[session-provider] Created session ${chatState.opencodeSessionId}`);
+          }
+
+          const sessionId = chatState.opencodeSessionId;
+
+          // 3. Ensure event stream is connected
+          stream.progress('Connecting to event stream...');
+          await state.backend.events.ensureStarted();
+
+          // 4. Open a per-session event stream
+          const events = state.backend.events.openSessionStream(sessionId);
+
+          // 5. Send prompt and stream response
+          stream.progress('Sending message...');
+          logger.appendLine(
+            `[session-provider] Prompting session ${sessionId}: ${request.prompt.substring(0, 50)}`,
+          );
+
+          // Build prompt options from current agent/model selection
+          const promptOptions: { model?: { providerID: string; modelID: string }; agent?: string } = {};
+          if (state.selectedAgentOverride) {
+            promptOptions.agent = state.selectedAgentOverride;
+          }
+          if (state.selectedModelOverride) {
+            promptOptions.model = state.selectedModelOverride;
+          }
+
+          // Fire prompt (non-blocking) — events arrive through the session stream
+          const promptPromise = state.backend.sessions.prompt(
+            sessionId,
+            request.prompt,
+            directory,
+            promptOptions,
+          ).then((result) => {
+            if (result.error) {
+              logger.appendLine(`[session-provider] Prompt error: ${JSON.stringify(result.error)}`);
+            }
+          }).catch((err: unknown) => {
+            logger.appendLine(`[session-provider] Prompt exception: ${err instanceof Error ? err.message : String(err)}`);
+          });
+
+          // 6. Render events through StreamBridge (same pipeline as @opencode participant)
+          const tracker = new ExternalEditTracker();
+          const bridge = new StreamBridge({
+            logger: { appendLine: (m: string) => logger.appendLine(m) },
+            sessionId,
+            knownFileUris: new Set((await collectOpenFileUris()).map(u => u.toString())),
+            tracker,
+            directory,
+          });
+
+          try {
+            await bridge.run(events.stream, stream, token);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : 'Connection lost';
+            logger.appendLine(`[session-provider] Stream error: ${msg}`);
+            stream.markdown(`\n\u26A0\uFE0F ${msg}\n`);
+          } finally {
+            state.backend.events.closeSessionStream(sessionId);
+          }
+
+          // Ensure prompt completes
+          await promptPromise;
+
+          return { metadata: {} };
+        },
       };
-
-      logger.appendLine(
-        `[experimental-session] Capabilities: ${JSON.stringify(caps)}`,
-      );
-
-      return null;
     },
   };
 }
