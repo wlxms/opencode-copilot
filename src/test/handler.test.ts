@@ -22,7 +22,13 @@ const mockSdkClient = {
   event: {
     subscribe: vi.fn(),
   },
-  postSessionIdPermissionsPermissionId: vi.fn(),
+  permission: {
+    reply: vi.fn(),
+  },
+  question: {
+    reply: vi.fn(),
+    reject: vi.fn(),
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -90,25 +96,26 @@ describe('createParticipantHandler', () => {
       sessions: {
         create: vi.fn(async (options?: { title?: string; directory?: string }) => {
           const result = await mockSdkClient.session.create({
-            body: options?.title ? { title: options.title } : undefined,
-            query: options?.directory ? { directory: options.directory } : undefined,
+            directory: options?.directory,
+            title: options?.title,
           });
           return { data: result.data ? { id: result.data.id ?? '', title: result.data.title ?? '', createdAt: new Date() } : undefined, error: result.error };
         }),
         get: vi.fn(async () => ({ data: undefined })),
         prompt: vi.fn(async (id: string, text: string, directory?: string) => {
           const result = await mockSdkClient.session.prompt({
-            path: { id },
-            body: { parts: [{ type: 'text', text }] },
-            query: directory ? { directory } : undefined,
+            sessionID: id,
+            directory,
+            parts: [{ type: 'text', text }],
           });
           return { data: result };
         }),
         revert: vi.fn(async (id: string, messageId: string, partId?: string, directory?: string) => {
           const result = await mockSdkClient.session.revert({
-            path: { id },
-            body: { messageID: messageId, ...(partId ? { partID: partId } : {}) },
-            query: directory ? { directory } : undefined,
+            sessionID: id,
+            directory,
+            messageID: messageId,
+            partID: partId,
           });
           if (result && typeof result === 'object' && 'error' in result) {
             return { error: String(result.error) };
@@ -117,15 +124,23 @@ describe('createParticipantHandler', () => {
         }),
         abort: vi.fn(async (id: string, directory?: string) => {
           const result = await mockSdkClient.session.abort({
-            path: { id },
-            query: directory ? { directory } : undefined,
+            sessionID: id,
+            directory,
           });
           return { data: result.data };
         }),
         list: vi.fn(async () => ({ data: [] })),
+        children: vi.fn(),
+        status: vi.fn(),
+        descendants: vi.fn(() => []),
+        findAncestor: vi.fn(),
+        parent: vi.fn(),
       },
       config: {
         models: vi.fn(async () => ({ data: [] })),
+        agents: vi.fn(),
+        get: vi.fn(),
+        update: vi.fn(),
       },
       events: {
         openSessionStream: vi.fn((sessionId: string) => ({
@@ -161,6 +176,10 @@ describe('createParticipantHandler', () => {
       permissions: {
         reply: vi.fn(async () => undefined),
       },
+      questions: {
+        reply: vi.fn(),
+        reject: vi.fn(),
+      },
     };
 
     state = {
@@ -176,6 +195,7 @@ describe('createParticipantHandler', () => {
         dispose: vi.fn(),
       } as unknown as vscode.OutputChannel,
       sessionMap: new Map(),
+      statusBar: {} as any,
     };
 
     stream = {
@@ -187,7 +207,7 @@ describe('createParticipantHandler', () => {
     token = {
       isCancellationRequested: false,
       onCancellationRequested: vi.fn(() => ({ dispose: vi.fn() })),
-    } as unknown as vscode.CancellationToken;
+    };
 
     // Default abort mock — resolves to prevent handler crash on cancellation
     mockSdkClient.session.abort.mockResolvedValue({ data: true });
@@ -318,8 +338,8 @@ describe('createParticipantHandler', () => {
 
     // Session was created with workspace directory and title
     expect(mockSdkClient.session.create).toHaveBeenCalledWith({
-      body: { title: 'Chat chat-1' },
-      query: { directory: '/test/workspace' },
+      directory: '/test/workspace',
+      title: 'Chat chat-1',
     });
     // Session stored in sessionMap under the vscode chat session ID
     expect(state.sessionMap.get('chat-1')?.opencodeSessionId).toBe('session-1');
@@ -327,13 +347,11 @@ describe('createParticipantHandler', () => {
     // Events subscribed
     expect(state.backend.events.ensureStarted).toHaveBeenCalledOnce();
 
-    // Prompt sent with correct format (path/body/query)
+    // Prompt sent with correct format (v2 flat params)
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      path: { id: 'session-1' },
-      body: {
-        parts: [{ type: 'text', text: 'write a test' }],
-      },
-      query: { directory: '/test/workspace' },
+      sessionID: 'session-1',
+      parts: [{ type: 'text', text: 'write a test' }],
+      directory: '/test/workspace',
     });
 
     // Progress was reported
@@ -377,11 +395,9 @@ describe('createParticipantHandler', () => {
     expect(mockSdkClient.session.create).not.toHaveBeenCalled();
     // Should send message to existing session with directory query
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      path: { id: 'existing-session' },
-      body: {
-        parts: [{ type: 'text', text: 'follow up' }],
-      },
-      query: { directory: '/test/workspace' },
+      sessionID: 'existing-session',
+      parts: [{ type: 'text', text: 'follow up' }],
+      directory: '/test/workspace',
     });
     expect(result!.metadata).toHaveProperty('sessionId', 'existing-session');
   });
@@ -421,9 +437,9 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Should revert msg-1 (the extraneous turn, from back to front)
     expect(mockSdkClient.session.revert).toHaveBeenCalledTimes(1);
     expect(mockSdkClient.session.revert).toHaveBeenCalledWith({
-      path: { id: 'revert-session' },
-      body: { messageID: 'msg-1' },
-      query: { directory: '/test/workspace' },
+      sessionID: 'revert-session',
+      messageID: 'msg-1',
+      directory: '/test/workspace',
     });
 
     // Should NOT create a new session
@@ -437,9 +453,9 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
 
     // Should prompt on the same reverted session
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      path: { id: 'revert-session' },
-      body: { parts: [{ type: 'text', text: 'edited follow-up' }] },
-      query: { directory: '/test/workspace' },
+      sessionID: 'revert-session',
+      parts: [{ type: 'text', text: 'edited follow-up' }],
+      directory: '/test/workspace',
     });
     expect(result!.metadata).toHaveProperty('sessionId', 'revert-session');
   });
@@ -475,14 +491,14 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Should revert msg-2 first (back to front), then msg-1
     expect(mockSdkClient.session.revert).toHaveBeenCalledTimes(2);
     expect(mockSdkClient.session.revert).toHaveBeenNthCalledWith(1, {
-      path: { id: 'revert-session-3' },
-      body: { messageID: 'msg-2' },
-      query: { directory: '/test/workspace' },
+      sessionID: 'revert-session-3',
+      messageID: 'msg-2',
+      directory: '/test/workspace',
     });
     expect(mockSdkClient.session.revert).toHaveBeenNthCalledWith(2, {
-      path: { id: 'revert-session-3' },
-      body: { messageID: 'msg-1' },
-      query: { directory: '/test/workspace' },
+      sessionID: 'revert-session-3',
+      messageID: 'msg-1',
+      directory: '/test/workspace',
     });
 
     // TurnMap should keep only msg-0
@@ -526,9 +542,9 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
 
     // Should prompt on the same session
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      path: { id: 'full-rewind-session' },
-      body: { parts: [{ type: 'text', text: 'start fresh' }] },
-      query: { directory: '/test/workspace' },
+      sessionID: 'full-rewind-session',
+      parts: [{ type: 'text', text: 'start fresh' }],
+      directory: '/test/workspace',
     });
   });
 
@@ -567,14 +583,14 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
 
     // Should fall back by creating a new session
     expect(mockSdkClient.session.create).toHaveBeenCalledWith({
-      query: { directory: '/test/workspace' },
+      directory: '/test/workspace',
     });
 
     // Should prompt on the fallback session
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      path: { id: 'fallback-session' },
-      body: { parts: [{ type: 'text', text: 'after revert fail' }] },
-      query: { directory: '/test/workspace' },
+      sessionID: 'fallback-session',
+      parts: [{ type: 'text', text: 'after revert fail' }],
+      directory: '/test/workspace',
     });
 
     // TurnMap should be reset
@@ -695,11 +711,9 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     expect(state.backend.start).not.toHaveBeenCalled();
     expect(mockSdkClient.session.create).not.toHaveBeenCalled();
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      path: { id: 'existing-id' },
-      body: {
-        parts: [{ type: 'text', text: 'question' }],
-      },
-      query: { directory: '/test/workspace' },
+      sessionID: 'existing-id',
+      parts: [{ type: 'text', text: 'question' }],
+      directory: '/test/workspace',
     });
   });
 
@@ -755,8 +769,8 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Verify abort was called with the correct session ID
     expect(mockSdkClient.session.abort).toHaveBeenCalledWith(
       expect.objectContaining({
-        path: { id: 'session-abort-test' },
-        query: { directory: '/test/workspace' },
+        sessionID: 'session-abort-test',
+        directory: '/test/workspace',
       }),
     );
   });

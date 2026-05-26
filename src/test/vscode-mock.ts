@@ -135,7 +135,7 @@ export class Uri {
         this.fsPath = path.replace(/\//g, '\\');
     }
 
-    with(_change: unknown): Uri {
+    with(_change: unknown): this {
         return this;
     }
 
@@ -170,6 +170,16 @@ export interface ChatRequest {
 
 export interface ChatContext {
     history: Array<unknown>;
+}
+
+/**
+ * Minimal MarkdownString mock — needed by streaming.ts formatPastTenseMsg / formatFileBubbleMessage.
+ * The real class concatenates markdown; for tests a plain string container suffices.
+ */
+export class MarkdownString {
+    value: string;
+    constructor(value: string) { this.value = value; }
+    toString() { return this.value; }
 }
 
 /**

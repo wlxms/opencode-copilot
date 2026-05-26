@@ -28,7 +28,13 @@ function createMockClient() {
     event: {
       subscribe: vi.fn(),
     },
-    postSessionIdPermissionsPermissionId: vi.fn(),
+    permission: {
+      reply: vi.fn(),
+    },
+    question: {
+      reply: vi.fn(),
+      reject: vi.fn(),
+    },
   };
 }
 
@@ -62,9 +68,17 @@ describe('routeCommand', () => {
         revert: vi.fn(),
         abort: vi.fn(),
         list: vi.fn(),
+        children: vi.fn(),
+        status: vi.fn(),
+        descendants: vi.fn(),
+        findAncestor: vi.fn(),
+        parent: vi.fn(),
       },
       config: {
         models: vi.fn(async () => ({ data: [] })),
+        agents: vi.fn(),
+        get: vi.fn(),
+        update: vi.fn(),
       },
       events: {
         openSessionStream: vi.fn(),
@@ -74,6 +88,10 @@ describe('routeCommand', () => {
       },
       permissions: {
         reply: vi.fn(async () => undefined),
+      },
+      questions: {
+        reply: vi.fn(),
+        reject: vi.fn(),
       },
     };
     state = {
@@ -89,6 +107,7 @@ describe('routeCommand', () => {
         dispose: vi.fn(),
       } as unknown as vscode.OutputChannel,
       sessionMap: new Map(),
+      statusBar: {} as any,
     };
     stream = {
       markdown: vi.fn(),
@@ -98,7 +117,7 @@ describe('routeCommand', () => {
     token = {
       isCancellationRequested: false,
       onCancellationRequested: vi.fn(),
-    } as unknown as vscode.CancellationToken;
+    };
   });
 
   // -----------------------------------------------------------------------

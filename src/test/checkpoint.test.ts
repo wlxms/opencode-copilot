@@ -88,7 +88,7 @@ describe('CheckpointManager', () => {
   it('resolveIdle is idempotent — second call does not throw', () => {
     manager.createIdlePromise();
     manager.resolveIdle();
-    expect(() => manager.resolveIdle()).not.toThrow();
+    expect(() => { manager.resolveIdle(); }).not.toThrow();
   });
 
   // -------------------------------------------------------------------------
@@ -134,7 +134,7 @@ describe('CheckpointManager', () => {
   // -------------------------------------------------------------------------
 
   it('dispose when no checkpoint exists is safe', () => {
-    expect(() => manager.dispose()).not.toThrow();
+    expect(() => { manager.dispose(); }).not.toThrow();
   });
 });
 
