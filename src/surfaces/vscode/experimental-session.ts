@@ -39,7 +39,7 @@
  *
  * @module
  */
-import * as vscode from 'vscode';
+import type * as vscode from 'vscode';
 import type { ExtensionState } from '../../types';
 import type { OpenCodeEvent, OpenCodeEventStream } from '../../backends/opencode/sdk-events';
 
@@ -86,8 +86,8 @@ export interface SessionToolInvocation {
   toolName: string;
   toolCallId: string;
   isError?: boolean;
-  invocationMessage?: string;
-  pastTenseMessage?: string;
+  invocationMessage?: string | vscode.MarkdownString;
+  pastTenseMessage?: string | vscode.MarkdownString;
   toolSpecificData?: Record<string, unknown>;
   isComplete?: boolean;
 }
@@ -187,7 +187,7 @@ export class ExperimentalChatSession {
 
   private handlePartUpdated(evt: OpenCodeEvent): void {
     const part = (evt as { properties?: { part?: { type: string } } }).properties?.part;
-    if (!part) return;
+    if (!part) {return;}
 
     switch (part.type) {
       case 'reasoning':
@@ -207,7 +207,7 @@ export class ExperimentalChatSession {
 
   private handlePartDelta(evt: OpenCodeEvent): void {
     const props = (evt as { properties?: { partID: string; delta: string; field?: string } }).properties;
-    if (!props?.delta) return;
+    if (!props?.delta) {return;}
 
     // We don't track part kinds here (that's the renderer's job).
     // For structured content, we accumulate into the current frame.
@@ -222,7 +222,7 @@ export class ExperimentalChatSession {
 
   private handleSessionDiff(evt: OpenCodeEvent): void {
     const diffs = (evt as { properties?: { diff?: Array<{ file: string; additions?: number; deletions?: number; status: string }> } }).properties?.diff;
-    if (!diffs?.length) return;
+    if (!diffs?.length) {return;}
 
     const entries: SessionDiffEntry[] = diffs
       .filter((d) => d.status !== 'deleted')
@@ -241,10 +241,10 @@ export class ExperimentalChatSession {
   private handleToolState(toolPart: {
     callID?: string;
     tool?: string;
-    state?: { status: string; input?: Record<string, unknown>; output?: string; title?: string; error?: string };
+    state?: { status: string; input?: Record<string, unknown>; output?: string; title?: string; error?: string; startTime?: number; endTime?: number };
   }): void {
     const state = toolPart.state;
-    if (!state) return;
+    if (!state) {return;}
 
     const toolName = toolPart.tool ?? 'unknown';
     const callID = toolPart.callID ?? 'unknown';
@@ -386,7 +386,7 @@ export async function renderWithExperimentalSurface(
   const hasToolPart = hasChatToolInvocationPart();
   const hasMultiDiff = hasChatResponseMultiDiffPart();
 
-  const logger = { appendLine: (m: string) => console.log(m) };
+  const logger = { appendLine: (m: string) => { console.log(m); } };
 
   logger.appendLine(
     `[experimental-session] caps: fullProposed=${hasFullProposed}, ` +

@@ -26,15 +26,15 @@ function createBackend(): AcpBackend {
 }
 
 function getBackendDisplayName(backendName: string): string {
-  if (backendName === 'opencode') return 'OpenCode';
-  if (!backendName) return '--';
+  if (backendName === 'opencode') {return 'OpenCode';}
+  if (!backendName) {return '--';}
   return backendName.charAt(0).toUpperCase() + backendName.slice(1);
 }
 
 /** Refresh status bar items from the current state */
 async function refreshStatusBar(s: ExtensionState): Promise<void> {
   try {
-    let agentName = s.currentAgent ?? '--';
+    const agentName = s.currentAgent ?? '--';
     let modelName = s.currentModelDisplayName ?? '--';
 
     if (!s.currentModelDisplayName && s.currentModel) {
@@ -87,9 +87,57 @@ async function loadDefaultsFromConfig(s: ExtensionState): Promise<void> {
       }
     }
 
+    // If still no model, try current agent's model or agent config override
+    if (!s.currentModel && s.currentAgent) {
+      // Try agent's model field (may be string or {modelID, providerID} object)
+      const agentData = (agentsResult.data ?? []).find((a: any) => a.id === s.currentAgent);
+      let modelId: string | undefined;
+      let providerId: string | undefined;
+
+      const rawModel = agentData?.model;
+      if (typeof rawModel === 'object' && rawModel !== null) {
+        modelId = rawModel.modelID;
+        providerId = rawModel.providerID;
+      } else if (typeof rawModel === 'string') {
+        modelId = rawModel;
+      }
+
+      // Try agent config override
+      if (!modelId && configResult.data?.agent) {
+        const agentCfg = configResult.data.agent[s.currentAgent];
+        if (typeof agentCfg?.model === 'string') {
+          modelId = agentCfg.model;
+        }
+      }
+
+      if (modelId) {
+        // Try to resolve display name from models list
+        try {
+          const modelsResp = await s.backend.config.models();
+          const models = modelsResp.data ?? [];
+          let match = models.find((m: any) => m.id === modelId);
+          if (!match) {
+            match = models.find((m: any) => m.id.includes(modelId) || modelId.includes(m.id));
+          }
+          if (match) {
+            s.currentModel = { providerID: providerId ?? match.provider ?? '', modelID: match.id };
+            s.currentModelDisplayName = match.name ?? match.id;
+          } else {
+            s.currentModel = { providerID: providerId ?? '', modelID: modelId };
+            s.currentModelDisplayName = modelId;
+          }
+        } catch {
+          s.currentModel = { providerID: providerId ?? '', modelID: modelId };
+          s.currentModelDisplayName = modelId;
+        }
+      }
+    }
+
     await refreshStatusBar(s);
-  } catch {
-    // non-critical — defaults will be loaded on first server start
+  } catch (err) {
+    s.outputChannel.appendLine(
+      `[extension] loadDefaultsFromConfig error: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
 
@@ -133,7 +181,7 @@ export function activate(context: vscode.ExtensionContext) {
 
       // Wire up message handler
       panel.onDidRequestChange = async (message: SettingsMessage) => {
-        if (!state) return;
+        if (!state) {return;}
 
         try {
           switch (message.type) {
@@ -186,7 +234,7 @@ export function activate(context: vscode.ExtensionContext) {
               break;
             }
             case 'updateConfig': {
-              await state.backend.config.update(message.config as any);
+              await state.backend.config.update(message.config);
               await pushDataToPanel(state, panel);
               break;
             }
@@ -199,6 +247,7 @@ export function activate(context: vscode.ExtensionContext) {
       };
 
       // Push initial data
+      if (!state) {return;}
       await pushDataToPanel(state, panel);
     },
   );
@@ -260,7 +309,9 @@ async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise
         id: a.id,
         name: a.name,
         description: a.description,
-        model: a.model,
+        model: typeof (a).model === 'object' && (a).model !== null
+          ? ((a).model.modelID ?? String((a).model))
+          : a.model,
         mode: a.mode,
         hidden: a.hidden,
       })),
@@ -277,17 +328,64 @@ async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise
       config: configResp.data ?? {},
     };
 
-    if (!s.currentModel && configResp.data?.model) {
-      const match = (modelsResp.data ?? []).find(m => m.id === configResp.data?.model);
-      if (match) {
-        s.currentModel = {
-          providerID: match.provider ?? '',
-          modelID: match.id,
-        };
-        s.currentModelDisplayName = match.name ?? match.id;
-        data.currentModel = s.currentModel;
+    // Try to resolve currentModel from: 1) state, 2) config.model, 3) agent's model
+    if (!s.currentModel) {
+      let resolvedModelId: string | undefined;
+      let resolvedProvider: string | undefined;
+
+      // Strategy 2: from config.model
+      if (configResp.data?.model) {
+        resolvedModelId = configResp.data.model;
+      }
+
+      // Strategy 3: from current agent's model field (may be string or object)
+      if (!resolvedModelId && s.currentAgent) {
+        const agentData = (agentsResp.data ?? []).find((a: any) => a.id === s.currentAgent);
+        const rawModel = agentData?.model;
+        if (typeof rawModel === 'object' && rawModel !== null) {
+          resolvedModelId = rawModel.modelID;
+          resolvedProvider = rawModel.providerID;
+        } else if (typeof rawModel === 'string') {
+          resolvedModelId = rawModel;
+        }
+      }
+
+      // Strategy 4: from agent config override
+      if (!resolvedModelId && s.currentAgent) {
+        const agentConfig = configResp.data?.agent?.[s.currentAgent];
+        if (agentConfig?.model) {
+          resolvedModelId = agentConfig.model;
+        }
+      }
+
+      if (resolvedModelId) {
+        const models = modelsResp.data ?? [];
+        // Try exact match first, then contains match
+        let match = models.find((m: any) => m.id === resolvedModelId);
+        if (!match) {
+          match = models.find((m: any) => m.id.includes(resolvedModelId) || resolvedModelId.includes(m.id));
+        }
+        if (match) {
+          s.currentModel = {
+            providerID: match.provider ?? '',
+            modelID: match.id,
+          };
+          s.currentModelDisplayName = match.name ?? match.id;
+          data.currentModel = s.currentModel;
+          data.currentModelDisplayName = s.currentModelDisplayName;
+        } else {
+          // Model not found in list — still set it as raw value for display
+          s.currentModel = { providerID: '', modelID: resolvedModelId };
+          s.currentModelDisplayName = resolvedModelId;
+          data.currentModel = s.currentModel;
+          data.currentModelDisplayName = s.currentModelDisplayName;
+        }
       }
     }
+
+    s.outputChannel.appendLine(`[settings] pushDataToPanel: currentModel=${JSON.stringify(s.currentModel)}, currentModelDisplayName=${s.currentModelDisplayName}, configModel=${configResp.data?.model}, currentAgent=${s.currentAgent}`);
+    s.outputChannel.appendLine(`[settings] pushDataToPanel: models count=${data.models.length}, model IDs=${data.models.map((m: any) => m.id + '(' + m.providerId + ')').join(', ')}`);
+    s.outputChannel.appendLine(`[settings] pushDataToPanel: agents=${data.agents.map((a: any) => a.id + ':model=' + (a.model ?? 'none')).join(', ')}`);
 
     panel.updateData(data);
   } catch {

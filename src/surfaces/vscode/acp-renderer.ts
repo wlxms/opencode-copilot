@@ -48,7 +48,7 @@ import {
   hasChatResponseMultiDiffPart,
   hasChatSubagentToolInvocationData,
 } from './capabilities';
-import { SubagentScope, formatSubagentProgress } from '../../participant/subagent';
+import { type SubagentScope, formatSubagentProgress } from '../../participant/subagent';
 
 // ---------------------------------------------------------------------------
 // Extended stream type for proposed API methods
@@ -226,6 +226,11 @@ export class AcpRenderer {
       case 'permission.asked':
         // Permission events are wire-protocol concerns — no rendering needed
         return { rendered: false, eventType: 'permission.asked' };
+      case 'question.asked':
+      case 'question.replied':
+      case 'question.rejected':
+        // Question events are handled by StreamBridge — no rendering needed here
+        return { rendered: false, eventType: evt.type };
       default:
         return { rendered: false, eventType: evt.type };
     }
@@ -263,11 +268,11 @@ export class AcpRenderer {
    */
   private handlePartUpdated(evt: MessagePartUpdatedEvent, stream: Stream): boolean {
     const part = evt.properties?.part;
-    if (!part) return false;
+    if (!part) {return false;}
 
     switch (part.type) {
       case 'text': {
-        const textPart = part as TextStreamPart;
+        const textPart = part;
         const msgId = textPart.messageID;
         // Capture user message ID on first text part
         if (
@@ -288,14 +293,14 @@ export class AcpRenderer {
 
       case 'reasoning': {
         this.assistantPhaseStarted = true;
-        const reasoningPart = part as ReasoningStreamPart;
+        const reasoningPart = part;
         this.partKinds.set(reasoningPart.id, 'reasoning');
         return false;
       }
 
       case 'tool': {
         this.assistantPhaseStarted = true;
-        const toolPart = part as StreamToolPart;
+        const toolPart = part;
         this.partKinds.set(toolPart.id, 'tool');
         return this.handleToolState(toolPart, stream);
       }
@@ -319,7 +324,7 @@ export class AcpRenderer {
     stream: Stream,
   ): boolean {
     const props = evt.properties;
-    if (!props?.delta) return false;
+    if (!props?.delta) {return false;}
 
     const partID = props.partID;
     const delta = props.delta;
@@ -344,7 +349,7 @@ export class AcpRenderer {
    */
   private handleSessionDiff(evt: SessionDiffEvent, stream: Stream): boolean {
     const diffs = evt.properties?.diff;
-    if (!diffs?.length) return false;
+    if (!diffs?.length) {return false;}
 
     if (!hasChatResponseMultiDiffPart() || !stream.push) {
       return false;
@@ -365,10 +370,10 @@ export class AcpRenderer {
         return entry;
       });
 
-    if (!entries.length) return false;
+    if (!entries.length) {return false;}
 
     const Ctor = Proposed.ChatResponseMultiDiffPart;
-    if (!Ctor) return false;
+    if (!Ctor) {return false;}
 
     try {
       const diffPart = new Ctor(entries, 'File Changes', true);
@@ -389,7 +394,7 @@ export class AcpRenderer {
    */
   private handleToolState(part: StreamToolPart, stream: Stream): boolean {
     const state = part.state;
-    if (!state) return false;
+    if (!state) {return false;}
 
     const toolName = part.tool ?? 'unknown';
     const callID = part.callID ?? part.id;
@@ -508,7 +513,7 @@ export class AcpRenderer {
               description,
               agentName,
               prompt,
-            ) as ChatSubagentToolInvocationData;
+            );
           }
           stream.push(part as unknown as vscode.ChatResponsePart);
           this.progressivePushed.add(callID);
@@ -704,11 +709,11 @@ export class AcpRenderer {
    * Uses the same `partKinds` whitelist strategy as StreamBridge.
    */
   private isSubagentInternalEvent(evt: OpenCodeEvent): boolean {
-    if (this.activeSubagentScopes.size === 0) return false;
+    if (this.activeSubagentScopes.size === 0) {return false;}
 
     if (evt.type === 'message.part.updated') {
-      const part = (evt as MessagePartUpdatedEvent).properties?.part;
-      if (!part) return false;
+      const part = (evt).properties?.part;
+      if (!part) {return false;}
       // Structural parent parts are never subagent-internal
       if (part.type === 'reasoning' ||
           part.type === 'step-start' || part.type === 'step-finish') {
@@ -723,16 +728,16 @@ export class AcpRenderer {
       // Parent-level task/subagent tool invocations are NOT subagent-internal.
       // Without this, a second parallel task tool would be captured instead of rendered.
       if (part.type === 'tool') {
-        const toolName = (part as StreamToolPart).tool;
-        if (toolName === 'task' || toolName === 'subagent') return false;
+        const toolName = (part).tool;
+        if (toolName === 'task' || toolName === 'subagent') {return false;}
       }
-      if (this.partKinds.has(part.id)) return false;
+      if (this.partKinds.has(part.id)) {return false;}
       return true;
     }
 
     if (evt.type === 'message.part.delta') {
       const partId = (evt as { properties?: { partID?: string } }).properties?.partID;
-      if (partId && this.partKinds.has(partId)) return false;
+      if (partId && this.partKinds.has(partId)) {return false;}
       return !!partId;
     }
 
@@ -763,7 +768,7 @@ export class AcpRenderer {
     if (this._hasToolUI && stream.updateToolInvocation) {
       const completedCount = scope.toolCalls.filter(tc => tc.status === 'completed').length;
       let msg = `Subagent finished — ${completedCount} tool${completedCount !== 1 ? 's' : ''}`;
-      if (progress) msg += ` (${progress})`;
+      if (progress) {msg += ` (${progress})`;}
       try {
         stream.updateToolInvocation(scope.callId, { invocationMessage: msg });
       } catch { /* best-effort */ }
@@ -794,7 +799,7 @@ export class AcpRenderer {
               agentName,
               prompt,
               result,
-            ) as ChatSubagentToolInvocationData;
+            );
           } else {
             part.toolSpecificData = {
               description,
@@ -843,9 +848,9 @@ export class AcpRenderer {
       return;
     }
 
-    if (evt.type !== 'message.part.updated') return;
-    const part = (evt as MessagePartUpdatedEvent).properties?.part;
-    if (!part) return;
+    if (evt.type !== 'message.part.updated') {return;}
+    const part = (evt).properties?.part;
+    if (!part) {return;}
 
     // Collect text output from subagent and push to subagent card
     if (part.type === 'text') {
@@ -865,11 +870,11 @@ export class AcpRenderer {
       return;
     }
 
-    if (part.type !== 'tool') return;
+    if (part.type !== 'tool') {return;}
 
-    const toolPart = part as StreamToolPart;
+    const toolPart = part;
     const state = toolPart.state;
-    if (!state) return;
+    if (!state) {return;}
 
     const toolName = toolPart.tool ?? 'unknown';
     const title = getToolTitle(state);
@@ -924,7 +929,7 @@ export class AcpRenderer {
       const childCallId = toolPart.callID ?? toolPart.id ?? '';
       if (state.status === 'completed' || state.status === 'error') {
         // Push completed child tool card with full rendering
-        if (this._hasToolUI && hasChatToolInvocationPart() && stream.push) {
+        if (this._hasToolUI && hasChatToolInvocationPart() && typeof stream.push === 'function') {
           try {
             // Register first with subAgentInvocationId
             if (stream.beginToolInvocation) {
@@ -1156,7 +1161,7 @@ export function buildToolSpecificData(
           agentName,
           prompt,
           result,
-        ) as ChatSubagentToolInvocationData;
+        );
       }
 
       return {
@@ -1431,7 +1436,7 @@ export function renderToolFallback(
       : '';
 
   stream.markdown(`\n\u{1F527} **${display}** \`${toolName}\``);
-  if (inputLine) stream.markdown(` — ${inputLine}`);
+  if (inputLine) {stream.markdown(` — ${inputLine}`);}
   if (output) {
     stream.markdown(`\n\`\`\`\n${truncate(output, 300)}\n\`\`\`\n`);
   }
@@ -1444,7 +1449,7 @@ export function renderToolFallback(
 
 /** Truncate text to `maxLen` characters, appending '…' if truncated. */
 export function truncate(text: string, maxLen: number): string {
-  if (!text || text.length <= maxLen) return text;
+  if (!text || text.length <= maxLen) {return text;}
   return text.substring(0, maxLen) + '\u2026';
 }
 
@@ -1453,7 +1458,7 @@ export function formatInput(
   input: Record<string, unknown>,
   fallback: string,
 ): string {
-  if (!input || Object.keys(input).length === 0) return fallback;
+  if (!input || Object.keys(input).length === 0) {return fallback;}
   return Object.entries(input)
     .map(([k, v]) => `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
     .join('\n');

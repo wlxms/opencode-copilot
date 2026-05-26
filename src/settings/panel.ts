@@ -62,9 +62,9 @@ export class SettingsPanel {
     this.panel.iconPath = new vscode.ThemeIcon('gear');
     this.panel.webview.html = this.getHtml();
 
-    this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
+    this.panel.onDidDispose(() => { this.dispose(); }, null, this.disposables);
     this.panel.webview.onDidReceiveMessage(
-      (message: SettingsMessage) => this.handleMessage(message),
+      (message: SettingsMessage) => { this.handleMessage(message); },
       null,
       this.disposables,
     );
@@ -110,7 +110,6 @@ export class SettingsPanel {
       --accent-hover: var(--vscode-button-hoverBackground);
       --accent-fg: var(--vscode-button-foreground);
       --focus: var(--vscode-focusBorder);
-      --selected: color-mix(in srgb, var(--accent) 14%, transparent);
     }
     * { box-sizing: border-box; }
     body {
@@ -195,10 +194,23 @@ export class SettingsPanel {
     }
     .backend-meta { color: var(--muted); font-size: 11px; }
     .session-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .session-grid > .card { display: flex; flex-direction: column; margin-bottom: 0; }
     .list-card-item {
       padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 8px; cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease;
     }
-    .list-card-item.selected { border-color: var(--accent); background: var(--selected); }
+    .list-card-item:hover {
+      background: color-mix(in srgb, var(--fg) 6%, transparent);
+      border-color: color-mix(in srgb, var(--fg) 15%, transparent);
+    }
+    .list-card-item.selected {
+      border-color: color-mix(in srgb, var(--fg) 25%, transparent);
+      background: color-mix(in srgb, var(--fg) 8%, transparent);
+    }
+    .list-card-item.selected:hover {
+      background: color-mix(in srgb, var(--fg) 12%, transparent);
+      border-color: color-mix(in srgb, var(--fg) 35%, transparent);
+    }
     .item-title { font-weight: 600; }
     .item-meta { color: var(--muted); font-size: 11px; }
     .provider-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
@@ -212,8 +224,8 @@ export class SettingsPanel {
       color: var(--muted); padding: 18px; border: 1px dashed var(--border); border-radius: 8px; text-align: center;
     }
     .dropdown-container { position: relative; width: 100%; }
-    .dropdown-trigger { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; background: var(--input-bg); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; color: var(--fg); text-align: left; }
-    .dropdown-trigger:hover { border-color: var(--focus); }
+    .dropdown-trigger { display: flex; justify-content: space-between; align-items: center; width: 100%; padding: 10px 12px; background: var(--input-bg); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; color: var(--fg); text-align: left; transition: background 0.15s ease, border-color 0.15s ease; }
+    .dropdown-trigger:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); border-color: color-mix(in srgb, var(--fg) 15%, transparent); }
     .dropdown-trigger .item-title { font-weight: 600; font-size: 13px; }
     .dropdown-trigger .item-meta { color: var(--muted); font-size: 11px; }
     .dropdown-trigger-icon { margin-left: 8px; color: var(--muted); font-size: 10px; }
@@ -430,7 +442,7 @@ export class SettingsPanel {
       let currentAgentName = 'Select Agent';
       let currentAgentMeta = '...';
       
-      (data.agents || []).filter(a => !a.hidden).forEach(a => {
+      (data.agents || []).filter(a => !a.hidden && a.mode !== 'subagent').forEach(a => {
         const isSelected = a.id === data.currentAgent;
         if (isSelected) {
           currentAgentName = a.name || a.id;
@@ -459,15 +471,39 @@ export class SettingsPanel {
       let currentModelMeta = '...';
       const currentModelId = (data.currentModel && data.currentModel.modelID) || data.config?.model;
 
+      console.log('[settings] Model matching debug:', {
+        currentModel: data.currentModel,
+        currentModelId,
+        configModel: data.config?.model,
+        currentModelDisplayName: data.currentModelDisplayName,
+        modelsCount: (data.models || []).length,
+      });
+
       if (!data.models || data.models.length === 0) {
         modelPanel.innerHTML = '<div class="empty-state">No models available from the current backend configuration.</div>';
       } else {
+        let matched = false;
         data.models.forEach(m => {
-          const isSelected = !!currentModelId && m.id === currentModelId;
+          // Multi-level matching: exact id match, then try stripping provider prefix
+          let isSelected = false;
+          if (currentModelId) {
+            isSelected = m.id === currentModelId;
+            if (!isSelected && currentModelId.includes('/')) {
+              isSelected = m.id === currentModelId.split('/').pop();
+            }
+            if (!isSelected && m.id.includes('/')) {
+              isSelected = m.id.split('/').pop() === currentModelId;
+            }
+            if (!isSelected) {
+              isSelected = m.id.includes(currentModelId) || currentModelId.includes(m.id);
+            }
+          }
           if (isSelected) {
+            matched = true;
             currentModelName = m.name || m.id;
             currentModelMeta = m.provider || 'Unknown provider';
           }
+          console.log('[settings] Model compare:', { modelId: m.id, currentModelId, isSelected });
           const item = document.createElement('div');
           item.className = 'list-card-item' + (isSelected ? ' selected' : '');
           item.innerHTML = '<div class="item-title">' + escapeHtml(m.name || m.id) + '</div>' +
@@ -479,6 +515,7 @@ export class SettingsPanel {
           };
           modelPanel.appendChild(item);
         });
+        console.log('[settings] Model match result:', { matched, currentModelId });
       }
       
       modelSelected.innerHTML = '<div class="item-title">' + escapeHtml(currentModelName) + '</div>' +

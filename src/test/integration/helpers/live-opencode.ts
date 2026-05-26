@@ -47,7 +47,7 @@ export class StreamMonitor {
       // Drain all remaining waiters so they don't hang
       for (const [, handlers] of this.waiters) {
         for (const h of handlers) {
-          h({ type: 'server.connected' } as AcpEvent); // sentinel — caller must check
+          h({ type: 'server.connected' }); // sentinel — caller must check
         }
         handlers.length = 0;
       }
@@ -58,10 +58,10 @@ export class StreamMonitor {
   async waitForEvent(eventType: string, timeoutMs: number): Promise<AcpEvent | null> {
     // Check buffer first
     const existing = this.buffer.find((e) => e.type === eventType);
-    if (existing) return existing;
+    if (existing) {return existing;}
 
     // If stream already ended, give up immediately
-    if (this.ended) return null;
+    if (this.ended) {return null;}
 
     // Wait for it
     return new Promise((resolve) => {
@@ -87,12 +87,12 @@ export class StreamMonitor {
   async waitForAnyEvent(types: string[], timeoutMs: number): Promise<AcpEvent | null> {
     for (const t of types) {
       const existing = this.buffer.find((e) => e.type === t);
-      if (existing) return existing;
+      if (existing) {return existing;}
     }
-    if (this.ended) return null;
+    if (this.ended) {return null;}
 
     return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(null), timeoutMs);
+      const timer = setTimeout(() => { resolve(null); }, timeoutMs);
 
       for (const eventType of types) {
         const handlers = this.waiters.get(eventType) ?? [];
@@ -116,7 +116,7 @@ export class StreamMonitor {
   /** Wait for the underlying stream to fully end (or timeout). */
   async waitForEnd(timeoutMs: number): Promise<void> {
     const timer = new Promise<void>((_, reject) =>
-      setTimeout(() => reject(new Error(`Stream did not end within ${timeoutMs}ms`)), timeoutMs),
+      setTimeout(() => { reject(new Error(`Stream did not end within ${timeoutMs}ms`)); }, timeoutMs),
     );
     await Promise.race([this.consumePromise, timer]);
   }
@@ -142,7 +142,7 @@ export class StreamMonitor {
  * Returns the new content if different from original, null if unchanged/missing.
  */
 export function checkFileModified(filePath: string, originalContent: string): string | null {
-  if (!existsSync(filePath)) return null;
+  if (!existsSync(filePath)) {return null;}
   const current = readFileSync(filePath, 'utf-8');
   return current !== originalContent ? current : null;
 }
