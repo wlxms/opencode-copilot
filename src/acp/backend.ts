@@ -17,6 +17,7 @@ import type {
   AcpPermissionResponse,
   AcpServerInfo,
   AcpServerStatus,
+  BackendSettingsDescriptor,
 } from './types';
 
 // ===========================================================================
@@ -155,6 +156,17 @@ export interface AcpQuestionOperations {
 }
 
 // ===========================================================================
+// Backend settings provider (pluggable settings UI)
+// ===========================================================================
+
+export interface BackendSettingsProvider {
+  /** Build the settings descriptor for the current backend state */
+  getDescriptor(agents: AcpAgent[], models: AcpModel[]): Promise<BackendSettingsDescriptor>;
+  /** Persist backend-specific settings values */
+  saveValues(values: Record<string, unknown>): Promise<void>;
+}
+
+// ===========================================================================
 // Complete backend contract
 // ===========================================================================
 
@@ -177,4 +189,9 @@ export interface AcpBackend {
   events: AcpEventOperations;
   permissions: AcpPermissionOperations;
   questions: AcpQuestionOperations;
+
+  // -- pluggable settings UI -------------------------------------------
+
+  /** Optional: provides backend-specific settings descriptor for the UI */
+  readonly settingsProvider?: BackendSettingsProvider;
 }

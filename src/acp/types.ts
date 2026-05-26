@@ -332,3 +332,73 @@ export interface AcpModelSelection {
   modelID: string;
   variant?: string;
 }
+
+// ===========================================================================
+// Backend Settings Descriptor (pluggable settings UI)
+// ===========================================================================
+
+export interface TextField {
+  type: 'text';
+  key: string;
+  label: string;
+  description?: string;
+  placeholder?: string;
+}
+
+export interface SelectField {
+  type: 'select';
+  key: string;
+  label: string;
+  description?: string;
+  options: Array<{ value: string; label: string }>;
+}
+
+export interface ToggleField {
+  type: 'toggle';
+  key: string;
+  label: string;
+  description?: string;
+}
+
+export interface InfoCardsField {
+  type: 'info-cards';
+  key: string;
+  items: Array<{
+    title: string;
+    details: Array<{ label: string; value: string }>;
+  }>;
+}
+
+/**
+ * A map field: each item gets the same set of sub-fields.
+ * Values are stored as: { [mapKey]: { [itemId]: { [subFieldKey]: value } } }
+ */
+export interface MapField {
+  type: 'map';
+  key: string;
+  label: string;
+  description?: string;
+  items: Array<{ id: string; label: string; description?: string }>;
+  fields: Array<TextField | SelectField | ToggleField>;
+}
+
+export type SettingsField = TextField | SelectField | ToggleField | InfoCardsField | MapField;
+
+export interface SettingsFieldGroup {
+  key: string;
+  title?: string;
+  description?: string;
+  collapsible?: boolean;
+  fields: SettingsField[];
+}
+
+export interface BackendSettingsTab {
+  id: string;
+  title: string;
+  groups: SettingsFieldGroup[];
+}
+
+export interface BackendSettingsDescriptor {
+  tabs: BackendSettingsTab[];
+  values: Record<string, unknown>;
+}
