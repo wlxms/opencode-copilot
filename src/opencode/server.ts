@@ -80,9 +80,12 @@ export class OpenCodeServerManager implements OpenCodeServerController {
       const instance = await createOpencode({
         port: 0,
       });
+      // Cast at the architectural boundary: SDK v2 OpencodeClient → our typed contract.
+      // The shapes are compatible at runtime; the type mismatch is due to SDK's complex
+      // ServerSentEventsResult / RequestResult generics vs our simpler SdkResponse wrapper.
       this.instance = {
         server: instance.server,
-        client: instance.client,
+        client: instance.client as unknown as OpenCodeClient,
       };
       this.serverUrl = instance.server.url;
       this.status = 'running';

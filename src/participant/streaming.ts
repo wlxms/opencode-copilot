@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import type {
   AcpEvent,
+  AcpResult,
   AcpStreamPart,
   AcpTextPart,
   AcpReasoningPart,
@@ -41,6 +42,8 @@ type Stream = vscode.ChatResponseStream & {
   beginToolInvocation?(callId: string, name: string, data?: ChatToolInvocationStreamData): void;
   updateToolInvocation?(callId: string, data: ChatToolInvocationStreamData): void;
   questionCarousel?(questions: ChatQuestion[], allowSkip?: boolean): Thenable<Record<string, unknown> | undefined>;
+  /** Proposed API: push a ChatResponsePart directly to the stream */
+  push?(part: unknown): void;
 };
 
 type ProposedVscode = typeof vscode & {
@@ -89,20 +92,20 @@ interface StreamBridgeOptions {
     permissionId: string,
     response: 'once' | 'always' | 'reject',
     directory?: string,
-  ) => Promise<unknown>;
+  ) => Promise<void>;
   /** Reply callback for question.asked */
   replyToQuestion?: (
     sessionId: string,
     requestId: string,
     answers: Array<Array<string>>,
     directory?: string,
-  ) => Promise<unknown>;
+  ) => Promise<AcpResult<boolean>>;
   /** Reject callback for question.asked (user skipped/rejected) */
   rejectQuestion?: (
     sessionId: string,
     requestId: string,
     directory?: string,
-  ) => Promise<unknown>;
+  ) => Promise<AcpResult<boolean>>;
   /** Workspace directory for API calls */
   directory?: string;
   /** Check if any child sessions are still running (busy). Returns true if at least one child is busy. */

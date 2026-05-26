@@ -392,8 +392,10 @@ export function createParticipantHandler(
                   questionDirectory,
                 ).then((result) => {
                   state.outputChannel.appendLine(`[handler] question reply result: ${JSON.stringify(result)}`);
+                  return result;
                 }).catch((err: unknown) => {
                   state.outputChannel.appendLine(`[handler] question reply error: ${err instanceof Error ? err.message : String(err)}`);
+                  return { error: err instanceof Error ? err.message : String(err) };
                 })
               ),
               rejectQuestion: (questionSessionId, requestId, questionDirectory) => (
@@ -403,8 +405,10 @@ export function createParticipantHandler(
                   questionDirectory,
                 ).then((result) => {
                   state.outputChannel.appendLine(`[handler] question reject result: ${JSON.stringify(result)}`);
+                  return result;
                 }).catch((err: unknown) => {
                   state.outputChannel.appendLine(`[handler] question reject error: ${err instanceof Error ? err.message : String(err)}`);
+                  return { error: err instanceof Error ? err.message : String(err) };
                 })
               ),
               directory,
