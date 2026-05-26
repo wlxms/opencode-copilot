@@ -31,6 +31,8 @@ import type {
 } from '../../acp/types';
 import { normalizeStreamEvent } from './events';
 import type { OpenCodeEventStream } from './sdk-events';
+import type { OpenCodeClient, SdkAgentData } from '../../types';
+import { OpenCodeSettingsProvider } from './settings';
 
 // ===========================================================================
 // AcpEventStream implementation wrapping OpenCodeEventStream
@@ -115,67 +117,6 @@ function safeStringify(value: unknown): string {
 }
 
 // ===========================================================================
-// Shape of the SDK client that we consume.
-// Stops short of importing OpenCodeClient from types/index.ts.
-// ===========================================================================
-
-interface ClientSessionOps {
-  create(parameters?: { directory?: string; workspace?: string; parentID?: string; title?: string; agent?: string; model?: unknown; permission?: unknown; workspaceID?: string }): Promise<{ data?: { id?: string; title?: string; time?: { created?: number } }; error?: unknown }>;
-  get(parameters: { sessionID: string; directory?: string; workspace?: string }): Promise<{ data?: { id?: string; title?: string; time?: { created?: number } }; error?: unknown }>;
-  prompt(parameters: { sessionID: string; directory?: string; workspace?: string; parts?: unknown; model?: unknown; agent?: string }): Promise<{ data?: unknown; error?: unknown }>;
-  revert(parameters: { sessionID: string; directory?: string; workspace?: string; messageID: string; partID?: string }): Promise<{ data?: unknown; error?: unknown }>;
-  abort(parameters: { sessionID: string; directory?: string; workspace?: string }): Promise<{ data?: boolean; error?: unknown }>;
-  list(parameters?: { directory?: string; workspace?: string }): Promise<{ data?: Array<{ id?: string; title?: string; time?: { created?: number } }>; error?: unknown }>;
-  children(parameters: { sessionID: string; directory?: string; workspace?: string }): Promise<{ data?: Array<{ id?: string; parentID?: string }>; error?: unknown }>;
-  status(parameters?: { directory?: string; workspace?: string }): Promise<{ data?: Record<string, AcpSessionStatus>; error?: unknown }>;
-}
-
-interface ClientConfigOps {
-  providers(parameters?: { directory?: string; workspace?: string }): Promise<{
-    data?: { providers?: Array<{ id: string; name: string; models?: Array<{ id: string; name?: string; providerID?: string; capabilities?: Record<string, unknown> }> }> };
-    error?: unknown;
-  }>;
-}
-
-interface ClientEventOps {
-  subscribe(): Promise<OpenCodeEventStream>;
-}
-
-interface ClientGlobalOps {
-  event(): Promise<OpenCodeEventStream>;
-}
-
-interface ClientPermissionOps {
-  reply(parameters: {
-    requestID: string;
-    directory?: string;
-    reply?: 'once' | 'always' | 'reject';
-    message?: string;
-  }): Promise<{ data?: boolean; error?: unknown }>;
-}
-
-interface ClientQuestionOps {
-  reply(parameters: {
-    requestID: string;
-    directory?: string;
-    answers?: Array<Array<string>>;
-  }): Promise<{ data?: boolean; error?: unknown }>;
-  reject(parameters: {
-    requestID: string;
-    directory?: string;
-  }): Promise<{ data?: boolean; error?: unknown }>;
-}
-
-interface SdkClient {
-  session: ClientSessionOps;
-  config: ClientConfigOps;
-  event: ClientEventOps;
-  global: ClientGlobalOps;
-  question: ClientQuestionOps;
-  permission: ClientPermissionOps;
-}
-
-// ===========================================================================
 // Adapter
 // ===========================================================================
 
@@ -184,7 +125,7 @@ export class OpenCodeBackend implements AcpBackend {
 
   private readonly serverManager = new OpenCodeServerManager();
   private readonly eventBroker = new GlobalEventBroker();
-  private rawClient: unknown = null;
+  private rawClient: OpenCodeClient | null = null;
 
   // =======================================================================
   // Lifecycle
@@ -231,10 +172,10 @@ export class OpenCodeBackend implements AcpBackend {
   // Internal: typed reference to the SDK client
   // =======================================================================
 
-  private get sdk(): SdkClient {
+  private get sdk(): OpenCodeClient {
     const c = this.serverManager.getClient();
     if (!c) {throw new Error('Server not running');}
-    return c as unknown as SdkClient;
+    return c;
   }
 
   // =======================================================================
@@ -321,7 +262,7 @@ export class OpenCodeBackend implements AcpBackend {
           parts: [{ type: 'text', text }],
           model: options?.model,
           agent: options?.agent,
-        } as any);
+        });
         const error = getResultError(result);
         if (error !== undefined) {
           return {
@@ -431,22 +372,21 @@ export class OpenCodeBackend implements AcpBackend {
 
     agents: async (directory?: string): Promise<AcpResult<AcpAgent[]>> => {
       try {
-        const rawClient = this.serverManager.getClient() as any;
-        const result = await rawClient.app.agents({
+        const result = await this.sdk.app.agents({
           directory,
         });
         const error = getResultError(result);
         if (error !== undefined) {
           return { error: extractErrorMessage(error, 'List agents failed') };
         }
-        const agents: AcpAgent[] = (result.data ?? []).map((a: any) => ({
+        const agents: AcpAgent[] = (result.data ?? []).map((a: SdkAgentData) => ({
           id: a.id ?? a.name ?? '',
           name: a.name ?? a.id,
           description: a.description,
           model: typeof a.model === 'object' && a.model !== null
             ? (a.model.modelID ?? String(a.model))
             : a.model,
-          mode: a.mode,
+          mode: a.mode as AcpAgent['mode'],
           hidden: a.hidden,
         }));
         return { data: agents };
@@ -457,8 +397,7 @@ export class OpenCodeBackend implements AcpBackend {
 
     get: async (directory?: string): Promise<AcpResult<AcpConfig>> => {
       try {
-        const rawClient = this.serverManager.getClient() as any;
-        const configResult = await rawClient.config.get({
+        const configResult = await this.sdk.config.get({
           directory,
         });
         const error = getResultError(configResult);
@@ -472,8 +411,8 @@ export class OpenCodeBackend implements AcpBackend {
           default_agent: raw.default_agent,
           disabled_providers: raw.disabled_providers,
           enabled_providers: raw.enabled_providers,
-          agent: raw.agent,
-          provider: raw.provider,
+          agent: raw.agent as AcpConfig['agent'],
+          provider: raw.provider as AcpConfig['provider'],
         };
         return { data: config };
       } catch (err) {
@@ -483,8 +422,7 @@ export class OpenCodeBackend implements AcpBackend {
 
     update: async (config: Partial<AcpConfig>, directory?: string): Promise<AcpResult<void>> => {
       try {
-        const rawClient = this.serverManager.getClient() as any;
-        const result = await rawClient.config.update({
+        const result = await this.sdk.config.update({
           directory,
           config,
         });
@@ -498,6 +436,12 @@ export class OpenCodeBackend implements AcpBackend {
       }
     },
   };
+
+  // =======================================================================
+  // Settings provider — declarative backend-specific settings UI
+  // =======================================================================
+
+  readonly settingsProvider = new OpenCodeSettingsProvider(this.config);
 
   // =======================================================================
   // Events — delegates to GlobalEventBroker + normalisation
@@ -519,11 +463,9 @@ export class OpenCodeBackend implements AcpBackend {
     },
 
     ensureStarted: async (): Promise<void> => {
-      // Pass the raw SDK client — structurally compatible with
-      // the OpenCodeClient interface consumed by GlobalEventBroker.
       const c = this.rawClient;
       if (c) {
-        await this.eventBroker.ensureStarted(c as Parameters<GlobalEventBroker['ensureStarted']>[0]);
+        await this.eventBroker.ensureStarted(c);
       }
     },
   };

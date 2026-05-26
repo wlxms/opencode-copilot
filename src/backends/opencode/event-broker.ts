@@ -238,16 +238,16 @@ export class GlobalEventBroker {
       case 'question.asked':
         return event.properties?.sessionID;
       case 'question.replied':
-        return (event as any).properties?.sessionID;
+        return event.properties.sessionID;
       case 'question.rejected':
-        return (event as any).properties?.sessionID;
+        return event.properties.sessionID;
       case 'session.created':
       case 'session.updated':
       case 'session.deleted': {
         // properties.info.id contains the session ID (from SDK Session type)
-        const info = (event as any).properties?.info;
-        const id = info?.id as string | undefined;
-        if (id && event.type === 'session.created' && info?.parentID) {
+        const { info } = event.properties;
+        const id: string = info.id;
+        if (event.type === 'session.created' && info.parentID) {
           // Auto-detect child sessions from parentID field
           this.childToParent.set(id, info.parentID);
           this.log(`child session detected: childId=${id}, parentId=${info.parentID}`);
@@ -255,7 +255,7 @@ export class GlobalEventBroker {
         return id;
       }
       case 'session.status':
-        return (event as any).properties?.sessionID;
+        return event.properties.sessionID;
       default:
         return getEventSessionIdFromProperties(event);
     }
@@ -373,8 +373,22 @@ function unwrapStreamEvent(event: OpenCodeStreamEvent): OpenCodeEvent {
 }
 
 function getEventSessionIdFromProperties(event: OpenCodeEvent): string | undefined {
-  const withProperties = event as OpenCodeEvent & {
-    properties?: { sessionID?: string; info?: { sessionID?: string } };
-  };
-  return withProperties.properties?.sessionID ?? withProperties.properties?.info?.sessionID;
+  if (!('properties' in event)) {return undefined;}
+  const props = event.properties;
+  if (!props || typeof props !== 'object') {return undefined;}
+
+  const propsObj = props as Record<string, unknown>;
+
+  if (typeof propsObj.sessionID === 'string') {
+    return propsObj.sessionID;
+  }
+
+  if (propsObj.info && typeof propsObj.info === 'object') {
+    const info = propsObj.info as Record<string, unknown>;
+    if (typeof info.sessionID === 'string') {
+      return info.sessionID;
+    }
+  }
+
+  return undefined;
 }
