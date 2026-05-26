@@ -135,6 +135,9 @@ export type AcpEventType =
   | 'session.error'
   | 'permission.asked'
   | 'permission.replied'
+  | 'question.asked'
+  | 'question.replied'
+  | 'question.rejected'
   | 'server.connected'
   | 'server.heartbeat';
 
@@ -195,6 +198,43 @@ export interface AcpPermissionReplyEvent {
   response: string;
 }
 
+// ===========================================================================
+// Question events
+// ===========================================================================
+
+export interface AcpQuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface AcpQuestionInfo {
+  question: string;
+  header: string;
+  options: Array<AcpQuestionOption>;
+  multiple?: boolean;
+  custom?: boolean;
+}
+
+export interface AcpQuestionRequestEvent {
+  type: 'question.asked';
+  questionId: string;
+  sessionId: string;
+  questions: Array<AcpQuestionInfo>;
+  tool?: { messageId: string; callId: string };
+}
+
+export interface AcpQuestionReplyEvent {
+  type: 'question.replied';
+  sessionId: string;
+  requestId: string;
+}
+
+export interface AcpQuestionRejectedEvent {
+  type: 'question.rejected';
+  sessionId: string;
+  requestId: string;
+}
+
 export interface AcpServerLifecycleEvent {
   type: 'server.connected' | 'server.heartbeat';
 }
@@ -214,6 +254,9 @@ export type AcpEvent =
   | AcpSessionStatusEvent
   | AcpPermissionRequestEvent
   | AcpPermissionReplyEvent
+  | AcpQuestionRequestEvent
+  | AcpQuestionReplyEvent
+  | AcpQuestionRejectedEvent
   | AcpServerLifecycleEvent;
 
 // ===========================================================================
@@ -239,7 +282,7 @@ export interface AcpAgent {
   id: string;
   name?: string;
   description?: string;
-  model?: string;
+  model?: string | { modelID: string; providerID: string };
   mode?: 'subagent' | 'primary' | 'all';
   hidden?: boolean;
 }

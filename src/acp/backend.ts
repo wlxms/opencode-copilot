@@ -11,6 +11,12 @@ import type {
   AcpSessionStatus,
   AcpAgent,
   AcpConfig,
+  AcpResult,
+  AcpEvent,
+  AcpModel,
+  AcpPermissionResponse,
+  AcpServerInfo,
+  AcpServerStatus,
 } from './types';
 
 // ===========================================================================
@@ -66,6 +72,17 @@ export interface AcpSessionOperations {
 
   /** Get status of all sessions: { [sessionId]: SessionStatus } */
   status(directory?: string): Promise<AcpResult<Record<string, AcpSessionStatus>>>;
+
+  // -- Hierarchy navigation (sub-agent session tree) ---------------------
+
+  /** Get all descendant session IDs (children, grandchildren, etc.) */
+  descendants(parentId: string): string[];
+
+  /** Walk up the parent chain and return the first session ID found in `candidateIds` */
+  findAncestor(sessionId: string, candidateIds: Set<string>): string | undefined;
+
+  /** Get the parent session ID for a given session */
+  parent(sessionId: string): string | undefined;
 }
 
 // ===========================================================================
@@ -117,6 +134,27 @@ export interface AcpPermissionOperations {
 }
 
 // ===========================================================================
+// Question operations
+// ===========================================================================
+
+export interface AcpQuestionOperations {
+  /** Reply to a question.asked request with user answers */
+  reply(
+    sessionId: string,
+    requestId: string,
+    answers: Array<Array<string>>,
+    directory?: string,
+  ): Promise<AcpResult<boolean>>;
+
+  /** Reject a question.asked request */
+  reject(
+    sessionId: string,
+    requestId: string,
+    directory?: string,
+  ): Promise<AcpResult<boolean>>;
+}
+
+// ===========================================================================
 // Complete backend contract
 // ===========================================================================
 
@@ -138,4 +176,5 @@ export interface AcpBackend {
   config: AcpConfigOperations;
   events: AcpEventOperations;
   permissions: AcpPermissionOperations;
+  questions: AcpQuestionOperations;
 }
