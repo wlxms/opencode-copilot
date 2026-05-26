@@ -14,12 +14,14 @@ import type {
   AcpConfigOperations,
   AcpEventOperations,
   AcpPermissionOperations,
+  AcpQuestionOperations,
   AcpEventStream,
 } from '../../acp/backend';
 import type {
   AcpServerInfo,
   AcpServerStatus,
   AcpSessionInfo,
+  AcpSessionStatus,
   AcpModel,
   AcpAgent,
   AcpConfig,
@@ -118,17 +120,20 @@ function safeStringify(value: unknown): string {
 // ===========================================================================
 
 interface ClientSessionOps {
-  create(opts: { body?: Record<string, unknown>; query?: { directory?: string } }): Promise<{ data?: { id?: string; title?: string; time?: { created?: number } } }>;
-  get(opts: { path: { id: string }; query?: { directory?: string } }): Promise<{ data?: { id?: string; title?: string; time?: { created?: number } } }>;
-  prompt(opts: { path: { id: string }; body: { parts: Array<{ type: 'text'; text: string }> }; query?: { directory?: string } }): Promise<unknown>;
-  revert(opts: { path: { id: string }; body: { messageID: string; partID?: string }; query?: { directory?: string } }): Promise<unknown>;
-  abort(opts: { path: { id: string }; query?: { directory?: string } }): Promise<{ data?: boolean }>;
-  list(opts: { query?: { directory?: string } }): Promise<{ data?: Array<{ id?: string; title?: string; time?: { created?: number } }> }>;
+  create(parameters?: { directory?: string; workspace?: string; parentID?: string; title?: string; agent?: string; model?: unknown; permission?: unknown; workspaceID?: string }): Promise<{ data?: { id?: string; title?: string; time?: { created?: number } }; error?: unknown }>;
+  get(parameters: { sessionID: string; directory?: string; workspace?: string }): Promise<{ data?: { id?: string; title?: string; time?: { created?: number } }; error?: unknown }>;
+  prompt(parameters: { sessionID: string; directory?: string; workspace?: string; parts?: unknown; model?: unknown; agent?: string }): Promise<{ data?: unknown; error?: unknown }>;
+  revert(parameters: { sessionID: string; directory?: string; workspace?: string; messageID: string; partID?: string }): Promise<{ data?: unknown; error?: unknown }>;
+  abort(parameters: { sessionID: string; directory?: string; workspace?: string }): Promise<{ data?: boolean; error?: unknown }>;
+  list(parameters?: { directory?: string; workspace?: string }): Promise<{ data?: Array<{ id?: string; title?: string; time?: { created?: number } }>; error?: unknown }>;
+  children(parameters: { sessionID: string; directory?: string; workspace?: string }): Promise<{ data?: Array<{ id?: string; parentID?: string }>; error?: unknown }>;
+  status(parameters?: { directory?: string; workspace?: string }): Promise<{ data?: Record<string, AcpSessionStatus>; error?: unknown }>;
 }
 
 interface ClientConfigOps {
-  providers(opts: { query?: { directory?: string } }): Promise<{
+  providers(parameters?: { directory?: string; workspace?: string }): Promise<{
     data?: { providers?: Array<{ id: string; name: string; models?: Array<{ id: string; name?: string; providerID?: string; capabilities?: Record<string, unknown> }> }> };
+    error?: unknown;
   }>;
 }
 
@@ -141,11 +146,24 @@ interface ClientGlobalOps {
 }
 
 interface ClientPermissionOps {
-  postSessionIdPermissionsPermissionId(opts: {
-    path: { id: string; permissionID: string };
-    body?: { response: string };
-    query?: { directory?: string };
-  }): Promise<unknown>;
+  reply(parameters: {
+    requestID: string;
+    directory?: string;
+    reply?: 'once' | 'always' | 'reject';
+    message?: string;
+  }): Promise<{ data?: boolean; error?: unknown }>;
+}
+
+interface ClientQuestionOps {
+  reply(parameters: {
+    requestID: string;
+    directory?: string;
+    answers?: Array<Array<string>>;
+  }): Promise<{ data?: boolean; error?: unknown }>;
+  reject(parameters: {
+    requestID: string;
+    directory?: string;
+  }): Promise<{ data?: boolean; error?: unknown }>;
 }
 
 interface SdkClient {
@@ -153,7 +171,8 @@ interface SdkClient {
   config: ClientConfigOps;
   event: ClientEventOps;
   global: ClientGlobalOps;
-  postSessionIdPermissionsPermissionId: ClientPermissionOps['postSessionIdPermissionsPermissionId'];
+  question: ClientQuestionOps;
+  permission: ClientPermissionOps;
 }
 
 // ===========================================================================
@@ -214,7 +233,7 @@ export class OpenCodeBackend implements AcpBackend {
 
   private get sdk(): SdkClient {
     const c = this.serverManager.getClient();
-    if (!c) throw new Error('Server not running');
+    if (!c) {throw new Error('Server not running');}
     return c as unknown as SdkClient;
   }
 
@@ -226,8 +245,8 @@ export class OpenCodeBackend implements AcpBackend {
     create: async (options?): Promise<AcpResult<AcpSessionInfo>> => {
       try {
         const result = await this.sdk.session.create({
-          body: options?.title ? { title: options.title } : undefined,
-          query: options?.directory ? { directory: options.directory } : undefined,
+          directory: options?.directory,
+          title: options?.title,
         });
         const error = getResultError(result);
         if (error !== undefined) {
@@ -244,10 +263,7 @@ export class OpenCodeBackend implements AcpBackend {
 
     get: async (id: string, directory?: string): Promise<AcpResult<AcpSessionInfo>> => {
       try {
-        const result = await this.sdk.session.get({
-          path: { id },
-          query: directory ? { directory } : undefined,
-        });
+        const result = await this.sdk.session.get({ sessionID: id, directory });
         const error = getResultError(result);
         if (error !== undefined) {
           return { error: extractErrorMessage(error, 'Session not found') };
@@ -263,16 +279,13 @@ export class OpenCodeBackend implements AcpBackend {
 
     children: async (id: string, directory?: string) => {
       try {
-        const result = await this.sdk.session.children({
-          path: { id },
-          query: directory ? { directory } : undefined,
-        });
+        const result = await this.sdk.session.children({ sessionID: id, directory });
         const error = getResultError(result);
         if (error !== undefined) {
           return { error: extractErrorMessage(error, 'Failed to get children') };
         }
         return {
-          data: (result.data ?? []).map(s => ({ id: s.id, parentID: s.parentID })),
+          data: (result.data ?? []).map(s => ({ id: s.id ?? '', parentID: s.parentID ?? '' })),
         };
       } catch (err) {
         return { error: err instanceof Error ? err.message : String(err) };
@@ -281,9 +294,7 @@ export class OpenCodeBackend implements AcpBackend {
 
     status: async (directory?: string) => {
       try {
-        const result = await this.sdk.session.status({
-          query: directory ? { directory } : undefined,
-        });
+        const result = await this.sdk.session.status({ directory });
         const error = getResultError(result);
         if (error !== undefined) {
           return { error: extractErrorMessage(error, 'Failed to get session status') };
@@ -305,13 +316,11 @@ export class OpenCodeBackend implements AcpBackend {
     ): Promise<AcpResult<unknown>> => {
       try {
         const result = await this.sdk.session.prompt({
-          path: { id },
-          query: directory ? { directory } : undefined,
-          body: {
-            parts: [{ type: 'text', text }],
-            model: options?.model,
-            agent: options?.agent,
-          },
+          sessionID: id,
+          directory,
+          parts: [{ type: 'text', text }],
+          model: options?.model,
+          agent: options?.agent,
         } as any);
         const error = getResultError(result);
         if (error !== undefined) {
@@ -330,9 +339,10 @@ export class OpenCodeBackend implements AcpBackend {
     revert: async (id: string, messageId: string, partId?: string, directory?: string): Promise<AcpResult<unknown>> => {
       try {
         const result = await this.sdk.session.revert({
-          path: { id },
-          body: { messageID: messageId, ...(partId ? { partID: partId } : {}) },
-          query: directory ? { directory } : undefined,
+          sessionID: id,
+          directory,
+          messageID: messageId,
+          partID: partId,
         });
         const error = getResultError(result);
         if (error !== undefined) {
@@ -346,10 +356,7 @@ export class OpenCodeBackend implements AcpBackend {
 
     abort: async (id: string, directory?: string): Promise<AcpResult<boolean>> => {
       try {
-        const result = await this.sdk.session.abort({
-          path: { id },
-          query: directory ? { directory } : undefined,
-        });
+        const result = await this.sdk.session.abort({ sessionID: id, directory });
         const error = getResultError(result);
         if (error !== undefined) {
           return { error: extractErrorMessage(error, 'Abort failed') };
@@ -362,9 +369,7 @@ export class OpenCodeBackend implements AcpBackend {
 
     list: async (directory?: string): Promise<AcpResult<AcpSessionInfo[]>> => {
       try {
-        const result = await this.sdk.session.list({
-          query: directory ? { directory } : undefined,
-        });
+        const result = await this.sdk.session.list({ directory });
         const error = getResultError(result);
         if (error !== undefined) {
           return { error: extractErrorMessage(error, 'List sessions failed') };
@@ -373,6 +378,20 @@ export class OpenCodeBackend implements AcpBackend {
       } catch (err) {
         return { error: err instanceof Error ? err.message : String(err) };
       }
+    },
+
+    // -- Hierarchy navigation (delegates to GlobalEventBroker) --
+
+    descendants: (parentId: string): string[] => {
+      return this.eventBroker.getDescendantSessions(parentId);
+    },
+
+    findAncestor: (sessionId: string, candidateIds: Set<string>): string | undefined => {
+      return this.eventBroker.findAncestorIn(sessionId, candidateIds);
+    },
+
+    parent: (sessionId: string): string | undefined => {
+      return this.eventBroker.getParentSession(sessionId);
     },
   };
 
@@ -383,9 +402,7 @@ export class OpenCodeBackend implements AcpBackend {
   readonly config: AcpConfigOperations = {
     models: async (directory?: string): Promise<AcpResult<AcpModel[]>> => {
       try {
-        const result = await this.sdk.config.providers({
-          query: directory ? { directory } : undefined,
-        });
+        const result = await this.sdk.config.providers({ directory });
         const error = getResultError(result);
         if (error !== undefined) {
           return { error: extractErrorMessage(error, 'List models failed') };
@@ -416,7 +433,7 @@ export class OpenCodeBackend implements AcpBackend {
       try {
         const rawClient = this.serverManager.getClient() as any;
         const result = await rawClient.app.agents({
-          query: directory ? { directory } : undefined,
+          directory,
         });
         const error = getResultError(result);
         if (error !== undefined) {
@@ -426,7 +443,9 @@ export class OpenCodeBackend implements AcpBackend {
           id: a.id ?? a.name ?? '',
           name: a.name ?? a.id,
           description: a.description,
-          model: a.model,
+          model: typeof a.model === 'object' && a.model !== null
+            ? (a.model.modelID ?? String(a.model))
+            : a.model,
           mode: a.mode,
           hidden: a.hidden,
         }));
@@ -440,7 +459,7 @@ export class OpenCodeBackend implements AcpBackend {
       try {
         const rawClient = this.serverManager.getClient() as any;
         const configResult = await rawClient.config.get({
-          query: directory ? { directory } : undefined,
+          directory,
         });
         const error = getResultError(configResult);
         if (error !== undefined) {
@@ -466,7 +485,7 @@ export class OpenCodeBackend implements AcpBackend {
       try {
         const rawClient = this.serverManager.getClient() as any;
         const result = await rawClient.config.update({
-          query: directory ? { directory } : undefined,
+          directory,
           config,
         });
         const error = getResultError(result);
@@ -510,33 +529,6 @@ export class OpenCodeBackend implements AcpBackend {
   };
 
   // =======================================================================
-  // Session hierarchy — delegates to GlobalEventBroker
-  // =======================================================================
-
-  /**
-   * Walk up the parent chain from `sessionId` and return the first session ID
-   * that appears in `candidateIds`. Used by StreamBridge to route grandchild events.
-   */
-  findAncestorScope(sessionId: string, candidateIds: Set<string>): string | undefined {
-    return this.eventBroker.findAncestorIn(sessionId, candidateIds);
-  }
-
-  /**
-   * Get the parent session ID for a given session, or undefined.
-   */
-  getParentSession(sessionId: string): string | undefined {
-    return this.eventBroker.getParentSession(sessionId);
-  }
-
-  /**
-   * Get all descendant session IDs (children, grandchildren, etc.) of the given session.
-   * Used for cascade-abort when the user cancels a parent session.
-   */
-  getDescendantSessions(parentId: string): string[] {
-    return this.eventBroker.getDescendantSessions(parentId);
-  }
-
-  // =======================================================================
   // Permissions
   // =======================================================================
 
@@ -547,11 +539,60 @@ export class OpenCodeBackend implements AcpBackend {
       response: AcpPermissionResponse,
       directory?: string,
     ): Promise<void> => {
-      await this.sdk.postSessionIdPermissionsPermissionId({
-        path: { id: sessionId, permissionID: permissionId },
-        body: { response },
-        query: directory ? { directory } : undefined,
+      const result = await this.sdk.permission.reply({
+        requestID: permissionId,
+        directory,
+        reply: response,
       });
+      if (result.error) {
+        throw new Error(`Permission reply failed: ${extractErrorMessage(result.error, 'Unknown error')}`);
+      }
+    },
+  };
+
+  // =======================================================================
+  // Questions
+  // =======================================================================
+
+  readonly questions: AcpQuestionOperations = {
+    reply: async (
+      sessionId: string,
+      requestId: string,
+      answers: Array<Array<string>>,
+      directory?: string,
+    ): Promise<AcpResult<boolean>> => {
+      try {
+        const result = await this.sdk.question.reply({
+          requestID: requestId,
+          directory,
+          answers,
+        });
+        if (result.data !== undefined) {
+          return { data: true };
+        }
+        return { error: `Question reply failed: ${JSON.stringify(result.error)}` };
+      } catch (err) {
+        return { error: extractErrorMessage(err, 'Failed to reply to question') };
+      }
+    },
+
+    reject: async (
+      sessionId: string,
+      requestId: string,
+      directory?: string,
+    ): Promise<AcpResult<boolean>> => {
+      try {
+        const result = await this.sdk.question.reject({
+          requestID: requestId,
+          directory,
+        });
+        if (result.data !== undefined) {
+          return { data: true };
+        }
+        return { error: `Question reject failed: ${JSON.stringify(result.error)}` };
+      } catch (err) {
+        return { error: extractErrorMessage(err, 'Failed to reject question') };
+      }
     },
   };
 }

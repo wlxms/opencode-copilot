@@ -66,7 +66,7 @@ export function formatSubagentProgress(scope: SubagentScope): string {
       counts.set(tc.name, (counts.get(tc.name) ?? 0) + 1);
     }
   }
-  if (counts.size === 0) return '';
+  if (counts.size === 0) {return '';}
   const parts: string[] = [];
   for (const [name, count] of counts) {
     parts.push(count > 1 ? `${count}× ${name}` : name);

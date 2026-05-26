@@ -1,7 +1,7 @@
 import type {
   EventSubscribeResponse,
   FilePart,
-} from '@opencode-ai/sdk';
+} from '@opencode-ai/sdk/v2';
 
 /** Real SSE event types from the OpenCode server */
 
@@ -28,6 +28,11 @@ export const EVENT_SESSION_IDLE = 'session.idle' as const;
 export const EVENT_PERMISSION_ASKED = 'permission.asked' as const;
 export const EVENT_PERMISSION_REPLIED = 'permission.replied' as const;
 
+// Question events
+export const EVENT_QUESTION_ASKED = 'question.asked' as const;
+export const EVENT_QUESTION_REPLIED = 'question.replied' as const;
+export const EVENT_QUESTION_REJECTED = 'question.rejected' as const;
+
 /** All known real event type strings */
 export type RealEventType =
   | typeof EVENT_SERVER_CONNECTED
@@ -44,7 +49,10 @@ export type RealEventType =
   | typeof EVENT_SESSION_ERROR
   | typeof EVENT_SESSION_IDLE
   | typeof EVENT_PERMISSION_ASKED
-  | typeof EVENT_PERMISSION_REPLIED;
+  | typeof EVENT_PERMISSION_REPLIED
+  | typeof EVENT_QUESTION_ASKED
+  | typeof EVENT_QUESTION_REPLIED
+  | typeof EVENT_QUESTION_REJECTED;
 
 /**
  * Part types in message.part.updated events.
@@ -247,6 +255,63 @@ export interface PermissionRepliedEvent {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Question events
+// ---------------------------------------------------------------------------
+
+export interface QuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface QuestionInfo {
+  question: string;
+  header: string;
+  options: Array<QuestionOption>;
+  multiple?: boolean;
+  custom?: boolean;
+}
+
+export interface QuestionTool {
+  messageID: string;
+  callID: string;
+}
+
+export interface QuestionRequest {
+  id: string;
+  sessionID: string;
+  questions: Array<QuestionInfo>;
+  tool?: QuestionTool;
+}
+
+export type QuestionAnswer = Array<string>;
+
+export interface QuestionReplied {
+  sessionID: string;
+  requestID: string;
+  answers: Array<QuestionAnswer>;
+}
+
+export interface QuestionRejected {
+  sessionID: string;
+  requestID: string;
+}
+
+export interface QuestionAskedEvent {
+  type: 'question.asked';
+  properties: QuestionRequest;
+}
+
+export interface QuestionRepliedEvent {
+  type: 'question.replied';
+  properties: QuestionReplied;
+}
+
+export interface QuestionRejectedEvent {
+  type: 'question.rejected';
+  properties: QuestionRejected;
+}
+
 type OtherSdkEvents = Exclude<
   EventSubscribeResponse,
   | Extract<EventSubscribeResponse, { type: 'message.part.updated' }>
@@ -260,7 +325,10 @@ export type OpenCodeEvent =
   | SessionIdleEvent
   | SessionDiffEvent
   | PermissionAskedEvent
-  | PermissionRepliedEvent;
+  | PermissionRepliedEvent
+  | QuestionAskedEvent
+  | QuestionRepliedEvent
+  | QuestionRejectedEvent;
 
 export interface OpenCodeGlobalEventEnvelope {
   directory: string;

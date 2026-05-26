@@ -22,7 +22,7 @@ function unwrapData(result: unknown): unknown {
 }
 
 function asSessionLike(value: unknown): SessionLike {
-  return isRecord(value) ? value as SessionLike : {};
+  return isRecord(value) ? value : {};
 }
 
 export interface SessionData {
@@ -44,6 +44,6 @@ export function extractSession(result: unknown): SessionData {
 /** Extract a session list from an SDK response */
 export function extractSessions(result: unknown): SessionData[] {
   const list = unwrapData(result);
-  if (!Array.isArray(list)) return [];
+  if (!Array.isArray(list)) {return [];}
   return list.map(extractSession);
 }

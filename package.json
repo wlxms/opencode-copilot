@@ -94,6 +94,14 @@
           {
             "name": "test-thinking",
             "description": "Diagnostic: verify thinkingProgress API and reasoning/text boundary rendering"
+          },
+          {
+            "name": "test-question",
+            "description": "Diagnostic: test questionCarousel UI flow (single-select, multi-select, text input)"
+          },
+          {
+            "name": "test-question",
+            "description": "Test questionCarousel UI flow (single-select, multi-select, text input)"
           }
         ]
       }
@@ -103,15 +111,22 @@
     "compile": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
     "watch": "npm run compile -- --sourcemap --watch",
     "lint": "tsc --noEmit",
+    "lint:eslint": "eslint src/",
+    "lint:all": "tsc --noEmit && eslint src/",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration": "vitest run -c vitest.integration.config.ts"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^20.19.40",
     "@types/vscode": "^1.118.0",
+    "@typescript-eslint/eslint-plugin": "^8.60.0",
+    "@typescript-eslint/parser": "^8.60.0",
     "esbuild": "^0.24.2",
+    "eslint": "^10.4.0",
     "typescript": "^5.9.3",
+    "typescript-eslint": "^8.60.0",
     "vitest": "^4.1.5"
   },
   "dependencies": {

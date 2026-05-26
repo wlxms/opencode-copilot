@@ -1,11 +1,4 @@
-import * as vscode from 'vscode';
-import type {
-  ConfigProvidersResponse,
-  SessionCreateResponse,
-  SessionGetResponse,
-  SessionPromptResponse,
-  SessionRevertResponse,
-} from '@opencode-ai/sdk';
+import type * as vscode from 'vscode';
 import type { OpenCodeEventStream } from '../backends/opencode/sdk-events';
 import type { AcpBackend } from '../acp/backend';
 import type { StatusBarManager } from '../statusbar';
@@ -18,44 +11,73 @@ export interface OpenCodeApiResponse<T, E = unknown> {
 
 export interface OpenCodeClient {
   session: {
-    create(options?: {
-      body?: { parentID?: string; title?: string };
-      query?: { directory?: string };
-    }): Promise<OpenCodeApiResponse<SessionCreateResponse>>;
-    get(options: {
-      path: { id: string };
-      query?: { directory?: string };
-    }): Promise<OpenCodeApiResponse<SessionGetResponse>>;
-    prompt(options: {
-      path: { id: string };
-      body: { parts: Array<{ type: 'text'; text: string }> };
-      query?: { directory?: string };
-    }): Promise<OpenCodeApiResponse<SessionPromptResponse>>;
-    revert(options: {
-      path: { id: string };
-      body: { messageID: string; partID?: string };
-      query?: { directory?: string };
-    }): Promise<OpenCodeApiResponse<SessionRevertResponse>>;
-    abort(options: {
-      path: { id: string };
-      query?: { directory?: string };
-    }): Promise<OpenCodeApiResponse<boolean>>;
+    create(parameters?: {
+      directory?: string;
+      parentID?: string;
+      title?: string;
+    }): Promise<unknown>;
+    get(parameters: {
+      sessionID: string;
+      directory?: string;
+    }): Promise<unknown>;
+    prompt(parameters: {
+      sessionID: string;
+      directory?: string;
+      parts?: Array<{ type: 'text'; text: string }>;
+      model?: { providerID: string; modelID: string };
+      agent?: string;
+    }): Promise<unknown>;
+    revert(parameters: {
+      sessionID: string;
+      directory?: string;
+      messageID: string;
+      partID?: string;
+    }): Promise<unknown>;
+    abort(parameters: {
+      sessionID: string;
+      directory?: string;
+    }): Promise<unknown>;
+    list(parameters?: {
+      directory?: string;
+    }): Promise<unknown>;
+    children(parameters: {
+      sessionID: string;
+      directory?: string;
+    }): Promise<unknown>;
+    status(parameters?: {
+      directory?: string;
+    }): Promise<unknown>;
   };
   global: {
-    event(): Promise<OpenCodeEventStream>;
+    event(): Promise<unknown>;
   };
   event: {
-    subscribe(): Promise<OpenCodeEventStream>;
+    subscribe(): Promise<unknown>;
   };
   config: {
-    providers(): Promise<OpenCodeApiResponse<ConfigProvidersResponse>>;
+    providers(parameters?: {
+      directory?: string;
+    }): Promise<unknown>;
   };
-  /** Reply to a permission.asked request — approves or rejects the paused tool */
-  postSessionIdPermissionsPermissionId(options: {
-    path: { id: string; permissionID: string };
-    body?: { response: 'once' | 'always' | 'reject' };
-    query?: { directory?: string };
-  }): Promise<unknown>;
+  permission: {
+    reply(parameters: {
+      requestID: string;
+      directory?: string;
+      reply?: 'once' | 'always' | 'reject';
+      message?: string;
+    }): Promise<unknown>;
+  };
+  question: {
+    reply(parameters: {
+      requestID: string;
+      directory?: string;
+      answers?: Array<Array<string>>;
+    }): Promise<unknown>;
+    reject(parameters: {
+      requestID: string;
+      directory?: string;
+    }): Promise<unknown>;
+  };
 }
 
 export interface OpenCodeServerController {

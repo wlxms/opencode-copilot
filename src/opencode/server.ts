@@ -1,4 +1,4 @@
-import { createOpencode } from '@opencode-ai/sdk';
+import { createOpencode } from '@opencode-ai/sdk/v2';
 import { existsSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
 import type { OpenCodeClient, OpenCodeServerController } from '../types';
