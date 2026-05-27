@@ -17,6 +17,7 @@ import type {
   AcpPermissionResponse,
   AcpServerInfo,
   AcpServerStatus,
+  AcpMessageHistory,
   BackendSettingsDescriptor,
 } from './types';
 
@@ -84,6 +85,12 @@ export interface AcpSessionOperations {
 
   /** Get the parent session ID for a given session */
   parent(sessionId: string): string | undefined;
+
+  /**
+   * Get message history for a session.
+   * Returns user/assistant message pairs with text content extracted from parts.
+   */
+  messages(id: string, directory?: string): Promise<AcpResult<AcpMessageHistory>>;
 }
 
 // ===========================================================================

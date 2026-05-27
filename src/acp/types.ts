@@ -269,6 +269,24 @@ export interface AcpResult<T, E = string> {
 }
 
 // ===========================================================================
+// Message history (for session history restoration)
+// ===========================================================================
+
+export interface AcpHistoryMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  /** Extracted text content (from parts for user, or joined text parts for assistant) */
+  text: string;
+  /** Tool call summaries for assistant messages */
+  toolCalls?: Array<{ toolName: string; callId?: string }>;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AcpMessageHistory {
+  items: AcpHistoryMessage[];
+}
+
+// ===========================================================================
 // Permission responses
 // ===========================================================================
 

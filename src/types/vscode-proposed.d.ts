@@ -51,11 +51,30 @@ declare module 'vscode' {
   // ---------------------------------------------------------------------------
 
   /**
-   * Represents the input state of a chat session, including selected options.
+   * Represents the current state of user inputs for a chat session.
    */
   export interface ChatSessionInputState {
-    sessionResource?: Uri;
-    sessionOptions?: ReadonlyArray<{ optionId: string; value: string | ChatSessionProviderOptionItem }>;
+    /**
+     * Fired when the input state is disposed.
+     */
+    readonly onDidDispose: Event<void>;
+
+    /**
+     * Fired when the input state is changed by the user.
+     */
+    readonly onDidChange: Event<void>;
+
+    /**
+     * The resource associated with this chat session.
+     */
+    readonly sessionResource: Uri | undefined;
+
+    /**
+     * The groups of options to show in the UI for user input.
+     *
+     * To update the groups you must replace the entire `groups` array with a new array.
+     */
+    groups: readonly ChatSessionProviderOptionGroup[];
   }
 
   // ---------------------------------------------------------------------------
@@ -64,10 +83,6 @@ declare module 'vscode' {
 
   /**
    * Represents a chat session returned by `provideChatSessionContent`.
-   *
-   * This is the core object that VS Code uses to render the session and route
-   * requests. The `requestHandler` property is critical — without it, VS Code
-   * falls back to the default Copilot agent.
    */
   export interface ChatSession {
     /**
@@ -88,8 +103,6 @@ declare module 'vscode' {
     /**
      * Optional callback for proactive session response (e.g. resuming
      * an ongoing interaction when the session becomes active).
-     *
-     * If not provided, the chat session is assumed to not currently be running.
      */
     readonly activeResponseCallback?: (
       stream: ChatResponseStream,
@@ -98,9 +111,6 @@ declare module 'vscode' {
 
     /**
      * Handles new request for the session.
-     *
-     * If not set, then the session will be considered read-only and no
-     * requests can be made.
      */
     readonly requestHandler: ChatRequestHandler | undefined;
 
@@ -115,24 +125,34 @@ declare module 'vscode' {
   }
 
   // ---------------------------------------------------------------------------
+  // ChatSessionProviderOptions
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Options returned by provideChatSessionProviderOptions.
+   */
+  export interface ChatSessionProviderOptions {
+    /**
+     * Provider-defined option groups (0-2 groups supported).
+     */
+    readonly optionGroups?: readonly ChatSessionProviderOptionGroup[];
+
+    /**
+     * The set of default options used for new chat sessions.
+     */
+    readonly newSessionOptions?: Record<string, string | ChatSessionProviderOptionItem>;
+  }
+
+  // ---------------------------------------------------------------------------
   // ChatSessionContentProvider
   // ---------------------------------------------------------------------------
 
   /**
    * Provides content for chat sessions of a specific type (URI scheme).
-   *
-   * Extensions implement this interface and register it via
-   * `vscode.chat.registerChatSessionContentProvider()` to appear as a
-   * session target in VS Code's chat view.
    */
   export interface ChatSessionContentProvider {
     /**
      * Provide the content for a chat session identified by its resource URI.
-     *
-     * @param resource - The URI of the chat session to provide content for.
-     * @param token - Cancellation token.
-     * @param context - Additional context for the chat session.
-     * @returns The chat session, including its request handler.
      */
     provideChatSessionContent(
       resource: Uri,
@@ -141,14 +161,20 @@ declare module 'vscode' {
     ): Thenable<ChatSession> | ChatSession;
 
     /**
-     * Optional event fired when provider-level options change.
+     * @deprecated
+     *
+     * Event that the provider can fire to signal that the available provider options have changed.
+     * When fired, the editor will re-query provideChatSessionProviderOptions.
      */
     readonly onDidChangeChatSessionProviderOptions?: Event<void>;
 
     /**
-     * Option groups for this provider (e.g. model picker, agent picker).
+     * Called as soon as you register (call me once).
+     * Returns option groups and default session options.
      */
-    readonly optionGroups?: readonly ChatSessionProviderOptionGroup[];
+    provideChatSessionProviderOptions?(
+      token: CancellationToken,
+    ): Thenable<ChatSessionProviderOptions>;
   }
 
   // ---------------------------------------------------------------------------

@@ -314,161 +314,498 @@ export const OPENCODE_SESSION_SCHEME = 'opencode-copilot.opencode';
  */
 export function createSessionContentProvider(
   state: ExtensionState,
-  _context: vscode.ExtensionContext,
+  context: vscode.ExtensionContext,
 ): vscode.ChatSessionContentProvider {
   const logger = state.outputChannel;
 
-  return {
-    provideChatSessionContent(
-      resource: vscode.Uri,
-      _token: vscode.CancellationToken,
-      _context: { readonly inputState: vscode.ChatSessionInputState },
-    ): vscode.ChatSession {
+  // -- Option Groups: Agent & Model pickers --------------------------------
+
+  const onDidChangeOptionsEmitter = new vscode.EventEmitter<void>();
+  let cachedOptionGroups: vscode.ChatSessionProviderOptionGroup[] = [];
+
+  /** Build option groups from backend config */
+  async function refreshOptionGroups(): Promise<void> {
+    try {
+      const directory = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+
+      logger.appendLine(`[session-provider] Refreshing option groups (backend running=${state.backend.isRunning()})...`);
+
+      // Fetch agents and models in parallel
+      const [agentsResult, modelsResult] = await Promise.all([
+        state.backend.config.agents(directory),
+        state.backend.config.models(directory),
+      ]);
+
+      const agents = (agentsResult.data ?? []).filter(a => !a.hidden);
+      const models = modelsResult.data ?? [];
+
       logger.appendLine(
-        `[session-provider] provideChatSessionContent called for ${resource.toString()}`,
+        `[session-provider] Backend returned: ${agentsResult.data?.length ?? 0} agents (error=${agentsResult.error ?? 'none'}), ${modelsResult.data?.length ?? 0} models (error=${modelsResult.error ?? 'none'})`,
       );
 
-      return {
-        history: [],
+      // Build agent option items
+      const agentItems: vscode.ChatSessionProviderOptionItem[] = agents.map(a => ({
+        id: `agent-${a.id}`,
+        name: a.name ?? a.id,
+        description: a.description,
+        default: a.id === (state.selectedAgentOverride ?? state.currentAgent),
+      }));
 
-        /**
-         * Request handler invoked by VS Code when the user sends a message
-         * in an OpenCode session target.
-         *
-         * This reuses the same backend pipeline as the @opencode participant:
-         *   1. Ensure server is running
-         *   2. Resolve/create OpenCode session
-         *   3. Send prompt and stream events through StreamBridge
-         */
-        requestHandler: async (
-          request: vscode.ChatRequest,
-          _context: vscode.ChatContext,
-          stream: vscode.ChatResponseStream,
-          token: vscode.CancellationToken,
-        ): Promise<vscode.ChatResult> => {
-          logger.appendLine(
-            `[session-provider] requestHandler invoked: "${request.prompt?.substring(0, 80)}"`,
-          );
+      // Find selected agent item
+      const currentAgentId = state.selectedAgentOverride ?? state.currentAgent;
+      const selectedAgent = agentItems.find(i => i.id === `agent-${currentAgentId}`) ?? agentItems[0];
 
-          // Guard: cancellation
-          if (token.isCancellationRequested) {
-            stream.markdown('\u26A0\uFE0F Cancelled\n');
+      // Build model option items
+      const modelItems: vscode.ChatSessionProviderOptionItem[] = models.map(m => ({
+        id: `model-${m.provider ?? 'default'}/${m.id}`,
+        name: m.name ?? m.id,
+        description: m.providerName,
+        default: m.id === (state.selectedModelOverride?.modelID ?? state.currentModel?.modelID),
+      }));
+
+      // Find selected model item — match by both provider and model ID
+      const currentModelId = state.selectedModelOverride?.modelID ?? state.currentModel?.modelID;
+      const currentProviderId = state.selectedModelOverride?.providerID ?? state.currentModel?.providerID;
+      let selectedModel = modelItems[0];
+      if (currentModelId) {
+        // First try exact match with provider
+        if (currentProviderId) {
+          selectedModel = modelItems.find(i => i.id === `model-${currentProviderId}/${currentModelId}`) ?? modelItems[0];
+        }
+        // Fallback: match by model ID only
+        if (selectedModel === modelItems[0] && currentModelId !== modelItems[0]?.id.split('/').pop()) {
+          selectedModel = modelItems.find(i => {
+            const parts = i.id.split('/');
+            return parts[parts.length - 1] === currentModelId;
+          }) ?? modelItems[0];
+        }
+      }
+
+      cachedOptionGroups = [
+        ...(agentItems.length > 0 ? [{
+          id: 'agents',
+          name: 'Agent',
+          items: agentItems,
+          selected: selectedAgent,
+        }] : []),
+        ...(modelItems.length > 0 ? [{
+          id: 'models',
+          name: 'Model',
+          items: modelItems,
+          selected: selectedModel,
+        }] : []),
+      ];
+
+      onDidChangeOptionsEmitter.fire();
+      logger.appendLine(
+        `[session-provider] Option groups refreshed: ${agentItems.length} agents, ${modelItems.length} models`,
+      );
+    } catch (err) {
+      logger.appendLine(
+        `[session-provider] Failed to refresh option groups: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Kick off initial load (non-blocking, fires event when ready).
+  // This will likely fail if the backend isn't running yet — that's fine,
+  // provideChatSessionProviderOptions will be called again when the event fires.
+  refreshOptionGroups().catch(err => {
+    logger.appendLine(`[session-provider] Initial option groups load failed (will retry on first use): ${err}`);
+  });
+
+  // -- Session History Restoration -----------------------------------------
+
+  /**
+   * Extract session ID from the resource URI.
+   * URI format: opencode-copilot.opencode:/<sessionId>
+   */
+  function extractSessionId(resource: vscode.Uri): string {
+    const path = resource.path;
+    // Remove leading slash
+    return path.startsWith('/') ? path.slice(1) : path;
+  }
+
+  /**
+   * Fetch message history from the backend and map to VSCode turn format.
+   */
+  async function fetchSessionHistory(
+    sessionId: string,
+    token: vscode.CancellationToken,
+  ): Promise<(vscode.ChatRequestTurn | vscode.ChatResponseTurn)[]> {
+    const result = await state.backend.sessions.messages(sessionId);
+    if (result.error || !result.data) {
+      logger.appendLine(
+        `[session-provider] Failed to fetch history for ${sessionId}: ${result.error ?? 'no data'}`,
+      );
+      return [];
+    }
+
+    const messages = result.data.items;
+    const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
+    const turnMap: Array<{ vscodeTurn: number; opencodeMessageId: string }> = [];
+    let turnIndex = 0;
+
+    for (const msg of messages) {
+      if (token.isCancellationRequested) { break; }
+
+      if (msg.role === 'user') {
+        history.push(createRequestTurn(
+          msg.text,
+          undefined, // command
+          [],        // references
+        ));
+      } else if (msg.role === 'assistant') {
+        const responses: vscode.ChatResponseMarkdownPart[] = [];
+
+        // Add text as markdown response
+        if (msg.text) {
+          responses.push(new vscode.ChatResponseMarkdownPart(msg.text));
+        }
+
+        // Build turn metadata for session recovery
+        const turnMetadata: Record<string, unknown> = {
+          sessionId,
+          turnMap: [...turnMap],
+        };
+
+        history.push(createResponseTurn(
+          responses,
+          { metadata: turnMetadata },
+        ));
+
+        turnMap.push({
+          vscodeTurn: turnIndex,
+          opencodeMessageId: msg.id,
+        });
+        turnIndex++;
+      }
+    }
+
+    logger.appendLine(
+      `[session-provider] Restored ${history.length} turns for session ${sessionId}`,
+    );
+    return history;
+  }
+
+  // -- Request Handler (shared across new and restored sessions) ------------
+
+  /**
+   * Create the request handler that routes prompts to the OpenCode backend.
+   * Captures selected agent/model from a closure so each session can have its own.
+   */
+  function createRequestHandler(
+    selectedAgent?: string,
+    selectedModel?: { providerID: string; modelID: string },
+  ): vscode.ChatRequestHandler {
+    return async (
+      request: vscode.ChatRequest,
+      _ctx: vscode.ChatContext,
+      stream: vscode.ChatResponseStream,
+      token: vscode.CancellationToken,
+    ): Promise<vscode.ChatResult> => {
+      logger.appendLine(
+        `[session-provider] requestHandler invoked: "${request.prompt?.substring(0, 80)}"`,
+      );
+
+      // Guard: cancellation
+      if (token.isCancellationRequested) {
+        stream.markdown('\u26A0\uFE0F Cancelled\n');
+        return { metadata: {} };
+      }
+
+      // Guard: empty prompt
+      if (!request.prompt?.trim()) {
+        stream.markdown('Please enter a prompt.');
+        return { metadata: {} };
+      }
+
+      // 1. Ensure backend is running
+      const status = state.backend.getStatus();
+      if (status !== 'running') {
+        try {
+          stream.progress('Starting OpenCode server...');
+          const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+          const result = await state.backend.start(workspacePath);
+          if (result.error || !result.data) {
+            const msg = typeof result.error === 'string' ? result.error : 'Unknown error';
+            stream.markdown(`\u26A0\uFE0F Failed to start OpenCode: ${msg}`);
             return { metadata: {} };
           }
-
-          // Guard: empty prompt
-          if (!request.prompt?.trim()) {
-            stream.markdown('Please enter a prompt.');
-            return { metadata: {} };
-          }
-
-          // 1. Ensure backend is running
-          const status = state.backend.getStatus();
-          if (status !== 'running') {
-            try {
-              stream.progress('Starting OpenCode server...');
-              const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
-              const result = await state.backend.start(workspacePath);
-              if (result.error || !result.data) {
-                const msg = typeof result.error === 'string' ? result.error : 'Unknown error';
-                stream.markdown(`\u26A0\uFE0F Failed to start OpenCode: ${msg}`);
-                return { metadata: {} };
-              }
-              logger.appendLine(`[session-provider] Server started at ${result.data.url}`);
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : 'Unknown error';
-              stream.markdown(`\u26A0\uFE0F Failed to start OpenCode: ${msg}`);
-              return { metadata: {} };
-            }
-          }
-
-          // 2. Create or reuse OpenCode session
-          const directory = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
-          const vscodeSessionId = request.sessionId ?? `session-${Date.now()}`;
-          let chatState = state.sessionMap.get(vscodeSessionId);
-          if (!chatState) {
-            chatState = { opencodeSessionId: '', turnMap: [] };
-            state.sessionMap.set(vscodeSessionId, chatState);
-          }
-
-          if (!chatState.opencodeSessionId) {
-            stream.progress('Creating new session...');
-            const result = await state.backend.sessions.create({
-              title: `Chat ${vscodeSessionId.slice(0, 8)}`,
-              directory,
-            });
-            if (result.error || !result.data) {
-              stream.markdown('\u26A0\uFE0F Failed to create OpenCode session.');
-              return { metadata: {} };
-            }
-            chatState.opencodeSessionId = result.data.id ?? '';
-            logger.appendLine(`[session-provider] Created session ${chatState.opencodeSessionId}`);
-          }
-
-          const sessionId = chatState.opencodeSessionId;
-
-          // 3. Ensure event stream is connected
-          stream.progress('Connecting to event stream...');
-          await state.backend.events.ensureStarted();
-
-          // 4. Open a per-session event stream
-          const events = state.backend.events.openSessionStream(sessionId);
-
-          // 5. Send prompt and stream response
-          stream.progress('Sending message...');
-          logger.appendLine(
-            `[session-provider] Prompting session ${sessionId}: ${request.prompt.substring(0, 50)}`,
-          );
-
-          // Build prompt options from current agent/model selection
-          const promptOptions: { model?: { providerID: string; modelID: string }; agent?: string } = {};
-          if (state.selectedAgentOverride) {
-            promptOptions.agent = state.selectedAgentOverride;
-          }
-          if (state.selectedModelOverride) {
-            promptOptions.model = state.selectedModelOverride;
-          }
-
-          // Fire prompt (non-blocking) — events arrive through the session stream
-          const promptPromise = state.backend.sessions.prompt(
-            sessionId,
-            request.prompt,
-            directory,
-            promptOptions,
-          ).then((result) => {
-            if (result.error) {
-              logger.appendLine(`[session-provider] Prompt error: ${JSON.stringify(result.error)}`);
-            }
-          }).catch((err: unknown) => {
-            logger.appendLine(`[session-provider] Prompt exception: ${err instanceof Error ? err.message : String(err)}`);
-          });
-
-          // 6. Render events through StreamBridge (same pipeline as @opencode participant)
-          const tracker = new ExternalEditTracker();
-          const bridge = new StreamBridge({
-            logger: { appendLine: (m: string) => logger.appendLine(m) },
-            sessionId,
-            knownFileUris: new Set((await collectOpenFileUris()).map(u => u.toString())),
-            tracker,
-            directory,
-          });
-
-          try {
-            await bridge.run(events.stream, stream, token);
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : 'Connection lost';
-            logger.appendLine(`[session-provider] Stream error: ${msg}`);
-            stream.markdown(`\n\u26A0\uFE0F ${msg}\n`);
-          } finally {
-            state.backend.events.closeSessionStream(sessionId);
-          }
-
-          // Ensure prompt completes
-          await promptPromise;
-
+          logger.appendLine(`[session-provider] Server started at ${result.data.url}`);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : 'Unknown error';
+          stream.markdown(`\u26A0\uFE0F Failed to start OpenCode: ${msg}`);
           return { metadata: {} };
-        },
-      };
+        }
+      }
+
+      // 2. Create or reuse OpenCode session
+      const directory = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+      const vscodeSessionId = request.sessionId ?? `session-${Date.now()}`;
+      let chatState = state.sessionMap.get(vscodeSessionId);
+      if (!chatState) {
+        chatState = { opencodeSessionId: '', turnMap: [] };
+        state.sessionMap.set(vscodeSessionId, chatState);
+      }
+
+      if (!chatState.opencodeSessionId) {
+        stream.progress('Creating new session...');
+        const result = await state.backend.sessions.create({
+          title: `Chat ${vscodeSessionId.slice(0, 8)}`,
+          directory,
+        });
+        if (result.error || !result.data) {
+          stream.markdown('\u26A0\uFE0F Failed to create OpenCode session.');
+          return { metadata: {} };
+        }
+        chatState.opencodeSessionId = result.data.id ?? '';
+        logger.appendLine(`[session-provider] Created session ${chatState.opencodeSessionId}`);
+      }
+
+      const sessionId = chatState.opencodeSessionId;
+
+      // 3. Ensure event stream is connected
+      stream.progress('Connecting to event stream...');
+      await state.backend.events.ensureStarted();
+
+      // 4. Open a per-session event stream
+      const events = state.backend.events.openSessionStream(sessionId);
+
+      // 5. Send prompt and stream response
+      stream.progress('Sending message...');
+      logger.appendLine(
+        `[session-provider] Prompting session ${sessionId}: ${request.prompt.substring(0, 50)}`,
+      );
+
+      // Build prompt options — use session-level overrides first, then fall back to global state
+      const promptOptions: { model?: { providerID: string; modelID: string }; agent?: string } = {};
+      if (selectedAgent) {
+        promptOptions.agent = selectedAgent;
+      } else if (state.selectedAgentOverride) {
+        promptOptions.agent = state.selectedAgentOverride;
+      }
+      if (selectedModel) {
+        promptOptions.model = selectedModel;
+      } else if (state.selectedModelOverride) {
+        promptOptions.model = state.selectedModelOverride;
+      }
+
+      // Fire prompt (non-blocking) — events arrive through the session stream
+      const promptPromise = state.backend.sessions.prompt(
+        sessionId,
+        request.prompt,
+        directory,
+        promptOptions,
+      ).then((result) => {
+        if (result.error) {
+          logger.appendLine(`[session-provider] Prompt error: ${JSON.stringify(result.error)}`);
+        }
+      }).catch((err: unknown) => {
+        logger.appendLine(`[session-provider] Prompt exception: ${err instanceof Error ? err.message : String(err)}`);
+      });
+
+      // 6. Render events through StreamBridge (same pipeline as @opencode participant)
+      const tracker = new ExternalEditTracker();
+      const bridge = new StreamBridge({
+        logger: { appendLine: (m: string) => logger.appendLine(m) },
+        sessionId,
+        knownFileUris: new Set((await collectOpenFileUris()).map(u => u.toString())),
+        tracker,
+        directory,
+      });
+
+      try {
+        await bridge.run(events.stream, stream, token);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Connection lost';
+        logger.appendLine(`[session-provider] Stream error: ${msg}`);
+        stream.markdown(`\n\u26A0\uFE0F ${msg}\n`);
+      } finally {
+        state.backend.events.closeSessionStream(sessionId);
+      }
+
+      // Ensure prompt completes
+      await promptPromise;
+
+      return { metadata: {} };
+    };
+  }
+
+  // -- The Provider --------------------------------------------------------
+
+  return {
+    /**
+     * Called by VSCode at registration time and whenever
+     * onDidChangeChatSessionProviderOptions fires.
+     * Returns the option groups (agent picker, model picker).
+     */
+    provideChatSessionProviderOptions(
+      _token: vscode.CancellationToken,
+    ): vscode.Thenable<vscode.ChatSessionProviderOptions> {
+      // If we have cached groups, return them immediately.
+      // Otherwise trigger a refresh and return the promise.
+      if (cachedOptionGroups.length > 0) {
+        return { optionGroups: cachedOptionGroups };
+      }
+
+      // Backend might be running now — try to load
+      return refreshOptionGroups().then(() => ({
+        optionGroups: cachedOptionGroups,
+      }));
+    },
+
+    /**
+     * Fired when option groups change (backend starts, config changes).
+     * VSCode will re-call provideChatSessionProviderOptions.
+     */
+    onDidChangeChatSessionProviderOptions: onDidChangeOptionsEmitter.event,
+
+    provideChatSessionContent(
+      resource: vscode.Uri,
+      token: vscode.CancellationToken,
+      providerContext: { readonly inputState: vscode.ChatSessionInputState },
+    ): vscode.Thenable<vscode.ChatSession> {
+      const sessionId = extractSessionId(resource);
+      logger.appendLine(
+        `[session-provider] provideChatSessionContent called for ${resource.toString()} (sessionId=${sessionId})`,
+      );
+
+      // Refresh option groups if they haven't been populated yet.
+      // This handles the case where the backend wasn't running during
+      // provider creation but is now available (user just selected the target).
+      if (cachedOptionGroups.length === 0 && state.backend.isRunning()) {
+        refreshOptionGroups().catch(() => { /* already logged */ });
+      }
+
+      // Parse selected agent/model from inputState.groups[].selected
+      let resolvedAgent: string | undefined;
+      let resolvedModel: { providerID: string; modelID: string } | undefined;
+
+      const inputGroups = providerContext.inputState?.groups ?? [];
+      for (const group of inputGroups) {
+        const selected = group.selected;
+        if (!selected) { continue; }
+
+        if (group.id === 'agents') {
+          // OptionItem.id format: "agent-<agentId>"
+          const agentId = selected.id.replace(/^agent-/, '');
+          resolvedAgent = agentId;
+          state.selectedAgentOverride = agentId;
+        }
+
+        if (group.id === 'models') {
+          // OptionItem.id format: "model-<providerId>/<modelId>"
+          const modelPart = selected.id.replace(/^model-/, '');
+          const slashIdx = modelPart.indexOf('/');
+          if (slashIdx >= 0) {
+            const providerID = modelPart.slice(0, slashIdx);
+            const modelID = modelPart.slice(slashIdx + 1);
+            resolvedModel = { providerID, modelID };
+            state.selectedModelOverride = { providerID, modelID };
+          }
+        }
+      }
+
+      // New session — no history to restore
+      // VSCode generates untitled-* URIs for fresh sessions; only real OpenCode
+      // session IDs (e.g. from session.list()) should trigger history fetch.
+      if (!sessionId || sessionId === 'new') {
+        return {
+          title: 'New OpenCode Session',
+          history: [],
+          requestHandler: createRequestHandler(resolvedAgent, resolvedModel),
+        };
+      }
+
+      // For untitled-* sessions (VSCode-managed), look up the OpenCode session
+      // that was previously created via requestHandler. The sessionMap key is
+      // request.sessionId which matches the untitled-* ID from the URI path.
+      if (sessionId.startsWith('untitled-')) {
+        const chatState = state.sessionMap.get(sessionId);
+        if (chatState?.opencodeSessionId) {
+          logger.appendLine(
+            `[session-provider] Found existing OpenCode session ${chatState.opencodeSessionId} for VSCode session ${sessionId}`,
+          );
+
+          // Fetch history from the OpenCode backend
+          return (async (): Promise<vscode.ChatSession> => {
+            try {
+              const backendStatus = state.backend.getStatus();
+              if (backendStatus !== 'running') {
+                const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+                await state.backend.start(workspacePath);
+              }
+
+              const history = await fetchSessionHistory(chatState.opencodeSessionId, token);
+              return {
+                title: `OpenCode Session`,
+                history,
+                requestHandler: createRequestHandler(resolvedAgent, resolvedModel),
+              };
+            } catch (err) {
+              logger.appendLine(
+                `[session-provider] Failed to restore session history: ${err instanceof Error ? err.message : String(err)}`,
+              );
+              return {
+                title: 'OpenCode Session',
+                history: [],
+                requestHandler: createRequestHandler(resolvedAgent, resolvedModel),
+              };
+            }
+          })();
+        }
+
+        // No existing OpenCode session for this untitled tab — it's genuinely new
+        return {
+          title: 'New OpenCode Session',
+          history: [],
+          requestHandler: createRequestHandler(resolvedAgent, resolvedModel),
+        };
+      }
+
+      // Existing session — fetch history from backend
+      return (async (): Promise<vscode.ChatSession> => {
+        try {
+          // Ensure backend is running before fetching
+          const backendStatus = state.backend.getStatus();
+          if (backendStatus !== 'running') {
+            const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+            await state.backend.start(workspacePath);
+          }
+
+          // Get session info for title
+          const sessionInfo = await state.backend.sessions.get(sessionId);
+          const title = sessionInfo.data?.title ?? `Session ${sessionId.slice(0, 8)}`;
+
+          // Fetch message history
+          const history = await fetchSessionHistory(sessionId, token);
+
+          // Store in session map for request handler continuity
+          const vscodeSessionKey = resource.toString();
+          if (!state.sessionMap.has(vscodeSessionKey)) {
+            state.sessionMap.set(vscodeSessionKey, {
+              opencodeSessionId: sessionId,
+              turnMap: [],
+            });
+          }
+
+          return {
+            title,
+            history,
+            requestHandler: createRequestHandler(resolvedAgent, resolvedModel),
+          };
+        } catch (err) {
+          logger.appendLine(
+            `[session-provider] Failed to fetch session history: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return {
+            title: 'OpenCode (offline)',
+            history: [],
+            requestHandler: createRequestHandler(resolvedAgent, resolvedModel),
+          };
+        }
+      })();
     },
   };
 }
@@ -551,6 +888,41 @@ export async function renderWithExperimentalSurface(
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Create a ChatRequestTurn for session history restoration.
+ *
+ * VSCode's stable types mark the constructor as @hidden/private, but the
+ * proposed chatSessionsProvider API allows extensions to construct these objects.
+ * We use a type-safe factory to avoid `as any` at call sites.
+ */
+function createRequestTurn(
+  prompt: string,
+  command: string | undefined,
+  references: readonly vscode.ChatPromptReference[],
+): vscode.ChatRequestTurn {
+  // The proposed API exposes the constructor at runtime despite @types marking it private.
+  const Ctor = vscode.ChatRequestTurn as unknown as new (
+    p: string,
+    c: string | undefined,
+    r: readonly vscode.ChatPromptReference[],
+  ) => vscode.ChatRequestTurn;
+  return new Ctor(prompt, command, references);
+}
+
+/**
+ * Create a ChatResponseTurn for session history restoration.
+ */
+function createResponseTurn(
+  response: readonly vscode.ChatResponseMarkdownPart[],
+  result: vscode.ChatResult,
+): vscode.ChatResponseTurn {
+  const Ctor = vscode.ChatResponseTurn as unknown as new (
+    r: readonly vscode.ChatResponseMarkdownPart[],
+    res: vscode.ChatResult,
+  ) => vscode.ChatResponseTurn;
+  return new Ctor(response, result);
+}
 
 function getTitle(state: { title?: string }): string | undefined {
   return state.title;

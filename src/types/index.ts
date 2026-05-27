@@ -56,6 +56,79 @@ export interface SdkConfigData {
 }
 
 // ===========================================================================
+// SDK message / part shapes (from session.messages() response)
+// ===========================================================================
+
+export interface SdkUserMessage {
+  id: string;
+  sessionID: string;
+  role: 'user';
+  time: { created: number };
+  agent: string;
+  model: { providerID: string; modelID: string };
+}
+
+export interface SdkAssistantMessage {
+  id: string;
+  sessionID: string;
+  role: 'assistant';
+  time: { created: number; completed?: number };
+  parentID: string;
+  modelID: string;
+  providerID: string;
+  cost: number;
+  tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } };
+  error?: { name: string; data?: { message?: string } };
+}
+
+export type SdkMessage = SdkUserMessage | SdkAssistantMessage;
+
+export interface SdkTextPart {
+  id: string;
+  sessionID: string;
+  messageID: string;
+  type: 'text';
+  text: string;
+  synthetic?: boolean;
+}
+
+export interface SdkReasoningPart {
+  id: string;
+  sessionID: string;
+  messageID: string;
+  type: 'reasoning';
+  text: string;
+}
+
+export interface SdkToolPart {
+  id: string;
+  sessionID: string;
+  messageID: string;
+  type: 'tool';
+  tool: string;
+  callID?: string;
+  state?: { status: string; input?: Record<string, unknown>; output?: string; title?: string; error?: string };
+}
+
+export interface SdkSubtaskPart {
+  id: string;
+  sessionID: string;
+  messageID: string;
+  type: 'subtask';
+  prompt: string;
+  description: string;
+  agent: string;
+}
+
+export type SdkPart = SdkTextPart | SdkReasoningPart | SdkToolPart | SdkSubtaskPart | {
+  id: string;
+  sessionID: string;
+  messageID: string;
+  type: string;
+  [key: string]: unknown;
+};
+
+// ===========================================================================
 // OpenCodeClient — typed contract for the OpenCode SDK v2 client
 //
 // This interface describes the subset of the SDK v2 OpencodeClient API
@@ -103,6 +176,11 @@ export interface OpenCodeClient {
     status(parameters?: {
       directory?: string;
     }): Promise<SdkResponse<Record<string, AcpSessionStatus>>>;
+    messages(parameters: {
+      id: string;
+      directory?: string;
+      limit?: number;
+    }): Promise<SdkResponse<Array<{ info: SdkMessage; parts: SdkPart[] }>>>;
   };
   global: {
     event(): Promise<OpenCodeEventStream>;

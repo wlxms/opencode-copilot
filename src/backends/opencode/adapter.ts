@@ -28,6 +28,8 @@ import type {
   AcpResult,
   AcpPermissionResponse,
   AcpEvent,
+  AcpMessageHistory,
+  AcpHistoryMessage,
 } from '../../acp/types';
 import { normalizeStreamEvent } from './events';
 import type { OpenCodeEventStream } from './sdk-events';
@@ -333,6 +335,62 @@ export class OpenCodeBackend implements AcpBackend {
 
     parent: (sessionId: string): string | undefined => {
       return this.eventBroker.getParentSession(sessionId);
+    },
+
+    messages: async (id: string, directory?: string): Promise<AcpResult<AcpMessageHistory>> => {
+      try {
+        const result = await this.sdk.session.messages({ id, directory });
+        const error = getResultError(result);
+        if (error !== undefined) {
+          return { error: extractErrorMessage(error, 'Failed to get messages') };
+        }
+
+        const items = result.data ?? [];
+        const mapped: AcpHistoryMessage[] = [];
+
+        for (const item of items) {
+          if (item.info.role === 'user') {
+            // UserMessage: text is in the parts (type='text')
+            const text = item.parts
+              .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+              .map(p => p.text)
+              .join('\n');
+            mapped.push({
+              id: item.info.id,
+              role: 'user',
+              text: text || '(no text)',
+            });
+          } else if (item.info.role === 'assistant') {
+            // AssistantMessage: join text parts, collect tool call summaries
+            const textParts: string[] = [];
+            const toolCalls: Array<{ toolName: string; callId?: string }> = [];
+
+            for (const part of item.parts) {
+              if (part.type === 'text') {
+                textParts.push((part as { type: 'text'; text: string }).text);
+              } else if (part.type === 'tool') {
+                const tp = part as { type: 'tool'; tool: string; callID?: string };
+                toolCalls.push({ toolName: tp.tool, callId: tp.callID });
+              }
+            }
+
+            mapped.push({
+              id: item.info.id,
+              role: 'assistant',
+              text: textParts.join('\n'),
+              toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+              metadata: {
+                sessionId: item.info.sessionID,
+                cost: item.info.cost,
+              },
+            });
+          }
+        }
+
+        return { data: { items: mapped } };
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) };
+      }
     },
   };
 
