@@ -161,6 +161,19 @@ declare module 'vscode' {
     ): Thenable<ChatSession> | ChatSession;
 
     /**
+     * Called when the user changes an option in the session picker UI.
+     * Receives the session resource and the updated option values.
+     *
+     * This is the mechanism by which VSCode notifies the extension that
+     * the user selected a different model/agent/option in the chat bar picker.
+     */
+    provideHandleOptionsChange?(
+      sessionResource: Uri,
+      updates: ReadonlyArray<{ readonly optionId: string; readonly value?: string }>,
+      token: CancellationToken,
+    ): void;
+
+    /**
      * @deprecated
      *
      * Event that the provider can fire to signal that the available provider options have changed.
@@ -249,5 +262,87 @@ declare module 'vscode' {
       defaultChatParticipant: ChatParticipant,
       capabilities?: ChatSessionCapabilities,
     ): Disposable;
+
+    /**
+     * Creates a new chat session item controller for managing session lists.
+     */
+    export function createChatSessionItemController(
+      chatSessionType: string,
+      refreshHandler: (token: CancellationToken) => Thenable<void>,
+    ): ChatSessionItemController;
+  }
+
+  // ---------------------------------------------------------------------------
+  // ChatSessionItemController
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Manages chat session items (the session list visible to users).
+   */
+  export interface ChatSessionItemController {
+    readonly id: string;
+
+    /** Dispose the controller and its items. */
+    dispose(): void;
+
+    /** Managed collection of chat session items. */
+    readonly items: ChatSessionItemCollection;
+
+    /** Creates a new chat session item. */
+    createChatSessionItem(resource: Uri, label: string): ChatSessionItem;
+
+    /** Called by VSCode to refresh the session list. */
+    refreshHandler: (token: CancellationToken) => Thenable<void>;
+
+    /** Called when user starts a new chat session from this controller. */
+    newChatSessionItemHandler?: (context: ChatSessionItemControllerNewItemHandlerContext, token: CancellationToken) => Thenable<ChatSessionItem>;
+
+    /** Called when user forks a session. */
+    forkHandler?: (sessionResource: Uri, request: ChatRequestTurn | undefined, token: CancellationToken) => Thenable<ChatSessionItem> | ChatSessionItem;
+
+    /** Resolve additional data for a session item (e.g., timing, badge). */
+    resolveChatSessionItem?: (item: ChatSessionItem, token: CancellationToken) => Thenable<ChatSessionItem>;
+
+    /** Get the input state for a session. */
+    getChatSessionInputState?: (sessionResource: Uri | undefined, context: { previousInputState: ChatSessionInputState }, token: CancellationToken) => Thenable<ChatSessionInputState | undefined>;
+
+    /** Event fired when a session item's state changes. */
+    readonly onDidChangeChatSessionItemState?: Event<ChatSessionItem>;
+  }
+
+  /** Context for creating a new session item. */
+  export interface ChatSessionItemControllerNewItemHandlerContext {
+    readonly request: {
+      readonly prompt: string;
+      readonly command?: string;
+    };
+    readonly inputState: ChatSessionInputState;
+  }
+
+  /** A collection of chat session items. */
+  export interface ChatSessionItemCollection {
+    readonly size: number;
+    replace(items: readonly ChatSessionItem[]): void;
+  }
+
+  /** Represents a chat session in the session list. */
+  export interface ChatSessionItem {
+    readonly resource: Uri;
+    label: string;
+    iconPath?: IconPath;
+    description?: string;
+    detail?: string;
+    timing?: { readonly created?: number; readonly modified?: number };
+    state?: ChatSessionStatus;
+    badge?: string;
+    dispose(): void;
+  }
+
+  /** Status of a chat session. */
+  export enum ChatSessionStatus {
+    Failed = 0,
+    Completed = 1,
+    InProgress = 2,
+    NeedsInput = 3,
   }
 }

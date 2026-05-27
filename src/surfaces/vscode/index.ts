@@ -33,3 +33,4 @@ export * from './capabilities';
 export * from './acp-renderer';
 export * from './stable-participant';
 export * from './experimental-session';
+export * from './session-store';

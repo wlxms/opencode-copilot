@@ -267,18 +267,24 @@ export interface ExtensionState {
    * Same VSCode chat panel = same sessionId → reuse OpenCode session.
    * New VSCode chat = new sessionId → create new OpenCode session.
    * Each chat has its own turnMap, so switching chats doesn't lose rewind context.
+   *
+   * **Note:** The experimental session surface also uses `sessionStore` for
+   * provider-owned session identity. This map remains for backward compatibility
+   * with the stable participant handler.
    */
   sessionMap: Map<string, SessionState>;
+  /**
+   * Provider-owned session store for the experimental chat surface.
+   * Separates VS Code resource identity from provider logical session identity
+   * and backend session identity. Only set when the proposed API is available.
+   */
+  sessionStore?: import('../surfaces/vscode/session-store').OpenCodeSessionStore;
   /** Status bar controller (shows backend / agent / model) */
   statusBar: StatusBarManager;
-  /** Current agent selection for next prompt */
+  /** Current agent selection — the single source of truth. Written by ANY UI (settings panel, session target picker). Read by ALL handlers. */
   currentAgent?: string;
-  /** Current model selection for next prompt */
+  /** Current model selection — the single source of truth. Written by ANY UI, read by ALL handlers. */
   currentModel?: AcpModelSelection;
   /** Current model display name for status bar / UI */
   currentModelDisplayName?: string;
-  /** Explicit agent override chosen by user for prompt calls */
-  selectedAgentOverride?: string;
-  /** Explicit model override chosen by user for prompt calls */
-  selectedModelOverride?: AcpModelSelection;
 }
