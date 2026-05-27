@@ -901,4 +901,104 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
       expect.stringContaining('Prompt error'),
     );
   });
+
+  // -----------------------------------------------------------------------
+  // Store-backed session resolution (unified provider session identity)
+  // -----------------------------------------------------------------------
+
+  it('should resolve session through store when sessionResource is available', async () => {
+    const { OpenCodeSessionStore } = await import('../surfaces/vscode/session-store');
+    const testMemento = new (class {
+      private vals = new Map<string, unknown>();
+      keys() { return Array.from(this.vals.keys()); }
+      get<T>(key: string) { return this.vals.get(key) as T | undefined; }
+      update(key: string, value: unknown) { this.vals.set(key, value); return Promise.resolve(); }
+    })();
+    const store = new OpenCodeSessionStore(testMemento as any, state.outputChannel);
+    state.sessionStore = store;
+
+    backendStatus = 'running';
+    mockSdkClient.session.create.mockResolvedValue({
+      data: { id: 'store-session-1' },
+    });
+    mockSdkClient.global.event.mockResolvedValue({ stream: emptyEventStream() });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
+    const handler = createParticipantHandler(state);
+    const sessionResource = vscode.Uri.parse('opencode-copilot.opencode:/untitled-store-test');
+
+    const result = await handler(
+      createRequest({
+        prompt: 'store test',
+        sessionId: 'chat-store-1',
+        sessionResource,
+      } as any),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    // Should have created a session via backend
+    expect(mockSdkClient.session.create).toHaveBeenCalled();
+
+    // Store should have a bound backend session
+    const resolved = store.resolve(sessionResource);
+    expect(resolved.backendSessionId).toBe('store-session-1');
+    expect(resolved.isPlaceholder).toBe(false);
+
+    // Legacy sessionMap should be mirrored
+    expect(state.sessionMap.get('chat-store-1')?.opencodeSessionId).toBe('store-session-1');
+
+    // Clean up
+    delete (state as any).sessionStore;
+  });
+
+  it('should reuse store-bound session on subsequent requests', async () => {
+    const { OpenCodeSessionStore } = await import('../surfaces/vscode/session-store');
+    const testMemento = new (class {
+      private vals = new Map<string, unknown>();
+      keys() { return Array.from(this.vals.keys()); }
+      get<T>(key: string) { return this.vals.get(key) as T | undefined; }
+      update(key: string, value: unknown) { this.vals.set(key, value); return Promise.resolve(); }
+    })();
+    const store = new OpenCodeSessionStore(testMemento as any, state.outputChannel);
+    state.sessionStore = store;
+
+    backendStatus = 'running';
+    const sessionResource = vscode.Uri.parse('opencode-copilot.opencode:/untitled-store-reuse');
+
+    // Pre-bind in the store
+    const resolved = store.resolve(sessionResource);
+    store.bindBackendSession(resolved.providerSessionId, 'ses-prebound');
+
+    mockSdkClient.global.event.mockResolvedValue({ stream: emptyEventStream() });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
+    const handler = createParticipantHandler(state);
+
+    const result = await handler(
+      createRequest({
+        prompt: 'reuse test',
+        sessionId: 'chat-store-2',
+        sessionResource,
+      } as any),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    // Should NOT create a new session (reusing store-bound one)
+    expect(mockSdkClient.session.create).not.toHaveBeenCalled();
+
+    // Should prompt on the pre-bound session
+    expect(mockSdkClient.session.prompt).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionID: 'ses-prebound' }),
+    );
+
+    // Legacy sessionMap should be mirrored
+    expect(state.sessionMap.get('chat-store-2')?.opencodeSessionId).toBe('ses-prebound');
+
+    // Clean up
+    delete (state as any).sessionStore;
+  });
 });
