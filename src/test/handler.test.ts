@@ -130,6 +130,7 @@ describe('createParticipantHandler', () => {
           return { data: result.data };
         }),
         list: vi.fn(async () => ({ data: [] })),
+        update: vi.fn(async () => ({ data: { id: 'updated-session', title: 'Updated Title', createdAt: new Date() } })),
         children: vi.fn(),
         status: vi.fn(),
         descendants: vi.fn(() => []),
@@ -970,5 +971,72 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     expect(state.outputChannel.appendLine).toHaveBeenCalledWith(
       expect.stringContaining('Prompt error'),
     );
+  });
+
+  it('should update sessionMap title from backend after turn completes', async () => {
+    const handler = createParticipantHandler(state);
+
+    backendStatus = 'running';
+    state.sessionMap.set('chat-title-test', {
+      opencodeSessionId: 'ses-title-123',
+      turnMap: [],
+      title: 'New OpenCode Session',
+    });
+
+    // Backend returns an auto-generated title
+    vi.mocked(state.backend.sessions.get).mockResolvedValue({
+      data: { id: 'ses-title-123', title: 'How to implement OAuth', createdAt: new Date() },
+    });
+
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+
+    const result = await handler(
+      createRequest({ prompt: 'how to implement oauth', sessionId: 'chat-title-test' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    // Handler should complete normally
+    expect(result!.metadata).toHaveProperty('sessionId');
+
+    // sessionMap should be updated with the backend title
+    const chatState = state.sessionMap.get('chat-title-test');
+    expect(chatState?.title).toBe('How to implement OAuth');
+  });
+
+  it('should not overwrite existing non-placeholder title with backend placeholder', async () => {
+    const handler = createParticipantHandler(state);
+
+    backendStatus = 'running';
+    state.sessionMap.set('chat-title-keep', {
+      opencodeSessionId: 'ses-title-456',
+      turnMap: [],
+      title: 'Existing Good Title',
+    });
+
+    // Backend returns a placeholder title
+    vi.mocked(state.backend.sessions.get).mockResolvedValue({
+      data: { id: 'ses-title-456', title: 'Session 001', createdAt: new Date() },
+    });
+
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+
+    const result = await handler(
+      createRequest({ prompt: 'test keeping title', sessionId: 'chat-title-keep' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    expect(result!.metadata).toHaveProperty('sessionId');
+
+    // sessionMap should keep the existing non-placeholder title
+    const chatState = state.sessionMap.get('chat-title-keep');
+    expect(chatState?.title).toBe('Existing Good Title');
   });
 });

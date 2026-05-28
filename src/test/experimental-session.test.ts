@@ -40,6 +40,7 @@ describe('createSessionContentProvider', () => {
         sessions: {
           create: vi.fn(),
           get: sessionGet,
+          update: vi.fn(async () => ({ data: { id: 'updated-session', title: 'Updated Title', createdAt: new Date() } })),
           prompt: vi.fn(),
           revert: vi.fn(),
           abort: vi.fn(),
@@ -177,5 +178,131 @@ describe('createSessionContentProvider', () => {
     expect(state.backend.sessions.messages).toHaveBeenCalledWith('ses_restore');
     expect(session.title).toBe('Need help with session titles');
     expect(state.sessionMap.get(restoredResourceKey)?.title).toBe('Need help with session titles');
+  });
+
+  // =========================================================================
+  // Title persistence tests — verify fix for titles reverting to placeholder
+  // after tab switches (backend stores placeholder at create time).
+  // =========================================================================
+
+  it('derives title from history when backend returns placeholder title "New OpenCode Session"', async () => {
+    state.backend.sessions.get = vi.fn(async () => ({
+      data: { id: 'ses_placeholder', title: 'New OpenCode Session', createdAt: new Date('2026-05-28T03:00:00Z') },
+    }));
+    state.backend.sessions.messages = vi.fn(async () => ({
+      data: {
+        items: [
+          { id: 'user_1', role: 'user' as const, text: 'How do I fix the auth bug?' },
+          { id: 'assistant_1', role: 'assistant' as const, text: 'Let me check', toolCalls: [] },
+        ],
+      },
+    }));
+
+    const { provider } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    const session = await provider.provideChatSessionContent(
+      vscode.Uri.parse('opencode-copilot.opencode:/ses_placeholder'),
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+      { inputState: {} as vscode.ChatSessionInputState },
+    );
+
+    expect(session.title).toBe('How do I fix the auth bug?');
+  });
+
+  it('derives title from history when backend returns placeholder "OpenCode Session xxx"', async () => {
+    state.backend.sessions.get = vi.fn(async () => ({
+      data: { id: 'ses_abc12345', title: 'OpenCode Session abc12345', createdAt: new Date('2026-05-28T03:00:00Z') },
+    }));
+    state.backend.sessions.messages = vi.fn(async () => ({
+      data: {
+        items: [
+          { id: 'user_1', role: 'user' as const, text: 'Refactor the database layer' },
+          { id: 'assistant_1', role: 'assistant' as const, text: 'Sure', toolCalls: [] },
+        ],
+      },
+    }));
+
+    const { provider } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    const session = await provider.provideChatSessionContent(
+      vscode.Uri.parse('opencode-copilot.opencode:/ses_abc12345'),
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+      { inputState: {} as vscode.ChatSessionInputState },
+    );
+
+    expect(session.title).toBe('Refactor the database layer');
+  });
+
+  it('prefers runtime non-placeholder title over placeholder when same opencodeSessionId has multiple entries', async () => {
+    state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
+
+    // Original tab entry with derived title
+    state.sessionMap.set('opencode-copilot.opencode:/untitled-1', {
+      opencodeSessionId: 'ses_dup',
+      turnMap: [],
+      title: 'Derived From Prompt',
+      createdAt: new Date('2026-05-28T01:00:00Z'),
+    });
+
+    // Session list click created a duplicate entry with placeholder title
+    state.sessionMap.set('opencode-copilot.opencode:/ses_dup', {
+      opencodeSessionId: 'ses_dup',
+      turnMap: [],
+      title: 'New OpenCode Session',
+      createdAt: new Date('2026-05-28T01:00:00Z'),
+    });
+
+    const { controller } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    await controller!.refreshHandler({
+      isCancellationRequested: false,
+      onCancellationRequested: () => ({ dispose() {} }),
+    });
+
+    const items = Array.from(controller!.items).map(([, item]) => item);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.label).toBe('Derived From Prompt');
+  });
+
+  it('restoring existing session reuses non-placeholder title from another sessionMap entry', async () => {
+    // Pre-populate sessionMap with the original entry that has the derived title
+    state.sessionMap.set('opencode-copilot.opencode:/untitled-1', {
+      opencodeSessionId: 'ses_existing',
+      turnMap: [],
+      title: 'My original prompt title',
+      createdAt: new Date('2026-05-28T01:00:00Z'),
+    });
+
+    // Backend still has the placeholder title (never updated in backend)
+    state.backend.sessions.get = vi.fn(async () => ({
+      data: { id: 'ses_existing', title: 'New OpenCode Session', createdAt: new Date('2026-05-28T01:00:00Z') },
+    }));
+    state.backend.sessions.messages = vi.fn(async () => ({
+      data: { items: [] },
+    }));
+
+    const { provider } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    const session = await provider.provideChatSessionContent(
+      vscode.Uri.parse('opencode-copilot.opencode:/ses_existing'),
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+      { inputState: {} as vscode.ChatSessionInputState },
+    );
+
+    const newKey = vscode.Uri.parse('opencode-copilot.opencode:/ses_existing').toString();
+    expect(state.sessionMap.get(newKey)?.title).toBe('My original prompt title');
+    expect(session.title).toBe('My original prompt title');
   });
 });

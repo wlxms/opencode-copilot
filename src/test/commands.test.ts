@@ -64,6 +64,7 @@ describe('routeCommand', () => {
       sessions: {
         create: vi.fn(),
         get: vi.fn(),
+        update: vi.fn(async () => ({ data: undefined })),
         prompt: vi.fn(),
         revert: vi.fn(),
         abort: vi.fn(),
