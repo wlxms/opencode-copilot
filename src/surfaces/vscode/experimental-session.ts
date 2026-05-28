@@ -294,6 +294,14 @@ export class ExperimentalChatSession {
  */
 export const OPENCODE_SESSION_SCHEME = 'opencode-copilot.opencode';
 
+function getWorkspaceDirectory(): string | undefined {
+  return vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+}
+
+function createSessionResource(sessionId: string): vscode.Uri {
+  return vscode.Uri.parse(`${OPENCODE_SESSION_SCHEME}:/${sessionId}`);
+}
+
 /**
  * Create a `vscode.ChatSessionContentProvider` that registers OpenCode
  * as a session target in VS Code's chat view.
@@ -325,6 +333,7 @@ export function createSessionContentProvider(
   controller: vscode.ChatSessionItemController | undefined;
 } {
   const logger = state.outputChannel;
+  const directory = getWorkspaceDirectory();
 
   // -- Option Groups: Agent & Model pickers --------------------------------
 
@@ -334,8 +343,6 @@ export function createSessionContentProvider(
   /** Build option groups from backend config */
   async function refreshOptionGroups(): Promise<void> {
     try {
-      const directory = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
-
       logger.appendLine(`[session-provider] Refreshing option groups (backend running=${state.backend.isRunning()})...`);
 
       // Fetch agents and models in parallel
@@ -415,6 +422,138 @@ export function createSessionContentProvider(
     }
   }
 
+  async function ensureBackendRunning(): Promise<void> {
+    if (state.backend.getStatus() === 'running') {
+      return;
+    }
+
+    const result = await state.backend.start(directory);
+    if (result.error) {
+      throw new Error(typeof result.error === 'string' ? result.error : 'Failed to start backend');
+    }
+  }
+
+  function isPlaceholderSessionTitle(title: string | undefined): boolean {
+    const normalized = title?.trim() ?? '';
+    return !normalized || normalized === 'New OpenCode Session' || normalized.startsWith('OpenCode Session ');
+  }
+
+  function createSessionLabelFromPrompt(prompt: string | undefined, sessionId: string): string {
+    const normalized = (prompt ?? '').replace(/\s+/g, ' ').trim();
+    if (!normalized) {
+      return `Session ${sessionId.slice(0, 8)}`;
+    }
+
+    return normalized.length > 60 ? `${normalized.slice(0, 57).trimEnd()}…` : normalized;
+  }
+
+  function getHistoryDerivedSessionTitle(
+    history: readonly (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[],
+    sessionId: string,
+  ): string {
+    const firstRequest = history.find(
+      (turn): turn is vscode.ChatRequestTurn => turn instanceof vscode.ChatRequestTurn,
+    );
+    return createSessionLabelFromPrompt(firstRequest?.prompt, sessionId);
+  }
+
+  function collectRuntimeSessions(): Array<{ id: string; title: string; createdAt: Date }> {
+    const runtimeSessions = new Map<string, { id: string; title: string; createdAt: Date }>();
+
+    for (const chatState of state.sessionMap.values()) {
+      if (!chatState.opencodeSessionId) {
+        continue;
+      }
+
+      runtimeSessions.set(chatState.opencodeSessionId, {
+        id: chatState.opencodeSessionId,
+        title: chatState.title ?? '',
+        createdAt: chatState.createdAt ?? new Date(),
+      });
+    }
+
+    return Array.from(runtimeSessions.values());
+  }
+
+  function getSessionLabel(session: { title: string; id: string }): string {
+    const title = session.title.trim();
+    return title.length > 0 ? title : `Session ${session.id.slice(0, 8)}`;
+  }
+
+  function getSessionDescription(_session: { id: string; title: string }): string | undefined {
+    return undefined;
+  }
+
+  function mergeSessions(
+    listedSessions: readonly { id: string; title: string; createdAt: Date }[],
+    runtimeSessions: readonly { id: string; title: string; createdAt: Date }[],
+  ): Array<{ id: string; title: string; createdAt: Date }> {
+    const merged = new Map<string, { id: string; title: string; createdAt: Date }>();
+
+    for (const session of listedSessions) {
+      merged.set(session.id, session);
+    }
+
+    for (const session of runtimeSessions) {
+      const existing = merged.get(session.id);
+      if (!existing) {
+        merged.set(session.id, session);
+        continue;
+      }
+
+      merged.set(session.id, {
+        id: session.id,
+        title: !isPlaceholderSessionTitle(existing.title) ? existing.title : session.title,
+        createdAt: existing.createdAt ?? session.createdAt,
+      });
+    }
+
+    return Array.from(merged.values()).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  }
+
+  function publishSessionItems(controller: vscode.ChatSessionItemController, sessions: readonly { id: string; title: string; createdAt: Date }[]): void {
+    const items = sessions.map((session) => {
+      const resource = createSessionResource(session.id);
+      const item = controller.createChatSessionItem(resource, getSessionLabel(session));
+      item.description = getSessionDescription(session);
+      item.status = vscode.ChatSessionStatus.Completed;
+      item.timing = { created: session.createdAt.getTime() };
+      item.tooltip = session.id;
+      return item;
+    });
+
+    controller.items.replace(items);
+    logger.appendLine(`[session-provider] Published ${items.length} session item(s) to Session list`);
+  }
+
+  async function refreshSessionItems(): Promise<void> {
+    if (!controller) {
+      return;
+    }
+
+    await ensureBackendRunning();
+    const sessionsResult = await state.backend.sessions.list(directory);
+    const runtimeSessions = collectRuntimeSessions();
+
+    logger.appendLine(
+      `[session-provider] Refreshing Session list (directory=${directory ?? 'none'}, ` +
+      `listError=${sessionsResult.error ?? 'none'}, listCount=${sessionsResult.data?.length ?? 0}, runtimeCount=${runtimeSessions.length})`,
+    );
+
+    if (sessionsResult.error) {
+      logger.appendLine(`[session-provider] Session list source error: ${sessionsResult.error}`);
+    }
+
+    const listedSessions = sessionsResult.data ?? [];
+    const mergedSessions = mergeSessions(listedSessions, runtimeSessions);
+
+    logger.appendLine(
+      `[session-provider] Session list merged result: ${mergedSessions.map(s => `${s.id}:${getSessionLabel(s)}`).join(', ') || '(empty)'}`,
+    );
+
+    publishSessionItems(controller, mergedSessions);
+  }
+
   // Kick off initial load (non-blocking, fires event when ready).
   // This will likely fail if the backend isn't running yet — that's fine,
   // provideChatSessionProviderOptions will be called again when the event fires.
@@ -438,11 +577,19 @@ export function createSessionContentProvider(
     controller = (vscode.chat as any).createChatSessionItemController(
       OPENCODE_SESSION_SCHEME,
       async (_token: vscode.CancellationToken) => {
-        // Refresh handler — called when VSCode wants to refresh session items.
-        // We don't manage session items, so this is a no-op.
-        await refreshOptionGroups();
+        await Promise.all([
+          refreshOptionGroups(),
+          refreshSessionItems().catch((err) => {
+            logger.appendLine(
+              `[session-provider] Session item refresh failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            controller?.items.replace([]);
+          }),
+        ]);
       },
     ) as vscode.ChatSessionItemController;
+
+    state.refreshSessionItems = refreshSessionItems;
 
     controller.getChatSessionInputState = (
       _sessionResource: vscode.Uri | undefined,
@@ -496,6 +643,14 @@ export function createSessionContentProvider(
   } else {
     logger.appendLine('[session-provider] ChatSessionItemController API not available — picker changes will NOT propagate');
   }
+
+  context.subscriptions.push({
+    dispose: () => {
+      if (state.refreshSessionItems === refreshSessionItems) {
+        state.refreshSessionItems = undefined;
+      }
+    },
+  });
 
   // -- Session History Restoration -----------------------------------------
 
@@ -653,11 +808,7 @@ export function createSessionContentProvider(
           // Fetch history from the OpenCode backend
           return (async (): Promise<vscode.ChatSession> => {
             try {
-              const backendStatus = state.backend.getStatus();
-              if (backendStatus !== 'running') {
-                const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
-                await state.backend.start(workspacePath);
-              }
+              await ensureBackendRunning();
 
               const history = await fetchSessionHistory(chatState.opencodeSessionId, token);
               return {
@@ -689,26 +840,31 @@ export function createSessionContentProvider(
       // Existing session — fetch history from backend
       return (async (): Promise<vscode.ChatSession> => {
         try {
-          // Ensure backend is running before fetching
-          const backendStatus = state.backend.getStatus();
-          if (backendStatus !== 'running') {
-            const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
-            await state.backend.start(workspacePath);
-          }
+          await ensureBackendRunning();
 
           // Get session info for title
           const sessionInfo = await state.backend.sessions.get(sessionId);
-          const title = sessionInfo.data?.title ?? `Session ${sessionId.slice(0, 8)}`;
 
           // Fetch message history
           const history = await fetchSessionHistory(sessionId, token);
+          const backendTitle = sessionInfo.data?.title?.trim() ?? '';
+          const title = backendTitle || getHistoryDerivedSessionTitle(history, sessionId);
 
           // Store in session map for request handler continuity
           const vscodeSessionKey = resource.toString();
-          if (!state.sessionMap.has(vscodeSessionKey)) {
+          const existingState = state.sessionMap.get(vscodeSessionKey);
+          if (existingState) {
+            existingState.opencodeSessionId = sessionId;
+            if (!existingState.title?.trim() || isPlaceholderSessionTitle(existingState.title)) {
+              existingState.title = title;
+            }
+            existingState.createdAt = sessionInfo.data?.createdAt ?? existingState.createdAt ?? new Date();
+          } else {
             state.sessionMap.set(vscodeSessionKey, {
               opencodeSessionId: sessionId,
               turnMap: [],
+              title,
+              createdAt: sessionInfo.data?.createdAt ?? new Date(),
             });
           }
 
