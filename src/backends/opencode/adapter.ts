@@ -339,7 +339,7 @@ export class OpenCodeBackend implements AcpBackend {
 
     messages: async (id: string, directory?: string): Promise<AcpResult<AcpMessageHistory>> => {
       try {
-        const result = await this.sdk.session.messages({ id, directory });
+        const result = await this.sdk.session.messages({ sessionID: id, directory });
         const error = getResultError(result);
         if (error !== undefined) {
           return { error: extractErrorMessage(error, 'Failed to get messages') };
