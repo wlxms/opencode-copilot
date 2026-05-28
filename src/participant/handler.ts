@@ -87,6 +87,42 @@ function recoverFromHistory(context: vscode.ChatContext): RecoveredHistory {
   return { sessionId: null, turnMap: [] };
 }
 
+function getSessionResourceKey(request: vscode.ChatRequest): string | undefined {
+  const sessionResource = request.sessionResource;
+  if (!sessionResource) {
+    return undefined;
+  }
+
+  try {
+    return sessionResource.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function aliasSessionState(
+  state: ExtensionState,
+  sourceKey: string | undefined,
+  targetKey: string | undefined,
+): void {
+  if (!sourceKey || !targetKey || sourceKey === targetKey) {
+    return;
+  }
+
+  const existing = state.sessionMap.get(sourceKey);
+  if (existing && !state.sessionMap.has(targetKey)) {
+    state.sessionMap.set(targetKey, existing);
+  }
+}
+
+function getInitialSessionTitle(vscodeSessionId: string): string {
+  if (vscodeSessionId.includes('/untitled-')) {
+    return 'New OpenCode Session';
+  }
+
+  return `OpenCode Session ${vscodeSessionId.slice(0, 8)}`;
+}
+
 /**
  * Resolve or create an OpenCode session for this VSCode chat.
  *
@@ -133,7 +169,7 @@ async function resolveSession(
   if (!chatState.opencodeSessionId) {
     stream.progress('Creating new session...');
     const result = await state.backend.sessions.create({
-      title: `Chat ${vscodeSessionId.slice(0, 8)}`,
+      title: getInitialSessionTitle(vscodeSessionId),
       directory,
     });
     if (result.error || !result.data) {
@@ -141,6 +177,8 @@ async function resolveSession(
       return null;
     }
     chatState.opencodeSessionId = result.data.id;
+    chatState.title = result.data.title;
+    chatState.createdAt = result.data.createdAt;
     stream.progress('Session ready');
     state.outputChannel.appendLine(
       `[handler] Created new OpenCode session ${chatState.opencodeSessionId} for VSCode chat ${vscodeSessionId}`,
@@ -205,6 +243,8 @@ async function resolveSession(
         }
         chatState.opencodeSessionId = createResult.data.id;
         chatState.turnMap = [];
+        chatState.title = createResult.data.title;
+        chatState.createdAt = createResult.data.createdAt;
         return chatState.opencodeSessionId;
       }
     } else {
@@ -274,8 +314,37 @@ export function createParticipantHandler(
       // 5. Resolve session (handles rewind via revert)
       // request.sessionId from chatParticipantPrivate identifies the VSCode chat
       const vscodeSessionId = request.sessionId ?? 'unknown';
+      const sessionResourceKey = getSessionResourceKey(request);
+
+      // Session-target switches can restore state under the provider resource URI
+      // before the first follow-up prompt arrives with a VSCode chat sessionId.
+      // Alias that restored state so the request handler reuses the selected
+      // session instead of creating a detached one.
+      aliasSessionState(state, sessionResourceKey, vscodeSessionId);
+
       const sessionId = await resolveSession(state, context, stream, vscodeSessionId, directory);
       if (!sessionId) {return { metadata: {} };}
+
+      aliasSessionState(state, vscodeSessionId, sessionResourceKey);
+
+      const activeChatState = state.sessionMap.get(vscodeSessionId);
+      if (activeChatState) {
+        const resolvedTitle = (() => {
+          if (activeChatState.title?.trim()) {
+            return activeChatState.title;
+          }
+
+          const sessionResource = request.sessionResource?.toString();
+          if (sessionResource?.includes('/untitled-')) {
+            return 'New OpenCode Session';
+          }
+
+          return `OpenCode Session ${sessionId.slice(0, 8)}`;
+        })();
+
+        activeChatState.title = resolvedTitle;
+        activeChatState.createdAt = activeChatState.createdAt ?? new Date();
+      }
 
       const executeTurnWithBridge = async (): Promise<void> => {
         stream.progress('Connecting to event stream...');
@@ -471,6 +540,14 @@ export function createParticipantHandler(
           state.outputChannel.appendLine(
             `[handler] Recorded turn ${chatState.turnMap.length - 1}: messageID=${userMessageId} (total turns=${chatState.turnMap.length})`,
           );
+        }
+
+        if (state.refreshSessionItems) {
+          state.outputChannel.appendLine(`[handler] Refreshing Session list for session ${sessionId}`);
+          await state.refreshSessionItems().catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            state.outputChannel.appendLine(`[handler] Session list refresh failed: ${msg}`);
+          });
         }
       };
 
