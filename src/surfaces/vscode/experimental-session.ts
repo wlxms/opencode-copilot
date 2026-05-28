@@ -348,6 +348,10 @@ export function createSessionContentProvider(
   const logger = state.outputChannel;
   const directory = getWorkspaceDirectory();
 
+  // ── Local session cache ──────────────────────────────────────────────
+  const SESSION_CACHE_KEY = 'opencode.sessionItems';
+  interface CachedSessionItem { id: string; title: string; createdAt: number; }
+
   // -- Option Groups: Agent & Model pickers --------------------------------
 
   const onDidChangeOptionsEmitter = new vscode.EventEmitter<void>();
@@ -549,6 +553,13 @@ export function createSessionContentProvider(
 
     controller.items.replace(items);
     logger.appendLine(`[session-provider] Published ${items.length} session item(s) to Session list`);
+
+    try {
+      const cached: CachedSessionItem[] = sessions.map(s => ({
+        id: s.id, title: s.title, createdAt: s.createdAt.getTime(),
+      }));
+      context.globalState.update(SESSION_CACHE_KEY, cached);
+    } catch { /* non-critical */ }
   }
 
   async function refreshSessionItems(): Promise<void> {
@@ -575,6 +586,66 @@ export function createSessionContentProvider(
     logger.appendLine(
       `[session-provider] Session list merged result: ${mergedSessions.map(s => `${s.id}:${getSessionLabel(s)}`).join(', ') || '(empty)'}`,
     );
+
+    // Daemon has no sessions and sessionMap is empty → restore from cache
+    if (mergedSessions.length === 0 && runtimeSessions.length === 0) {
+      try {
+        const cached = context.globalState.get<CachedSessionItem[]>(SESSION_CACHE_KEY);
+        if (cached?.length) {
+          const restored = cached.map(c => ({ id: c.id, title: c.title, createdAt: new Date(c.createdAt) }));
+          logger.appendLine(`[session-provider] Restored ${restored.length} session(s) from local cache`);
+          publishSessionItems(controller, restored);
+          return;
+        }
+      } catch { /* cache unavailable, skip */ }
+      logger.appendLine('[session-provider] Skipping publish — no sessions available');
+      return;
+    }
+
+    publishSessionItems(controller, mergedSessions);
+  }
+
+  async function refreshSessionItems(): Promise<void> {
+    if (!controller) {
+      return;
+    }
+
+    await ensureBackendRunning();
+    const sessionsResult = await state.backend.sessions.list(directory);
+    const runtimeSessions = collectRuntimeSessions();
+
+    logger.appendLine(
+      `[session-provider] Refreshing Session list (directory=${directory ?? 'none'}, ` +
+      `listError=${sessionsResult.error ?? 'none'}, listCount=${sessionsResult.data?.length ?? 0}, runtimeCount=${runtimeSessions.length})`,
+    );
+
+    if (sessionsResult.error) {
+      logger.appendLine(`[session-provider] Session list source error: ${sessionsResult.error}`);
+    }
+
+    const listedSessions = sessionsResult.data ?? [];
+    const mergedSessions = mergeSessions(listedSessions, runtimeSessions);
+
+    logger.appendLine(
+      `[session-provider] Session list merged result: ${mergedSessions.map(s => `${s.id}:${getSessionLabel(s)}`).join(', ') || '(empty)'}`,
+    );
+
+    if (mergedSessions.length === 0 && runtimeSessions.length === 0) {
+      // Restore from local cache if daemon has no sessions yet
+      try {
+        const cached = context.globalState.get<CachedSessionItem[]>(SESSION_CACHE_KEY);
+        if (cached && cached.length > 0) {
+          const restored = cached.map(c => ({
+            id: c.id, title: c.title, createdAt: new Date(c.createdAt),
+          }));
+          logger.appendLine(`[session-provider] Restored ${restored.length} session(s) from local cache`);
+          publishSessionItems(controller, restored);
+          return;
+        }
+      } catch { /* skip */ }
+      logger.appendLine('[session-provider] Skipping publish — no sessions available');
+      return;
+    }
 
     publishSessionItems(controller, mergedSessions);
   }
