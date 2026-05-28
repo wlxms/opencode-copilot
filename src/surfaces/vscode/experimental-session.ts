@@ -356,11 +356,74 @@ export function createSessionContentProvider(
 
   const onDidChangeOptionsEmitter = new vscode.EventEmitter<void>();
   let cachedOptionGroups: vscode.ChatSessionProviderOptionGroup[] = [];
+  /** Guard against re-entrant refreshOptionGroups() calls (e.g. event fire → VSCode re-query loop) */
+  let optionGroupsRefreshInFlight: Promise<void> | null = null;
+  /**
+   * Reference to the most recently created inputState.
+   * VSCode's provideChatSessionProviderOptions only affects NEW sessions;
+   * to update the picker text in an ALREADY-OPEN session we must push
+   * new groups into the existing inputState object directly.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let currentInputState: any = undefined;
+
+  /** Placeholder option groups shown while the backend is not yet running */
+  function buildConnectingOptionGroups(): vscode.ChatSessionProviderOptionGroup[] {
+    return [
+      {
+        id: 'agents',
+        name: 'Agent',
+        items: [{ id: 'agent-connecting', name: '--', description: 'Waiting for backend' }],
+        selected: { id: 'agent-connecting', name: '--', description: 'Waiting for backend' },
+      },
+      {
+        id: 'models',
+        name: 'Model',
+        items: [{ id: 'model-connecting', name: '--', description: 'Waiting for backend' }],
+        selected: { id: 'model-connecting', name: '--', description: 'Waiting for backend' },
+      },
+    ];
+  }
+
+  /** Check whether cached option groups are still placeholder/stub groups */
+  function isPlaceholderGroups(groups: vscode.ChatSessionProviderOptionGroup[]): boolean {
+    return groups.length > 0 && (groups[0]?.selected?.id?.endsWith('-connecting') ?? false);
+  }
 
   /** Build option groups from backend config */
   async function refreshOptionGroups(): Promise<void> {
+    // Guard: if a refresh is already in-flight, return the existing promise.
+    // This prevents re-entrant loops where provideChatSessionProviderOptions
+    // calls refreshOptionGroups → onDidChangeOptionsEmitter.fire() →
+    // VSCode re-calls provideChatSessionProviderOptions → refreshOptionGroups.
+    if (optionGroupsRefreshInFlight) {
+      return optionGroupsRefreshInFlight;
+    }
+
+    optionGroupsRefreshInFlight = doRefreshOptionGroups();
     try {
-      logger.appendLine(`[session-provider] Refreshing option groups (backend running=${state.backend.isRunning()})...`);
+      await optionGroupsRefreshInFlight;
+    } finally {
+      optionGroupsRefreshInFlight = null;
+    }
+  }
+
+  /** Actual work — separated so the guard can deduplicate calls */
+  async function doRefreshOptionGroups(): Promise<void> {
+    try {
+      // If backend is not running, show placeholder groups without calling backend
+      if (!state.backend.isRunning()) {
+        const prevGroups = cachedOptionGroups;
+        cachedOptionGroups = buildConnectingOptionGroups();
+        // Only fire event if groups actually changed (avoid re-triggering VSCode re-poll)
+        if (prevGroups !== cachedOptionGroups) {
+          onDidChangeOptionsEmitter.fire();
+        }
+        logger.appendLine('[session-provider] Backend not running — showing "Connecting…" option groups');
+        return;
+      }
+
+      logger.appendLine(`[session-provider] Refreshing option groups (backend running=true)...`);
 
       // Fetch agents and models in parallel
       const [agentsResult, modelsResult] = await Promise.all([
@@ -567,7 +630,14 @@ export function createSessionContentProvider(
       return;
     }
 
-    await ensureBackendRunning();
+    // Skip session list refresh when backend is not running.
+    // This preserves VSCode's default session list (user can navigate back)
+    // instead of replacing it with an empty list.
+    if (!state.backend.isRunning()) {
+      logger.appendLine('[session-provider] Backend not running — skipping session list refresh');
+      return;
+    }
+
     const sessionsResult = await state.backend.sessions.list(directory);
     const runtimeSessions = collectRuntimeSessions();
 
@@ -591,49 +661,6 @@ export function createSessionContentProvider(
     if (mergedSessions.length === 0 && runtimeSessions.length === 0) {
       try {
         const cached = context.globalState.get<CachedSessionItem[]>(SESSION_CACHE_KEY);
-        if (cached?.length) {
-          const restored = cached.map(c => ({ id: c.id, title: c.title, createdAt: new Date(c.createdAt) }));
-          logger.appendLine(`[session-provider] Restored ${restored.length} session(s) from local cache`);
-          publishSessionItems(controller, restored);
-          return;
-        }
-      } catch { /* cache unavailable, skip */ }
-      logger.appendLine('[session-provider] Skipping publish — no sessions available');
-      return;
-    }
-
-    publishSessionItems(controller, mergedSessions);
-  }
-
-  async function refreshSessionItems(): Promise<void> {
-    if (!controller) {
-      return;
-    }
-
-    await ensureBackendRunning();
-    const sessionsResult = await state.backend.sessions.list(directory);
-    const runtimeSessions = collectRuntimeSessions();
-
-    logger.appendLine(
-      `[session-provider] Refreshing Session list (directory=${directory ?? 'none'}, ` +
-      `listError=${sessionsResult.error ?? 'none'}, listCount=${sessionsResult.data?.length ?? 0}, runtimeCount=${runtimeSessions.length})`,
-    );
-
-    if (sessionsResult.error) {
-      logger.appendLine(`[session-provider] Session list source error: ${sessionsResult.error}`);
-    }
-
-    const listedSessions = sessionsResult.data ?? [];
-    const mergedSessions = mergeSessions(listedSessions, runtimeSessions);
-
-    logger.appendLine(
-      `[session-provider] Session list merged result: ${mergedSessions.map(s => `${s.id}:${getSessionLabel(s)}`).join(', ') || '(empty)'}`,
-    );
-
-    if (mergedSessions.length === 0 && runtimeSessions.length === 0) {
-      // Restore from local cache if daemon has no sessions yet
-      try {
-        const cached = context.globalState.get<CachedSessionItem[]>(SESSION_CACHE_KEY);
         if (cached && cached.length > 0) {
           const restored = cached.map(c => ({
             id: c.id, title: c.title, createdAt: new Date(c.createdAt),
@@ -650,12 +677,28 @@ export function createSessionContentProvider(
     publishSessionItems(controller, mergedSessions);
   }
 
-  // Kick off initial load (non-blocking, fires event when ready).
-  // This will likely fail if the backend isn't running yet — that's fine,
-  // provideChatSessionProviderOptions will be called again when the event fires.
+  // Kick off initial option groups load (non-blocking).
+  // When backend is not running this will show "Connecting…" placeholders.
+  // When backend IS already running this will populate real data.
   refreshOptionGroups().catch(err => {
-    logger.appendLine(`[session-provider] Initial option groups load failed (will retry on first use): ${err}`);
+    logger.appendLine(`[session-provider] Initial option groups load failed: ${err}`);
   });
+
+  // Register a one-shot callback so that when the backend finishes starting,
+  // we immediately refresh option groups + session list with real data.
+  // This avoids polling: no repeated requests while backend is offline.
+  const onBackendReadyHandler = () => {
+    logger.appendLine('[session-provider] Backend ready — refreshing option groups and session list');
+    refreshOptionGroups().catch(err => {
+      logger.appendLine(`[session-provider] Backend-ready option groups refresh failed: ${err}`);
+    });
+    refreshSessionItems().catch(err => {
+      logger.appendLine(
+        `[session-provider] Backend-ready session list refresh failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  };
+  state.onBackendReady = onBackendReadyHandler;
 
   // -- ChatSessionItemController: Picker Tracking --------------------------
   // The controller creates tracked inputState objects via createChatSessionInputState().
@@ -679,7 +722,10 @@ export function createSessionContentProvider(
             logger.appendLine(
               `[session-provider] Session item refresh failed: ${err instanceof Error ? err.message : String(err)}`,
             );
-            controller?.items.replace([]);
+            // Do NOT replace items with [] — that wipes VSCode's default
+            // session list and traps the user in an empty view. The
+            // onBackendReady callback will populate items once the backend
+            // is available.
           }),
         ]);
       },
@@ -697,6 +743,19 @@ export function createSessionContentProvider(
       // onDidChange fires on the returned inputState.
       const inputState = controller!.createChatSessionInputState(cachedOptionGroups);
 
+      // Keep a reference so we can push group updates to an already-open session
+      // when the backend connects (VSCode won't re-query a live inputState).
+      currentInputState = inputState;
+
+      // Listen for option-group refreshes and push new groups into
+      // this inputState so the picker text updates in real time.
+      const syncListener = onDidChangeOptionsEmitter.event(() => {
+        if (currentInputState && !isPlaceholderGroups(cachedOptionGroups)) {
+          logger.appendLine('[session-provider] Pushing updated groups to current inputState');
+          currentInputState.groups = cachedOptionGroups;
+        }
+      });
+
       // Subscribe to changes — update state.currentAgent/currentModel in real-time.
       inputState.onDidChange(() => {
         const groups = inputState.groups ?? [];
@@ -708,6 +767,12 @@ export function createSessionContentProvider(
         for (const group of groups) {
           const selected = group.selected;
           if (!selected) { continue; }
+
+          // Skip placeholder items — they shouldn't leak into state
+          if (selected.id.endsWith('-connecting')) {
+            logger.appendLine(`[session-provider] Picker ignored placeholder selection: ${selected.id}`);
+            continue;
+          }
 
           if (group.id === 'agents') {
             const agentId = selected.id.replace(/^agent-/, '');
@@ -730,6 +795,10 @@ export function createSessionContentProvider(
 
       inputState.onDidDispose(() => {
         logger.appendLine(`[session-provider] InputState disposed for ${_sessionResource?.toString() ?? 'new session'}`);
+        syncListener.dispose();
+        if (currentInputState === inputState) {
+          currentInputState = undefined;
+        }
       });
 
       return inputState;
@@ -744,6 +813,9 @@ export function createSessionContentProvider(
     dispose: () => {
       if (state.refreshSessionItems === refreshSessionItems) {
         state.refreshSessionItems = undefined;
+      }
+      if (state.onBackendReady === onBackendReadyHandler) {
+        state.onBackendReady = undefined;
       }
     },
   });
@@ -840,13 +912,21 @@ export function createSessionContentProvider(
     provideChatSessionProviderOptions(
       _token: vscode.CancellationToken,
     ): vscode.Thenable<vscode.ChatSessionProviderOptions> {
-      // If we have cached groups, return them immediately.
-      // Otherwise trigger a refresh and return the promise.
-      if (cachedOptionGroups.length > 0) {
+      // If we have real data cached, return immediately.
+      if (cachedOptionGroups.length > 0 && !isPlaceholderGroups(cachedOptionGroups)) {
         return { optionGroups: cachedOptionGroups };
       }
 
-      // Backend might be running now — try to load
+      // If a refresh is already in-flight, return the in-flight promise.
+      // This prevents re-entrant loops where fire() → VSCode re-query → refresh again.
+      if (optionGroupsRefreshInFlight) {
+        return optionGroupsRefreshInFlight.then(() => ({
+          optionGroups: cachedOptionGroups,
+        }));
+      }
+
+      // Backend might be running now — if so, fetch real data.
+      // If still offline, refreshOptionGroups() returns placeholders.
       return refreshOptionGroups().then(() => ({
         optionGroups: cachedOptionGroups,
       }));

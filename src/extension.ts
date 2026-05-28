@@ -179,6 +179,9 @@ export function activate(context: vscode.ExtensionContext) {
     outputChannel.appendLine(`[extension] Backend started at ${result.data?.url}`);
     // Load default agent/model from config and update status bar
     loadDefaultsFromConfig(state!);
+    // Notify session provider that backend is ready so it can refresh
+    // option groups and session list (avoids polling while offline).
+    state!.onBackendReady?.();
   }).catch((err: unknown) => {
     outputChannel.appendLine(
       `[extension] Backend start error: ${err instanceof Error ? err.message : String(err)}`,

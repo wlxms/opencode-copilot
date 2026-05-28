@@ -286,4 +286,10 @@ export interface ExtensionState {
   currentModelDisplayName?: string;
   /** Refresh published chat session items, if the session provider is active. */
   refreshSessionItems?: () => Promise<void>;
+  /**
+   * Called once when the backend transitions from not-running to running.
+   * Used by the session provider to trigger its first real data fetch
+   * without polling while the backend is offline.
+   */
+  onBackendReady?: () => void;
 }
