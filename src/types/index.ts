@@ -149,6 +149,11 @@ export interface OpenCodeClient {
       sessionID: string;
       directory?: string;
     }): Promise<SdkResponse<SdkSessionData>>;
+    update(parameters: {
+      sessionID: string;
+      directory?: string;
+      title?: string;
+    }): Promise<SdkResponse<SdkSessionData>>;
     prompt(parameters: {
       sessionID: string;
       directory?: string;

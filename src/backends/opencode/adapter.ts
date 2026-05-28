@@ -220,6 +220,26 @@ export class OpenCodeBackend implements AcpBackend {
       }
     },
 
+    update: async (id: string, options: { title?: string; directory?: string }): Promise<AcpResult<AcpSessionInfo>> => {
+      try {
+        const result = await this.sdk.session.update({
+          sessionID: id,
+          directory: options.directory,
+          title: options.title,
+        });
+        const error = getResultError(result);
+        if (error !== undefined) {
+          return { error: extractErrorMessage(error, 'Session update failed') };
+        }
+        if (!result.data) {
+          return { error: 'Session update failed' };
+        }
+        return { data: toAcpSessionInfo(result.data) };
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+
     children: async (id: string, directory?: string) => {
       try {
         const result = await this.sdk.session.children({ sessionID: id, directory });

@@ -45,6 +45,11 @@ export interface AcpSessionOperations {
     directory?: string,
   ): Promise<AcpResult<AcpSessionInfo>>;
 
+  update(
+    id: string,
+    options: { title?: string; directory?: string },
+  ): Promise<AcpResult<AcpSessionInfo>>;
+
   prompt(
     id: string,
     text: string,
