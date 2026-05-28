@@ -271,14 +271,10 @@ export interface ExtensionState {
   sessionMap: Map<string, SessionState>;
   /** Status bar controller (shows backend / agent / model) */
   statusBar: StatusBarManager;
-  /** Current agent selection for next prompt */
+  /** Current agent selection — the single source of truth. Written by ANY UI (settings panel, session target picker). Read by ALL handlers. */
   currentAgent?: string;
-  /** Current model selection for next prompt */
+  /** Current model selection — the single source of truth. Written by ANY UI, read by ALL handlers. */
   currentModel?: AcpModelSelection;
   /** Current model display name for status bar / UI */
   currentModelDisplayName?: string;
-  /** Explicit agent override chosen by user for prompt calls */
-  selectedAgentOverride?: string;
-  /** Explicit model override chosen by user for prompt calls */
-  selectedModelOverride?: AcpModelSelection;
 }

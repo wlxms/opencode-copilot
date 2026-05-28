@@ -289,11 +289,11 @@ export function createParticipantHandler(
 
         // Build prompt options from current agent/model selection
         const promptOptions: { model?: { providerID: string; modelID: string }; agent?: string } = {};
-        if (state.selectedAgentOverride) {
-          promptOptions.agent = state.selectedAgentOverride;
+        if (state.currentAgent) {
+          promptOptions.agent = state.currentAgent;
         }
-        if (state.selectedModelOverride) {
-          promptOptions.model = state.selectedModelOverride;
+        if (state.currentModel) {
+          promptOptions.model = state.currentModel;
         }
         state.outputChannel.appendLine(
           `[handler] Prompt options: ${JSON.stringify(promptOptions)}`,
