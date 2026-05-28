@@ -209,7 +209,6 @@ export function activate(context: vscode.ExtensionContext) {
             }
             case 'setAgent': {
               state.currentAgent = message.agentId;
-              state.selectedAgentOverride = message.agentId;
               await refreshStatusBar(state);
               await pushDataToPanel(state, panel);
               break;
@@ -224,10 +223,6 @@ export function activate(context: vscode.ExtensionContext) {
                 const match = (modelsResp.data ?? []).find(m => m.id === message.modelID && m.provider === message.providerID);
                 state.currentModelDisplayName = match?.name ?? message.modelID;
               }
-              state.selectedModelOverride = {
-                providerID: message.providerID,
-                modelID: message.modelID,
-              };
               await refreshStatusBar(state);
               await pushDataToPanel(state, panel);
               break;
@@ -329,7 +324,7 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   if (hasRegisterChatSessionContentProvider()) {
-    const provider = createSessionContentProvider(state, context);
+    const { provider, controller } = createSessionContentProvider(state, context);
     const registration = vscode.chat.registerChatSessionContentProvider(
       OPENCODE_SESSION_SCHEME,
       provider,
@@ -338,7 +333,11 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     context.subscriptions.push(registration);
-    outputChannel.appendLine('[extension] Session content provider registered — OpenCode appears in Session Target dropdown');
+    if (controller) {
+      outputChannel.appendLine(`[extension] Session content provider registered (controller id=${controller.id}) — OpenCode appears in Session Target dropdown`);
+    } else {
+      outputChannel.appendLine('[extension] Session content provider registered (no controller — picker changes will NOT propagate) — OpenCode appears in Session Target dropdown');
+    }
   } else {
     outputChannel.appendLine('[extension] chatSessionsProvider API unavailable — session target registration skipped');
   }

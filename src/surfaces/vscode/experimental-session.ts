@@ -47,10 +47,8 @@
 import * as vscode from 'vscode';
 import type { ExtensionState } from '../../types';
 import type { OpenCodeEvent, OpenCodeEventStream } from '../../backends/opencode/sdk-events';
+import { createParticipantHandler } from '../../participant/handler';
 
-import { StreamBridge } from '../../participant/streaming';
-import { ExternalEditTracker } from '../../participant/external-edit-tracker';
-import { collectOpenFileUris } from '../../participant/checkpoint';
 
 import {
   AcpRenderer,
@@ -300,22 +298,32 @@ export const OPENCODE_SESSION_SCHEME = 'opencode-copilot.opencode';
  * Create a `vscode.ChatSessionContentProvider` that registers OpenCode
  * as a session target in VS Code's chat view.
  *
- * The returned provider:
- * - `provideChatSessionContent(uri, token)` — returns a ChatSession with a
- *   `requestHandler` that routes chat requests through our OpenCode backend.
+ * == Picker Architecture ==
+ * We create a `ChatSessionItemController` alongside the content provider.
+ * The controller's `getChatSessionInputState` creates tracked inputState
+ * objects via `controller.createChatSessionInputState()`. VSCode monitors
+ * these objects, so `inputState.onDidChange` actually fires when the user
+ * changes picker selections — unlike inputState received from the content
+ * provider's context, which is NOT tracked by VSCode.
  *
- * The request handler reuses the same StreamBridge + AcpRenderer pipeline
- * as the stable participant surface, ensuring feature parity.
+ * Flow:
+ * 1. Controller's `getChatSessionInputState` → creates tracked inputState
+ * 2. VSCode tracks it, fires `onDidChange` when user changes picker
+ * 3. We subscribe to `onDidChange` → parse groups → update state.currentAgent/currentModel
+ * 4. Handler reads state.currentAgent/currentModel at prompt time
  *
  * @param state - The global extension state.
  * @param context - The extension context (for subscriptions).
- * @returns A `vscode.ChatSessionContentProvider` instance ready for
- *          registration via `vscode.chat.registerChatSessionContentProvider()`.
+ * @returns Object with `provider` (ChatSessionContentProvider) and
+ *          `controller` (ChatSessionItemController), both ready for registration.
  */
 export function createSessionContentProvider(
   state: ExtensionState,
   context: vscode.ExtensionContext,
-): vscode.ChatSessionContentProvider {
+): {
+  provider: vscode.ChatSessionContentProvider;
+  controller: vscode.ChatSessionItemController | undefined;
+} {
   const logger = state.outputChannel;
 
   // -- Option Groups: Agent & Model pickers --------------------------------
@@ -348,11 +356,11 @@ export function createSessionContentProvider(
         id: `agent-${a.id}`,
         name: a.name ?? a.id,
         description: a.description,
-        default: a.id === (state.selectedAgentOverride ?? state.currentAgent),
+        default: a.id === state.currentAgent,
       }));
 
       // Find selected agent item
-      const currentAgentId = state.selectedAgentOverride ?? state.currentAgent;
+      const currentAgentId = state.currentAgent;
       const selectedAgent = agentItems.find(i => i.id === `agent-${currentAgentId}`) ?? agentItems[0];
 
       // Build model option items
@@ -360,12 +368,12 @@ export function createSessionContentProvider(
         id: `model-${m.provider ?? 'default'}/${m.id}`,
         name: m.name ?? m.id,
         description: m.providerName,
-        default: m.id === (state.selectedModelOverride?.modelID ?? state.currentModel?.modelID),
+        default: m.id === (state.currentModel?.modelID),
       }));
 
       // Find selected model item — match by both provider and model ID
-      const currentModelId = state.selectedModelOverride?.modelID ?? state.currentModel?.modelID;
-      const currentProviderId = state.selectedModelOverride?.providerID ?? state.currentModel?.providerID;
+      const currentModelId = state.currentModel?.modelID;
+      const currentProviderId = state.currentModel?.providerID;
       let selectedModel = modelItems[0];
       if (currentModelId) {
         // First try exact match with provider
@@ -413,6 +421,81 @@ export function createSessionContentProvider(
   refreshOptionGroups().catch(err => {
     logger.appendLine(`[session-provider] Initial option groups load failed (will retry on first use): ${err}`);
   });
+
+  // -- ChatSessionItemController: Picker Tracking --------------------------
+  // The controller creates tracked inputState objects via createChatSessionInputState().
+  // VSCode monitors these objects, so onDidChange actually fires when the user
+  // changes picker selections. Without the controller, inputState.onDidChange
+  // is dead (VSCode only tracks inputStates from controllers).
+
+  const chat = vscode.chat as Record<string, unknown>;
+  const hasControllerAPI = typeof chat.createChatSessionItemController === 'function';
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let controller: vscode.ChatSessionItemController | undefined;
+
+  if (hasControllerAPI) {
+    controller = (vscode.chat as any).createChatSessionItemController(
+      OPENCODE_SESSION_SCHEME,
+      async (_token: vscode.CancellationToken) => {
+        // Refresh handler — called when VSCode wants to refresh session items.
+        // We don't manage session items, so this is a no-op.
+        await refreshOptionGroups();
+      },
+    ) as vscode.ChatSessionItemController;
+
+    controller.getChatSessionInputState = (
+      _sessionResource: vscode.Uri | undefined,
+      _context: { readonly previousInputState: vscode.ChatSessionInputState | undefined },
+      _token: vscode.CancellationToken,
+    ): vscode.ChatSessionInputState => {
+      // Create a tracked inputState from our option groups.
+      // VSCode monitors this object — when the user changes a picker selection,
+      // onDidChange fires on the returned inputState.
+      const inputState = controller!.createChatSessionInputState(cachedOptionGroups);
+
+      // Subscribe to changes — update state.currentAgent/currentModel in real-time.
+      inputState.onDidChange(() => {
+        const groups = inputState.groups ?? [];
+        logger.appendLine(
+          `[session-provider] Picker changed: ${groups.length} groups` +
+          groups.map(g => ` [${g.id}] selected=${g.selected?.id ?? '(none)'}`).join(''),
+        );
+
+        for (const group of groups) {
+          const selected = group.selected;
+          if (!selected) { continue; }
+
+          if (group.id === 'agents') {
+            const agentId = selected.id.replace(/^agent-/, '');
+            state.currentAgent = agentId;
+            logger.appendLine(`[session-provider] Picker set currentAgent=${agentId}`);
+          }
+
+          if (group.id === 'models') {
+            const modelPart = selected.id.replace(/^model-/, '');
+            const slashIdx = modelPart.indexOf('/');
+            if (slashIdx >= 0) {
+              const providerID = modelPart.slice(0, slashIdx);
+              const modelID = modelPart.slice(slashIdx + 1);
+              state.currentModel = { providerID, modelID };
+              logger.appendLine(`[session-provider] Picker set currentModel=${providerID}/${modelID}`);
+            }
+          }
+        }
+      });
+
+      inputState.onDidDispose(() => {
+        logger.appendLine(`[session-provider] InputState disposed for ${_sessionResource?.toString() ?? 'new session'}`);
+      });
+
+      return inputState;
+    };
+
+    logger.appendLine(`[session-provider] ChatSessionItemController created (id=${controller.id})`);
+  } else {
+    logger.appendLine('[session-provider] ChatSessionItemController API not available — picker changes will NOT propagate');
+  }
 
   // -- Session History Restoration -----------------------------------------
 
@@ -488,153 +571,16 @@ export function createSessionContentProvider(
     return history;
   }
 
-  // -- Request Handler (shared across new and restored sessions) ------------
-
-  /**
-   * Create the request handler that routes prompts to the OpenCode backend.
-   * Captures selected agent/model from a closure so each session can have its own.
-   */
-  function createRequestHandler(
-    selectedAgent?: string,
-    selectedModel?: { providerID: string; modelID: string },
-  ): vscode.ChatRequestHandler {
-    return async (
-      request: vscode.ChatRequest,
-      _ctx: vscode.ChatContext,
-      stream: vscode.ChatResponseStream,
-      token: vscode.CancellationToken,
-    ): Promise<vscode.ChatResult> => {
-      logger.appendLine(
-        `[session-provider] requestHandler invoked: "${request.prompt?.substring(0, 80)}"`,
-      );
-
-      // Guard: cancellation
-      if (token.isCancellationRequested) {
-        stream.markdown('\u26A0\uFE0F Cancelled\n');
-        return { metadata: {} };
-      }
-
-      // Guard: empty prompt
-      if (!request.prompt?.trim()) {
-        stream.markdown('Please enter a prompt.');
-        return { metadata: {} };
-      }
-
-      // 1. Ensure backend is running
-      const status = state.backend.getStatus();
-      if (status !== 'running') {
-        try {
-          stream.progress('Starting OpenCode server...');
-          const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
-          const result = await state.backend.start(workspacePath);
-          if (result.error || !result.data) {
-            const msg = typeof result.error === 'string' ? result.error : 'Unknown error';
-            stream.markdown(`\u26A0\uFE0F Failed to start OpenCode: ${msg}`);
-            return { metadata: {} };
-          }
-          logger.appendLine(`[session-provider] Server started at ${result.data.url}`);
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : 'Unknown error';
-          stream.markdown(`\u26A0\uFE0F Failed to start OpenCode: ${msg}`);
-          return { metadata: {} };
-        }
-      }
-
-      // 2. Create or reuse OpenCode session
-      const directory = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
-      const vscodeSessionId = request.sessionId ?? `session-${Date.now()}`;
-      let chatState = state.sessionMap.get(vscodeSessionId);
-      if (!chatState) {
-        chatState = { opencodeSessionId: '', turnMap: [] };
-        state.sessionMap.set(vscodeSessionId, chatState);
-      }
-
-      if (!chatState.opencodeSessionId) {
-        stream.progress('Creating new session...');
-        const result = await state.backend.sessions.create({
-          title: `Chat ${vscodeSessionId.slice(0, 8)}`,
-          directory,
-        });
-        if (result.error || !result.data) {
-          stream.markdown('\u26A0\uFE0F Failed to create OpenCode session.');
-          return { metadata: {} };
-        }
-        chatState.opencodeSessionId = result.data.id ?? '';
-        logger.appendLine(`[session-provider] Created session ${chatState.opencodeSessionId}`);
-      }
-
-      const sessionId = chatState.opencodeSessionId;
-
-      // 3. Ensure event stream is connected
-      stream.progress('Connecting to event stream...');
-      await state.backend.events.ensureStarted();
-
-      // 4. Open a per-session event stream
-      const events = state.backend.events.openSessionStream(sessionId);
-
-      // 5. Send prompt and stream response
-      stream.progress('Sending message...');
-      logger.appendLine(
-        `[session-provider] Prompting session ${sessionId}: ${request.prompt.substring(0, 50)}`,
-      );
-
-      // Build prompt options — use session-level overrides first, then fall back to global state
-      const promptOptions: { model?: { providerID: string; modelID: string }; agent?: string } = {};
-      if (selectedAgent) {
-        promptOptions.agent = selectedAgent;
-      } else if (state.selectedAgentOverride) {
-        promptOptions.agent = state.selectedAgentOverride;
-      }
-      if (selectedModel) {
-        promptOptions.model = selectedModel;
-      } else if (state.selectedModelOverride) {
-        promptOptions.model = state.selectedModelOverride;
-      }
-
-      // Fire prompt (non-blocking) — events arrive through the session stream
-      const promptPromise = state.backend.sessions.prompt(
-        sessionId,
-        request.prompt,
-        directory,
-        promptOptions,
-      ).then((result) => {
-        if (result.error) {
-          logger.appendLine(`[session-provider] Prompt error: ${JSON.stringify(result.error)}`);
-        }
-      }).catch((err: unknown) => {
-        logger.appendLine(`[session-provider] Prompt exception: ${err instanceof Error ? err.message : String(err)}`);
-      });
-
-      // 6. Render events through StreamBridge (same pipeline as @opencode participant)
-      const tracker = new ExternalEditTracker();
-      const bridge = new StreamBridge({
-        logger: { appendLine: (m: string) => logger.appendLine(m) },
-        sessionId,
-        knownFileUris: new Set((await collectOpenFileUris()).map(u => u.toString())),
-        tracker,
-        directory,
-      });
-
-      try {
-        await bridge.run(events.stream, stream, token);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Connection lost';
-        logger.appendLine(`[session-provider] Stream error: ${msg}`);
-        stream.markdown(`\n\u26A0\uFE0F ${msg}\n`);
-      } finally {
-        state.backend.events.closeSessionStream(sessionId);
-      }
-
-      // Ensure prompt completes
-      await promptPromise;
-
-      return { metadata: {} };
-    };
-  }
-
   // -- The Provider --------------------------------------------------------
+  // Following the Copilot CLI pattern: the session provider only provides content
+  // (history, title) and manages option groups (agent/model picker).
+  // All request handling is delegated to the same ChatParticipant handler used
+  // by the stable surface (participant/handler.ts), ensuring a shared session
+  // lifecycle. Picker changes update state.currentAgent/currentModel via the
+  // controller's tracked inputState.onDidChange, and the handler reads from
+  // state at prompt time.
 
-  return {
+  const provider: vscode.ChatSessionContentProvider = {
     /**
      * Called by VSCode at registration time and whenever
      * onDidChangeChatSessionProviderOptions fires.
@@ -678,34 +624,10 @@ export function createSessionContentProvider(
         refreshOptionGroups().catch(() => { /* already logged */ });
       }
 
-      // Parse selected agent/model from inputState.groups[].selected
-      let resolvedAgent: string | undefined;
-      let resolvedModel: { providerID: string; modelID: string } | undefined;
-
-      const inputGroups = providerContext.inputState?.groups ?? [];
-      for (const group of inputGroups) {
-        const selected = group.selected;
-        if (!selected) { continue; }
-
-        if (group.id === 'agents') {
-          // OptionItem.id format: "agent-<agentId>"
-          const agentId = selected.id.replace(/^agent-/, '');
-          resolvedAgent = agentId;
-          state.selectedAgentOverride = agentId;
-        }
-
-        if (group.id === 'models') {
-          // OptionItem.id format: "model-<providerId>/<modelId>"
-          const modelPart = selected.id.replace(/^model-/, '');
-          const slashIdx = modelPart.indexOf('/');
-          if (slashIdx >= 0) {
-            const providerID = modelPart.slice(0, slashIdx);
-            const modelID = modelPart.slice(slashIdx + 1);
-            resolvedModel = { providerID, modelID };
-            state.selectedModelOverride = { providerID, modelID };
-          }
-        }
-      }
+      // NOTE: Picker selection changes are handled by the ChatSessionItemController's
+      // getChatSessionInputState → onDidChange subscription (set up above).
+      // We no longer need to read inputState here — the controller keeps
+      // state.currentAgent/currentModel updated in real-time.
 
       // New session — no history to restore
       // VSCode generates untitled-* URIs for fresh sessions; only real OpenCode
@@ -714,7 +636,7 @@ export function createSessionContentProvider(
         return {
           title: 'New OpenCode Session',
           history: [],
-          requestHandler: createRequestHandler(resolvedAgent, resolvedModel),
+          requestHandler: createParticipantHandler(state),
         };
       }
 
@@ -741,7 +663,7 @@ export function createSessionContentProvider(
               return {
                 title: `OpenCode Session`,
                 history,
-                requestHandler: createRequestHandler(resolvedAgent, resolvedModel),
+                requestHandler: createParticipantHandler(state),
               };
             } catch (err) {
               logger.appendLine(
@@ -750,7 +672,7 @@ export function createSessionContentProvider(
               return {
                 title: 'OpenCode Session',
                 history: [],
-                requestHandler: createRequestHandler(resolvedAgent, resolvedModel),
+                requestHandler: createParticipantHandler(state),
               };
             }
           })();
@@ -760,7 +682,7 @@ export function createSessionContentProvider(
         return {
           title: 'New OpenCode Session',
           history: [],
-          requestHandler: createRequestHandler(resolvedAgent, resolvedModel),
+          requestHandler: createParticipantHandler(state),
         };
       }
 
@@ -793,7 +715,7 @@ export function createSessionContentProvider(
           return {
             title,
             history,
-            requestHandler: createRequestHandler(resolvedAgent, resolvedModel),
+            requestHandler: createParticipantHandler(state),
           };
         } catch (err) {
           logger.appendLine(
@@ -802,12 +724,14 @@ export function createSessionContentProvider(
           return {
             title: 'OpenCode (offline)',
             history: [],
-            requestHandler: createRequestHandler(resolvedAgent, resolvedModel),
+            requestHandler: createParticipantHandler(state),
           };
         }
       })();
     },
   };
+
+  return { provider, controller };
 }
 
 // ---------------------------------------------------------------------------

@@ -227,6 +227,57 @@ declare module 'vscode' {
   // Chat namespace extension
   // ---------------------------------------------------------------------------
 
+  // ---------------------------------------------------------------------------
+  // ChatSessionItemController
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Callback invoked to refresh the collection of chat session items
+   * for a ChatSessionItemController.
+   */
+  export type ChatSessionItemControllerRefreshHandler = (
+    token: CancellationToken,
+  ) => Thenable<void>;
+
+  /**
+   * Callback invoked to get the input state for a chat session.
+   * Returns a ChatSessionInputState created via controller.createChatSessionInputState().
+   */
+  export type ChatSessionControllerGetInputState = (
+    sessionResource: Uri | undefined,
+    context: {
+      readonly previousInputState: ChatSessionInputState | undefined;
+    },
+    token: CancellationToken,
+  ) => Thenable<ChatSessionInputState> | ChatSessionInputState;
+
+  /**
+   * Manages chat sessions for a specific chat session type.
+   * Created via vscode.chat.createChatSessionItemController().
+   *
+   * The controller creates tracked inputState objects (via createChatSessionInputState)
+   * that VSCode monitors for changes — unlike inputState from ChatSessionContentProvider,
+   * controller-created inputState has a working onDidChange event.
+   */
+  export interface ChatSessionItemController {
+    readonly id: string;
+
+    /**
+     * Get the input state for a chat session.
+     * Must return a ChatSessionInputState created via createChatSessionInputState().
+     */
+    getChatSessionInputState?: ChatSessionControllerGetInputState;
+
+    /**
+     * Create a new managed ChatSessionInputState object.
+     * VSCode tracks this inputState and fires onDidChange when the user
+     * changes picker selections.
+     */
+    createChatSessionInputState(
+      groups: ChatSessionProviderOptionGroup[],
+    ): ChatSessionInputState;
+  }
+
   export namespace chat {
     /**
      * Register a chat session content provider for a given URI scheme.
@@ -249,5 +300,23 @@ declare module 'vscode' {
       defaultChatParticipant: ChatParticipant,
       capabilities?: ChatSessionCapabilities,
     ): Disposable;
+
+    /**
+     * Creates a ChatSessionItemController for managing chat session items
+     * and input state for a given chat session type.
+     *
+     * The controller is essential for picker support: it creates tracked
+     * inputState objects via createChatSessionInputState() that VSCode
+     * monitors, enabling onDidChange to fire when users change selections.
+     *
+     * @param chatSessionType - Must match the `type` in the `chatSessions`
+     *   contribution in package.json.
+     * @param refreshHandler - Called to refresh session items.
+     * @returns A ChatSessionItemController instance.
+     */
+    export function createChatSessionItemController(
+      chatSessionType: string,
+      refreshHandler: ChatSessionItemControllerRefreshHandler,
+    ): ChatSessionItemController;
   }
 }
