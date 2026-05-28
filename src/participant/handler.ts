@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { StreamBridge } from './streaming';
 import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
+import { isPlaceholderSessionTitle } from '../surfaces/vscode/experimental-session';
 
 import type { ExtensionState, TurnMapping } from '../types';
 import type { AcpChildSessionInfo, AcpSessionStatus, AcpResult } from '../acp/types';
@@ -329,20 +330,6 @@ export function createParticipantHandler(
 
       const activeChatState = state.sessionMap.get(vscodeSessionId);
       if (activeChatState) {
-        const resolvedTitle = (() => {
-          if (activeChatState.title?.trim()) {
-            return activeChatState.title;
-          }
-
-          const sessionResource = request.sessionResource?.toString();
-          if (sessionResource?.includes('/untitled-')) {
-            return 'New OpenCode Session';
-          }
-
-          return `OpenCode Session ${sessionId.slice(0, 8)}`;
-        })();
-
-        activeChatState.title = resolvedTitle;
         activeChatState.createdAt = activeChatState.createdAt ?? new Date();
       }
 
@@ -433,6 +420,7 @@ export function createParticipantHandler(
         // bridge again until no more subagent tasks are detected.
         let userMessageId: string | null = null;
         let needsContinue = true;
+        let sessionTitleFromBridge: string | undefined;
 
         try {
           while (needsContinue && !token.isCancellationRequested) {
@@ -511,6 +499,19 @@ export function createParticipantHandler(
               userMessageId = bridge.getUserMessageId();
             }
 
+            // Capture backend-generated session title from the first bridge run.
+            // session.updated events fire during streaming; the bridge stores the
+            // most recent non-placeholder title.
+            if (!sessionTitleFromBridge) {
+              const title = bridge.getSessionTitle();
+              state.outputChannel.appendLine(
+                `[handler] bridge.getSessionTitle() = ${JSON.stringify(title)}`,
+              );
+              if (title) {
+                sessionTitleFromBridge = title;
+              }
+            }
+
             // After subagent tasks completed, send continuation prompt and loop
             if (bridge.getHadSubagentTasks() && !token.isCancellationRequested) {
               state.outputChannel.appendLine('[handler] Subagent tasks completed — sending continuation prompt');
@@ -533,6 +534,7 @@ export function createParticipantHandler(
           `[handler] User message ID for turn: ${!!chatState && !!userMessageId} (${userMessageId})`,
         );
         if (chatState && userMessageId) {
+          const wasFirstTurn = chatState.turnMap.length === 0;
           chatState.turnMap.push({
             vscodeTurn: chatState.turnMap.length,
             opencodeMessageId: userMessageId,
@@ -540,6 +542,79 @@ export function createParticipantHandler(
           state.outputChannel.appendLine(
             `[handler] Recorded turn ${chatState.turnMap.length - 1}: messageID=${userMessageId} (total turns=${chatState.turnMap.length})`,
           );
+
+          // Derive session title from first prompt (matches experimental-session logic)
+          if (wasFirstTurn) {
+            state.outputChannel.appendLine(
+              `[handler] First turn completed for session ${sessionId}`,
+            );
+          }
+        }
+
+        // Resolve session title. Priority:
+        // 1. Backend auto-generates title (via session.updated event)
+        // 2. sessions.get() returns a meaningful title
+        // 3. Derive from first prompt + push to backend via sessions.update()
+        let resolvedTitle = sessionTitleFromBridge;
+
+        if (!resolvedTitle || isPlaceholderSessionTitle(resolvedTitle)) {
+          try {
+            const sessionInfo = await state.backend.sessions.get(sessionId, directory);
+            const backendTitle = sessionInfo.data?.title?.trim() ?? '';
+            if (backendTitle && !isPlaceholderSessionTitle(backendTitle)) {
+              resolvedTitle = backendTitle;
+              state.outputChannel.appendLine(
+                `[handler] Title from sessions.get(): "${backendTitle}"`,
+              );
+            }
+          } catch (err: unknown) {
+            state.outputChannel.appendLine(
+              `[handler] sessions.get() for title failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+
+        // If still no meaningful title, derive from first prompt and push to backend.
+        // The backend's auto-title generation is model-dependent (e.g. doesn't work
+        // with GLM 5, requires GPT-5-nano via Zen), so we use sessions.update()
+        // as a reliable fallback for all providers.
+        // Skip if chatState already has a non-placeholder title (e.g. from a
+        // previous turn or manual rename).
+        const existingChatTitle = chatState?.title;
+        const hasExistingGoodTitle = existingChatTitle && !isPlaceholderSessionTitle(existingChatTitle);
+        const shouldDeriveTitle = (!resolvedTitle || isPlaceholderSessionTitle(resolvedTitle))
+          && (typeof wasFirstTurn === 'undefined' || wasFirstTurn)
+          && !isPlaceholderSessionTitle(request.prompt)
+          && !hasExistingGoodTitle;
+        if (shouldDeriveTitle) {
+          const derived = request.prompt.length > 60
+            ? `${request.prompt.slice(0, 57).trimEnd()}…`
+            : request.prompt;
+          if (derived && !isPlaceholderSessionTitle(derived)) {
+            try {
+              const updateResult = await state.backend.sessions.update(sessionId, {
+                title: derived,
+                directory,
+              });
+              resolvedTitle = updateResult.data?.title ?? derived;
+              state.outputChannel.appendLine(
+                `[handler] Title pushed via sessions.update(): "${resolvedTitle}"`,
+              );
+            } catch (err: unknown) {
+              state.outputChannel.appendLine(
+                `[handler] sessions.update() for title failed: ${err instanceof Error ? err.message : String(err)}`,
+              );
+              resolvedTitle = derived; // use derived title in sessionMap even if update fails
+            }
+          }
+        }
+
+        // Persist resolved title to sessionMap (only if existing title is placeholder)
+        if (resolvedTitle && !isPlaceholderSessionTitle(resolvedTitle)) {
+          const chatState = state.sessionMap.get(vscodeSessionId);
+          if (chatState && isPlaceholderSessionTitle(chatState.title)) {
+            chatState.title = resolvedTitle;
+          }
         }
 
         if (state.refreshSessionItems) {
