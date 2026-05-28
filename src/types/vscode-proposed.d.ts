@@ -223,6 +223,35 @@ declare module 'vscode' {
     supportsChangingSessionType?: boolean;
   }
 
+  export enum ChatSessionStatus {
+    Failed = 0,
+    Completed = 1,
+    InProgress = 2,
+    NeedsInput = 3,
+  }
+
+  export interface ChatSessionItem {
+    readonly resource: Uri;
+    label: string;
+    iconPath?: IconPath;
+    description?: string | MarkdownString;
+    badge?: string | MarkdownString;
+    status?: ChatSessionStatus;
+    tooltip?: string | MarkdownString;
+    readonly legacyResource?: Uri;
+    timing?: {
+      readonly created: number;
+    };
+  }
+
+  export interface ChatSessionItemCollection extends Iterable<readonly [id: Uri, chatSessionItem: ChatSessionItem]> {
+    readonly size: number;
+    replace(items: Iterable<ChatSessionItem>): void;
+    add(item: ChatSessionItem): void;
+    delete(resource: Uri): void;
+    get(resource: Uri): ChatSessionItem | undefined;
+  }
+
   // ---------------------------------------------------------------------------
   // Chat namespace extension
   // ---------------------------------------------------------------------------
@@ -261,6 +290,16 @@ declare module 'vscode' {
    */
   export interface ChatSessionItemController {
     readonly id: string;
+
+    dispose(): void;
+
+    readonly items: ChatSessionItemCollection;
+
+    createChatSessionItem(resource: Uri, label: string): ChatSessionItem;
+
+    readonly refreshHandler: ChatSessionItemControllerRefreshHandler;
+
+    resolveChatSessionItem?: (item: ChatSessionItem, token: CancellationToken) => Thenable<void>;
 
     /**
      * Get the input state for a chat session.

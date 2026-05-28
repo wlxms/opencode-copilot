@@ -254,6 +254,8 @@ export interface TurnMapping {
 export interface SessionState {
   opencodeSessionId: string;
   turnMap: TurnMapping[];
+  title?: string;
+  createdAt?: Date;
 }
 
 /** Global extension state shared across modules */
@@ -277,4 +279,6 @@ export interface ExtensionState {
   currentModel?: AcpModelSelection;
   /** Current model display name for status bar / UI */
   currentModelDisplayName?: string;
+  /** Refresh published chat session items, if the session provider is active. */
+  refreshSessionItems?: () => Promise<void>;
 }
