@@ -325,6 +325,19 @@ function createSessionResource(sessionId: string): vscode.Uri {
  * @returns Object with `provider` (ChatSessionContentProvider) and
  *          `controller` (ChatSessionItemController), both ready for registration.
  */
+/**
+ * Returns true if `title` is a placeholder/auto-generated session title
+ * that carries no meaningful information (e.g. "New OpenCode Session",
+ * "OpenCode Session abc", "Session abc", or empty).
+ */
+export function isPlaceholderSessionTitle(title: string | undefined): boolean {
+  const normalized = title?.trim() ?? '';
+  return !normalized
+    || normalized === 'New OpenCode Session'
+    || normalized.startsWith('OpenCode Session ')
+    || normalized.startsWith('Session ');
+}
+
 export function createSessionContentProvider(
   state: ExtensionState,
   context: vscode.ExtensionContext,
@@ -433,11 +446,6 @@ export function createSessionContentProvider(
     }
   }
 
-  function isPlaceholderSessionTitle(title: string | undefined): boolean {
-    const normalized = title?.trim() ?? '';
-    return !normalized || normalized === 'New OpenCode Session' || normalized.startsWith('OpenCode Session ');
-  }
-
   function createSessionLabelFromPrompt(prompt: string | undefined, sessionId: string): string {
     const normalized = (prompt ?? '').replace(/\s+/g, ' ').trim();
     if (!normalized) {
@@ -465,11 +473,28 @@ export function createSessionContentProvider(
         continue;
       }
 
-      runtimeSessions.set(chatState.opencodeSessionId, {
-        id: chatState.opencodeSessionId,
-        title: chatState.title ?? '',
-        createdAt: chatState.createdAt ?? new Date(),
-      });
+      const existing = runtimeSessions.get(chatState.opencodeSessionId);
+      const newTitle = chatState.title ?? '';
+
+      // Prefer non-placeholder titles when multiple sessionMap entries share
+      // the same opencodeSessionId (e.g. untitled-N vs opencode-copilot.opencode:/ses_xxx).
+      if (existing) {
+        const existingIsPlaceholder = isPlaceholderSessionTitle(existing.title);
+        const newIsPlaceholder = isPlaceholderSessionTitle(newTitle);
+        if (existingIsPlaceholder && !newIsPlaceholder) {
+          runtimeSessions.set(chatState.opencodeSessionId, {
+            id: chatState.opencodeSessionId,
+            title: newTitle,
+            createdAt: chatState.createdAt ?? existing.createdAt,
+          });
+        }
+      } else {
+        runtimeSessions.set(chatState.opencodeSessionId, {
+          id: chatState.opencodeSessionId,
+          title: newTitle,
+          createdAt: chatState.createdAt ?? new Date(),
+        });
+      }
     }
 
     return Array.from(runtimeSessions.values());
@@ -811,8 +836,34 @@ export function createSessionContentProvider(
               await ensureBackendRunning();
 
               const history = await fetchSessionHistory(chatState.opencodeSessionId, token);
+
+              // Determine title with priority:
+              // 1. Non-placeholder chatState title (already fetched from backend earlier)
+              // 2. Backend-generated title (fetch fresh in case it was generated after last update)
+              // 3. History-derived fallback
+              let title: string;
+              if (!isPlaceholderSessionTitle(chatState.title) && chatState.title?.trim()) {
+                title = chatState.title.trim();
+              } else {
+                // Try fetching the latest title from backend — it may have been
+                // auto-generated after the first response completed.
+                try {
+                  const sessionInfo = await state.backend.sessions.get(chatState.opencodeSessionId);
+                  const backendTitle = sessionInfo.data?.title?.trim() ?? '';
+                  if (!isPlaceholderSessionTitle(backendTitle)) {
+                    title = backendTitle;
+                    // Persist to sessionMap so subsequent tab switches skip the fetch
+                    chatState.title = backendTitle;
+                  } else {
+                    title = getHistoryDerivedSessionTitle(history, chatState.opencodeSessionId);
+                  }
+                } catch {
+                  title = getHistoryDerivedSessionTitle(history, chatState.opencodeSessionId);
+                }
+              }
+
               return {
-                title: `OpenCode Session`,
+                title,
                 history,
                 requestHandler: createParticipantHandler(state),
               };
@@ -821,7 +872,7 @@ export function createSessionContentProvider(
                 `[session-provider] Failed to restore session history: ${err instanceof Error ? err.message : String(err)}`,
               );
               return {
-                title: 'OpenCode Session',
+                title: chatState.title?.trim() || 'OpenCode (offline)',
                 history: [],
                 requestHandler: createParticipantHandler(state),
               };
@@ -848,28 +899,45 @@ export function createSessionContentProvider(
           // Fetch message history
           const history = await fetchSessionHistory(sessionId, token);
           const backendTitle = sessionInfo.data?.title?.trim() ?? '';
-          const title = backendTitle || getHistoryDerivedSessionTitle(history, sessionId);
+          // Use backend title only if it's a meaningful (non-placeholder) title;
+          // otherwise derive from the first user message in history.
+          const title = !isPlaceholderSessionTitle(backendTitle)
+            ? backendTitle
+            : getHistoryDerivedSessionTitle(history, sessionId);
 
           // Store in session map for request handler continuity
           const vscodeSessionKey = resource.toString();
           const existingState = state.sessionMap.get(vscodeSessionKey);
+          let bestTitle = title;
           if (existingState) {
             existingState.opencodeSessionId = sessionId;
             if (!existingState.title?.trim() || isPlaceholderSessionTitle(existingState.title)) {
               existingState.title = title;
             }
+            bestTitle = existingState.title;
             existingState.createdAt = sessionInfo.data?.createdAt ?? existingState.createdAt ?? new Date();
           } else {
+            // Before creating a new entry with a potentially placeholder title,
+            // check if any other sessionMap entry for the same opencodeSessionId
+            // already has a non-placeholder title (from a previous handler run).
+            if (isPlaceholderSessionTitle(title)) {
+              for (const cs of state.sessionMap.values()) {
+                if (cs.opencodeSessionId === sessionId && !isPlaceholderSessionTitle(cs.title)) {
+                  bestTitle = cs.title;
+                  break;
+                }
+              }
+            }
             state.sessionMap.set(vscodeSessionKey, {
               opencodeSessionId: sessionId,
               turnMap: [],
-              title,
+              title: bestTitle,
               createdAt: sessionInfo.data?.createdAt ?? new Date(),
             });
           }
 
           return {
-            title,
+            title: bestTitle,
             history,
             requestHandler: createParticipantHandler(state),
           };
