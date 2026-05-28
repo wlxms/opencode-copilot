@@ -15,6 +15,7 @@ import type {
   AcpFileDiff,
   AcpPermissionRequestEvent,
   AcpQuestionRequestEvent,
+  AcpSessionLifecycleEvent,
 } from '../acp/types';
 import type {
   ChatTerminalToolInvocationData,
@@ -162,6 +163,8 @@ export class StreamBridge {
   /** Active subagent scopes — filters child events from rendering as independent cards */
   private activeSubagentScopes: Map<string, SubagentScope> = new Map();
   /** Whether at least one subagent (task) tool completed during this bridge session */
+  /** Backend-generated session title captured from session.updated events */
+  private sessionTitle: string | undefined;
   private hadSubagentTasks = false;
   /** Whether a session.idle event was received (and deferred due to active subagents) */
   private deferredIdle = false;
@@ -208,6 +211,12 @@ export class StreamBridge {
    *  whether to send a continuation prompt after bridge stop. */
   getHadSubagentTasks(): boolean {
     return this.hadSubagentTasks;
+  }
+
+  /** Backend-generated session title captured from session.updated events.
+   *  Returns the most recent non-placeholder title, or undefined if none. */
+  getSessionTitle(): string | undefined {
+    return this.sessionTitle;
   }
 
   /**
@@ -545,6 +554,21 @@ export class StreamBridge {
           return { stop: false, rendered: false };
         }
         return { stop: true, rendered: false };
+      case 'session.updated': {
+        // Backend may auto-generate a meaningful title and broadcast it via
+        // session.updated. Capture it so the handler can update the session list.
+        const lifecycle = event as AcpSessionLifecycleEvent;
+        const rawTitle = lifecycle.title;
+        const trimmedTitle = rawTitle?.trim();
+        this.logTag(
+          'title',
+          `session.updated: sessionId=${lifecycle.sessionId}, rawTitle=${JSON.stringify(rawTitle)}, trimmed=${JSON.stringify(trimmedTitle)}`,
+        );
+        if (trimmedTitle) {
+          this.sessionTitle = trimmedTitle;
+        }
+        return { stop: false, rendered: false };
+      }
       case 'session.diff':
         return { stop: false, rendered: this.handleSessionDiff(event, stream) };
       case 'session.error': {
