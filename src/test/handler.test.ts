@@ -339,7 +339,7 @@ describe('createParticipantHandler', () => {
     // Session was created with workspace directory and title
     expect(mockSdkClient.session.create).toHaveBeenCalledWith({
       directory: '/test/workspace',
-      title: 'Chat chat-1',
+      title: 'OpenCode Session chat-1',
     });
     // Session stored in sessionMap under the vscode chat session ID
     expect(state.sessionMap.get('chat-1')?.opencodeSessionId).toBe('session-1');
@@ -400,6 +400,76 @@ describe('createParticipantHandler', () => {
       directory: '/test/workspace',
     });
     expect(result!.metadata).toHaveProperty('sessionId', 'existing-session');
+  });
+
+  it('should reuse restored target session when state exists under sessionResource', async () => {
+    backendStatus = 'running';
+    const resourceKey = 'opencode-copilot.opencode:///session-existing';
+    const restoredState = {
+      opencodeSessionId: 'existing-session',
+      turnMap: [],
+    };
+    state.sessionMap.set(resourceKey, restoredState);
+
+    const handler = createParticipantHandler(state);
+
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
+    const result = await handler(
+      createRequest({
+        prompt: 'continue restored chat',
+        sessionId: 'chat-from-target',
+        sessionResource: {
+          toString: () => resourceKey,
+          fsPath: '/test/chat',
+        } as vscode.Uri,
+      }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    expect(mockSdkClient.session.create).not.toHaveBeenCalled();
+    expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
+      sessionID: 'existing-session',
+      parts: [{ type: 'text', text: 'continue restored chat' }],
+      directory: '/test/workspace',
+    });
+    expect(state.sessionMap.get('chat-from-target')).toBe(restoredState);
+    expect(state.sessionMap.get(resourceKey)).toBe(restoredState);
+    expect(result!.metadata).toHaveProperty('sessionId', 'existing-session');
+  });
+
+  it('should create provider untitled sessions with New OpenCode Session title', async () => {
+    backendStatus = 'running';
+    const handler = createParticipantHandler(state);
+
+    mockSdkClient.session.create.mockResolvedValue({
+      data: { id: 'session-provider-1', title: 'New OpenCode Session' },
+    });
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
+    await handler(
+      createRequest({
+        prompt: 'provider start',
+        sessionId: 'opencode-copilot.opencode:/untitled-123',
+        sessionResource: { toString: () => 'opencode-copilot.opencode:/untitled-123', fsPath: '/test/chat' } as vscode.Uri,
+      }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    expect(mockSdkClient.session.create).toHaveBeenCalledWith({
+      directory: '/test/workspace',
+      title: 'New OpenCode Session',
+    });
   });
 
   // -----------------------------------------------------------------------
