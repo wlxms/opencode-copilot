@@ -8,6 +8,7 @@ import type { ExtensionState, TurnMapping } from '../types';
 import type { AcpChildSessionInfo, AcpSessionStatus, AcpResult } from '../acp/types';
 import { ExternalEditTracker } from './external-edit-tracker';
 import { collectOpenFileUris } from './checkpoint';
+import { extractAttachmentsFromReferences } from './references';
 
 /**
  * Get the VSCode workspace root path for the first workspace folder.
@@ -343,16 +344,53 @@ export function createParticipantHandler(
           `[handler] Prompting session ${sessionId} with: ${request.prompt.substring(0, 50)}`,
         );
 
-        // Build prompt options from current agent/model selection
-        const promptOptions: { model?: { providerID: string; modelID: string }; agent?: string } = {};
+        // Debug: log available request properties and toolReferences for attachment debugging
+        const reqKeys = Object.keys(request).filter(k => !k.startsWith('_')).join(',');
+        state.outputChannel.appendLine(`[handler] request keys: ${reqKeys}`);
+        const toolRefs = (request as { toolReferences?: readonly unknown[] }).toolReferences;
+        state.outputChannel.appendLine(
+          `[handler] toolReferences: ${toolRefs?.length ?? 0} items`,
+        );
+        if (toolRefs?.length) {
+          for (let ti = 0; ti < toolRefs.length; ti++) {
+            const tr = toolRefs[ti] as Record<string, unknown>;
+            state.outputChannel.appendLine(
+              `[handler]  toolRef[${ti}] name="${tr.name}" keys=${Object.keys(tr).join(',')}`,
+            );
+          }
+        }
+
+        // Also check for any attachments-like property on the request
+        const maybeAttachments = (request as { attachments?: unknown }).attachments;
+        state.outputChannel.appendLine(
+          `[handler] request.attachments: ${maybeAttachments === undefined ? 'undefined' : Array.isArray(maybeAttachments) ? `array[${maybeAttachments.length}]` : typeof maybeAttachments}`,
+        );
+
+        // Extract file/image attachments from VSCode chat references
+        const attachments = extractAttachmentsFromReferences(request.references, state.outputChannel);
+        if (attachments.length > 0) {
+          state.outputChannel.appendLine(
+            `[handler] Extracted ${attachments.length} attachment(s) from request references`,
+          );
+        }
+
+        // Build prompt options from current agent/model selection and attachments
+        const promptOptions: {
+          model?: { providerID: string; modelID: string };
+          agent?: string;
+          attachments?: typeof attachments;
+        } = {};
         if (state.currentAgent) {
           promptOptions.agent = state.currentAgent;
         }
         if (state.currentModel) {
           promptOptions.model = state.currentModel;
         }
+        if (attachments.length > 0) {
+          promptOptions.attachments = attachments;
+        }
         state.outputChannel.appendLine(
-          `[handler] Prompt options: ${JSON.stringify(promptOptions)}`,
+          `[handler] Prompt options: ${JSON.stringify({ ...promptOptions, attachments: attachments.length > 0 ? `[${attachments.length} items]` : undefined })}`,
         );
 
         const promptPromise = state.backend.sessions.prompt(

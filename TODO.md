@@ -8,4 +8,4 @@
 
 ## Medium Priority
 
-- [ ] **接收图片/附件/会话上下文**：支持从 VSCode 会话中接收图片、文件附件、会话历史等额外信息，传递给 OpenCode backend 处理
+- [x] **接收图片/附件/会话上下文**：支持从 VSCode 会话中接收图片、文件附件、会话历史等额外信息，传递给 OpenCode backend 处理
