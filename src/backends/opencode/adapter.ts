@@ -25,6 +25,7 @@ import type {
   AcpModel,
   AcpAgent,
   AcpConfig,
+  AcpFileAttachment,
   AcpResult,
   AcpPermissionResponse,
   AcpEvent,
@@ -275,13 +276,28 @@ export class OpenCodeBackend implements AcpBackend {
       options?: {
         model?: { providerID: string; modelID: string };
         agent?: string;
+        attachments?: AcpFileAttachment[];
       },
     ): Promise<AcpResult<unknown>> => {
       try {
+        const parts: unknown[] = [{ type: 'text', text }];
+
+        // Convert file attachments to SDK FilePartInput[] and prepend them
+        // so the text part remains the last/user-like part.
+        if (options?.attachments?.length) {
+          const fileParts = options.attachments.map((att) => ({
+            type: 'file' as const,
+            mime: att.mime,
+            filename: att.filename,
+            url: att.url,
+          }));
+          parts.unshift(...fileParts);
+        }
+
         const result = await this.sdk.session.prompt({
           sessionID: id,
           directory,
-          parts: [{ type: 'text', text }],
+          parts,
           model: options?.model,
           agent: options?.agent,
         });
