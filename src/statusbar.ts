@@ -1,12 +1,9 @@
 /**
- * Status bar controller — shows backend, agent, and model in the VS Code status bar.
+ * Status bar controller — single item, markdown table tooltip.
  *
- * Three items aligned right:
- *   $(server) OpenCode   — current backend name
- *   $(robot) Build       — current agent name
- *   $(sparkle) gpt-4o    — current model name
- *
- * Clicking any item opens the settings webview panel.
+ * Status bar: $(hubot) (icon only)
+ * Hover: markdown table | Backend | Agent | Model |
+ * Click: opencode.openSettings
  */
 import * as vscode from 'vscode';
 
@@ -14,75 +11,49 @@ export interface StatusBarState {
   backendName: string;
   agentName: string;
   modelName: string;
+  isBackendActive: boolean;
 }
 
 export class StatusBarManager implements vscode.Disposable {
-  private readonly backendItem: vscode.StatusBarItem;
-  private readonly agentItem: vscode.StatusBarItem;
-  private readonly modelItem: vscode.StatusBarItem;
-  private readonly _onDidClick = new vscode.EventEmitter<void>();
-  readonly onDidClick = this._onDidClick.event;
+  private readonly item: vscode.StatusBarItem;
 
   constructor() {
-    // Create 3 status bar items, aligned right, with descending priority
-    this.backendItem = vscode.window.createStatusBarItem(
+    this.item = vscode.window.createStatusBarItem(
       vscode.StatusBarAlignment.Right,
       100,
     );
-    this.agentItem = vscode.window.createStatusBarItem(
-      vscode.StatusBarAlignment.Right,
-      99,
-    );
-    this.modelItem = vscode.window.createStatusBarItem(
-      vscode.StatusBarAlignment.Right,
-      98,
-    );
-
-    // Set icons and tooltips
-    this.backendItem.text = '$(server) OpenCode';
-    this.backendItem.tooltip = 'OpenCode Backend';
-    this.backendItem.command = 'opencode.openSettings';
-
-    this.agentItem.text = '$(robot) --';
-    this.agentItem.tooltip = 'Current Agent (click to change)';
-    this.agentItem.command = 'opencode.openSettings';
-
-    this.modelItem.text = '$(sparkle) --';
-    this.modelItem.tooltip = 'Current Model (click to change)';
-    this.modelItem.command = 'opencode.openSettings';
-
-    // Show all items
-    this.backendItem.show();
-    this.agentItem.show();
-    this.modelItem.show();
+    this.item.text = '$(hubot)';
+    this.item.command = 'opencode.openSettings';
+    this.item.name = 'ACP';
+    this.item.show();
   }
 
-  /** Update all status bar items from the given state */
   update(state: StatusBarState): void {
-    this.backendItem.text = `$(server) ${state.backendName}`;
-    this.agentItem.text = `$(robot) ${state.agentName}`;
-    this.modelItem.text = `$(sparkle) ${state.modelName}`;
+    const md = new vscode.MarkdownString();
+    md.isTrusted = true;
+
+    const name = state.isBackendActive
+      ? state.backendName
+      : `${state.backendName} \\u26A0`;
+
+    md.appendMarkdown(`**ACP Copilot**\n\n`);
+    md.appendMarkdown(`| Backend | Agent | Model |\n`);
+    md.appendMarkdown(`|---------|-------|-------|\n`);
+    md.appendMarkdown(`| ${name} | ${state.agentName} | ${state.modelName} |`);
+
+    this.item.tooltip = md;
   }
 
-  /** Update just the backend display */
-  updateBackend(name: string): void {
-    this.backendItem.text = `$(server) ${name}`;
-  }
-
-  /** Update just the agent display */
-  updateAgent(name: string): void {
-    this.agentItem.text = `$(robot) ${name}`;
-  }
-
-  /** Update just the model display */
-  updateModel(name: string): void {
-    this.modelItem.text = `$(sparkle) ${name}`;
+  updateError(backendName: string): void {
+    this.update({
+      backendName,
+      agentName: '--',
+      modelName: '--',
+      isBackendActive: false,
+    });
   }
 
   dispose(): void {
-    this.backendItem.dispose();
-    this.agentItem.dispose();
-    this.modelItem.dispose();
-    this._onDidClick.dispose();
+    this.item.dispose();
   }
 }

@@ -59,6 +59,7 @@ async function refreshStatusBar(s: ExtensionState): Promise<void> {
       backendName: getBackendDisplayName(s.backend.name),
       agentName,
       modelName,
+      isBackendActive: s.backend.isRunning(),
     });
   } catch {
     // non-critical
@@ -195,7 +196,7 @@ export function activate(context: vscode.ExtensionContext) {
   backend.start(workspacePath).then(async (result) => {
     if (result.error) {
       outputChannel.appendLine(`[extension] Backend start failed: ${String(result.error)}`);
-      statusBar.updateBackend(`${backend.name} (error)`);
+      statusBar.updateError(backend.name);
       return;
     }
     outputChannel.appendLine(`[extension] Backend started at ${result.data?.url}`);
@@ -211,7 +212,7 @@ export function activate(context: vscode.ExtensionContext) {
     outputChannel.appendLine(
       `[extension] Backend start error: ${err instanceof Error ? err.message : String(err)}`,
     );
-    statusBar.updateBackend(`${backend.name} (error)`);
+    statusBar.updateError(backend.name);
   });
 
   // Register the settings panel command
