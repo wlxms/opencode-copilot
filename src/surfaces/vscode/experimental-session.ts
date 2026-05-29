@@ -353,6 +353,12 @@ export function createSessionContentProvider(
   const SESSION_CACHE_KEY = 'opencode.sessionItems';
   interface CachedSessionItem { id: string; title: string; createdAt: number; }
 
+  // Guard against concurrent refreshSessionItems() calls that can race
+  // when both the handler post-turn and VS Code's refreshHandler fire
+  // simultaneously, causing controller.items.replace() to overwrite a
+  // complete list with a partial one.
+  let sessionRefreshInFlight = false;
+
   // -- Option Groups: Agent & Model pickers --------------------------------
 
   const onDidChangeOptionsEmitter = new vscode.EventEmitter<void>();
@@ -605,9 +611,11 @@ export function createSessionContentProvider(
   }
 
   function publishSessionItems(controller: vscode.ChatSessionItemController, sessions: readonly { id: string; title: string; createdAt: Date }[]): void {
+    const sessionThemeIcon = new vscode.ThemeIcon('opencode-logo');
     const items = sessions.map((session) => {
       const resource = createSessionResource(session.id);
       const item = controller.createChatSessionItem(resource, getSessionLabel(session));
+      item.iconPath = sessionThemeIcon;
       item.description = getSessionDescription(session);
       item.status = vscode.ChatSessionStatus.Completed;
       item.timing = { created: session.createdAt.getTime() };
@@ -639,29 +647,96 @@ export function createSessionContentProvider(
       return;
     }
 
-    const sessionsResult = await state.backend.sessions.list(directory);
-    const runtimeSessions = collectRuntimeSessions();
-
-    logger.appendLine(
-      `[session-provider] Refreshing Session list (directory=${directory ?? 'none'}, ` +
-      `listError=${sessionsResult.error ?? 'none'}, listCount=${sessionsResult.data?.length ?? 0}, runtimeCount=${runtimeSessions.length})`,
-    );
-
-    if (sessionsResult.error) {
-      logger.appendLine(`[session-provider] Session list source error: ${sessionsResult.error}`);
+    // ---- Re-entrancy guard ----
+    // refreshSessionItems() can be called from multiple sources concurrently
+    // (onBackendReady, handler post-turn, VS Code refreshHandler).  If a
+    // refresh is already in-flight, skip this call — the in-flight call will
+    // publish the correct list.  We note the race so the cache-as-floor
+    // protection below knows to supplement from cache.
+    const isRace = sessionRefreshInFlight;
+    if (isRace) {
+      logger.appendLine('[session-provider] Refresh already in-flight — deferring to prior call');
     }
 
-    const listedSessions = sessionsResult.data ?? [];
-    const mergedSessions = mergeSessions(listedSessions, runtimeSessions);
+    sessionRefreshInFlight = true;
+    try {
+      const sessionsResult = await state.backend.sessions.list(directory);
+      const runtimeSessions = collectRuntimeSessions();
 
-    logger.appendLine(
-      `[session-provider] Session list merged result: ${mergedSessions.map(s => `${s.id}:${getSessionLabel(s)}`).join(', ') || '(empty)'}`,
-    );
+      logger.appendLine(
+        `[session-provider] Refreshing Session list (directory=${directory ?? 'none'}, ` +
+        `listError=${sessionsResult.error ?? 'none'}, listCount=${sessionsResult.data?.length ?? 0}, runtimeCount=${runtimeSessions.length})`,
+      );
 
-    // Daemon has no sessions and sessionMap is empty → restore from cache
-    if (mergedSessions.length === 0 && runtimeSessions.length === 0) {
+      if (sessionsResult.error) {
+        logger.appendLine(`[session-provider] Session list source error: ${sessionsResult.error}`);
+      }
+
+      const listedSessions = sessionsResult.data ?? [];
+      let mergedSessions = mergeSessions(listedSessions, runtimeSessions);
+
+      logger.appendLine(
+        `[session-provider] Session list merged result: ${mergedSessions.map(s => `${s.id}:${getSessionLabel(s)}`).join(', ') || '(empty)'}`,
+      );
+
+      // ---- Cache-as-floor protection ----
+      // The daemon's session.list() may be unreliable for directory-scoped
+      // queries (observed to return 0 even when sessions exist and their
+      // history is retrievable).  When the daemon returns fewer sessions than
+      // the cache, supplement missing entries from the cache.  This is always
+      // safe because the cache is updated every time we publish — if a session
+      // were legitimately deleted, the next daemon-scoped refresh would include
+      // it in the cache update, and eventually the stale entry ages out.
+      let cached: CachedSessionItem[] | undefined;
       try {
-        const cached = context.globalState.get<CachedSessionItem[]>(SESSION_CACHE_KEY);
+        cached = context.globalState.get<CachedSessionItem[]>(SESSION_CACHE_KEY);
+      } catch {
+        cached = undefined;
+      }
+
+      // Determine if the daemon returned suspiciously few sessions.
+      // "Suspicious" means: runs gave back 0 sessions but the cache or runtime
+      // has sessions — this indicates the daemon's list API is broken.
+      const daemonReturnedZero = listedSessions.length === 0;
+      const hasSourceOfTruth = (cached && cached.length > 0) || runtimeSessions.length > 0;
+      const shouldSupplement = daemonReturnedZero && hasSourceOfTruth;
+
+      if (shouldSupplement && cached && cached.length > mergedSessions.length) {
+        const mergedIds = new Set(mergedSessions.map(s => s.id));
+        const missingFromCache = cached
+          .filter(c => !mergedIds.has(c.id))
+          .map(c => ({
+            id: c.id, title: c.title, createdAt: new Date(c.createdAt),
+          }));
+        if (missingFromCache.length > 0) {
+          logger.appendLine(
+            `[session-provider] Daemon returned 0 sessions — supplementing ${missingFromCache.length} session(s) from cache ` +
+            `(runtime=${runtimeSessions.length}, cache=${cached.length})`,
+          );
+          mergedSessions = [...mergedSessions, ...missingFromCache]
+            .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+        }
+      } else if (isRace && cached && cached.length > mergedSessions.length) {
+        // Race-specific fallback: daemon returned some sessions but may be
+        // incomplete due to concurrent turn processing.
+        const mergedIds = new Set(mergedSessions.map(s => s.id));
+        const missingFromCache = cached
+          .filter(c => !mergedIds.has(c.id))
+          .map(c => ({
+            id: c.id, title: c.title, createdAt: new Date(c.createdAt),
+          }));
+        if (missingFromCache.length > 0) {
+          logger.appendLine(
+            `[session-provider] Race detected — supplementing ${missingFromCache.length} session(s) from cache ` +
+            `(daemon returned ${mergedSessions.length}, cache has ${cached.length})`,
+          );
+          mergedSessions = [...mergedSessions, ...missingFromCache]
+            .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+        }
+      }
+
+      // Daemon has no sessions and sessionMap is empty → restore from cache
+      if (mergedSessions.length === 0 && runtimeSessions.length === 0) {
         if (cached && cached.length > 0) {
           const restored = cached.map(c => ({
             id: c.id, title: c.title, createdAt: new Date(c.createdAt),
@@ -670,12 +745,14 @@ export function createSessionContentProvider(
           publishSessionItems(controller, restored);
           return;
         }
-      } catch { /* skip */ }
-      logger.appendLine('[session-provider] Skipping publish — no sessions available');
-      return;
-    }
+        logger.appendLine('[session-provider] Skipping publish — no sessions available');
+        return;
+      }
 
-    publishSessionItems(controller, mergedSessions);
+      publishSessionItems(controller, mergedSessions);
+    } finally {
+      sessionRefreshInFlight = false;
+    }
   }
 
   // Kick off initial option groups load (non-blocking).
@@ -806,6 +883,54 @@ export function createSessionContentProvider(
     };
 
     logger.appendLine(`[session-provider] ChatSessionItemController created (id=${controller.id})`);
+
+    // -- forkHandler: enables edit/rewind/fork UI buttons in the chat view ------
+    // Without this, VS Code sets hasForkHandler=false which hides the fork UI.
+    // This handler creates a child session and registers it as a new session item.
+    controller.forkHandler = async (
+      sessionResource: vscode.Uri,
+      request: vscode.ChatRequestTurn | undefined,
+      _token: vscode.CancellationToken,
+    ): Promise<vscode.ChatSessionItem> => {
+      const currentSessionId = extractSessionId(sessionResource);
+      const derivedLabel = request?.prompt
+        ? `Fork: ${request.prompt.slice(0, 40).trimEnd()}`
+        : 'Forked Session';
+      const title = derivedLabel.length > 0 ? derivedLabel : 'Forked Session';
+
+      logger.appendLine(
+        `[session-provider] Fork requested for session ${currentSessionId} (title="${title}")`,
+      );
+
+      const result = await state.backend.sessions.create({
+        parentId: currentSessionId,
+        directory,
+        title,
+      });
+
+      if (result.error || !result.data?.id) {
+        const msg = `Failed to create forked session: ${result.error ?? 'no id'}`;
+        logger.appendLine(`[session-provider] ${msg}`);
+        throw new Error(msg);
+      }
+
+      const newSessionId = result.data.id;
+      const newResource = createSessionResource(newSessionId);
+
+      const item = controller!.createChatSessionItem(newResource, getSessionLabel({ id: newSessionId, title }));
+      item.status = vscode.ChatSessionStatus.Completed;
+      item.timing = { created: Date.now() };
+      controller!.items.add(item);
+
+      logger.appendLine(
+        `[session-provider] Forked session ${newSessionId} created from ${currentSessionId}`,
+      );
+
+      // Refresh the session list so the new forked session appears
+      refreshSessionItems().catch(() => {});
+
+      return item;
+    };
   } else {
     logger.appendLine('[session-provider] ChatSessionItemController API not available — picker changes will NOT propagate');
   }
