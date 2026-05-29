@@ -7,6 +7,7 @@ import { createSessionContentProvider, OPENCODE_SESSION_SCHEME } from './surface
 import { hasRegisterChatSessionContentProvider } from './surfaces/vscode/capabilities';
 import { StatusBarManager } from './statusbar';
 import { SettingsPanel, type SettingsMessage, type SettingsData } from './settings/panel';
+import { hydrateStateFromPersisted, savePersistedSettingsState, extractPersistedState } from './settings/state-persistence';
 import type { ExtensionState } from './types';
 
 const KNOWN_PROVIDERS = [
@@ -74,6 +75,23 @@ async function loadDefaultsFromConfig(s: ExtensionState): Promise<void> {
 
     if (configResult.data) {
       const cfg = configResult.data;
+
+      // Validate persisted model against available models. If the persisted
+      // model no longer exists (e.g. backend config changed), clear it so
+      // the fallback logic below can find a suitable replacement.
+      if (s.currentModel) {
+        const modelsResp = await s.backend.config.models();
+        const models = modelsResp.data ?? [];
+        const modelStillValid = models.some(m => m.id === s.currentModel!.modelID);
+        if (!modelStillValid) {
+          s.outputChannel.appendLine(
+            `[extension] Persisted model "${s.currentModel.modelID}" not found in backend model list — clearing`,
+          );
+          s.currentModel = undefined;
+          s.currentModelDisplayName = undefined;
+        }
+      }
+
       if (!s.currentAgent && cfg.default_agent) {
         s.currentAgent = cfg.default_agent;
       }
@@ -168,9 +186,13 @@ export function activate(context: vscode.ExtensionContext) {
     statusBar,
   };
 
+  // Hydrate persistent settings BEFORE backend starts so loadDefaultsFromConfig
+  // sees the persisted values and won't overwrite them with config defaults.
+  hydrateStateFromPersisted(context, state);
+
   // Start backend immediately on activation
   const workspacePath = getWorkspaceDirectory();
-  backend.start(workspacePath).then((result) => {
+  backend.start(workspacePath).then(async (result) => {
     if (result.error) {
       outputChannel.appendLine(`[extension] Backend start failed: ${String(result.error)}`);
       statusBar.updateBackend(`${backend.name} (error)`);
@@ -178,7 +200,10 @@ export function activate(context: vscode.ExtensionContext) {
     }
     outputChannel.appendLine(`[extension] Backend started at ${result.data?.url}`);
     // Load default agent/model from config and update status bar
-    loadDefaultsFromConfig(state!);
+    await loadDefaultsFromConfig(state!);
+    // Persist whatever loadDefaultsFromConfig resolved (e.g. backend defaults
+    // when there's no persisted override yet).
+    savePersistedSettingsState(context, extractPersistedState(state!));
     // Notify session provider that backend is ready so it can refresh
     // option groups and session list (avoids polling while offline).
     state!.onBackendReady?.();
@@ -212,6 +237,7 @@ export function activate(context: vscode.ExtensionContext) {
             }
             case 'setAgent': {
               state.currentAgent = message.agentId;
+              savePersistedSettingsState(context, extractPersistedState(state));
               await refreshStatusBar(state);
               await pushDataToPanel(state, panel);
               break;
@@ -226,6 +252,7 @@ export function activate(context: vscode.ExtensionContext) {
                 const match = (modelsResp.data ?? []).find(m => m.id === message.modelID && m.provider === message.providerID);
                 state.currentModelDisplayName = match?.name ?? message.modelID;
               }
+              savePersistedSettingsState(context, extractPersistedState(state));
               await refreshStatusBar(state);
               await pushDataToPanel(state, panel);
               break;

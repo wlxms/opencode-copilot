@@ -263,6 +263,20 @@ export interface SessionState {
   createdAt?: Date;
 }
 
+// ===========================================================================
+// Persisted settings state (stored in VS Code globalState)
+// ===========================================================================
+
+/** Shape of settings state persisted in VS Code globalState (survives extension reloads) */
+export interface PersistedSettingsState {
+  /** Persisted agent selection (undefined = use backend default) */
+  currentAgent?: string;
+  /** Persisted model selection (undefined = use backend default or agent default) */
+  currentModel?: { providerID: string; modelID: string };
+  /** Persisted model display name for status bar / UI */
+  currentModelDisplayName?: string;
+}
+
 /** Global extension state shared across modules */
 export interface ExtensionState {
   /** ACP-compatible backend abstraction used by all surfaces */
