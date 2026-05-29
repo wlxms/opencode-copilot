@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000" fill="currentColor">
+  <!-- OpenCode brand logo — 1000×1000 for direct font glyph use
+       Three paths using non-zero fill rule:
+       1. Outer frame (clockwise) — fills entire square
+       2. Inner hole (counter-clockwise) — creates the bracket cutout
+       3. Inner fill (clockwise) — fills bottom half of the opening
+  -->
+  <path d="M0 0 H1000 V1000 H0 Z"/>
+  <path d="M750 200 H250 V800 H750 Z"/>
+  <path d="M250 400 H750 V800 H250 Z"/>
+</svg>

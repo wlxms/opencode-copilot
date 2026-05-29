@@ -346,7 +346,10 @@ export function activate(context: vscode.ExtensionContext) {
     'opencode-copilot.opencode',
     createParticipantHandler(state),
   );
-  participant.iconPath = new vscode.ThemeIcon('terminal');
+  participant.iconPath = {
+    light: vscode.Uri.joinPath(context.extensionUri, 'resources', 'opencode-icon-light.svg'),
+    dark: vscode.Uri.joinPath(context.extensionUri, 'resources', 'opencode-icon-dark.svg'),
+  };
 
   participant.onDidReceiveFeedback((feedback: vscode.ChatResultFeedback) => {
     outputChannel.appendLine(
