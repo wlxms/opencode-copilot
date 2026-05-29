@@ -48,6 +48,7 @@ import * as vscode from 'vscode';
 import type { ExtensionState } from '../../types';
 import type { OpenCodeEvent, OpenCodeEventStream } from '../../backends/opencode/sdk-events';
 import { createParticipantHandler } from '../../participant/handler';
+import { isUserSelectableAgent } from '../../acp/types';
 
 
 import {
@@ -431,7 +432,7 @@ export function createSessionContentProvider(
         state.backend.config.models(directory),
       ]);
 
-      const agents = (agentsResult.data ?? []).filter(a => !a.hidden);
+      const agents = (agentsResult.data ?? []).filter(a => isUserSelectableAgent(a));
       const models = modelsResult.data ?? [];
 
       logger.appendLine(

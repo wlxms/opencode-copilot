@@ -15,6 +15,7 @@ import type {
   SelectField,
   MapField,
 } from '../../acp/types';
+import { isUserSelectableAgent } from '../../acp/types';
 import type { AcpConfigOperations } from '../../acp/backend';
 
 export class OpenCodeSettingsProvider implements BackendSettingsProvider {
@@ -24,7 +25,7 @@ export class OpenCodeSettingsProvider implements BackendSettingsProvider {
     const configResp = await this.configOps.get();
     const rawConfig = (configResp.data ?? {}) as Record<string, unknown>;
 
-    const visibleAgents = agents.filter(a => !a.hidden);
+    const visibleAgents = agents.filter(a => isUserSelectableAgent(a));
     const modelOptions = models.map(m => ({
       value: m.id,
       label:

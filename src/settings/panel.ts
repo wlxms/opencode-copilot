@@ -601,7 +601,7 @@ export class SettingsPanel {
 
       const selDefaultAgent = document.getElementById('sel-default-agent');
       selDefaultAgent.innerHTML = '<option value="">(none)</option>';
-      (data.agents || []).filter(a => !a.hidden).forEach(a => {
+      (data.agents || []).filter(a => !a.hidden && a.mode !== 'subagent').forEach(a => {
         const opt = document.createElement('option');
         opt.value = a.id;
         opt.textContent = a.name || a.id;

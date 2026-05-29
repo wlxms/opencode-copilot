@@ -305,6 +305,15 @@ export interface AcpAgent {
   hidden?: boolean;
 }
 
+/**
+ * Returns true if an agent should appear in user-selectable pickers.
+ * Excludes hidden agents and subagent-mode agents so users only see
+ * agents they can intentionally invoke.
+ */
+export function isUserSelectableAgent(agent: AcpAgent): boolean {
+  return !agent.hidden && agent.mode !== 'subagent';
+}
+
 // ===========================================================================
 // Configuration
 // ===========================================================================

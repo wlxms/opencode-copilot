@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as vscode from 'vscode';
 import { createSessionContentProvider } from '../surfaces/vscode/experimental-session';
+import { isUserSelectableAgent } from '../acp/types';
+import type { AcpAgent } from '../acp/types';
 import type { ExtensionState } from '../types';
 
 describe('createSessionContentProvider', () => {
@@ -304,5 +306,72 @@ describe('createSessionContentProvider', () => {
     const newKey = vscode.Uri.parse('opencode-copilot.opencode:/ses_existing').toString();
     expect(state.sessionMap.get(newKey)?.title).toBe('My original prompt title');
     expect(session.title).toBe('My original prompt title');
+  });
+
+  // =========================================================================
+  // Agent filtering tests — ensures isUserSelectableAgent works correctly
+  // for both hidden and subagent-mode agents.
+  // =========================================================================
+
+  describe('isUserSelectableAgent', () => {
+    it('returns true for primary non-hidden agent', () => {
+      const agent: AcpAgent = { id: 'primary-agent', mode: 'primary' };
+      expect(isUserSelectableAgent(agent)).toBe(true);
+    });
+
+    it('returns true for agent with mode all and not hidden', () => {
+      const agent: AcpAgent = { id: 'all-mode-agent', mode: 'all' };
+      expect(isUserSelectableAgent(agent)).toBe(true);
+    });
+
+    it('returns false for hidden agent', () => {
+      const agent: AcpAgent = { id: 'hidden-agent', hidden: true, mode: 'primary' };
+      expect(isUserSelectableAgent(agent)).toBe(false);
+    });
+
+    it('returns false for subagent-mode agent', () => {
+      const agent: AcpAgent = { id: 'subagent', mode: 'subagent' };
+      expect(isUserSelectableAgent(agent)).toBe(false);
+    });
+
+    it('returns false for hidden subagent-mode agent', () => {
+      const agent: AcpAgent = { id: 'hidden-subagent', hidden: true, mode: 'subagent' };
+      expect(isUserSelectableAgent(agent)).toBe(false);
+    });
+
+    it('excludes hidden agents from filtered list', () => {
+      const agents: AcpAgent[] = [
+        { id: 'agent-1', mode: 'primary' },
+        { id: 'agent-2', hidden: true, mode: 'primary' },
+        { id: 'agent-3', mode: 'all' },
+      ];
+      const visible = agents.filter(isUserSelectableAgent);
+      expect(visible).toHaveLength(2);
+      expect(visible.map(a => a.id)).toEqual(['agent-1', 'agent-3']);
+    });
+
+    it('excludes subagent-mode agents from filtered list', () => {
+      const agents: AcpAgent[] = [
+        { id: 'primary-agent', mode: 'primary' },
+        { id: 'sub-agent', mode: 'subagent' },
+        { id: 'another-primary', mode: 'primary' },
+      ];
+      const visible = agents.filter(isUserSelectableAgent);
+      expect(visible).toHaveLength(2);
+      expect(visible.map(a => a.id)).toEqual(['primary-agent', 'another-primary']);
+    });
+
+    it('excludes both hidden and subagent agents together', () => {
+      const agents: AcpAgent[] = [
+        { id: 'good', mode: 'primary' },
+        { id: 'hidden-primary', hidden: true, mode: 'primary' },
+        { id: 'sub', mode: 'subagent' },
+        { id: 'hidden-sub', hidden: true, mode: 'subagent' },
+        { id: 'all-mode', mode: 'all' },
+      ];
+      const visible = agents.filter(isUserSelectableAgent);
+      expect(visible).toHaveLength(2);
+      expect(visible.map(a => a.id)).toEqual(['good', 'all-mode']);
+    });
   });
 });
