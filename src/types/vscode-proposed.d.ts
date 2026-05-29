@@ -315,6 +315,18 @@ declare module 'vscode' {
     createChatSessionInputState(
       groups: ChatSessionProviderOptionGroup[],
     ): ChatSessionInputState;
+
+    /**
+     * Handles a request to fork the session.
+     * When provided, VS Code shows the edit/rewind/fork buttons in the chat UI.
+     * When both this handler and {@link ChatSession.forkHandler} are registered,
+     * this handler takes precedence.
+     */
+    forkHandler?: (
+      sessionResource: Uri,
+      request: ChatRequestTurn | undefined,
+      token: CancellationToken,
+    ) => Thenable<ChatSessionItem> | ChatSessionItem;
   }
 
   export namespace chat {
