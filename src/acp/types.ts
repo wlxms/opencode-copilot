@@ -84,6 +84,26 @@ export interface AcpToolState {
   endTime?: number;
 }
 
+// ===========================================================================
+// Prompt attachments
+// ===========================================================================
+
+/**
+ * A file attachment included with a prompt (image, document, etc.).
+ * Protocol-agnostic — each backend adapter maps this to its SDK type.
+ */
+export interface AcpFileAttachment {
+  /** MIME type (e.g. "image/png", "text/plain", "application/pdf") */
+  mime: string;
+  /** Optional display filename */
+  filename?: string;
+  /**
+   * URL pointing to the file content.
+   * May be a `file://` URI for local files or a `data:` URI for inline content.
+   */
+  url: string;
+}
+
 export interface AcpBasePart {
   id: string;
   type: AcpPartType;

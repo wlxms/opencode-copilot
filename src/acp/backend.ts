@@ -11,6 +11,7 @@ import type {
   AcpSessionStatus,
   AcpAgent,
   AcpConfig,
+  AcpFileAttachment,
   AcpResult,
   AcpEvent,
   AcpModel,
@@ -57,6 +58,8 @@ export interface AcpSessionOperations {
     options?: {
       model?: { providerID: string; modelID: string };
       agent?: string;
+      /** File attachments (images, documents) to include with the prompt */
+      attachments?: AcpFileAttachment[];
     },
   ): Promise<AcpResult<unknown>>;
 
