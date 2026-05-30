@@ -1,13 +1,16 @@
 import * as vscode from 'vscode';
-import type { AcpBackend } from './acp/backend';
 import type { AcpAgent, AcpModel, AcpConfig, AcpProviderConfig, BackendSettingsDescriptor } from './acp/types';
-import { OpenCodeBackend } from './backends/opencode/adapter';
+import './backends/opencode/index'; // side-effect: registers 'opencode' backend
+import { createBackend } from './acp/backend-registry';
 import { createParticipantHandler } from './participant/handler';
 import { createSessionContentProvider, OPENCODE_SESSION_SCHEME } from './surfaces/vscode/experimental-session';
 import { hasRegisterChatSessionContentProvider } from './surfaces/vscode/capabilities';
 import { StatusBarManager } from './statusbar';
 import { SettingsPanel, type SettingsMessage, type SettingsData } from './settings/panel';
-import { hydrateStateFromPersisted, savePersistedSettingsState, extractPersistedState } from './settings/state-persistence';
+import { loadPersistedSettingsState, savePersistedSettingsState } from './settings/state-persistence';
+import { AppEventBus } from './acp/app-event-bus';
+import { SelectionStore } from './acp/selection-store';
+import { SessionManager } from './acp/session-manager';
 import type { ExtensionState } from './types';
 
 const KNOWN_PROVIDERS = [
@@ -35,10 +38,6 @@ function getWorkspaceDirectory(): string | undefined {
 
 let state: ExtensionState | undefined;
 
-function createBackend(): AcpBackend {
-  return new OpenCodeBackend();
-}
-
 function getBackendDisplayName(backendName: string): string {
   if (backendName === 'opencode') {return 'OpenCode';}
   if (!backendName) {return '--';}
@@ -48,12 +47,9 @@ function getBackendDisplayName(backendName: string): string {
 /** Refresh status bar items from the current state */
 async function refreshStatusBar(s: ExtensionState): Promise<void> {
   try {
-    const agentName = s.currentAgent ?? '--';
-    let modelName = s.currentModelDisplayName ?? '--';
-
-    if (!s.currentModelDisplayName && s.currentModel) {
-      modelName = s.currentModel.modelID;
-    }
+    const sel = s.selection.get();
+    const agentName = sel.agent ?? '--';
+    const modelName = sel.modelDisplayName ?? sel.model?.modelID ?? '--';
 
     s.statusBar.update({
       backendName: getBackendDisplayName(s.backend.name),
@@ -66,130 +62,31 @@ async function refreshStatusBar(s: ExtensionState): Promise<void> {
   }
 }
 
-/** Load default agent/model from backend config and update state */
-async function loadDefaultsFromConfig(s: ExtensionState): Promise<void> {
-  try {
-    const [configResult, agentsResult] = await Promise.all([
-      s.backend.config.get(),
-      s.backend.config.agents(),
-    ]);
-
-    if (configResult.data) {
-      const cfg = configResult.data;
-
-      // Validate persisted model against available models. If the persisted
-      // model no longer exists (e.g. backend config changed), clear it so
-      // the fallback logic below can find a suitable replacement.
-      if (s.currentModel) {
-        const modelsResp = await s.backend.config.models();
-        const models = modelsResp.data ?? [];
-        const modelStillValid = models.some(m => m.id === s.currentModel!.modelID);
-        if (!modelStillValid) {
-          s.outputChannel.appendLine(
-            `[extension] Persisted model "${s.currentModel.modelID}" not found in backend model list — clearing`,
-          );
-          s.currentModel = undefined;
-          s.currentModelDisplayName = undefined;
-        }
-      }
-
-      if (!s.currentAgent && cfg.default_agent) {
-        s.currentAgent = cfg.default_agent;
-      }
-      if (!s.currentModel && cfg.model) {
-        // Try to find provider for the default model
-        const modelsResp = await s.backend.config.models();
-        const models = modelsResp.data ?? [];
-        const match = models.find(m => m.id === cfg.model);
-        if (match) {
-          s.currentModel = {
-            providerID: match.provider ?? '',
-            modelID: match.id,
-          };
-          s.currentModelDisplayName = match.name ?? match.id;
-        }
-      }
-    }
-
-    // If still no agent, use first available primary agent
-    if (!s.currentAgent && agentsResult.data) {
-      const primary = agentsResult.data.find(a => a.mode === 'primary' && !a.hidden);
-      if (primary) {
-        s.currentAgent = primary.id;
-      }
-    }
-
-    // If still no model, try current agent's model or agent config override
-    if (!s.currentModel && s.currentAgent) {
-      // Try agent's model field (may be string or {modelID, providerID} object)
-      const agentData = (agentsResult.data ?? []).find((a: AcpAgent) => a.id === s.currentAgent);
-      let modelId: string | undefined;
-      let providerId: string | undefined;
-
-      const rawModel = agentData?.model;
-      if (typeof rawModel === 'object' && rawModel !== null) {
-        modelId = rawModel.modelID;
-        providerId = rawModel.providerID;
-      } else if (typeof rawModel === 'string') {
-        modelId = rawModel;
-      }
-
-      // Try agent config override
-      if (!modelId && configResult.data?.agent) {
-        const agentCfg = configResult.data.agent[s.currentAgent];
-        if (typeof agentCfg?.model === 'string') {
-          modelId = agentCfg.model;
-        }
-      }
-
-      if (modelId) {
-        // Try to resolve display name from models list
-        try {
-          const modelsResp = await s.backend.config.models();
-          const models = modelsResp.data ?? [];
-          let match = models.find((m: AcpModel) => m.id === modelId);
-          if (!match) {
-            match = models.find((m: AcpModel) => m.id.includes(modelId) || modelId.includes(m.id));
-          }
-          if (match) {
-            s.currentModel = { providerID: providerId ?? match.provider ?? '', modelID: match.id };
-            s.currentModelDisplayName = match.name ?? match.id;
-          } else {
-            s.currentModel = { providerID: providerId ?? '', modelID: modelId };
-            s.currentModelDisplayName = modelId;
-          }
-        } catch {
-          s.currentModel = { providerID: providerId ?? '', modelID: modelId };
-          s.currentModelDisplayName = modelId;
-        }
-      }
-    }
-
-    await refreshStatusBar(s);
-  } catch (err) {
-    s.outputChannel.appendLine(
-      `[extension] loadDefaultsFromConfig error: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-}
+// loadDefaultsFromConfig removed — logic moved to SelectionStore.resolveDefaults()
 
 export function activate(context: vscode.ExtensionContext) {
   const outputChannel = vscode.window.createOutputChannel('OpenCode Copilot');
   outputChannel.appendLine('[extension] OpenCode Copilot activating...');
 
-  const backend = createBackend();
+  const backend = createBackend('opencode');
   const statusBar = new StatusBarManager();
+  const bus = new AppEventBus();
+  const selection = new SelectionStore(backend, bus);
+  const sessions = new SessionManager(backend, bus);
 
   state = {
     backend,
+    selection,
+    sessions,
+    bus,
     outputChannel,
-    sessionMap: new Map(),
     statusBar,
   };
 
-  // Hydrate persistent settings BEFORE backend starts so loadDefaultsFromConfig
+  // Hydrate persistent settings BEFORE backend starts so resolveDefaults
   // sees the persisted values and won't overwrite them with config defaults.
-  hydrateStateFromPersisted(context, state);
+  const persisted = loadPersistedSettingsState(context);
+  selection.hydrate(persisted);
 
   // Start backend immediately on activation
   const workspacePath = getWorkspaceDirectory();
@@ -201,13 +98,13 @@ export function activate(context: vscode.ExtensionContext) {
     }
     outputChannel.appendLine(`[extension] Backend started at ${result.data?.url}`);
     // Load default agent/model from config and update status bar
-    await loadDefaultsFromConfig(state!);
-    // Persist whatever loadDefaultsFromConfig resolved (e.g. backend defaults
+    await selection.resolveDefaults();
+    // Persist whatever resolveDefaults resolved (e.g. backend defaults
     // when there's no persisted override yet).
-    savePersistedSettingsState(context, extractPersistedState(state!));
+    savePersistedSettingsState(context, selection.get());
     // Notify session provider that backend is ready so it can refresh
     // option groups and session list (avoids polling while offline).
-    state!.onBackendReady?.();
+    state!.bus.emit('backend-ready', void 0);
   }).catch((err: unknown) => {
     outputChannel.appendLine(
       `[extension] Backend start error: ${err instanceof Error ? err.message : String(err)}`,
@@ -237,23 +134,15 @@ export function activate(context: vscode.ExtensionContext) {
               break;
             }
             case 'setAgent': {
-              state.currentAgent = message.agentId;
-              savePersistedSettingsState(context, extractPersistedState(state));
+              await state.selection.setAgent(message.agentId);
+              savePersistedSettingsState(context, state.selection.get());
               await refreshStatusBar(state);
               await pushDataToPanel(state, panel);
               break;
             }
             case 'setModel': {
-              state.currentModel = {
-                providerID: message.providerID,
-                modelID: message.modelID,
-              };
-              {
-                const modelsResp = await state.backend.config.models().catch(() => ({ data: [] as AcpModel[] }));
-                const match = (modelsResp.data ?? []).find(m => m.id === message.modelID && m.provider === message.providerID);
-                state.currentModelDisplayName = match?.name ?? message.modelID;
-              }
-              savePersistedSettingsState(context, extractPersistedState(state));
+              await state.selection.setModel(message.providerID, message.modelID);
+              savePersistedSettingsState(context, state.selection.get());
               await refreshStatusBar(state);
               await pushDataToPanel(state, panel);
               break;
@@ -450,7 +339,7 @@ async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise
 
     const data: SettingsData = {
       backendName: getBackendDisplayName(s.backend.name),
-      agents: agents.map(a => ({
+      agents: agents.map((a: AcpAgent) => ({
         id: a.id,
         name: a.name,
         description: a.description,
@@ -460,16 +349,16 @@ async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise
         mode: a.mode,
         hidden: a.hidden,
       })),
-      models: models.map(m => ({
+      models: models.map((m: AcpModel) => ({
         id: m.id,
         name: m.name,
         provider: m.providerName ?? m.provider,
         providerId: m.provider,
         capabilities: m.capabilities,
       })),
-      currentAgent: s.currentAgent,
-      currentModel: s.currentModel,
-      currentModelDisplayName: s.currentModelDisplayName,
+      currentAgent: s.selection.get().agent,
+      currentModel: s.selection.get().model,
+      currentModelDisplayName: s.selection.get().modelDisplayName,
       defaultAgent: config.default_agent,
       defaultModel: config.model,
       backendSettings,
@@ -477,61 +366,7 @@ async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise
       availableProviders: KNOWN_PROVIDERS,
     };
 
-    // Try to resolve currentModel from: 1) state, 2) config.model, 3) agent's model
-    if (!s.currentModel) {
-      let resolvedModelId: string | undefined;
-      let resolvedProvider: string | undefined;
-
-      // Strategy 2: from config.model
-      if (config.model) {
-        resolvedModelId = config.model;
-      }
-
-      // Strategy 3: from current agent's model field (may be string or object)
-      if (!resolvedModelId && s.currentAgent) {
-        const agentData = agents.find((a: AcpAgent) => a.id === s.currentAgent);
-        const rawModel = agentData?.model;
-        if (typeof rawModel === 'object' && rawModel !== null) {
-          resolvedModelId = rawModel.modelID;
-          resolvedProvider = rawModel.providerID;
-        } else if (typeof rawModel === 'string') {
-          resolvedModelId = rawModel;
-        }
-      }
-
-      // Strategy 4: from agent config override
-      if (!resolvedModelId && s.currentAgent) {
-        const agentConfig = config.agent?.[s.currentAgent];
-        if (agentConfig?.model) {
-          resolvedModelId = agentConfig.model;
-        }
-      }
-
-      if (resolvedModelId) {
-        // Try exact match first, then contains match
-        let match = models.find((m: AcpModel) => m.id === resolvedModelId);
-        if (!match) {
-          match = models.find((m: AcpModel) => m.id.includes(resolvedModelId) || resolvedModelId.includes(m.id));
-        }
-        if (match) {
-          s.currentModel = {
-            providerID: match.provider ?? '',
-            modelID: match.id,
-          };
-          s.currentModelDisplayName = match.name ?? match.id;
-          data.currentModel = s.currentModel;
-          data.currentModelDisplayName = s.currentModelDisplayName;
-        } else {
-          // Model not found in list — still set it as raw value for display
-          s.currentModel = { providerID: '', modelID: resolvedModelId };
-          s.currentModelDisplayName = resolvedModelId;
-          data.currentModel = s.currentModel;
-          data.currentModelDisplayName = s.currentModelDisplayName;
-        }
-      }
-    }
-
-    s.outputChannel.appendLine(`[settings] pushDataToPanel: currentModel=${JSON.stringify(s.currentModel)}, currentModelDisplayName=${s.currentModelDisplayName}, configModel=${config.model}, currentAgent=${s.currentAgent}`);
+    s.outputChannel.appendLine(`[settings] pushDataToPanel: currentModel=${JSON.stringify(data.currentModel)}, configModel=${config.model}, currentAgent=${data.currentAgent}`);
     s.outputChannel.appendLine(`[settings] pushDataToPanel: models count=${data.models.length}, model IDs=${data.models.map((m) => m.id + '(' + m.providerId + ')').join(', ')}`);
     s.outputChannel.appendLine(`[settings] pushDataToPanel: agents=${data.agents.map((a) => a.id + ':model=' + (a.model ?? 'none')).join(', ')}`);
 
