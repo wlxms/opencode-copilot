@@ -34,17 +34,17 @@ export async function ensureServer(
   }
 
   if (status === 'starting') {
-    stream.progress('OpenCode is starting...');
+    stream.progress(`${state.backend.name} is starting...`);
     return false;
   }
 
   try {
-    stream.progress('Starting OpenCode server...');
+    stream.progress(`Starting ${state.backend.name} server...`);
     const workspacePath = getWorkspaceDirectory();
     const result = await state.backend.start(workspacePath);
     if (result.error || !result.data) {
       const msg = typeof result.error === 'string' ? result.error : 'Unknown error';
-      stream.markdown(`⚠️ Failed to start OpenCode: ${msg}`);
+      stream.markdown(`⚠️ Failed to start backend: ${msg}`);
       return false;
     }
     state.outputChannel.appendLine(`[handler] Server started at ${result.data.url}`);
@@ -52,7 +52,7 @@ export async function ensureServer(
     return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
-    stream.markdown(`⚠️ Failed to start OpenCode: ${msg}`);
+    stream.markdown(`⚠️ Failed to start backend: ${msg}`);
     return false;
   }
 }
@@ -81,7 +81,7 @@ function recoverFromHistory(context: vscode.ChatContext): RecoveredHistory {
     if (!metadata) {continue;}
 
     const sessionId = metadata.sessionId as string | undefined;
-    const turnMapRaw = metadata.turnMap as Array<{ vscodeTurn: number; opencodeMessageId: string }> | undefined;
+    const turnMapRaw = metadata.turnMap as Array<{ vscodeTurn: number; messageId: string }> | undefined;
     if (sessionId && turnMapRaw && Array.isArray(turnMapRaw)) {
       return { sessionId, turnMap: turnMapRaw };
     }
@@ -111,9 +111,9 @@ function aliasSessionState(
     return;
   }
 
-  const existing = state.sessionMap.get(sourceKey);
-  if (existing && !state.sessionMap.has(targetKey)) {
-    state.sessionMap.set(targetKey, existing);
+  const existing = state.sessions.get(sourceKey);
+  if (existing && !state.sessions.has(targetKey)) {
+    state.sessions.set(targetKey, existing);
   }
 }
 
@@ -143,17 +143,17 @@ async function resolveSession(
   directory?: string,
 ): Promise<string | null> {
   // Get or create per-VSCode-chat state
-  let chatState = state.sessionMap.get(vscodeSessionId);
+  let chatState = state.sessions.get(vscodeSessionId);
   if (!chatState) {
-    chatState = { opencodeSessionId: '', turnMap: [] };
-    state.sessionMap.set(vscodeSessionId, chatState);
+    chatState = { sessionId: '', turnMap: [] };
+    state.sessions.set(vscodeSessionId, chatState);
   }
 
   // Check for metadata recovery (VSCode restart / tab restore)
-  if (!chatState.opencodeSessionId) {
+  if (!chatState.sessionId) {
     const recovered = recoverFromHistory(context);
     if (recovered.sessionId) {
-      chatState.opencodeSessionId = recovered.sessionId;
+      chatState.sessionId = recovered.sessionId;
       chatState.turnMap = recovered.turnMap;
       state.outputChannel.appendLine(
         `[handler] Recovered session from history: ${recovered.sessionId} (${recovered.turnMap.length} turns)`,
@@ -168,34 +168,34 @@ async function resolveSession(
   const currentTurnIndex = requestTurns.length;
 
   // --- Case 1: New chat (no prior session) ---
-  if (!chatState.opencodeSessionId) {
+  if (!chatState.sessionId) {
     stream.progress('Creating new session...');
     const result = await state.backend.sessions.create({
       title: getInitialSessionTitle(vscodeSessionId),
       directory,
     });
     if (result.error || !result.data) {
-      stream.markdown('⚠️ Failed to create OpenCode session.');
+      stream.markdown('⚠️ Failed to create session.');
       return null;
     }
-    chatState.opencodeSessionId = result.data.id;
+    chatState.sessionId = result.data.id;
     chatState.title = result.data.title;
     chatState.createdAt = result.data.createdAt;
     stream.progress('Session ready');
     state.outputChannel.appendLine(
-      `[handler] Created new OpenCode session ${chatState.opencodeSessionId} for VSCode chat ${vscodeSessionId}`,
+      `[handler] Created new session ${chatState.sessionId} for VSCode chat ${vscodeSessionId}`,
     );
-    return chatState.opencodeSessionId;
+    return chatState.sessionId;
   }
 
   // --- Case 2: Continue (same turn count) ---
   if (currentTurnIndex === chatState.turnMap.length) {
     stream.progress('Reusing existing session...');
     state.outputChannel.appendLine(
-      `[handler] Reusing OpenCode session ${chatState.opencodeSessionId} for VSCode chat ${vscodeSessionId} (turn ${currentTurnIndex}) ` +
+      `[handler] Reusing session ${chatState.sessionId} for VSCode chat ${vscodeSessionId} (turn ${currentTurnIndex}) ` +
       `turnMap=${chatState.turnMap.length}`,
     );
-    return chatState.opencodeSessionId;
+    return chatState.sessionId;
   }
 
   // --- Case 3: Rewind (fewer turns than recorded) → revert ---
@@ -204,7 +204,7 @@ async function resolveSession(
     if (currentTurnIndex > 0) {
       stream.progress('Rewinding conversation...');
       state.outputChannel.appendLine(
-        `[handler] Rewind detected: reverting session ${chatState.opencodeSessionId} from turn ${currentTurnIndex} ` +
+        `[handler] Rewind detected: reverting session ${chatState.sessionId} from turn ${currentTurnIndex} ` +
         `(turnMap had ${chatState.turnMap.length} entries, keeping ${priorTurnMap.length})`,
       );
       // Revert each extraneous message from back to front (oldest first)
@@ -212,17 +212,17 @@ async function resolveSession(
       let revertCount = 0;
       for (let i = chatState.turnMap.length - 1; i >= currentTurnIndex; i--) {
         const entry = chatState.turnMap[i];
-        if (entry?.opencodeMessageId) {
+        if (entry?.messageId) {
           const revertResult = await state.backend.sessions.revert(
-            chatState.opencodeSessionId,
-            entry.opencodeMessageId,
+            chatState.sessionId,
+            entry.messageId,
             undefined,
             directory,
           );
           revertCount++;
           if (revertResult.error) {
             state.outputChannel.appendLine(
-              `[handler] Revert failed for message ${entry.opencodeMessageId}: ${JSON.stringify(revertResult.error)}`,
+              `[handler] Revert failed for message ${entry.messageId}: ${JSON.stringify(revertResult.error)}`,
             );
             allSucceeded = false;
             break;
@@ -240,28 +240,28 @@ async function resolveSession(
           directory,
         });
         if (createResult.error || !createResult.data) {
-          stream.markdown('⚠️ Failed to create OpenCode session after revert failure.');
+          stream.markdown('⚠️ Failed to create session after revert failure.');
           return null;
         }
-        chatState.opencodeSessionId = createResult.data.id;
+        chatState.sessionId = createResult.data.id;
         chatState.turnMap = [];
         chatState.title = createResult.data.title;
         chatState.createdAt = createResult.data.createdAt;
-        return chatState.opencodeSessionId;
+        return chatState.sessionId;
       }
     } else {
       // Rewound to the beginning — no prior message to revert to
       state.outputChannel.appendLine(
-        `[handler] Full rewind for session ${chatState.opencodeSessionId} — no revert needed`,
+        `[handler] Full rewind for session ${chatState.sessionId} — no revert needed`,
       );
     }
     chatState.turnMap = priorTurnMap;
   }
   state.outputChannel.appendLine(
-    `[handler] Reusing OpenCode session ${chatState.opencodeSessionId} for VSCode chat ${vscodeSessionId} (turn ${currentTurnIndex}) ` +
+    `[handler] Reusing session ${chatState.sessionId} for VSCode chat ${vscodeSessionId} (turn ${currentTurnIndex}) ` +
     `turnMap=${chatState.turnMap.length}`,
   );
-  return chatState.opencodeSessionId;
+  return chatState.sessionId;
 }
 
 /**
@@ -329,7 +329,7 @@ export function createParticipantHandler(
 
       aliasSessionState(state, vscodeSessionId, sessionResourceKey);
 
-      const activeChatState = state.sessionMap.get(vscodeSessionId);
+      const activeChatState = state.sessions.get(vscodeSessionId);
       if (activeChatState) {
         activeChatState.createdAt = activeChatState.createdAt ?? new Date();
       }
@@ -380,11 +380,12 @@ export function createParticipantHandler(
           agent?: string;
           attachments?: typeof attachments;
         } = {};
-        if (state.currentAgent) {
-          promptOptions.agent = state.currentAgent;
+        const sel = state.selection.get();
+        if (sel.agent) {
+          promptOptions.agent = sel.agent;
         }
-        if (state.currentModel) {
-          promptOptions.model = state.currentModel;
+        if (sel.model) {
+          promptOptions.model = sel.model;
         }
         if (attachments.length > 0) {
           promptOptions.attachments = attachments;
@@ -398,7 +399,7 @@ export function createParticipantHandler(
           request.prompt,
           directory,
           promptOptions,
-        ).then((result) => {
+        ).then((result: { error?: unknown; data?: unknown }) => {
           if (result.error) {
             state.outputChannel.appendLine(`[handler] Prompt error: ${String(result.error)}`);
           } else {
@@ -415,10 +416,10 @@ export function createParticipantHandler(
           if (aborted) {return;}
           aborted = true;
           state.outputChannel.appendLine(
-            `[handler] Cancellation requested, aborting OpenCode session ${sessionId} and descendants`,
+            `[handler] Cancellation requested, aborting session ${sessionId} and descendants`,
           );
           // Abort the parent session
-          state.backend.sessions.abort(sessionId, directory).then((result) => {
+          state.backend.sessions.abort(sessionId, directory).then((result: { data?: unknown }) => {
             state.outputChannel.appendLine(
               `[handler] Abort parent result: ${JSON.stringify(result?.data)}`,
             );
@@ -429,7 +430,7 @@ export function createParticipantHandler(
           // Abort all descendant sessions (children, grandchildren, etc.)
           const descendants = state.backend.sessions.descendants(sessionId);
           for (const childId of descendants) {
-            state.backend.sessions.abort(childId, directory).then((result) => {
+            state.backend.sessions.abort(childId, directory).then((result: { data?: unknown }) => {
               state.outputChannel.appendLine(
                 `[handler] Abort descendant ${childId} result: ${JSON.stringify(result?.data)}`,
               );
@@ -485,7 +486,7 @@ export function createParticipantHandler(
                   requestId,
                   answers,
                   questionDirectory,
-                ).then((result) => {
+                ).then((result: { data?: boolean; error?: string }) => {
                   state.outputChannel.appendLine(`[handler] question reply result: ${JSON.stringify(result)}`);
                   return result;
                 }).catch((err: unknown) => {
@@ -498,7 +499,7 @@ export function createParticipantHandler(
                   questionSessionId,
                   requestId,
                   questionDirectory,
-                ).then((result) => {
+                ).then((result: { data?: boolean; error?: string }) => {
                   state.outputChannel.appendLine(`[handler] question reject result: ${JSON.stringify(result)}`);
                   return result;
                 }).catch((err: unknown) => {
@@ -567,7 +568,7 @@ export function createParticipantHandler(
         await promptPromise;
 
         // 10. Record user message ID
-        const chatState = state.sessionMap.get(vscodeSessionId);
+        const chatState = state.sessions.get(vscodeSessionId);
         state.outputChannel.appendLine(
           `[handler] User message ID for turn: ${!!chatState && !!userMessageId} (${userMessageId})`,
         );
@@ -575,7 +576,7 @@ export function createParticipantHandler(
           const wasFirstTurn = chatState.turnMap.length === 0;
           chatState.turnMap.push({
             vscodeTurn: chatState.turnMap.length,
-            opencodeMessageId: userMessageId,
+            messageId: userMessageId,
           });
           state.outputChannel.appendLine(
             `[handler] Recorded turn ${chatState.turnMap.length - 1}: messageID=${userMessageId} (total turns=${chatState.turnMap.length})`,
@@ -649,19 +650,14 @@ export function createParticipantHandler(
 
         // Persist resolved title to sessionMap (only if existing title is placeholder)
         if (resolvedTitle && !isPlaceholderSessionTitle(resolvedTitle)) {
-          const chatState = state.sessionMap.get(vscodeSessionId);
+          const chatState = state.sessions.get(vscodeSessionId);
           if (chatState && isPlaceholderSessionTitle(chatState.title)) {
             chatState.title = resolvedTitle;
           }
         }
 
-        if (state.refreshSessionItems) {
-          state.outputChannel.appendLine(`[handler] Refreshing Session list for session ${sessionId}`);
-          await state.refreshSessionItems().catch((err: unknown) => {
-            const msg = err instanceof Error ? err.message : String(err);
-            state.outputChannel.appendLine(`[handler] Session list refresh failed: ${msg}`);
-          });
-        }
+        state.outputChannel.appendLine(`[handler] Refreshing Session list for session ${sessionId}`);
+        state.bus.emit('session-list-changed', void 0);
       };
 
       // 11. Execute turn with per-edit externalEdit lifecycle managed via tracker
@@ -671,7 +667,7 @@ export function createParticipantHandler(
       return {
         metadata: {
           sessionId,
-          turnMap: state.sessionMap.get(vscodeSessionId)?.turnMap ?? [],
+          turnMap: state.sessions.get(vscodeSessionId)?.turnMap ?? [],
         },
       };
     } catch (err) {

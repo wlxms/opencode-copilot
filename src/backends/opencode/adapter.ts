@@ -34,7 +34,7 @@ import type {
 } from '../../acp/types';
 import { normalizeStreamEvent } from './events';
 import type { OpenCodeEventStream } from './sdk-events';
-import type { OpenCodeClient, SdkAgentData } from '../../types';
+import type { OpenCodeClient, SdkAgentData } from './sdk-types';
 import { OpenCodeSettingsProvider } from './settings';
 
 // ===========================================================================

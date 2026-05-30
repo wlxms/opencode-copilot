@@ -1,7 +1,7 @@
 import { createOpencode } from '@opencode-ai/sdk/v2';
 import { existsSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
-import type { OpenCodeClient, OpenCodeServerController } from '../types';
+import type { OpenCodeClient, OpenCodeServerController } from '../backends/opencode/sdk-types';
 
 export type ServerStatus = 'stopped' | 'starting' | 'running' | 'error';
 

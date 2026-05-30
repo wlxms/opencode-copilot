@@ -1,7 +1,6 @@
 import * as vscode from 'vscode';
 import { writeFileSync, unlinkSync, existsSync } from 'fs';
 import { execSync, exec } from 'child_process';
-import type { Model, Provider } from '@opencode-ai/sdk/v2';
 import type { ExtensionState } from '../types';
 import type {
   ChatToolResourcesInvocationData,
@@ -1592,7 +1591,7 @@ async function handleTestStreamLatencyCommand(
     const promptStart = perfNow();
     const promptPromise = state.backend.sessions
       .prompt(sessionId, THINKING_PROMPT)
-      .then((result) => {
+      .then((result: { error?: unknown; data?: unknown }) => {
         if (result.error) {
           state.outputChannel.appendLine(
             `[stream-latency] Prompt error: ${String(result.error)}`,

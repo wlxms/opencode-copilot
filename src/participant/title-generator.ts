@@ -127,14 +127,12 @@ export async function retitleSession(
   if (llmTitle && !isPlaceholderSessionTitle(llmTitle)) {
     try {
       await state.backend.sessions.update(sessionId, { title: llmTitle, directory });
-      const cs = state.sessionMap.get(vscodeSessionId);
+      const cs = state.sessions.get(vscodeSessionId);
       if (cs && isPlaceholderSessionTitle(cs.title)) {
         cs.title = llmTitle;
       }
-      if (state.refreshSessionItems) {
-        logger.appendLine(`[title-gen] Refreshing session list after LLM title: "${llmTitle}"`);
-        await state.refreshSessionItems();
-      }
+      logger.appendLine(`[title-gen] Refreshing session list after LLM title: "${llmTitle}"`);
+      state.bus.emit('session-list-changed', void 0);
       logger.appendLine(`[title-gen] Title pushed via sessions.update(): "${llmTitle}"`);
     } catch (updateErr: unknown) {
       const msg = updateErr instanceof Error ? updateErr.message : String(updateErr);
