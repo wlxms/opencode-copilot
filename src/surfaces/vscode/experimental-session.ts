@@ -46,7 +46,8 @@
  */
 import * as vscode from 'vscode';
 import type { ExtensionState } from '../../types';
-import type { OpenCodeEvent, OpenCodeEventStream } from '../../backends/opencode/sdk-events';
+import type { AcpEvent } from '../../acp/types';
+import type { AcpEventStream } from '../../acp/backend';
 import { createParticipantHandler } from '../../participant/handler';
 import { isUserSelectableAgent } from '../../acp/types';
 
@@ -136,12 +137,12 @@ export class ExperimentalChatSession {
    * Process an ACP event and capture it as structured content.
    * Call after each event from the OpenCode event stream.
    */
-  processEvent(evt: OpenCodeEvent): void {
+  processEvent(evt: AcpEvent): void {
     switch (evt.type) {
-      case 'message.part.updated':
+      case 'part.updated':
         this.handlePartUpdated(evt);
         break;
-      case 'message.part.delta':
+      case 'part.delta':
         this.handlePartDelta(evt);
         break;
       case 'session.diff':
@@ -173,43 +174,44 @@ export class ExperimentalChatSession {
   // Event handlers
   // -------------------------------------------------------------------
 
-  private handlePartUpdated(evt: OpenCodeEvent): void {
-    const part = (evt as { properties?: { part?: { type: string } } }).properties?.part;
+  private handlePartUpdated(evt: AcpEvent): void {
+    if (evt.type !== 'part.updated') {return;}
+    const part = evt.part;
     if (!part) {return;}
 
     switch (part.type) {
       case 'reasoning':
         this.currentFrame.hasReasoning = true;
         break;
-      case 'tool': {
-        const toolPart = part as {
-          callID?: string;
-          tool?: string;
-          state?: { status: string; input?: Record<string, unknown>; output?: string; title?: string; error?: string };
-        };
-        this.handleToolState(toolPart);
+      case 'tool':
+        this.handleToolState({
+          callID: part.callId,
+          tool: part.toolName,
+          state: part.state as { status: string; input?: Record<string, unknown>; output?: string; title?: string; error?: string; startTime?: number; endTime?: number },
+        });
         break;
-      }
     }
   }
 
-  private handlePartDelta(evt: OpenCodeEvent): void {
-    const props = (evt as { properties?: { partID: string; delta: string; field?: string } }).properties;
-    if (!props?.delta) {return;}
+  private handlePartDelta(evt: AcpEvent): void {
+    if (evt.type !== 'part.delta') {return;}
+    const delta = evt.delta;
+    if (!delta) {return;}
 
     // We don't track part kinds here (that's the renderer's job).
     // For structured content, we accumulate into the current frame.
     if (this.currentFrame.hasReasoning) {
       this.currentFrame.reasoningText =
-        (this.currentFrame.reasoningText ?? '') + props.delta;
+        (this.currentFrame.reasoningText ?? '') + delta;
     } else {
       this.currentFrame.markdown =
-        (this.currentFrame.markdown ?? '') + props.delta;
+        (this.currentFrame.markdown ?? '') + delta;
     }
   }
 
-  private handleSessionDiff(evt: OpenCodeEvent): void {
-    const diffs = (evt as { properties?: { diff?: Array<{ file: string; additions?: number; deletions?: number; status: string }> } }).properties?.diff;
+  private handleSessionDiff(evt: AcpEvent): void {
+    if (evt.type !== 'session.diff') {return;}
+    const diffs = evt.diffs;
     if (!diffs?.length) {return;}
 
     const entries: SessionDiffEntry[] = diffs
@@ -318,8 +320,8 @@ function createSessionResource(sessionId: string): vscode.Uri {
  * Flow:
  * 1. Controller's `getChatSessionInputState` → creates tracked inputState
  * 2. VSCode tracks it, fires `onDidChange` when user changes picker
- * 3. We subscribe to `onDidChange` → parse groups → update state.currentAgent/currentModel
- * 4. Handler reads state.currentAgent/currentModel at prompt time
+ * 3. We subscribe to `onDidChange` → parse groups → update selection via state.selection.setAgent/setModel
+ * 4. Handler reads state.selection.get() at prompt time
  *
  * @param state - The global extension state.
  * @param context - The extension context (for subscriptions).
@@ -350,7 +352,7 @@ export function createSessionContentProvider(
   const directory = getWorkspaceDirectory();
 
   // ── Local session cache ──────────────────────────────────────────────
-  const SESSION_CACHE_KEY = 'opencode.sessionItems';
+  const SESSION_CACHE_KEY = 'acp.sessionItems';
   interface CachedSessionItem { id: string; title: string; createdAt: number; }
 
   // Guard against concurrent refreshSessionItems() calls that can race
@@ -438,36 +440,38 @@ export function createSessionContentProvider(
         state.backend.config.models(directory),
       ]);
 
-      const agents = (agentsResult.data ?? []).filter(a => isUserSelectableAgent(a));
+      const agents = (agentsResult.data ?? []).filter((a: { hidden?: boolean; mode?: string }) => isUserSelectableAgent(a as any));
       const models = modelsResult.data ?? [];
 
       logger.appendLine(
         `[session-provider] Backend returned: ${agentsResult.data?.length ?? 0} agents (error=${agentsResult.error ?? 'none'}), ${modelsResult.data?.length ?? 0} models (error=${modelsResult.error ?? 'none'})`,
       );
 
+      const sel = state.selection.get();
+
       // Build agent option items
-      const agentItems: vscode.ChatSessionProviderOptionItem[] = agents.map(a => ({
+      const agentItems: vscode.ChatSessionProviderOptionItem[] = (agents as any[]).map((a: any) => ({
         id: `agent-${a.id}`,
         name: a.name ?? a.id,
         description: a.description,
-        default: a.id === state.currentAgent,
+        default: a.id === sel.agent,
       }));
 
       // Find selected agent item
-      const currentAgentId = state.currentAgent;
+      const currentAgentId = sel.agent;
       const selectedAgent = agentItems.find(i => i.id === `agent-${currentAgentId}`) ?? agentItems[0];
 
       // Build model option items
-      const modelItems: vscode.ChatSessionProviderOptionItem[] = models.map(m => ({
+      const modelItems: vscode.ChatSessionProviderOptionItem[] = (models as any[]).map((m: any) => ({
         id: `model-${m.provider ?? 'default'}/${m.id}`,
         name: m.name ?? m.id,
         description: m.providerName,
-        default: m.id === (state.currentModel?.modelID),
+        default: m.id === (sel.model?.modelID),
       }));
 
       // Find selected model item — match by both provider and model ID
-      const currentModelId = state.currentModel?.modelID;
-      const currentProviderId = state.currentModel?.providerID;
+      const currentModelId = sel.model?.modelID;
+      const currentProviderId = sel.model?.providerID;
       let selectedModel = modelItems[0];
       if (currentModelId) {
         // First try exact match with provider
@@ -542,29 +546,29 @@ export function createSessionContentProvider(
   function collectRuntimeSessions(): Array<{ id: string; title: string; createdAt: Date }> {
     const runtimeSessions = new Map<string, { id: string; title: string; createdAt: Date }>();
 
-    for (const chatState of state.sessionMap.values()) {
-      if (!chatState.opencodeSessionId) {
+    for (const chatState of state.sessions.values()) {
+      if (!chatState.sessionId) {
         continue;
       }
 
-      const existing = runtimeSessions.get(chatState.opencodeSessionId);
+      const existing = runtimeSessions.get(chatState.sessionId);
       const newTitle = chatState.title ?? '';
 
       // Prefer non-placeholder titles when multiple sessionMap entries share
-      // the same opencodeSessionId (e.g. untitled-N vs opencode-copilot.opencode:/ses_xxx).
+      // the same sessionId (e.g. untitled-N vs opencode-copilot.opencode:/ses_xxx).
       if (existing) {
         const existingIsPlaceholder = isPlaceholderSessionTitle(existing.title);
         const newIsPlaceholder = isPlaceholderSessionTitle(newTitle);
         if (existingIsPlaceholder && !newIsPlaceholder) {
-          runtimeSessions.set(chatState.opencodeSessionId, {
-            id: chatState.opencodeSessionId,
+          runtimeSessions.set(chatState.sessionId, {
+            id: chatState.sessionId,
             title: newTitle,
             createdAt: chatState.createdAt ?? existing.createdAt,
           });
         }
       } else {
-        runtimeSessions.set(chatState.opencodeSessionId, {
-          id: chatState.opencodeSessionId,
+        runtimeSessions.set(chatState.sessionId, {
+          id: chatState.sessionId,
           title: newTitle,
           createdAt: chatState.createdAt ?? new Date(),
         });
@@ -776,7 +780,7 @@ export function createSessionContentProvider(
       );
     });
   };
-  state.onBackendReady = onBackendReadyHandler;
+  const backendReadyDispose = state.bus.on('backend-ready', onBackendReadyHandler);
 
   // -- ChatSessionItemController: Picker Tracking --------------------------
   // The controller creates tracked inputState objects via createChatSessionInputState().
@@ -789,6 +793,7 @@ export function createSessionContentProvider(
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let controller: vscode.ChatSessionItemController | undefined;
+  let sessionListChangedDispose: (() => void) | undefined;
 
   if (hasControllerAPI) {
     controller = (vscode.chat as any).createChatSessionItemController(
@@ -809,7 +814,13 @@ export function createSessionContentProvider(
       },
     ) as vscode.ChatSessionItemController;
 
-    state.refreshSessionItems = refreshSessionItems;
+    sessionListChangedDispose = state.bus.on('session-list-changed', () => {
+      refreshSessionItems().catch((err) => {
+        logger.appendLine(
+          `[session-provider] Session list refresh on event failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    });
 
     controller.getChatSessionInputState = (
       _sessionResource: vscode.Uri | undefined,
@@ -834,7 +845,7 @@ export function createSessionContentProvider(
         }
       });
 
-      // Subscribe to changes — update state.currentAgent/currentModel in real-time.
+      // Subscribe to changes — update selection in real-time.
       inputState.onDidChange(() => {
         const groups = inputState.groups ?? [];
         logger.appendLine(
@@ -854,7 +865,9 @@ export function createSessionContentProvider(
 
           if (group.id === 'agents') {
             const agentId = selected.id.replace(/^agent-/, '');
-            state.currentAgent = agentId;
+            state.selection.setAgent(agentId).catch((err: unknown) => {
+              logger.appendLine(`[session-provider] Failed to set agent: ${err}`);
+            });
             logger.appendLine(`[session-provider] Picker set currentAgent=${agentId}`);
           }
 
@@ -864,7 +877,9 @@ export function createSessionContentProvider(
             if (slashIdx >= 0) {
               const providerID = modelPart.slice(0, slashIdx);
               const modelID = modelPart.slice(slashIdx + 1);
-              state.currentModel = { providerID, modelID };
+              state.selection.setModel(providerID, modelID).catch((err: unknown) => {
+                logger.appendLine(`[session-provider] Failed to set model: ${err}`);
+              });
               logger.appendLine(`[session-provider] Picker set currentModel=${providerID}/${modelID}`);
             }
           }
@@ -901,12 +916,8 @@ export function createSessionContentProvider(
 
   context.subscriptions.push({
     dispose: () => {
-      if (state.refreshSessionItems === refreshSessionItems) {
-        state.refreshSessionItems = undefined;
-      }
-      if (state.onBackendReady === onBackendReadyHandler) {
-        state.onBackendReady = undefined;
-      }
+      backendReadyDispose();
+      sessionListChangedDispose?.();
     },
   });
 
@@ -927,7 +938,7 @@ export function createSessionContentProvider(
    *
    * For untitled sessions, the URI contains the VSCode-generated ID (e.g.
    * "untitled-xxx") which must be mapped to the OpenCode session ID via
-   * `state.sessionMap`. For real sessions (from the session list), the URI
+   * `state.sessions`. For real sessions (from the session list), the URI
    * already contains the OpenCode session ID.
    */
   function resolveOpenCodeSessionId(sessionResource: vscode.Uri): string | undefined {
@@ -938,18 +949,18 @@ export function createSessionContentProvider(
       return rawId;
     }
 
-    // Untitled sessions: look up the OpenCode session ID via sessionMap
+    // Untitled sessions: look up the OpenCode session ID via sessions
     if (rawId) {
-      const chatState = state.sessionMap.get(rawId);
-      if (chatState?.opencodeSessionId) {
-        return chatState.opencodeSessionId;
+      const chatState = state.sessions.get(rawId);
+      if (chatState?.sessionId) {
+        return chatState.sessionId;
       }
 
       // Also check by the full URI string (sessionResource-based keys)
       const uriKey = sessionResource.toString();
-      const uriState = state.sessionMap.get(uriKey);
-      if (uriState?.opencodeSessionId) {
-        return uriState.opencodeSessionId;
+      const uriState = state.sessions.get(uriKey);
+      if (uriState?.sessionId) {
+        return uriState.sessionId;
       }
     }
 
@@ -977,7 +988,7 @@ export function createSessionContentProvider(
       _token: vscode.CancellationToken,
     ): Promise<vscode.ChatSessionItem> => {
       const rawSessionId = extractSessionId(sessionResource);
-      const opencodeSessionId = resolveOpenCodeSessionId(sessionResource);
+      const sessionId = resolveOpenCodeSessionId(sessionResource);
 
       const derivedLabel = request?.prompt
         ? `Fork: ${request.prompt.slice(0, 40).trimEnd()}`
@@ -985,17 +996,17 @@ export function createSessionContentProvider(
       const title = derivedLabel.length > 0 ? derivedLabel : 'Forked Session';
 
       logger.appendLine(
-        `[session-provider] Fork requested for raw=${rawSessionId}, opencode=${opencodeSessionId ?? 'unknown'} (title="${title}")`,
+        `[session-provider] Fork requested for raw=${rawSessionId}, backend=${sessionId ?? 'unknown'} (title="${title}")`,
       );
 
-      if (!opencodeSessionId) {
+      if (!sessionId) {
         const msg = `Cannot fork session: unable to resolve OpenCode session ID for resource ${sessionResource.toString()}`;
         logger.appendLine(`[session-provider] ${msg}`);
         throw new Error(msg);
       }
 
       const result = await state.backend.sessions.create({
-        parentId: opencodeSessionId,
+        parentId: sessionId,
         directory,
         title,
       });
@@ -1015,7 +1026,7 @@ export function createSessionContentProvider(
       ctrl.items.add(item);
 
       logger.appendLine(
-        `[session-provider] Forked session ${newSessionId} created from ${opencodeSessionId}`,
+        `[session-provider] Forked session ${newSessionId} created from ${sessionId}`,
       );
 
       // Refresh the session list so the new forked session appears
@@ -1042,7 +1053,7 @@ export function createSessionContentProvider(
 
     const messages = result.data.items;
     const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
-    const turnMap: Array<{ vscodeTurn: number; opencodeMessageId: string }> = [];
+    const turnMap: Array<{ vscodeTurn: number; messageId: string }> = [];
     let turnIndex = 0;
 
     for (const msg of messages) {
@@ -1075,7 +1086,7 @@ export function createSessionContentProvider(
 
         turnMap.push({
           vscodeTurn: turnIndex,
-          opencodeMessageId: msg.id,
+          messageId: msg.id,
         });
         turnIndex++;
       }
@@ -1092,7 +1103,7 @@ export function createSessionContentProvider(
   // (history, title) and manages option groups (agent/model picker).
   // All request handling is delegated to the same ChatParticipant handler used
   // by the stable surface (participant/handler.ts), ensuring a shared session
-  // lifecycle. Picker changes update state.currentAgent/currentModel via the
+  // lifecycle. Picker changes update selection via the
   // controller's tracked inputState.onDidChange, and the handler reads from
   // state at prompt time.
 
@@ -1151,7 +1162,7 @@ export function createSessionContentProvider(
       // NOTE: Picker selection changes are handled by the ChatSessionItemController's
       // getChatSessionInputState → onDidChange subscription (set up above).
       // We no longer need to read inputState here — the controller keeps
-      // state.currentAgent/currentModel updated in real-time.
+      // selection updated in real-time.
 
       // New session — no history to restore
       // VSCode generates untitled-* URIs for fresh sessions; only real OpenCode
@@ -1166,13 +1177,13 @@ export function createSessionContentProvider(
       }
 
       // For untitled-* sessions (VSCode-managed), look up the OpenCode session
-      // that was previously created via requestHandler. The sessionMap key is
+      // that was previously created via requestHandler. The sessions key is
       // request.sessionId which matches the untitled-* ID from the URI path.
       if (sessionId.startsWith('untitled-')) {
-        const chatState = state.sessionMap.get(sessionId);
-        if (chatState?.opencodeSessionId) {
+        const chatState = state.sessions.get(sessionId);
+        if (chatState?.sessionId) {
           logger.appendLine(
-            `[session-provider] Found existing OpenCode session ${chatState.opencodeSessionId} for VSCode session ${sessionId}`,
+            `[session-provider] Found existing OpenCode session ${chatState.sessionId} for VSCode session ${sessionId}`,
           );
 
           // Fetch history from the OpenCode backend
@@ -1180,7 +1191,7 @@ export function createSessionContentProvider(
             try {
               await ensureBackendRunning();
 
-              const history = await fetchSessionHistory(chatState.opencodeSessionId, token);
+              const history = await fetchSessionHistory(chatState.sessionId, token);
 
               // Determine title with priority:
               // 1. Non-placeholder chatState title (already fetched from backend earlier)
@@ -1193,17 +1204,17 @@ export function createSessionContentProvider(
                 // Try fetching the latest title from backend — it may have been
                 // auto-generated after the first response completed.
                 try {
-                  const sessionInfo = await state.backend.sessions.get(chatState.opencodeSessionId);
+                  const sessionInfo = await state.backend.sessions.get(chatState.sessionId);
                   const backendTitle = sessionInfo.data?.title?.trim() ?? '';
                   if (!isPlaceholderSessionTitle(backendTitle)) {
                     title = backendTitle;
-                    // Persist to sessionMap so subsequent tab switches skip the fetch
+                    // Persist to sessions so subsequent tab switches skip the fetch
                     chatState.title = backendTitle;
                   } else {
-                    title = getHistoryDerivedSessionTitle(history, chatState.opencodeSessionId);
+                    title = getHistoryDerivedSessionTitle(history, chatState.sessionId);
                   }
                 } catch {
-                  title = getHistoryDerivedSessionTitle(history, chatState.opencodeSessionId);
+                  title = getHistoryDerivedSessionTitle(history, chatState.sessionId);
                 }
               }
 
@@ -1255,10 +1266,10 @@ export function createSessionContentProvider(
 
           // Store in session map for request handler continuity
           const vscodeSessionKey = resource.toString();
-          const existingState = state.sessionMap.get(vscodeSessionKey);
+          const existingState = state.sessions.get(vscodeSessionKey);
           let bestTitle = title;
           if (existingState) {
-            existingState.opencodeSessionId = sessionId;
+            existingState.sessionId = sessionId;
             if (!existingState.title?.trim() || isPlaceholderSessionTitle(existingState.title)) {
               existingState.title = title;
             }
@@ -1266,18 +1277,18 @@ export function createSessionContentProvider(
             existingState.createdAt = sessionInfo.data?.createdAt ?? existingState.createdAt ?? new Date();
           } else {
             // Before creating a new entry with a potentially placeholder title,
-            // check if any other sessionMap entry for the same opencodeSessionId
+            // check if any other sessions entry for the same sessionId
             // already has a non-placeholder title (from a previous handler run).
             if (isPlaceholderSessionTitle(title)) {
-              for (const cs of state.sessionMap.values()) {
-                if (cs.opencodeSessionId === sessionId && !isPlaceholderSessionTitle(cs.title)) {
-                  bestTitle = cs.title;
+              for (const cs of state.sessions.values()) {
+                if (cs.sessionId === sessionId && !isPlaceholderSessionTitle(cs.title)) {
+                  bestTitle = cs.title ?? bestTitle;
                   break;
                 }
               }
             }
-            state.sessionMap.set(vscodeSessionKey, {
-              opencodeSessionId: sessionId,
+            state.sessions.set(vscodeSessionKey, {
+              sessionId: sessionId,
               turnMap: [],
               title: bestTitle,
               createdAt: sessionInfo.data?.createdAt ?? new Date(),
@@ -1330,7 +1341,7 @@ export function createSessionContentProvider(
  */
 export async function renderWithExperimentalSurface(
   renderer: AcpRenderer,
-  eventStream: OpenCodeEventStream,
+  eventStream: AcpEventStream,
   stream: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<{ frames: SessionFrameContent[]; completed: boolean }> {
@@ -1357,19 +1368,19 @@ export async function renderWithExperimentalSurface(
         break;
       }
 
-      const evt = 'payload' in rawEvt ? rawEvt.payload : rawEvt;
+      const rawEvtTyped = rawEvt as AcpEvent;
 
       // Render to the live stream (uses proposed APIs if available)
-      const result = renderer.renderEvent(evt, stream);
+      const result = renderer.renderEvent(rawEvtTyped, stream);
 
       // Also capture as structured content
-      session.processEvent(evt);
+      session.processEvent(rawEvtTyped);
 
       if (result.rendered) {
         await yieldToEventLoop();
       }
 
-      if (evt.type === 'session.idle') {
+      if (rawEvtTyped.type === 'session.idle') {
         const frames = session.consumeFrames();
         return { frames, completed: true };
       }

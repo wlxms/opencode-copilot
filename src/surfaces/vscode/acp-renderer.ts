@@ -18,14 +18,19 @@
 import * as vscode from 'vscode';
 
 import type {
-  MessagePartUpdatedEvent,
-  SessionDiffEvent,
-  OpenCodeEvent,
-  TextStreamPart,
-  ReasoningStreamPart,
-  StreamToolPart,
-  StreamToolState,
-} from '../../backends/opencode/sdk-events';
+  AcpEvent,
+  AcpStreamPart,
+  AcpTextPart,
+  AcpReasoningPart,
+  AcpToolPart,
+  AcpToolState,
+  AcpStepPart,
+  AcpPartUpdatedEvent,
+  AcpPartDeltaEvent,
+  AcpSessionDiffEvent,
+  AcpSessionIdleEvent,
+  AcpFileDiff,
+} from '../../acp/types';
 
 import type {
   ChatTerminalToolInvocationData,
@@ -177,7 +182,7 @@ export class AcpRenderer {
    *
    * @returns `RenderResult` indicating whether anything was rendered.
    */
-  renderEvent(evt: OpenCodeEvent, stream: vscode.ChatResponseStream): RenderResult {
+  renderEvent(evt: AcpEvent, stream: vscode.ChatResponseStream): RenderResult {
     const s = stream as Stream;
 
     // Filter subagent-internal events: suppress rendering, capture for progress summary
@@ -187,23 +192,22 @@ export class AcpRenderer {
     }
 
     switch (evt.type) {
-      case 'message.part.updated':
+      case 'part.updated':
         return {
           rendered: this.handlePartUpdated(evt, s),
-          eventType: 'message.part.updated',
+          eventType: 'part.updated',
         };
-      case 'message.part.delta':
+      case 'part.delta':
         return {
           rendered: this.handlePartDelta(evt, s),
-          eventType: 'message.part.delta',
+          eventType: 'part.delta',
         };
       case 'session.idle': {
         // Check if this is a child session becoming idle.
         // Child session.idle events are forwarded by the event-broker to the
         // parent channel (via childToParent mapping). We match by childSessionId
         // and push the FINAL completed subagent card with aggregated progress.
-        const idleEvent = evt as { properties?: { sessionID?: string } };
-        const idleSessionId = idleEvent.properties?.sessionID;
+        const idleSessionId = evt.sessionId;
         if (idleSessionId) {
           for (const scope of this.activeSubagentScopes.values()) {
             if (scope.childSessionId === idleSessionId) {
@@ -220,7 +224,7 @@ export class AcpRenderer {
       }
       case 'session.diff':
         return {
-          rendered: this.handleSessionDiff(evt as SessionDiffEvent, s),
+          rendered: this.handleSessionDiff(evt, s),
           eventType: 'session.diff',
         };
       case 'permission.asked':
@@ -266,21 +270,21 @@ export class AcpRenderer {
    * Handle a `message.part.updated` event — register part kinds and
    * dispatch tool state transitions.
    */
-  private handlePartUpdated(evt: MessagePartUpdatedEvent, stream: Stream): boolean {
-    const part = evt.properties?.part;
+  private handlePartUpdated(evt: AcpPartUpdatedEvent, stream: Stream): boolean {
+    const part = evt.part;
     if (!part) {return false;}
 
     switch (part.type) {
       case 'text': {
         const textPart = part;
-        const msgId = textPart.messageID;
+        const msgId = textPart.messageId;
         // Capture user message ID on first text part
         if (
           !this.assistantPhaseStarted &&
           !this.userMessageId &&
           textPart.text.length > 0
         ) {
-          this.userMessageId = msgId;
+          this.userMessageId = msgId ?? null;
           this.log(`captured userMessageId=${msgId}`);
           return false;
         }
@@ -320,14 +324,12 @@ export class AcpRenderer {
    * Handle a `message.part.delta` event — stream reasoning or text tokens.
    */
   private handlePartDelta(
-    evt: Extract<OpenCodeEvent, { type: 'message.part.delta' }>,
+    evt: AcpPartDeltaEvent,
     stream: Stream,
   ): boolean {
-    const props = evt.properties;
-    if (!props?.delta) {return false;}
-
-    const partID = props.partID;
-    const delta = props.delta;
+    const partID = evt.partId;
+    const delta = evt.delta;
+    if (!delta) {return false;}
     const kind = this.partKinds.get(partID);
 
     if (kind === 'reasoning') {
@@ -347,8 +349,8 @@ export class AcpRenderer {
    * Handle a `session.diff` event — render file diffs using
    * `ChatResponseMultiDiffPart` if available.
    */
-  private handleSessionDiff(evt: SessionDiffEvent, stream: Stream): boolean {
-    const diffs = evt.properties?.diff;
+  private handleSessionDiff(evt: AcpSessionDiffEvent, stream: Stream): boolean {
+    const diffs = evt.diffs;
     if (!diffs?.length) {return false;}
 
     if (!hasChatResponseMultiDiffPart() || !stream.push) {
@@ -392,12 +394,12 @@ export class AcpRenderer {
   /**
    * Handle a tool state transition event.
    */
-  private handleToolState(part: StreamToolPart, stream: Stream): boolean {
+  private handleToolState(part: AcpToolPart, stream: Stream): boolean {
     const state = part.state;
     if (!state) {return false;}
 
-    const toolName = part.tool ?? 'unknown';
-    const callID = part.callID ?? part.id;
+    const toolName = part.toolName ?? 'unknown';
+    const callID = part.callId ?? part.id;
     const status = state.status;
 
     if (status === 'pending') {
@@ -446,14 +448,14 @@ export class AcpRenderer {
   private handleToolRunning(
     callID: string,
     toolName: string,
-    state: StreamToolState,
+    state: AcpToolState,
     stream: Stream,
   ): boolean {
     const meta = this.toolMetas.get(callID);
     if (meta) {
       meta.input = state.input ?? {};
       meta.title = getToolTitle(state);
-      meta.timeStart = getToolTime(state)?.start;
+      meta.timeStart = state.startTime;
     }
     // Track subagent scope so child events get filtered instead of leaking
     // Generate subAgentInvocationId at scope creation so child tools that
@@ -471,7 +473,7 @@ export class AcpRenderer {
           toolName,
           title: getToolTitle(state) ?? toolName,
           input: state.input ?? {},
-          timeStart: getToolTime(state)?.start,
+          timeStart: state.startTime,
         },
         descendantSessionIds: new Set(),
       });
@@ -530,13 +532,13 @@ export class AcpRenderer {
     callID: string,
     partId: string,
     toolName: string,
-    state: StreamToolState,
+    state: AcpToolState,
     stream: Stream,
   ): boolean {
     const meta = this.toolMetas.get(callID);
     if (meta) {
       meta.output = getToolOutput(state) ?? '';
-      meta.timeEnd = getToolTime(state)?.end;
+      meta.timeEnd = state.endTime;
       meta.title = getToolTitle(state) ?? meta.title;
     }
 
@@ -546,9 +548,8 @@ export class AcpRenderer {
     // At child session.idle, pushFinalSubagentCard updates with full duration.
     const subagentScope = this.activeSubagentScopes.get(callID);
     if ((toolName === 'task' || toolName === 'subagent') && subagentScope) {
-      const sdkState = state as { metadata?: Record<string, unknown>; output?: string };
-      const childSessionId = (sdkState.metadata?.sessionId ??
-        (typeof sdkState.output === 'string' ? sdkState.output.match(/task_id:\s*(\S+)/)?.[1] : undefined)) as string | undefined;
+      const childSessionId = (state.metadata?.sessionId ??
+        (typeof state.output === 'string' ? state.output.match(/task_id:\s*(\S+)/)?.[1] : undefined)) as string | undefined;
       if (childSessionId && !subagentScope.childSessionId) {
         subagentScope.childSessionId = childSessionId;
         this.log(`child session ID captured: callID=${callID}, childSessionId=${childSessionId}`);
@@ -589,7 +590,7 @@ export class AcpRenderer {
     callID: string,
     partId: string,
     toolName: string,
-    state: StreamToolState,
+    state: AcpToolState,
     stream: Stream,
   ): boolean {
     // Clean up subagent scope on error
@@ -603,7 +604,7 @@ export class AcpRenderer {
         stream,
         toolName,
         state.input,
-        'error' in state ? state.error : undefined,
+        state.error,
         getToolTitle(state),
       );
     }
@@ -621,7 +622,7 @@ export class AcpRenderer {
     stream: Stream,
     callID: string,
     toolName: string,
-    state: StreamToolState,
+    state: AcpToolState,
     isError?: boolean,
     subAgentInvocationId?: string,
   ): void {
@@ -636,9 +637,8 @@ export class AcpRenderer {
       const title = getToolTitle(state) ?? meta?.title ?? toolName;
       const input = state.input ?? meta?.input ?? {};
       const output = getToolOutput(state) ?? meta?.output ?? '';
-      const time = getToolTime(state);
-      const timeStart = time?.start ?? meta?.timeStart;
-      const timeEnd = time?.end ?? meta?.timeEnd;
+      const timeStart = state.startTime ?? meta?.timeStart;
+      const timeEnd = state.endTime ?? meta?.timeEnd;
 
       const part = new Ctor(toolName, callID);
 
@@ -708,11 +708,11 @@ export class AcpRenderer {
    * Works with OpenCodeEvent (SDK-level), where part data is at `evt.properties.part`.
    * Uses the same `partKinds` whitelist strategy as StreamBridge.
    */
-  private isSubagentInternalEvent(evt: OpenCodeEvent): boolean {
+  private isSubagentInternalEvent(evt: AcpEvent): boolean {
     if (this.activeSubagentScopes.size === 0) {return false;}
 
-    if (evt.type === 'message.part.updated') {
-      const part = (evt).properties?.part;
+    if (evt.type === 'part.updated') {
+      const part = evt.part;
       if (!part) {return false;}
       // Structural parent parts are never subagent-internal
       if (part.type === 'reasoning' ||
@@ -728,15 +728,15 @@ export class AcpRenderer {
       // Parent-level task/subagent tool invocations are NOT subagent-internal.
       // Without this, a second parallel task tool would be captured instead of rendered.
       if (part.type === 'tool') {
-        const toolName = (part).tool;
+        const toolName = part.toolName;
         if (toolName === 'task' || toolName === 'subagent') {return false;}
       }
       if (this.partKinds.has(part.id)) {return false;}
       return true;
     }
 
-    if (evt.type === 'message.part.delta') {
-      const partId = (evt as { properties?: { partID?: string } }).properties?.partID;
+    if (evt.type === 'part.delta') {
+      const partId = evt.partId;
       if (partId && this.partKinds.has(partId)) {return false;}
       return !!partId;
     }
@@ -827,11 +827,10 @@ export class AcpRenderer {
    *
    * Matches events to scope by childSessionId to correctly handle parallel subagents.
    */
-  private captureSubagentEvent(evt: OpenCodeEvent, stream?: Stream): void {
+  private captureSubagentEvent(evt: AcpEvent, stream?: Stream): void {
     // Handle text delta events from subagent — stream text into the subagent card
-    if (evt.type === 'message.part.delta') {
-      const deltaEvt = evt as { properties?: { partID?: string; delta?: string } };
-      const delta = deltaEvt.properties?.delta;
+    if (evt.type === 'part.delta') {
+      const delta = evt.delta;
       if (delta) {
         for (const scope of this.activeSubagentScopes.values()) {
           const currentText = (scope.lastText ?? '') + delta;
@@ -848,13 +847,13 @@ export class AcpRenderer {
       return;
     }
 
-    if (evt.type !== 'message.part.updated') {return;}
-    const part = (evt).properties?.part;
+    if (evt.type !== 'part.updated') {return;}
+    const part = evt.part;
     if (!part) {return;}
 
     // Collect text output from subagent and push to subagent card
     if (part.type === 'text') {
-      const text = (part as any).text;
+      const text = part.text;
       if (text && text.trim().length > 0) {
         for (const scope of this.activeSubagentScopes.values()) {
           scope.lastText = text;
@@ -872,15 +871,14 @@ export class AcpRenderer {
 
     if (part.type !== 'tool') {return;}
 
-    const toolPart = part;
-    const state = toolPart.state;
+    const state = part.state;
     if (!state) {return;}
 
-    const toolName = toolPart.tool ?? 'unknown';
+    const toolName = part.toolName ?? 'unknown';
     const title = getToolTitle(state);
 
     // -- Match the event to exactly one subagent scope (using childSessionId) --
-    const childSessionId = part.sessionID;
+    const childSessionId = part.sessionId;
     let matchedScope: SubagentScope | undefined;
 
     if (childSessionId) {
@@ -926,7 +924,7 @@ export class AcpRenderer {
     // Uses pushToolInvocation() for full toolSpecificData rendering
     // (terminal UI, file references, collapsible lists, etc.).
     if (matchedScope.subAgentInvocationId && stream) {
-      const childCallId = toolPart.callID ?? toolPart.id ?? '';
+      const childCallId = part.callId ?? part.id ?? '';
       if (state.status === 'completed' || state.status === 'error') {
         // Push completed child tool card with full rendering
         if (this._hasToolUI && hasChatToolInvocationPart() && typeof stream.push === 'function') {
@@ -958,7 +956,7 @@ export class AcpRenderer {
     }
 
     this.log(
-      `subagent capture: tool=${toolPart.tool}, status=${state.status}, ` +
+      `subagent capture: tool=${part.toolName}, status=${state.status}, ` +
       `childSessionId=${childSessionId ?? '<none>'}, callID=${matchedScope.callId}`,
     );
   }
@@ -1485,17 +1483,20 @@ export function detectLanguage(title: string): string {
   return 'bash';
 }
 
-function getToolTitle(state: StreamToolState): string | undefined {
+function getToolTitle(state: AcpToolState): string | undefined {
   return 'title' in state ? state.title : undefined;
 }
 
-function getToolOutput(state: StreamToolState): string | undefined {
+function getToolOutput(state: AcpToolState): string | undefined {
   return 'output' in state ? state.output : undefined;
 }
 
 function getToolTime(
-  state: StreamToolState,
+  state: AcpToolState,
 ): { start?: number; end?: number } | undefined {
-  return 'time' in state ? state.time : undefined;
+  if (state.startTime != null || state.endTime != null) {
+    return { start: state.startTime, end: state.endTime };
+  }
+  return undefined;
 }
 

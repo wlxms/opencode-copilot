@@ -105,8 +105,9 @@ export function createStableHandler(
       agent?: string;
       attachments?: typeof attachments;
     } = {};
-    if (state.currentAgent) {promptOptions.agent = state.currentAgent;}
-    if (state.currentModel) {promptOptions.model = state.currentModel;}
+    const sel = state.selection.get();
+    if (sel.agent) {promptOptions.agent = sel.agent;}
+    if (sel.model) {promptOptions.model = sel.model;}
     if (attachments.length > 0) {promptOptions.attachments = attachments;}
 
     const promptResult = await state.backend.sessions.prompt(
@@ -209,10 +210,10 @@ async function resolveSession(
   // Try to reuse existing session from sessionMap
   const vscodeSessionId = _request.sessionId;
   if (vscodeSessionId) {
-    const existing = state.sessionMap.get(vscodeSessionId);
-    if (existing?.opencodeSessionId) {
-      logger.appendLine(`[stable-participant] Reusing session ${existing.opencodeSessionId}`);
-      return existing.opencodeSessionId;
+    const existing = state.sessions.get(vscodeSessionId);
+    if (existing?.sessionId) {
+      logger.appendLine(`[stable-participant] Reusing session ${existing.sessionId}`);
+      return existing.sessionId;
     }
   }
 
@@ -221,21 +222,21 @@ async function resolveSession(
     const result = await state.backend.sessions.create({
       directory: getWorkspaceDirectory(),
     });
-    const opencodeSessionId = result.data?.id ?? null;
-    if (!opencodeSessionId) {
+    const sessionId = result.data?.id ?? null;
+    if (!sessionId) {
       stream.markdown('⚠️ Failed to create session.');
       return null;
     }
 
     if (vscodeSessionId) {
-      state.sessionMap.set(vscodeSessionId, {
-        opencodeSessionId,
+      state.sessions.set(vscodeSessionId, {
+        sessionId,
         turnMap: [],
       });
     }
 
-    logger.appendLine(`[stable-participant] Created session ${opencodeSessionId}`);
-    return opencodeSessionId;
+    logger.appendLine(`[stable-participant] Created session ${sessionId}`);
+    return sessionId;
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown';
     logger.appendLine(`[stable-participant] Session creation error: ${msg}`);
