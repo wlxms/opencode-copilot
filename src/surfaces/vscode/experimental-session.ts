@@ -887,53 +887,17 @@ export function createSessionContentProvider(
     // -- forkHandler: enables edit/rewind/fork UI buttons in the chat view ------
     // Without this, VS Code sets hasForkHandler=false which hides the fork UI.
     // This handler creates a child session and registers it as a new session item.
-    controller.forkHandler = async (
-      sessionResource: vscode.Uri,
-      request: vscode.ChatRequestTurn | undefined,
-      _token: vscode.CancellationToken,
-    ): Promise<vscode.ChatSessionItem> => {
-      const currentSessionId = extractSessionId(sessionResource);
-      const derivedLabel = request?.prompt
-        ? `Fork: ${request.prompt.slice(0, 40).trimEnd()}`
-        : 'Forked Session';
-      const title = derivedLabel.length > 0 ? derivedLabel : 'Forked Session';
+    controller.forkHandler = createForkHandler(controller);
 
-      logger.appendLine(
-        `[session-provider] Fork requested for session ${currentSessionId} (title="${title}")`,
-      );
-
-      const result = await state.backend.sessions.create({
-        parentId: currentSessionId,
-        directory,
-        title,
-      });
-
-      if (result.error || !result.data?.id) {
-        const msg = `Failed to create forked session: ${result.error ?? 'no id'}`;
-        logger.appendLine(`[session-provider] ${msg}`);
-        throw new Error(msg);
-      }
-
-      const newSessionId = result.data.id;
-      const newResource = createSessionResource(newSessionId);
-
-      const item = controller!.createChatSessionItem(newResource, getSessionLabel({ id: newSessionId, title }));
-      item.status = vscode.ChatSessionStatus.Completed;
-      item.timing = { created: Date.now() };
-      controller!.items.add(item);
-
-      logger.appendLine(
-        `[session-provider] Forked session ${newSessionId} created from ${currentSessionId}`,
-      );
-
-      // Refresh the session list so the new forked session appears
-      refreshSessionItems().catch(() => {});
-
-      return item;
-    };
   } else {
     logger.appendLine('[session-provider] ChatSessionItemController API not available — picker changes will NOT propagate');
   }
+
+  // Session-level forkHandler: attached to every ChatSession returned by
+  // provideChatSessionContent() so VSCode shows edit/rewind/fork buttons
+  // for sessions loaded through the session target (including untitled sessions
+  // that have no ChatSessionItem in the controller's item list).
+  const sessionForkHandler = controller?.forkHandler;
 
   context.subscriptions.push({
     dispose: () => {
@@ -956,6 +920,109 @@ export function createSessionContentProvider(
     const path = resource.path;
     // Remove leading slash
     return path.startsWith('/') ? path.slice(1) : path;
+  }
+
+  /**
+   * Resolve the real OpenCode session ID from a session resource URI.
+   *
+   * For untitled sessions, the URI contains the VSCode-generated ID (e.g.
+   * "untitled-xxx") which must be mapped to the OpenCode session ID via
+   * `state.sessionMap`. For real sessions (from the session list), the URI
+   * already contains the OpenCode session ID.
+   */
+  function resolveOpenCodeSessionId(sessionResource: vscode.Uri): string | undefined {
+    const rawId = extractSessionId(sessionResource);
+
+    // Real OpenCode session IDs (from session.list) are used directly
+    if (rawId && !rawId.startsWith('untitled-') && rawId !== 'new') {
+      return rawId;
+    }
+
+    // Untitled sessions: look up the OpenCode session ID via sessionMap
+    if (rawId) {
+      const chatState = state.sessionMap.get(rawId);
+      if (chatState?.opencodeSessionId) {
+        return chatState.opencodeSessionId;
+      }
+
+      // Also check by the full URI string (sessionResource-based keys)
+      const uriKey = sessionResource.toString();
+      const uriState = state.sessionMap.get(uriKey);
+      if (uriState?.opencodeSessionId) {
+        return uriState.opencodeSessionId;
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Create a forkHandler function for use by both the ChatSessionItemController
+   * and the ChatSession objects returned by provideChatSessionContent().
+   *
+   * The handler resolves the correct OpenCode session ID (mapping VSCode untitled
+   * IDs to backend session IDs), creates a child session, and registers it as a
+   * new session item in the controller.
+   */
+  function createForkHandler(
+    ctrl: vscode.ChatSessionItemController,
+  ): ((
+    sessionResource: vscode.Uri,
+    request: vscode.ChatRequestTurn | undefined,
+    _token: vscode.CancellationToken,
+  ) => Promise<vscode.ChatSessionItem>) {
+    return async (
+      sessionResource: vscode.Uri,
+      request: vscode.ChatRequestTurn | undefined,
+      _token: vscode.CancellationToken,
+    ): Promise<vscode.ChatSessionItem> => {
+      const rawSessionId = extractSessionId(sessionResource);
+      const opencodeSessionId = resolveOpenCodeSessionId(sessionResource);
+
+      const derivedLabel = request?.prompt
+        ? `Fork: ${request.prompt.slice(0, 40).trimEnd()}`
+        : 'Forked Session';
+      const title = derivedLabel.length > 0 ? derivedLabel : 'Forked Session';
+
+      logger.appendLine(
+        `[session-provider] Fork requested for raw=${rawSessionId}, opencode=${opencodeSessionId ?? 'unknown'} (title="${title}")`,
+      );
+
+      if (!opencodeSessionId) {
+        const msg = `Cannot fork session: unable to resolve OpenCode session ID for resource ${sessionResource.toString()}`;
+        logger.appendLine(`[session-provider] ${msg}`);
+        throw new Error(msg);
+      }
+
+      const result = await state.backend.sessions.create({
+        parentId: opencodeSessionId,
+        directory,
+        title,
+      });
+
+      if (result.error || !result.data?.id) {
+        const msg = `Failed to create forked session: ${result.error ?? 'no id'}`;
+        logger.appendLine(`[session-provider] ${msg}`);
+        throw new Error(msg);
+      }
+
+      const newSessionId = result.data.id;
+      const newResource = createSessionResource(newSessionId);
+
+      const item = ctrl.createChatSessionItem(newResource, getSessionLabel({ id: newSessionId, title }));
+      item.status = vscode.ChatSessionStatus.Completed;
+      item.timing = { created: Date.now() };
+      ctrl.items.add(item);
+
+      logger.appendLine(
+        `[session-provider] Forked session ${newSessionId} created from ${opencodeSessionId}`,
+      );
+
+      // Refresh the session list so the new forked session appears
+      refreshSessionItems().catch(() => {});
+
+      return item;
+    };
   }
 
   /**
@@ -1094,6 +1161,7 @@ export function createSessionContentProvider(
           title: 'New OpenCode Session',
           history: [],
           requestHandler: createParticipantHandler(state),
+          ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
         };
       }
 
@@ -1143,6 +1211,7 @@ export function createSessionContentProvider(
                 title,
                 history,
                 requestHandler: createParticipantHandler(state),
+                ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
               };
             } catch (err) {
               logger.appendLine(
@@ -1152,6 +1221,7 @@ export function createSessionContentProvider(
                 title: chatState.title?.trim() || 'OpenCode (offline)',
                 history: [],
                 requestHandler: createParticipantHandler(state),
+                ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
               };
             }
           })();
@@ -1162,6 +1232,7 @@ export function createSessionContentProvider(
           title: 'New OpenCode Session',
           history: [],
           requestHandler: createParticipantHandler(state),
+          ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
         };
       }
 
@@ -1217,6 +1288,7 @@ export function createSessionContentProvider(
             title: bestTitle,
             history,
             requestHandler: createParticipantHandler(state),
+            ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
           };
         } catch (err) {
           logger.appendLine(
@@ -1226,6 +1298,7 @@ export function createSessionContentProvider(
             title: 'OpenCode (offline)',
             history: [],
             requestHandler: createParticipantHandler(state),
+            ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
           };
         }
       })();
