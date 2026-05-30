@@ -343,7 +343,7 @@ describe('createParticipantHandler', () => {
       title: 'OpenCode Session chat-1',
     });
     // Session stored in sessionMap under the vscode chat session ID
-    expect(state.sessionMap.get('chat-1')?.opencodeSessionId).toBe('session-1');
+    expect(state.sessionMap.get('chat-1')?.sessionId).toBe('session-1');
 
     // Events subscribed
     expect(state.backend.events.ensureStarted).toHaveBeenCalledOnce();
@@ -372,7 +372,7 @@ describe('createParticipantHandler', () => {
     backendStatus = 'running';
     // Pre-populate sessionMap with existing session
     state.sessionMap.set('chat-1', {
-      opencodeSessionId: 'existing-session',
+      sessionId: 'existing-session',
       turnMap: [],
     });
 
@@ -407,7 +407,7 @@ describe('createParticipantHandler', () => {
     backendStatus = 'running';
     const resourceKey = 'opencode-copilot.opencode:///session-existing';
     const restoredState = {
-      opencodeSessionId: 'existing-session',
+      sessionId: 'existing-session',
       turnMap: [],
     };
     state.sessionMap.set(resourceKey, restoredState);
@@ -481,10 +481,10 @@ describe('createParticipantHandler', () => {
     backendStatus = 'running';
     // Simulate 2 completed turns: turnMap has 2 entries
     state.sessionMap.set('chat-revert-1', {
-      opencodeSessionId: 'revert-session',
+      sessionId: 'revert-session',
       turnMap: [
-        { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
-        { vscodeTurn: 1, opencodeMessageId: 'msg-1' },
+        { vscodeTurn: 0, messageId: 'msg-0' },
+        { vscodeTurn: 1, messageId: 'msg-1' },
       ],
     });
 
@@ -519,7 +519,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // TurnMap should be trimmed to keep only the first entry
     const chatState = state.sessionMap.get('chat-revert-1')!;
     expect(chatState.turnMap).toEqual([
-      { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
+      { vscodeTurn: 0, messageId: 'msg-0' },
     ]);
 
     // Should prompt on the same reverted session
@@ -535,11 +535,11 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     backendStatus = 'running';
     // Simulate 3 completed turns
     state.sessionMap.set('chat-revert-3', {
-      opencodeSessionId: 'revert-session-3',
+      sessionId: 'revert-session-3',
       turnMap: [
-        { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
-        { vscodeTurn: 1, opencodeMessageId: 'msg-1' },
-        { vscodeTurn: 2, opencodeMessageId: 'msg-2' },
+        { vscodeTurn: 0, messageId: 'msg-0' },
+        { vscodeTurn: 1, messageId: 'msg-1' },
+        { vscodeTurn: 2, messageId: 'msg-2' },
       ],
     });
 
@@ -575,7 +575,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // TurnMap should keep only msg-0
     const chatState = state.sessionMap.get('chat-revert-3')!;
     expect(chatState.turnMap).toEqual([
-      { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
+      { vscodeTurn: 0, messageId: 'msg-0' },
     ]);
     expect(result!.metadata).toHaveProperty('sessionId', 'revert-session-3');
   });
@@ -584,10 +584,10 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     backendStatus = 'running';
     // Simulate 2 completed turns
     state.sessionMap.set('chat-revert-full', {
-      opencodeSessionId: 'full-rewind-session',
+      sessionId: 'full-rewind-session',
       turnMap: [
-        { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
-        { vscodeTurn: 1, opencodeMessageId: 'msg-1' },
+        { vscodeTurn: 0, messageId: 'msg-0' },
+        { vscodeTurn: 1, messageId: 'msg-1' },
       ],
     });
 
@@ -622,10 +622,10 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
   it('should fall back to new session on revert failure', async () => {
     backendStatus = 'running';
     state.sessionMap.set('chat-revert-fail', {
-      opencodeSessionId: 'fail-session',
+      sessionId: 'fail-session',
       turnMap: [
-        { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
-        { vscodeTurn: 1, opencodeMessageId: 'msg-1' },
+        { vscodeTurn: 0, messageId: 'msg-0' },
+        { vscodeTurn: 1, messageId: 'msg-1' },
       ],
     });
 
@@ -761,7 +761,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     backendStatus = 'running';
     // Pre-populate sessionMap so session is reused
     state.sessionMap.set('chat-running', {
-      opencodeSessionId: 'existing-id',
+      sessionId: 'existing-id',
       turnMap: [],
     });
 
@@ -882,7 +882,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Set up full flow mocks
     backendStatus = 'running';
     state.sessionMap.set('chat-cp-1', {
-      opencodeSessionId: 'existing-session',
+      sessionId: 'existing-session',
       turnMap: [],
     });
 
@@ -918,7 +918,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Set up full flow mocks
     backendStatus = 'running';
     state.sessionMap.set('chat-cp-2', {
-      opencodeSessionId: 'existing-session',
+      sessionId: 'existing-session',
       turnMap: [],
     });
 
@@ -947,7 +947,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Set up so that the handler starts but prompt throws
     backendStatus = 'running';
     state.sessionMap.set('chat-cp-3', {
-      opencodeSessionId: 'existing-session',
+      sessionId: 'existing-session',
       turnMap: [],
     });
 
@@ -978,7 +978,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
 
     backendStatus = 'running';
     state.sessionMap.set('chat-title-test', {
-      opencodeSessionId: 'ses-title-123',
+      sessionId: 'ses-title-123',
       turnMap: [],
       title: 'New OpenCode Session',
     });
@@ -1012,7 +1012,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
 
     backendStatus = 'running';
     state.sessionMap.set('chat-title-keep', {
-      opencodeSessionId: 'ses-title-456',
+      sessionId: 'ses-title-456',
       turnMap: [],
       title: 'Existing Good Title',
     });

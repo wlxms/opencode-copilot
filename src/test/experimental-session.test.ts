@@ -115,7 +115,7 @@ describe('createSessionContentProvider', () => {
   it('publishes runtime session when backend list is empty', async () => {
     state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
     state.sessionMap.set('opencode-copilot.opencode:/untitled-1', {
-      opencodeSessionId: 'ses_runtime',
+      sessionId: 'ses_runtime',
       turnMap: [],
       title: 'Runtime Session',
       createdAt: new Date('2026-05-28T02:00:00Z'),
@@ -141,7 +141,7 @@ describe('createSessionContentProvider', () => {
   it('preserves restored provider session title in Session list items', async () => {
     state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
     state.sessionMap.set('opencode-copilot.opencode:/ses_restore', {
-      opencodeSessionId: 'ses_restore',
+      sessionId: 'ses_restore',
       turnMap: [],
       title: 'Restored Session',
       createdAt: new Date('2026-05-28T03:00:00Z'),
@@ -241,12 +241,12 @@ describe('createSessionContentProvider', () => {
     expect(session.title).toBe('Refactor the database layer');
   });
 
-  it('prefers runtime non-placeholder title over placeholder when same opencodeSessionId has multiple entries', async () => {
+  it('prefers runtime non-placeholder title over placeholder when same sessionId has multiple entries', async () => {
     state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
 
     // Original tab entry with derived title
     state.sessionMap.set('opencode-copilot.opencode:/untitled-1', {
-      opencodeSessionId: 'ses_dup',
+      sessionId: 'ses_dup',
       turnMap: [],
       title: 'Derived From Prompt',
       createdAt: new Date('2026-05-28T01:00:00Z'),
@@ -254,7 +254,7 @@ describe('createSessionContentProvider', () => {
 
     // Session list click created a duplicate entry with placeholder title
     state.sessionMap.set('opencode-copilot.opencode:/ses_dup', {
-      opencodeSessionId: 'ses_dup',
+      sessionId: 'ses_dup',
       turnMap: [],
       title: 'New OpenCode Session',
       createdAt: new Date('2026-05-28T01:00:00Z'),
@@ -278,7 +278,7 @@ describe('createSessionContentProvider', () => {
   it('restoring existing session reuses non-placeholder title from another sessionMap entry', async () => {
     // Pre-populate sessionMap with the original entry that has the derived title
     state.sessionMap.set('opencode-copilot.opencode:/untitled-1', {
-      opencodeSessionId: 'ses_existing',
+      sessionId: 'ses_existing',
       turnMap: [],
       title: 'My original prompt title',
       createdAt: new Date('2026-05-28T01:00:00Z'),
