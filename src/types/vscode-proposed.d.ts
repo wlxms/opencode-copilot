@@ -33,6 +33,30 @@ declare module 'vscode' {
 }
 
 /**
+ * Local augmentation for newer language-model metadata fields that exist in
+ * newer VS Code builds/proposals but are not yet present in our installed
+ * `@types/vscode` package.
+ */
+declare module 'vscode' {
+  export interface LanguageModelChatInformation {
+    /**
+     * When present, restricts this model to a specific chat session type.
+     */
+    readonly targetChatSessionType?: string;
+
+    /**
+     * Whether the model should appear in the user-facing model picker.
+     */
+    readonly isUserSelectable?: boolean;
+
+    /**
+     * Whether this model is the default selection.
+     */
+    readonly isDefault?: boolean | Record<string, boolean>;
+  }
+}
+
+/**
  * Proposed API types from vscode.proposed.chatSessionsProvider.d.ts (version 3)
  * Source: https://github.com/microsoft/vscode/blob/main/src/vscode-dts/vscode.proposed.chatSessionsProvider.d.ts
  *
