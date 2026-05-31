@@ -33,6 +33,7 @@ import * as vscode from 'vscode';
 import type { ExtensionState } from '../../types';
 import { AcpRenderer, renderToolFallback } from './acp-renderer';
 import { extractAttachmentsFromReferences } from '../../participant/references';
+import { resolvePromptModel } from '../../participant/handler';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -99,7 +100,9 @@ export function createStableHandler(
       logger.appendLine(`[stable-participant] Extracted ${attachments.length} attachment(s) from references`);
     }
 
-    // 4. Build prompt options (agent/model + attachments) and send prompt
+    // 4. Build prompt options (agent/model + attachments) and send prompt.
+    // Model resolution prefers request.model (native VS Code picker) over the
+    // extension's own SelectionStore to avoid stale custom state.
     const promptOptions: {
       model?: { providerID: string; modelID: string };
       agent?: string;
@@ -107,7 +110,9 @@ export function createStableHandler(
     } = {};
     const sel = state.selection.get();
     if (sel.agent) {promptOptions.agent = sel.agent;}
-    if (sel.model) {promptOptions.model = sel.model;}
+    // Resolve model: native VS Code picker → backend match → SelectionStore fallback
+    const resolvedModel = await resolvePromptModel(request, state);
+    if (resolvedModel) {promptOptions.model = resolvedModel;}
     if (attachments.length > 0) {promptOptions.attachments = attachments;}
 
     const promptResult = await state.backend.sessions.prompt(

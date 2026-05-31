@@ -5,10 +5,129 @@ import { isEmptyPrompt, ErrorMessages } from './errors';
 import { isPlaceholderSessionTitle } from '../surfaces/vscode/experimental-session';
 
 import type { ExtensionState, TurnMapping } from '../types';
-import type { AcpChildSessionInfo, AcpSessionStatus, AcpResult } from '../acp/types';
+import type { AcpChildSessionInfo, AcpSessionStatus, AcpResult, AcpModel } from '../acp/types';
 import { ExternalEditTracker } from './external-edit-tracker';
 import { collectOpenFileUris } from './checkpoint';
 import { extractAttachmentsFromReferences } from './references';
+
+// ---------------------------------------------------------------------------
+// Native model sync
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the model to use for a prompt, preferring the VS Code native
+ * language-model selection (`request.model`) over the extension's own
+ * SelectionStore state.
+ *
+ * The VS Code Chat Participant API (stable) exposes `request.model:
+ * LanguageModelChat` — an object carrying `.id`, `.vendor`, `.family`,
+ * `.version` — which reflects whichever model the user picked in VS Code's
+ * built-in model dropdown.  Prior to this function the extension only used
+ * its own `SelectionStore` (populated by the experimental session-provider
+ * option groups) which can go stale when the user changes the *native*
+ * picker without touching the extension's own model dropdown.
+ *
+ * Resolution order:
+ *  1. If `request.model` is present, attempt a fuzzy match against the
+ *     backend model catalogue (by `model.id`, then `model.family`, then
+ *     `model.name`).
+ *  2. On match, sync the match into `SelectionStore` so the custom UI
+ *     (status bar, option groups) stays consistent with the native picker.
+ *  3. On no match, fall back to the existing `SelectionStore` model.
+ *
+ * LIMITATION: `LanguageModelChat.id` is an opaque identifier assigned by
+ * the model contributor (e.g. `"gpt-4o"`).  It does NOT carry a provider
+ * prefix, so we cannot distinguish between identically-named models from
+ * different providers.  The heuristic matches the first backend model whose
+ * `id` or `name` overlaps.  If the heuristic cannot resolve a unique match
+ * we keep the SelectionStore value unchanged rather than guessing.
+ */
+export async function resolvePromptModel(
+  request: vscode.ChatRequest,
+  state: ExtensionState,
+): Promise<{ providerID: string; modelID: string } | undefined> {
+  const nativeModel = request.model;
+
+  // Fast path: no native model → use custom store
+  if (!nativeModel) {
+    return state.selection.get().model;
+  }
+
+  // Fetch the backend model catalogue for matching.
+  // Errors are non-fatal — fall back to SelectionStore on failure.
+  const modelsResult = await state.backend.config.models();
+  const backendModels: AcpModel[] = modelsResult.data ?? [];
+
+  if (backendModels.length === 0) {
+    // No catalogue to match against — use SelectionStore
+    return state.selection.get().model;
+  }
+
+  // Attempt matching: native model.id → backend model.id
+  // LanguageModelChat.id is opaque but often matches the model's common ID.
+  // We also try .family and .name as fallbacks.
+  type ModelRef = { providerID: string; modelID: string };
+  const candidates: ModelRef[] = [];
+
+  for (const bm of backendModels) {
+    const providerID = bm.provider ?? 'default';
+    // Match by id (exact)
+    if (bm.id === nativeModel.id) {
+      candidates.push({ providerID, modelID: bm.id });
+    }
+    // Match by name (exact, case-insensitive)
+    else if (bm.name && bm.name.toLowerCase() === nativeModel.id.toLowerCase()) {
+      candidates.push({ providerID, modelID: bm.id });
+    }
+    // Match by family (exact, case-insensitive)
+    else if (bm.id.toLowerCase() === (nativeModel as vscode.LanguageModelChat).family?.toLowerCase()) {
+      candidates.push({ providerID, modelID: bm.id });
+    }
+    // Partial match: native id is a substring of backend model id (or vice versa)
+    else if (
+      nativeModel.id.length >= 3 &&
+      (bm.id.toLowerCase().includes(nativeModel.id.toLowerCase()) ||
+       nativeModel.id.toLowerCase().includes(bm.id.toLowerCase()))
+    ) {
+      candidates.push({ providerID, modelID: bm.id });
+    }
+  }
+
+  // Deduplicate candidates (same providerID + modelID)
+  const unique = new Map<string, ModelRef>();
+  for (const c of candidates) {
+    unique.set(`${c.providerID}/${c.modelID}`, c);
+  }
+
+  const uniqueCandidates = [...unique.values()];
+
+  if (uniqueCandidates.length === 1) {
+    // Unique match — sync to SelectionStore and return
+    const match = uniqueCandidates[0];
+    const sel = state.selection.get();
+    // Only sync if different from current selection
+    if (!sel.model || sel.model.providerID !== match.providerID || sel.model.modelID !== match.modelID) {
+      await state.selection.setModel(match.providerID, match.modelID);
+    }
+    return match;
+  }
+
+  if (uniqueCandidates.length > 1) {
+    // Ambiguous match — cannot safely pick one.
+    // Fall back to SelectionStore to avoid silently switching providers.
+    // Log for diagnostics.
+    state.outputChannel.appendLine(
+      `[handler] Native model "${nativeModel.id}" matched ${uniqueCandidates.length} backend models — ` +
+      `falling back to SelectionStore to avoid ambiguity`,
+    );
+    return state.selection.get().model;
+  }
+
+  // No match at all — native model not in backend catalogue.
+  // Fall back to SelectionStore. This can happen when the native picker shows
+  // models that the backend doesn't serve (e.g. Copilot-only models).
+  return state.selection.get().model;
+}
 
 /**
  * Get the VSCode workspace root path for the first workspace folder.
@@ -374,7 +493,9 @@ export function createParticipantHandler(
           );
         }
 
-        // Build prompt options from current agent/model selection and attachments
+        // Build prompt options from agent selection, native model sync, and attachments.
+        // Model resolution prefers request.model (native VS Code picker) over the
+        // extension's own SelectionStore to avoid stale custom state.
         const promptOptions: {
           model?: { providerID: string; modelID: string };
           agent?: string;
@@ -384,8 +505,10 @@ export function createParticipantHandler(
         if (sel.agent) {
           promptOptions.agent = sel.agent;
         }
-        if (sel.model) {
-          promptOptions.model = sel.model;
+        // Resolve model: native VS Code picker → backend match → SelectionStore fallback
+        const resolvedModel = await resolvePromptModel(request, state);
+        if (resolvedModel) {
+          promptOptions.model = resolvedModel;
         }
         if (attachments.length > 0) {
           promptOptions.attachments = attachments;
@@ -572,8 +695,9 @@ export function createParticipantHandler(
         state.outputChannel.appendLine(
           `[handler] User message ID for turn: ${!!chatState && !!userMessageId} (${userMessageId})`,
         );
+        let wasFirstTurn = false;
         if (chatState && userMessageId) {
-          const wasFirstTurn = chatState.turnMap.length === 0;
+          wasFirstTurn = chatState.turnMap.length === 0;
           chatState.turnMap.push({
             vscodeTurn: chatState.turnMap.length,
             messageId: userMessageId,
@@ -622,7 +746,7 @@ export function createParticipantHandler(
         const existingChatTitle = chatState?.title;
         const hasExistingGoodTitle = existingChatTitle && !isPlaceholderSessionTitle(existingChatTitle);
         const shouldDeriveTitle = (!resolvedTitle || isPlaceholderSessionTitle(resolvedTitle))
-          && (typeof wasFirstTurn === 'undefined' || wasFirstTurn)
+          && wasFirstTurn
           && !isPlaceholderSessionTitle(request.prompt)
           && !hasExistingGoodTitle;
         if (shouldDeriveTitle) {

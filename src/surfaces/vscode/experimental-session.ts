@@ -18,7 +18,7 @@
  * │  │ → fetches session history from backend │  │
  * │  │ → returns ChatSessionContent           │  │
  * │  └───────────────────────────────────────┘  │
- * │  + optional optionGroups (model picker, etc) │
+ * │  + optional optionGroups (agent picker)     │
  * └─────────────────────────────────────────────┘
  *     │
  *     ▼
@@ -320,7 +320,7 @@ function createSessionResource(sessionId: string): vscode.Uri {
  * Flow:
  * 1. Controller's `getChatSessionInputState` → creates tracked inputState
  * 2. VSCode tracks it, fires `onDidChange` when user changes picker
- * 3. We subscribe to `onDidChange` → parse groups → update selection via state.selection.setAgent/setModel
+ * 3. We subscribe to `onDidChange` → parse groups → update selection via state.selection.setAgent
  * 4. Handler reads state.selection.get() at prompt time
  *
  * @param state - The global extension state.
@@ -361,7 +361,7 @@ export function createSessionContentProvider(
   // complete list with a partial one.
   let sessionRefreshInFlight = false;
 
-  // -- Option Groups: Agent & Model pickers --------------------------------
+  // -- Option Groups: Agent picker ----------------------------------------
 
   const onDidChangeOptionsEmitter = new vscode.EventEmitter<void>();
   let cachedOptionGroups: vscode.ChatSessionProviderOptionGroup[] = [];
@@ -384,12 +384,6 @@ export function createSessionContentProvider(
         name: 'Agent',
         items: [{ id: 'agent-connecting', name: '--', description: 'Waiting for backend' }],
         selected: { id: 'agent-connecting', name: '--', description: 'Waiting for backend' },
-      },
-      {
-        id: 'models',
-        name: 'Model',
-        items: [{ id: 'model-connecting', name: '--', description: 'Waiting for backend' }],
-        selected: { id: 'model-connecting', name: '--', description: 'Waiting for backend' },
       },
     ];
   }
@@ -434,17 +428,13 @@ export function createSessionContentProvider(
 
       logger.appendLine(`[session-provider] Refreshing option groups (backend running=true)...`);
 
-      // Fetch agents and models in parallel
-      const [agentsResult, modelsResult] = await Promise.all([
-        state.backend.config.agents(directory),
-        state.backend.config.models(directory),
-      ]);
+      // Fetch agents (model selection is delegated to VS Code's native model picker)
+      const agentsResult = await state.backend.config.agents(directory);
 
       const agents = (agentsResult.data ?? []).filter((a: { hidden?: boolean; mode?: string }) => isUserSelectableAgent(a as any));
-      const models = modelsResult.data ?? [];
 
       logger.appendLine(
-        `[session-provider] Backend returned: ${agentsResult.data?.length ?? 0} agents (error=${agentsResult.error ?? 'none'}), ${modelsResult.data?.length ?? 0} models (error=${modelsResult.error ?? 'none'})`,
+        `[session-provider] Backend returned: ${agentsResult.data?.length ?? 0} agents (error=${agentsResult.error ?? 'none'})`,
       );
 
       const sel = state.selection.get();
@@ -461,32 +451,6 @@ export function createSessionContentProvider(
       const currentAgentId = sel.agent;
       const selectedAgent = agentItems.find(i => i.id === `agent-${currentAgentId}`) ?? agentItems[0];
 
-      // Build model option items
-      const modelItems: vscode.ChatSessionProviderOptionItem[] = (models as any[]).map((m: any) => ({
-        id: `model-${m.provider ?? 'default'}/${m.id}`,
-        name: m.name ?? m.id,
-        description: m.providerName,
-        default: m.id === (sel.model?.modelID),
-      }));
-
-      // Find selected model item — match by both provider and model ID
-      const currentModelId = sel.model?.modelID;
-      const currentProviderId = sel.model?.providerID;
-      let selectedModel = modelItems[0];
-      if (currentModelId) {
-        // First try exact match with provider
-        if (currentProviderId) {
-          selectedModel = modelItems.find(i => i.id === `model-${currentProviderId}/${currentModelId}`) ?? modelItems[0];
-        }
-        // Fallback: match by model ID only
-        if (selectedModel === modelItems[0] && currentModelId !== modelItems[0]?.id.split('/').pop()) {
-          selectedModel = modelItems.find(i => {
-            const parts = i.id.split('/');
-            return parts[parts.length - 1] === currentModelId;
-          }) ?? modelItems[0];
-        }
-      }
-
       cachedOptionGroups = [
         ...(agentItems.length > 0 ? [{
           id: 'agents',
@@ -494,17 +458,11 @@ export function createSessionContentProvider(
           items: agentItems,
           selected: selectedAgent,
         }] : []),
-        ...(modelItems.length > 0 ? [{
-          id: 'models',
-          name: 'Model',
-          items: modelItems,
-          selected: selectedModel,
-        }] : []),
       ];
 
       onDidChangeOptionsEmitter.fire();
       logger.appendLine(
-        `[session-provider] Option groups refreshed: ${agentItems.length} agents, ${modelItems.length} models`,
+        `[session-provider] Option groups refreshed: ${agentItems.length} agents`,
       );
     } catch (err) {
       logger.appendLine(
@@ -870,19 +828,6 @@ export function createSessionContentProvider(
             });
             logger.appendLine(`[session-provider] Picker set currentAgent=${agentId}`);
           }
-
-          if (group.id === 'models') {
-            const modelPart = selected.id.replace(/^model-/, '');
-            const slashIdx = modelPart.indexOf('/');
-            if (slashIdx >= 0) {
-              const providerID = modelPart.slice(0, slashIdx);
-              const modelID = modelPart.slice(slashIdx + 1);
-              state.selection.setModel(providerID, modelID).catch((err: unknown) => {
-                logger.appendLine(`[session-provider] Failed to set model: ${err}`);
-              });
-              logger.appendLine(`[session-provider] Picker set currentModel=${providerID}/${modelID}`);
-            }
-          }
         }
       });
 
@@ -1100,7 +1045,7 @@ export function createSessionContentProvider(
 
   // -- The Provider --------------------------------------------------------
   // Following the Copilot CLI pattern: the session provider only provides content
-  // (history, title) and manages option groups (agent/model picker).
+  // (history, title) and manages option groups (agent picker).
   // All request handling is delegated to the same ChatParticipant handler used
   // by the stable surface (participant/handler.ts), ensuring a shared session
   // lifecycle. Picker changes update selection via the
@@ -1109,16 +1054,16 @@ export function createSessionContentProvider(
 
   const provider: vscode.ChatSessionContentProvider = {
     /**
-     * Called by VSCode at registration time and whenever
-     * onDidChangeChatSessionProviderOptions fires.
-     * Returns the option groups (agent picker, model picker).
+      * Called by VSCode at registration time and whenever
+      * onDidChangeChatSessionProviderOptions fires.
+      * Returns the option groups (agent picker).
      */
     provideChatSessionProviderOptions(
       _token: vscode.CancellationToken,
-    ): vscode.Thenable<vscode.ChatSessionProviderOptions> {
+    ): Thenable<vscode.ChatSessionProviderOptions> {
       // If we have real data cached, return immediately.
       if (cachedOptionGroups.length > 0 && !isPlaceholderGroups(cachedOptionGroups)) {
-        return { optionGroups: cachedOptionGroups };
+        return Promise.resolve({ optionGroups: cachedOptionGroups });
       }
 
       // If a refresh is already in-flight, return the in-flight promise.
@@ -1146,7 +1091,7 @@ export function createSessionContentProvider(
       resource: vscode.Uri,
       token: vscode.CancellationToken,
       providerContext: { readonly inputState: vscode.ChatSessionInputState },
-    ): vscode.Thenable<vscode.ChatSession> {
+    ): Thenable<vscode.ChatSession> {
       const sessionId = extractSessionId(resource);
       logger.appendLine(
         `[session-provider] provideChatSessionContent called for ${resource.toString()} (sessionId=${sessionId})`,
@@ -1168,12 +1113,12 @@ export function createSessionContentProvider(
       // VSCode generates untitled-* URIs for fresh sessions; only real OpenCode
       // session IDs (e.g. from session.list()) should trigger history fetch.
       if (!sessionId || sessionId === 'new') {
-        return {
+        return Promise.resolve({
           title: 'New OpenCode Session',
           history: [],
           requestHandler: createParticipantHandler(state),
           ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
-        };
+        });
       }
 
       // For untitled-* sessions (VSCode-managed), look up the OpenCode session
@@ -1239,12 +1184,12 @@ export function createSessionContentProvider(
         }
 
         // No existing OpenCode session for this untitled tab — it's genuinely new
-        return {
+        return Promise.resolve({
           title: 'New OpenCode Session',
           history: [],
           requestHandler: createParticipantHandler(state),
           ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
-        };
+        });
       }
 
       // Existing session — fetch history from backend
