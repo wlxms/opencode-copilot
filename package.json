@@ -54,9 +54,11 @@
         "icon": "$(opencode-logo)",
         "inputPlaceholder": "Ask OpenCode anything...",
         "canDelegate": true,
+        "requiresCustomModels": true,
         "capabilities": {
           "supportsFileAttachments": true,
-          "supportsToolAttachments": true
+          "supportsToolAttachments": true,
+          "supportsImageAttachments": true
         },
         "commands": [
           {
@@ -120,6 +122,12 @@
             "description": "Test questionCarousel UI flow (single-select, multi-select, text input)"
           }
         ]
+      }
+    ],
+    "languageModelChatProviders": [
+      {
+        "vendor": "opencode",
+        "displayName": "OpenCode"
       }
     ]
   },

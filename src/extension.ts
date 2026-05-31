@@ -5,6 +5,7 @@ import { createBackend } from './acp/backend-registry';
 import { createParticipantHandler } from './participant/handler';
 import { createSessionContentProvider, OPENCODE_SESSION_SCHEME } from './surfaces/vscode/experimental-session';
 import { hasRegisterChatSessionContentProvider } from './surfaces/vscode/capabilities';
+import { registerLanguageModelChatProvider } from './surfaces/vscode/language-model-provider';
 import { StatusBarManager } from './statusbar';
 import { SettingsPanel, type SettingsMessage, type SettingsData } from './settings/panel';
 import { loadPersistedSettingsState, savePersistedSettingsState } from './settings/state-persistence';
@@ -263,6 +264,12 @@ export function activate(context: vscode.ExtensionContext) {
     }
   } else {
     outputChannel.appendLine('[extension] chatSessionsProvider API unavailable — session target registration skipped');
+  }
+
+  // Register native VS Code language model provider (opencode vendor)
+  const lmRegistration = registerLanguageModelChatProvider(state);
+  if (lmRegistration) {
+    context.subscriptions.push(lmRegistration);
   }
 
   context.subscriptions.push(outputChannel, participant, statusBar, openSettingsCommand);
