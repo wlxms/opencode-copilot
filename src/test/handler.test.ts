@@ -39,7 +39,8 @@ import * as vscode from 'vscode';
 import { createParticipantHandler } from '../participant/handler';
 import type { OpenCodeEvent } from '../backends/opencode/sdk-events';
 import type { AcpServerStatus } from '../acp/types';
-import type { ExtensionState } from '../types';
+import type { ExtensionState, SessionState } from '../types';
+import { AppEventBus } from '../acp/app-event-bus';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -74,7 +75,7 @@ function createRequest(
 // ---------------------------------------------------------------------------
 
 describe('createParticipantHandler', () => {
-  let state: ExtensionState;
+  let state: ExtensionState & { sessionMap: Map<string, SessionState> };
   let stream: vscode.ChatResponseStream;
   let token: vscode.CancellationToken;
   let backendStatus: AcpServerStatus;
@@ -82,6 +83,7 @@ describe('createParticipantHandler', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     backendStatus = 'stopped';
+    const sessionStore = new Map<string, SessionState>();
 
     const backend: AcpBackend = {
       name: 'opencode',
@@ -136,6 +138,7 @@ describe('createParticipantHandler', () => {
         descendants: vi.fn(() => []),
         findAncestor: vi.fn(),
         parent: vi.fn(),
+        messages: vi.fn(),
       },
       config: {
         models: vi.fn(async () => ({ data: [] })),
@@ -195,8 +198,20 @@ describe('createParticipantHandler', () => {
         hide: vi.fn(),
         dispose: vi.fn(),
       } as unknown as vscode.OutputChannel,
-      sessionMap: new Map(),
-      statusBar: {} as any,
+      sessions: {
+        get: vi.fn((key: string) => sessionStore.get(key)),
+        has: vi.fn((key: string) => sessionStore.has(key)),
+        set: vi.fn((key: string, value: SessionState) => { sessionStore.set(key, value); }),
+        values: vi.fn(() => sessionStore.values()),
+      } as unknown as ExtensionState['sessions'],
+      sessionMap: sessionStore,
+      statusBar: {} as ExtensionState['statusBar'],
+      selection: {
+        get: vi.fn(() => ({ agent: undefined, model: undefined })),
+        setModel: vi.fn(async () => {}),
+        setAgent: vi.fn(async () => {}),
+      } as unknown as ExtensionState['selection'],
+      bus: new AppEventBus(),
     };
 
     stream = {
@@ -686,7 +701,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     );
 
     expect(stream.markdown).toHaveBeenCalledWith(
-      expect.stringContaining('Failed to start OpenCode'),
+      expect.stringContaining('Failed to start backend'),
     );
   });
 
@@ -708,7 +723,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     );
 
     expect(stream.markdown).toHaveBeenCalledWith(
-      expect.stringContaining('Failed to start OpenCode'),
+      expect.stringContaining('Failed to start backend'),
     );
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('not found'),
@@ -749,7 +764,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     );
 
     expect(stream.markdown).toHaveBeenCalledWith(
-      expect.stringContaining('Failed to start OpenCode'),
+      expect.stringContaining('Failed to start backend'),
     );
   });
 
@@ -1038,5 +1053,136 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // sessionMap should keep the existing non-placeholder title
     const chatState = state.sessionMap.get('chat-title-keep');
     expect(chatState?.title).toBe('Existing Good Title');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolvePromptModel — native model sync tests
+// ---------------------------------------------------------------------------
+
+import { resolvePromptModel } from '../participant/handler';
+
+describe('resolvePromptModel', () => {
+  let state: ExtensionState;
+  let backend: AcpBackend;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+
+    backend = {
+      config: {
+        models: vi.fn(async () => ({ data: [] })),
+      },
+    } as unknown as AcpBackend;
+
+    state = {
+      backend,
+      outputChannel: {
+        appendLine: vi.fn(),
+      } as any,
+      selection: {
+        get: vi.fn(() => ({ agent: undefined, model: { providerID: 'openai', modelID: 'gpt-4' } })),
+        setModel: vi.fn(async () => {}),
+      },
+    } as unknown as ExtensionState;
+  });
+
+  it('should fall back to SelectionStore when request.model is undefined', async () => {
+    const request = createRequest({ prompt: 'test' });
+    // request.model is undefined by default in createRequest
+    const result = await resolvePromptModel(request, state);
+
+    expect(result).toEqual({ providerID: 'openai', modelID: 'gpt-4' });
+    expect(state.selection.setModel).not.toHaveBeenCalled();
+  });
+
+  it('should fall back to SelectionStore when backend model list is empty', async () => {
+    const request = createRequest({
+      prompt: 'test',
+      model: { id: 'gpt-4o', name: 'GPT-4o', vendor: 'openai', family: 'gpt-4o', version: '1' } as any,
+    });
+
+    const result = await resolvePromptModel(request, state);
+
+    expect(result).toEqual({ providerID: 'openai', modelID: 'gpt-4' });
+    expect(state.selection.setModel).not.toHaveBeenCalled();
+  });
+
+  it('should match native model id to backend model and sync selection', async () => {
+    (backend.config.models as ReturnType<typeof vi.fn>).mockResolvedValue({
+      data: [
+        { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai' },
+        { id: 'claude-3', name: 'Claude 3', provider: 'anthropic' },
+      ],
+    });
+    // SelectionStore has a different model
+    (state.selection.get as ReturnType<typeof vi.fn>).mockReturnValue({
+      agent: undefined,
+      model: { providerID: 'anthropic', modelID: 'claude-3' },
+    });
+
+    const request = createRequest({
+      prompt: 'test',
+      model: { id: 'gpt-4o', name: 'GPT-4o', vendor: 'openai', family: 'gpt-4o', version: '1' } as any,
+    });
+
+    const result = await resolvePromptModel(request, state);
+
+    expect(result).toEqual({ providerID: 'openai', modelID: 'gpt-4o' });
+    // Should sync to SelectionStore since it differs from current
+    expect(state.selection.setModel).toHaveBeenCalledWith('openai', 'gpt-4o');
+  });
+
+  it('should not re-sync when native model matches current selection', async () => {
+    (backend.config.models as ReturnType<typeof vi.fn>).mockResolvedValue({
+      data: [{ id: 'gpt-4', name: 'GPT-4', provider: 'openai' }],
+    });
+
+    const request = createRequest({
+      prompt: 'test',
+      model: { id: 'gpt-4', name: 'GPT-4', vendor: 'openai', family: 'gpt-4', version: '1' } as any,
+    });
+
+    const result = await resolvePromptModel(request, state);
+
+    expect(result).toEqual({ providerID: 'openai', modelID: 'gpt-4' });
+    // Same as current — no sync needed
+    expect(state.selection.setModel).not.toHaveBeenCalled();
+  });
+
+  it('should fall back to SelectionStore on ambiguous match (multiple candidates)', async () => {
+    (backend.config.models as ReturnType<typeof vi.fn>).mockResolvedValue({
+      data: [
+        { id: 'gpt-4', name: 'GPT-4', provider: 'openai' },
+        { id: 'gpt-4', name: 'GPT-4 Custom', provider: 'custom' },
+      ],
+    });
+
+    const request = createRequest({
+      prompt: 'test',
+      model: { id: 'gpt-4', name: 'GPT-4', vendor: 'openai', family: 'gpt-4', version: '1' } as any,
+    });
+
+    const result = await resolvePromptModel(request, state);
+
+    // Ambiguous — should fall back to SelectionStore
+    expect(result).toEqual({ providerID: 'openai', modelID: 'gpt-4' });
+    expect(state.selection.setModel).not.toHaveBeenCalled();
+  });
+
+  it('should fall back to SelectionStore when native model not in backend catalogue', async () => {
+    (backend.config.models as ReturnType<typeof vi.fn>).mockResolvedValue({
+      data: [{ id: 'claude-3', name: 'Claude 3', provider: 'anthropic' }],
+    });
+
+    const request = createRequest({
+      prompt: 'test',
+      model: { id: 'copilot-model-x', name: 'Copilot X', vendor: 'copilot', family: 'unknown', version: '1' } as any,
+    });
+
+    const result = await resolvePromptModel(request, state);
+
+    // No match — fall back to SelectionStore
+    expect(result).toEqual({ providerID: 'openai', modelID: 'gpt-4' });
   });
 });

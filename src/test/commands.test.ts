@@ -4,6 +4,7 @@ import type { AcpBackend } from '../acp/backend';
 import type { AcpServerStatus } from '../acp/types';
 import type { ExtensionState } from '../types';
 import { routeCommand } from '../participant/commands';
+import { AppEventBus } from '../acp/app-event-bus';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -51,6 +52,7 @@ describe('routeCommand', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     backendStatus = 'stopped';
+    const sessionStore = new Map<string, unknown>();
     const backend: AcpBackend = {
       name: 'opencode',
       start: vi.fn(async () => {
@@ -74,6 +76,7 @@ describe('routeCommand', () => {
         descendants: vi.fn(),
         findAncestor: vi.fn(),
         parent: vi.fn(),
+        messages: vi.fn(),
       },
       config: {
         models: vi.fn(async () => ({ data: [] })),
@@ -107,8 +110,19 @@ describe('routeCommand', () => {
         hide: vi.fn(),
         dispose: vi.fn(),
       } as unknown as vscode.OutputChannel,
-      sessionMap: new Map(),
-      statusBar: {} as any,
+      sessions: {
+        get: vi.fn((key: string) => sessionStore.get(key)),
+        has: vi.fn((key: string) => sessionStore.has(key)),
+        set: vi.fn((key: string, value: unknown) => { sessionStore.set(key, value); }),
+        values: vi.fn(() => sessionStore.values()),
+      } as unknown as ExtensionState['sessions'],
+      statusBar: {} as ExtensionState['statusBar'],
+      selection: {
+        get: vi.fn(() => ({ agent: undefined, model: undefined, modelDisplayName: undefined })),
+        setAgent: vi.fn(async () => {}),
+        setModel: vi.fn(async () => {}),
+      } as unknown as ExtensionState['selection'],
+      bus: new AppEventBus(),
     };
     stream = {
       markdown: vi.fn(),
@@ -145,7 +159,7 @@ describe('routeCommand', () => {
     await routeCommand('new', state, stream, token);
 
     expect(stream.markdown).toHaveBeenCalledWith(
-      expect.stringContaining('Failed to start OpenCode'),
+      expect.stringContaining('Failed to start backend'),
     );
   });
 
@@ -211,7 +225,7 @@ describe('routeCommand', () => {
     await routeCommand('model', state, stream, token);
 
     expect(stream.markdown).toHaveBeenCalledWith(
-      expect.stringContaining('Failed to start OpenCode'),
+      expect.stringContaining('Failed to start backend'),
     );
   });
 

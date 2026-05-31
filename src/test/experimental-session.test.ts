@@ -4,11 +4,13 @@ import { createSessionContentProvider } from '../surfaces/vscode/experimental-se
 import { isUserSelectableAgent } from '../acp/types';
 import type { AcpAgent } from '../acp/types';
 import type { ExtensionState } from '../types';
+import { AppEventBus } from '../acp/app-event-bus';
 
 describe('createSessionContentProvider', () => {
   let state: ExtensionState;
 
   beforeEach(() => {
+    const sessionStore = new Map<string, unknown>();
     const sessionsList = vi.fn(async () => ({
       data: [
         { id: 'ses_1', title: 'First Session', createdAt: new Date('2026-05-28T00:00:00Z') },
@@ -36,7 +38,7 @@ describe('createSessionContentProvider', () => {
         name: 'opencode',
         start: vi.fn(async () => ({ data: { url: 'http://127.0.0.1:4096', status: 'running' as const } })),
         stop: vi.fn(async () => undefined),
-        getStatus: vi.fn(() => 'running'),
+        getStatus: vi.fn((): import('../acp/types').AcpServerStatus => 'running'),
         getUrl: vi.fn(() => 'http://127.0.0.1:4096'),
         isRunning: vi.fn(() => true),
         sessions: {
@@ -63,6 +65,7 @@ describe('createSessionContentProvider', () => {
         events: {
           ensureStarted: vi.fn(),
           openSessionStream: vi.fn(),
+          openGlobalStream: vi.fn(),
           closeSessionStream: vi.fn(),
         },
         permissions: {
@@ -74,11 +77,19 @@ describe('createSessionContentProvider', () => {
         },
       },
       outputChannel: vscode.window.createOutputChannel('test'),
-      sessionMap: new Map(),
+      sessions: {
+        get: vi.fn((key: string) => sessionStore.get(key)),
+        has: vi.fn((key: string) => sessionStore.has(key)),
+        set: vi.fn((key: string, value: unknown) => { sessionStore.set(key, value); }),
+        values: vi.fn(() => sessionStore.values()),
+      } as unknown as ExtensionState['sessions'],
       statusBar: { update: vi.fn() } as unknown as ExtensionState['statusBar'],
-      currentAgent: undefined,
-      currentModel: undefined,
-      currentModelDisplayName: undefined,
+      selection: {
+        get: vi.fn(() => ({ agent: undefined, model: undefined, modelDisplayName: undefined })),
+        setAgent: vi.fn(async () => {}),
+        setModel: vi.fn(async () => {}),
+      } as unknown as ExtensionState['selection'],
+      bus: new AppEventBus(),
     };
 
     (vscode.workspace as { workspaceFolders?: Array<{ uri: vscode.Uri; name: string; index: number }> }).workspaceFolders = [
@@ -114,7 +125,7 @@ describe('createSessionContentProvider', () => {
 
   it('publishes runtime session when backend list is empty', async () => {
     state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
-    state.sessionMap.set('opencode-copilot.opencode:/untitled-1', {
+    state.sessions.set('opencode-copilot.opencode:/untitled-1', {
       sessionId: 'ses_runtime',
       turnMap: [],
       title: 'Runtime Session',
@@ -140,7 +151,7 @@ describe('createSessionContentProvider', () => {
 
   it('preserves restored provider session title in Session list items', async () => {
     state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
-    state.sessionMap.set('opencode-copilot.opencode:/ses_restore', {
+    state.sessions.set('opencode-copilot.opencode:/ses_restore', {
       sessionId: 'ses_restore',
       turnMap: [],
       title: 'Restored Session',
@@ -179,7 +190,7 @@ describe('createSessionContentProvider', () => {
 
     expect(state.backend.sessions.messages).toHaveBeenCalledWith('ses_restore');
     expect(session.title).toBe('Need help with session titles');
-    expect(state.sessionMap.get(restoredResourceKey)?.title).toBe('Need help with session titles');
+    expect(state.sessions.get(restoredResourceKey)?.title).toBe('Need help with session titles');
   });
 
   // =========================================================================
@@ -245,7 +256,7 @@ describe('createSessionContentProvider', () => {
     state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
 
     // Original tab entry with derived title
-    state.sessionMap.set('opencode-copilot.opencode:/untitled-1', {
+    state.sessions.set('opencode-copilot.opencode:/untitled-1', {
       sessionId: 'ses_dup',
       turnMap: [],
       title: 'Derived From Prompt',
@@ -253,7 +264,7 @@ describe('createSessionContentProvider', () => {
     });
 
     // Session list click created a duplicate entry with placeholder title
-    state.sessionMap.set('opencode-copilot.opencode:/ses_dup', {
+    state.sessions.set('opencode-copilot.opencode:/ses_dup', {
       sessionId: 'ses_dup',
       turnMap: [],
       title: 'New OpenCode Session',
@@ -277,7 +288,7 @@ describe('createSessionContentProvider', () => {
 
   it('restoring existing session reuses non-placeholder title from another sessionMap entry', async () => {
     // Pre-populate sessionMap with the original entry that has the derived title
-    state.sessionMap.set('opencode-copilot.opencode:/untitled-1', {
+    state.sessions.set('opencode-copilot.opencode:/untitled-1', {
       sessionId: 'ses_existing',
       turnMap: [],
       title: 'My original prompt title',
@@ -304,7 +315,7 @@ describe('createSessionContentProvider', () => {
     );
 
     const newKey = vscode.Uri.parse('opencode-copilot.opencode:/ses_existing').toString();
-    expect(state.sessionMap.get(newKey)?.title).toBe('My original prompt title');
+    expect(state.sessions.get(newKey)?.title).toBe('My original prompt title');
     expect(session.title).toBe('My original prompt title');
   });
 

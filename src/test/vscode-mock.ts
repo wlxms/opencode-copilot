@@ -116,6 +116,36 @@ export class ChatParticipant {
     }
 }
 
+export class LanguageModelTextPart {
+    constructor(public readonly value: string) {}
+}
+
+export interface LanguageModelChatCapabilities {
+    readonly imageInput?: boolean;
+    readonly toolCalling?: boolean | number;
+}
+
+export interface LanguageModelChatInformation {
+    readonly id: string;
+    readonly name: string;
+    readonly family: string;
+    readonly version: string;
+    readonly maxInputTokens: number;
+    readonly maxOutputTokens: number;
+    readonly capabilities: LanguageModelChatCapabilities;
+    readonly targetChatSessionType?: string;
+    readonly isUserSelectable?: boolean;
+    readonly isDefault?: boolean | Record<string, boolean>;
+}
+
+export interface LanguageModelChat {
+    readonly id: string;
+    readonly family: string;
+    readonly vendor?: string;
+    readonly name?: string;
+    readonly version?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Interfaces (minimal shape for unit tests)
 // ---------------------------------------------------------------------------
@@ -356,6 +386,12 @@ export const chat = {
                 items.clear();
             },
         };
+    },
+};
+
+export const lm = {
+    registerLanguageModelChatProvider(_vendor: string, _provider: unknown) {
+        return { dispose() {} };
     },
 };
 
