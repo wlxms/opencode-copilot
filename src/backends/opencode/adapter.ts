@@ -446,7 +446,9 @@ export class OpenCodeBackend implements AcpBackend {
         const models: AcpModel[] = [];
         for (const provider of providers) {
           for (const m of Object.values(provider.models ?? {})) {
-            const capRecord = m.capabilities;
+            const rawM = m as unknown as Record<string, unknown>;
+            const capRecord = rawM.capabilities as Record<string, unknown> | undefined;
+            const limitRecord = rawM.limit as Record<string, number> | undefined;
             models.push({
               id: m.id,
               name: m.name ?? m.id,
@@ -455,6 +457,9 @@ export class OpenCodeBackend implements AcpBackend {
               capabilities: capRecord
                 ? Object.keys(capRecord).filter((k) => Boolean(capRecord[k]))
                 : undefined,
+              capabilitiesRaw: capRecord,
+              maxInputTokens: limitRecord?.context,
+              maxOutputTokens: limitRecord?.output,
             });
           }
         }

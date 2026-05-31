@@ -27,7 +27,14 @@ export interface AcpModel {
   provider?: string;
   /** Human-readable provider name (used for UI only) */
   providerName?: string;
+  /** Top-level truthy capability keys (legacy flat view, e.g. ["toolcall", "attachment"]) */
   capabilities?: string[];
+  /** Nested capability info: `input.image` indicates vision support */
+  capabilitiesRaw?: Record<string, unknown>;
+  /** Max input / context tokens (from SDK `limit.context`) */
+  maxInputTokens?: number;
+  /** Max output tokens (from SDK `limit.output`) */
+  maxOutputTokens?: number;
 }
 
 export interface AcpProvider {
