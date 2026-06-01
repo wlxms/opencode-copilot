@@ -32,7 +32,9 @@
 
 import * as vscode from 'vscode';
 import type { ExtensionState } from '../../types';
-import type { AcpEvent, AcpModel } from '../../acp/types';
+import { streamViaProvider } from './streaming-client';
+import { providerRegistry } from '../../acpmodels/provider-registry';
+import { AuthReader } from '../../acpmodels/auth-reader';
 
 // ---------------------------------------------------------------------------
 // Extended model info carrying backend metadata
@@ -40,7 +42,7 @@ import type { AcpEvent, AcpModel } from '../../acp/types';
 
 /**
  * Language model information enriched with backend routing data.
- * The extra `provider` / `providerID` fields let us route a chat request
+ * The extra `providerID` field lets us route a chat request
  * to the correct backend model when VS Code invokes `provideLanguageModelChatResponse`.
  */
 export interface OpenCodeLanguageModelChatInformation
@@ -55,76 +57,6 @@ export interface OpenCodeLanguageModelChatInformation
 
 /** Vendor identifier used for `vscode.lm.registerLanguageModelChatProvider` */
 const VENDOR_ID = 'opencode';
-const TARGET_SESSION_TYPE = 'opencode-copilot.opencode';
-
-// ---------------------------------------------------------------------------
-// Capability mapping
-// ---------------------------------------------------------------------------
-
-/**
- * Map ACP model capabilities to VS Code LanguageModelChatCapabilities.
- *
- * The OpenCode backend SDK returns capability data in two layers:
- *   Top-level keys:  `toolcall` (boolean), `attachment` (boolean), `reasoning`, …
- *   Nested `input`:  `{ text, audio, image, video, pdf }` — each boolean.
- *
- * Image support is determined by `capabilities.input.image === true`
- * (the most precise indicator), falling back to `attachment === true`.
- * Tool calling is `capabilities.toolcall === true`.
- */
-function toLmCapabilities(acp: AcpModel): vscode.LanguageModelChatCapabilities {
-  const raw = acp.capabilitiesRaw as Record<string, unknown> | undefined;
-  if (!raw) {
-    return {};
-  }
-
-  // Image / vision — prefer `input.image`, fall back to `attachment`.
-  let hasImage = false;
-  const inputCaps = raw.input as Record<string, unknown> | undefined;
-  if (inputCaps && typeof inputCaps.image === 'boolean') {
-    hasImage = inputCaps.image === true;
-  } else if (typeof raw.attachment === 'boolean') {
-    hasImage = raw.attachment === true;
-  }
-
-  // Tool calling — `toolcall` boolean.
-  const hasTool = raw.toolcall === true;
-
-  return {
-    imageInput: hasImage || undefined,
-    toolCalling: hasTool || undefined,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Model → LM information
-// ---------------------------------------------------------------------------
-
-/**
- * Convert an AcpModel to an OpenCodeLanguageModelChatInformation.
- *
- * Uses provider + model ID to build a unique-but-stable `id`.
- * Token limits come from the backend's `limit.context` / `limit.output`.
- * If the backend doesn't provide limits, use safe defaults.
- */
-function toLmModel(m: AcpModel, isFirst: boolean): OpenCodeLanguageModelChatInformation {
-  const providerID = m.provider ?? 'default';
-  const caps = toLmCapabilities(m);
-  return {
-    id: `${providerID}/${m.id}`,
-    name: m.name ?? m.id,
-    family: m.providerName ?? providerID,
-    version: '1',
-    // Use real limits from backend or fall back to reasonable defaults.
-    maxInputTokens: m.maxInputTokens ?? 128_000,
-    maxOutputTokens: m.maxOutputTokens ?? 16_384,
-    capabilities: caps,
-    targetChatSessionType: TARGET_SESSION_TYPE,
-    isUserSelectable: true,
-    isDefault: isFirst ? true : undefined,
-    providerID,
-  };
-}
 
 // ---------------------------------------------------------------------------
 // Capability check
@@ -164,6 +96,11 @@ export function createLanguageModelChatProvider(
   const unsubBackendReady = state.bus.on('backend-ready', () => {
     onChangeEmitter.fire();
   });
+
+  const unsubSelectionChanged = state.bus.on('selection-changed', () => {
+    onChangeEmitter.fire();
+  });
+
   const provider: vscode.LanguageModelChatProvider<OpenCodeLanguageModelChatInformation> = {
     onDidChangeLanguageModelChatInformation: onChangeEmitter.event,
 
@@ -177,20 +114,25 @@ export function createLanguageModelChatProvider(
           return cachedModels;
         }
 
-        const result = await state.backend.config.models();
-        if (result.error) {
-          logger.appendLine(`[lm-provider] Failed to fetch models: ${result.error}`);
-          return cachedModels;
-        }
+        // Use ACPModels exposure list — already filtered to exclude
+        // models that Copilot has, and includes OpenCode-unique models.
+        const exposed = state.acpModels?.getModelsForExposure() ?? [];
+        const entries: OpenCodeLanguageModelChatInformation[] = exposed.map((r, i) => ({
+          id: `${r.vendor}/${r.modelId}`,
+          name: r.displayName,
+          family: r.vendor,
+          version: '1',
+          maxInputTokens: r.maxInputTokens,
+          maxOutputTokens: r.maxOutputTokens,
+          capabilities: r.capabilities,
+          isUserSelectable: true,
+          isDefault: i === 0 ? true : undefined,
+          providerID: r.vendor,
+        }));
 
-        const acpModels = result.data ?? [];
-        cachedModels = acpModels.map((m, i) => toLmModel(m, i === 0));
-
-        // Log capability keys present in backend models (for debugging mismatches)
-        const allCaps = new Set(acpModels.flatMap((m) => m.capabilities ?? []));
+        cachedModels = entries;
         logger.appendLine(
-          `[lm-provider] Reported ${cachedModels.length} models to VS Code. ` +
-          `Capability keys seen: [${[...allCaps].join(', ') || 'none'}]`,
+          `[lm-provider] Reported ${cachedModels.length} models from ACPModels exposure list.`,
         );
         return cachedModels;
       } catch (err) {
@@ -203,81 +145,49 @@ export function createLanguageModelChatProvider(
       model: OpenCodeLanguageModelChatInformation,
       messages: readonly vscode.LanguageModelChatRequestMessage[],
       _options: vscode.ProvideLanguageModelChatResponseOptions,
-      progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+      progress: vscode.Progress<vscode.LanguageModelResponsePart2>,
       token: vscode.CancellationToken,
     ): Promise<void> {
-      // Flatten messages into a single text prompt for the backend.
-      // A full chat-to-ACP message mapping is out of scope for this PoC;
-      // we concatenate text parts to form the user prompt.
-      const lastUserMsg = messages[messages.length - 1];
-      const textParts: string[] = [];
-      if (lastUserMsg) {
-        for (const part of lastUserMsg.content) {
-          if (part instanceof vscode.LanguageModelTextPart) {
-            textParts.push(part.value);
-          }
-        }
-      }
-      const promptText = textParts.join('\n');
+      const bareId = model.id.includes('/') ? model.id.split('/').pop()! : model.id;
+      const providerID = model.providerID;
 
-      if (!promptText) {
+      const providerMeta = providerRegistry.get(providerID);
+      if (!providerMeta) {
+        error(progress, `Unknown provider "${providerID}"`);
         return;
       }
 
-      // Create a temporary session for this request
-      const sessionResult = await state.backend.sessions.create({ title: 'LM Provider Chat' });
-      if (sessionResult.error || !sessionResult.data) {
-        logger.appendLine(`[lm-provider] Failed to create session: ${sessionResult.error}`);
+      // Resolve API key: use "public" for free providers, auth.json for paid ones.
+      let apiKey: string | undefined;
+      if (isFreeProvider(providerID)) {
+        apiKey = 'public';
+      } else {
+        const authReader = new AuthReader();
+        await authReader.load();
+        apiKey = authReader.getApiKey(providerID);
+      }
+
+      if (!apiKey) {
+        error(progress, `No API key configured for provider "${providerID}". Add it via \`opencode /connect ${providerID}\` or set the ${providerID.toUpperCase()}_API_KEY environment variable.`);
         return;
       }
 
-      const sessionId = sessionResult.data.id;
+      logger.appendLine(`[lm-provider] Streaming via ${providerMeta.npm} ${providerMeta.baseURL} model="${bareId}"`);
 
-      // Set up cancellation → abort
-      token.onCancellationRequested(() => {
-        state.backend.sessions.abort(sessionId).catch(() => { /* best effort */ });
-      });
-
-      // Open event stream before sending the prompt
-      const eventStream = state.backend.events.openSessionStream(sessionId);
-
-      // Send prompt with model selection from the targeted model info
-      await state.backend.sessions.prompt(sessionId, promptText, undefined, {
-        model: { providerID: model.providerID, modelID: model.id.split('/').pop() ?? model.id },
-      });
-
-      // Stream text events to VS Code via ACP event stream
       try {
-        for await (const event of eventStream.stream as AsyncIterable<AcpEvent>) {
-          if (token.isCancellationRequested) { break; }
-
-          // Part delta: incremental text from the model
-          if (event.type === 'part.delta') {
-            progress.report(new vscode.LanguageModelTextPart(event.delta));
-          }
-
-          // Part updated with a text part: full/snapshot text (skip if already
-          // streaming deltas — deltas are preferred for latency)
-          if (event.type === 'part.updated' && event.part.type === 'text' && !event.delta) {
-            progress.report(new vscode.LanguageModelTextPart(event.part.text));
-          }
-
-          // Session went idle — response complete
-          if (event.type === 'session.idle') {
-            break;
-          }
-
-          // Session error — stop streaming
-          if (event.type === 'session.error') {
-            logger.appendLine(`[lm-provider] Session error: ${event.error ?? 'unknown'}`);
-            break;
-          }
-        }
+        await streamViaProvider({
+          providerMeta,
+          apiKey,
+          modelId: bareId,
+          messages,
+          tools: _options.tools,
+          progress,
+          token,
+        });
       } catch (err) {
-        if (token.isCancellationRequested) { return; }
-        logger.appendLine(`[lm-provider] Stream error: ${err instanceof Error ? err.message : String(err)}`);
-      } finally {
-        state.backend.events.closeSessionStream(sessionId);
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.appendLine(`[lm-provider] Provider stream error: ${msg}`);
+        error(progress, `Provider error: ${msg}`);
       }
     },
 
@@ -305,6 +215,7 @@ export function createLanguageModelChatProvider(
     provider,
     dispose: () => {
       unsubBackendReady();
+      unsubSelectionChanged();
       onChangeEmitter.dispose();
     },
   };
@@ -337,4 +248,15 @@ export function registerLanguageModelChatProvider(
       dispose();
     },
   };
+}
+
+// ── Helpers ────────────────────────────────────────────────────
+
+/** Providers that use "public" auth (free tier, no key required) */
+function isFreeProvider(providerID: string): boolean {
+  return providerID === 'opencode' || providerID === 'ollama';
+}
+
+function error(progress: vscode.Progress<vscode.LanguageModelResponsePart>, msg: string): void {
+  progress.report(new vscode.LanguageModelTextPart(`❌ ${msg}`));
 }

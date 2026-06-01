@@ -16,6 +16,7 @@ import type {
   AcpPermissionOperations,
   AcpQuestionOperations,
   AcpEventStream,
+  AcpAuthOperations,
 } from '../../acp/backend';
 import type {
   AcpServerInfo,
@@ -534,6 +535,19 @@ export class OpenCodeBackend implements AcpBackend {
         return { error: extractErrorMessage(err, 'Update config failed') };
       }
     },
+
+    updateGlobal: async (config: Partial<AcpConfig>): Promise<AcpResult<void>> => {
+      try {
+        const result = await this.sdk.global.config.update({ config });
+        const error = getResultError(result);
+        if (error !== undefined) {
+          return { error: extractErrorMessage(error, 'Update global config failed') };
+        }
+        return { data: undefined };
+      } catch (err) {
+        return { error: extractErrorMessage(err, 'Update global config failed') };
+      }
+    },
   };
 
   // =======================================================================
@@ -633,6 +647,39 @@ export class OpenCodeBackend implements AcpBackend {
         return { error: `Question reject failed: ${JSON.stringify(result.error)}` };
       } catch (err) {
         return { error: extractErrorMessage(err, 'Failed to reject question') };
+      }
+    },
+  };
+
+  // =======================================================================
+  // Auth — delegates to v2 SDK auth.set / auth.remove
+  // =======================================================================
+
+  readonly auth: AcpAuthOperations = {
+    setKey: async (providerID: string, key: string): Promise<AcpResult<void>> => {
+      try {
+        const result = await this.sdk.auth.set({
+          providerID,
+          auth: { type: 'api', key },
+        });
+        if (result.error) {
+          return { error: extractErrorMessage(result.error, 'Auth set failed') };
+        }
+        return { data: undefined };
+      } catch (err) {
+        return { error: extractErrorMessage(err, 'Auth set failed') };
+      }
+    },
+
+    removeKey: async (providerID: string): Promise<AcpResult<void>> => {
+      try {
+        const result = await this.sdk.auth.remove({ providerID });
+        if (result.error) {
+          return { error: extractErrorMessage(result.error, 'Auth remove failed') };
+        }
+        return { data: undefined };
+      } catch (err) {
+        return { error: extractErrorMessage(err, 'Auth remove failed') };
       }
     },
   };

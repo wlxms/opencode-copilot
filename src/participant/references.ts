@@ -8,6 +8,7 @@
  * @module
  */
 import * as vscode from 'vscode';
+import * as path from 'path';
 import type { AcpFileAttachment } from '../acp/types';
 
 // ---------------------------------------------------------------------------
@@ -61,6 +62,34 @@ const EXT_MIME: Record<string, string> = {
 function guessMimeFromExt(fsPath: string): string {
   const ext = fsPath.slice(fsPath.lastIndexOf('.')).toLowerCase();
   return EXT_MIME[ext] || 'application/octet-stream';
+}
+
+/** True when the MIME type represents an image that the model can view. */
+function isImageMime(mime: string): boolean {
+  return mime.startsWith('image/');
+}
+
+/**
+ * Convert an absolute filesystem path into a prompt-friendly reference.
+ * Paths inside `workspaceDir` become relative; paths outside stay absolute.
+ * Returns `undefined` when no displayable path can be derived.
+ */
+function toDisplayPath(
+  fsPath: string,
+  workspaceDir: string | undefined,
+): string | undefined {
+  if (!fsPath) {return undefined;}
+  if (!workspaceDir) {return fsPath;}
+  let rel: string;
+  try {
+    rel = path.relative(workspaceDir, fsPath);
+  } catch {
+    return fsPath;
+  }
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return fsPath;
+  }
+  return rel;
 }
 
 // ---------------------------------------------------------------------------
@@ -291,67 +320,114 @@ function binaryToDataUri(data: unknown, mimeType: string, logger?: { appendLine(
 // ---------------------------------------------------------------------------
 
 /**
- * Extract a single `AcpFileAttachment` from a `ChatPromptReference.value`.
+ * Result of scanning VSCode `ChatRequest.references`.
  *
- * Returns `undefined` if the value is not a file/image reference.
+ * - `attachments` — image references to forward as `FilePartInput.url`
+ *   (pasted images as `data:` URIs, image files as `file://` URIs).
+ * - `paths` — non-image file/directory references that must NOT be
+ *   transmitted as binary; the caller is expected to surface them as
+ *   plain text in the user prompt so the model can use tools to read them.
  */
-export function extractAttachmentFromReference(
-  value: unknown,
-  logger?: { appendLine(m: string): void },
-): AcpFileAttachment | undefined {
-  const ref = extractUriRef(value, logger);
-  if (!ref) {return undefined;}
-
-  const filename = ref.fsPath.split(/[/\\]/).pop() || undefined;
-  const mime = guessMimeFromExt(ref.fsPath);
-
-  logger?.appendLine(`[ref]  → attachment: mime=${mime} file=${filename}`);
-
-  return { mime, filename, url: ref.url };
+export interface ExtractedReferences {
+  attachments: AcpFileAttachment[];
+  paths: string[];
 }
 
 /**
- * Extract all file attachments from a VSCode `ChatRequest.references` array.
+ * Extract image attachments and non-image path references from a VSCode
+ * `ChatRequest.references` array.
  *
- * @param references - The `ChatRequest.references` array.
- * @param logger     - Optional logger for debug output.
- * @returns Deduplicated list of `AcpFileAttachment` objects.
+ * - Pasted images and image files (`image/*` mime) become `AcpFileAttachment`
+ *   entries — the opencode backend reads the URL and embeds the bytes.
+ * - Everything else (text files, source code, configs, directories,
+ *   unknown extensions) becomes a plain path string.  Paths inside
+ *   `workspaceDir` are emitted relative to it; everything else stays
+ *   absolute.  The caller is responsible for injecting these into the
+ *   text prompt so the model knows which files the user referenced.
+ *
+ * @param references  - The `ChatRequest.references` array.
+ * @param workspaceDir - Absolute path to the workspace root, used to
+ *                       relativise in-workspace paths.  When `undefined`,
+ *                       all paths are emitted absolutely.
+ * @param logger      - Optional logger for debug output.
  */
 export function extractAttachmentsFromReferences(
-  references: readonly { readonly value: unknown }[] | undefined,
+  references: readonly vscode.ChatPromptReference[] | undefined,
+  workspaceDir: string | undefined,
   logger?: { appendLine(m: string): void },
-): AcpFileAttachment[] {
+): ExtractedReferences {
   if (!references || references.length === 0) {
     logger?.appendLine('[ref] No references');
-    return [];
+    return { attachments: [], paths: [] };
   }
 
-  logger?.appendLine(`[ref] Processing ${references.length} reference(s)`);
+  logger?.appendLine(`[ref] Processing ${references.length} reference(s) (workspaceDir=${workspaceDir ?? 'unset'})`);
 
-  const seen = new Set<string>();
+  const seenAttachments = new Set<string>();
+  const seenPaths = new Set<string>();
   const attachments: AcpFileAttachment[] = [];
+  const paths: string[] = [];
 
   for (let i = 0; i < references.length; i++) {
     const ref = references[i];
     logger?.appendLine(`[ref] ref[${i}] id="${ref.id}" range=[${ref.range?.[0] ?? '-'},${ref.range?.[1] ?? '-'}]`);
 
-    const attachment = extractAttachmentFromReference(ref.value, logger);
-    if (attachment) {
-      if (!seen.has(attachment.url)) {
-        seen.add(attachment.url);
-        attachments.push(attachment);
-        logger?.appendLine(`[ref]  ✓ added: ${attachment.url}`);
+    const uriRef = extractUriRef(ref.value, logger);
+    if (!uriRef) {continue;}
+
+    if (uriRef.scheme === 'data') {
+      // Pasted image — already a data: URI, forward as-is.
+      const filename = uriRef.fsPath.split(/[/\\]/).pop() || undefined;
+      const mime = guessMimeFromExt(uriRef.fsPath);
+      if (!seenAttachments.has(uriRef.url)) {
+        seenAttachments.add(uriRef.url);
+        attachments.push({ mime, filename, url: uriRef.url });
+        logger?.appendLine(`[ref]  ✓ image attachment (pasted): ${filename ?? uriRef.url.slice(0, 60)}`);
       } else {
-        logger?.appendLine('[ref]  − duplicate, skipped');
+        logger?.appendLine('[ref]  − duplicate image attachment, skipped');
       }
+      continue;
+    }
+
+    // scheme === 'file' — a real filesystem reference.
+    const filename = uriRef.fsPath.split(/[/\\]/).pop() || undefined;
+    const mime = guessMimeFromExt(uriRef.fsPath);
+
+    if (isImageMime(mime)) {
+      // Image file on disk — keep as file:// URL so the model can see it.
+      if (!seenAttachments.has(uriRef.url)) {
+        seenAttachments.add(uriRef.url);
+        attachments.push({ mime, filename, url: uriRef.url });
+        logger?.appendLine(`[ref]  ✓ image file attachment: ${filename ?? uriRef.fsPath}`);
+      } else {
+        logger?.appendLine('[ref]  − duplicate image file attachment, skipped');
+      }
+      continue;
+    }
+
+    // Non-image file or directory — emit as a plain path so the model
+    // can decide whether to read it with a tool, instead of having the
+    // backend slurp the bytes and convert to base64.
+    const display = toDisplayPath(uriRef.fsPath, workspaceDir);
+    if (!display) {continue;}
+    if (!seenPaths.has(display)) {
+      seenPaths.add(display);
+      paths.push(display);
+      logger?.appendLine(`[ref]  ✓ path reference: ${display}`);
+    } else {
+      logger?.appendLine('[ref]  − duplicate path reference, skipped');
     }
   }
 
   if (attachments.length > 0) {
-    logger?.appendLine(`[ref] Total: ${attachments.length} attachment(s) extracted`);
-  } else {
-    logger?.appendLine('[ref] No attachments extracted');
+    logger?.appendLine(`[ref] Total: ${attachments.length} image attachment(s)`);
+  }
+  if (paths.length > 0) {
+    logger?.appendLine(`[ref] Total: ${paths.length} path reference(s)`);
+  }
+  if (attachments.length === 0 && paths.length === 0) {
+    logger?.appendLine('[ref] No references extracted');
   }
 
-  return attachments;
+  return { attachments, paths };
 }

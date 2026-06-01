@@ -83,6 +83,11 @@ describe('routeCommand', () => {
         agents: vi.fn(),
         get: vi.fn(),
         update: vi.fn(),
+        updateGlobal: vi.fn(async () => ({ data: undefined })),
+      },
+      auth: {
+        setKey: vi.fn(async () => ({ data: undefined })),
+        removeKey: vi.fn(async () => ({ data: undefined })),
       },
       events: {
         openSessionStream: vi.fn(),
@@ -123,6 +128,13 @@ describe('routeCommand', () => {
         setModel: vi.fn(async () => {}),
       } as unknown as ExtensionState['selection'],
       bus: new AppEventBus(),
+      acpModels: {
+        sync: vi.fn(async () => {}),
+        resolve: vi.fn(() => ({ kind: 'not-found' as const })),
+        getModelsForCopilotRegistration: vi.fn(() => []),
+        refresh: vi.fn(async () => {}),
+        dispose: vi.fn(),
+      } as unknown as ExtensionState['acpModels'],
     };
     stream = {
       markdown: vi.fn(),

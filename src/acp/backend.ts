@@ -116,6 +116,9 @@ export interface AcpConfigOperations {
 
   /** Update configuration (partial merge) */
   update(config: Partial<AcpConfig>, directory?: string): Promise<AcpResult<void>>;
+
+  /** Update global configuration (persists to disk, no restart needed) */
+  updateGlobal(config: Partial<AcpConfig>): Promise<AcpResult<void>>;
 }
 
 // ===========================================================================
@@ -182,6 +185,18 @@ export interface BackendSettingsProvider {
 }
 
 // ===========================================================================
+// Auth operations
+// ===========================================================================
+
+/** Auth key operations shared across all ACP backends */
+export interface AcpAuthOperations {
+  /** Persist an API key for a provider (writes to backend auth storage) */
+  setKey(providerID: string, key: string): Promise<AcpResult<void>>;
+  /** Remove an API key for a provider */
+  removeKey(providerID: string): Promise<AcpResult<void>>;
+}
+
+// ===========================================================================
 // Complete backend contract
 // ===========================================================================
 
@@ -204,6 +219,7 @@ export interface AcpBackend {
   events: AcpEventOperations;
   permissions: AcpPermissionOperations;
   questions: AcpQuestionOperations;
+  auth: AcpAuthOperations;
 
   // -- pluggable settings UI -------------------------------------------
 

@@ -54,6 +54,28 @@ declare module 'vscode' {
      */
     readonly isDefault?: boolean | Record<string, boolean>;
   }
+
+  /**
+   * A thinking / reasoning part of a language model response.
+   * Used to stream reasoning content separately from text content.
+   */
+  export class LanguageModelThinkingPart {
+    /** The reasoning text content */
+    value: string;
+    /** Optional identifier for this thinking block */
+    id?: string;
+    /** Optional metadata (e.g. { vscode_reasoning_done: true }) */
+    metadata?: { readonly [key: string]: any };
+
+    constructor(value: string, id?: string, metadata?: { readonly [key: string]: any });
+  }
+
+  /**
+   * Extended response part type that includes thinking + data parts.
+   * Required for providers to stream thinking blocks.
+   * (From vscode.proposed.chatProvider.d.ts)
+   */
+  export type LanguageModelResponsePart2 = LanguageModelResponsePart | LanguageModelDataPart | LanguageModelThinkingPart;
 }
 
 /**

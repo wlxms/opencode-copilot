@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "AI coding assistant powered by OpenCode",
   "engines": {
-    "vscode": "^1.110.0"
+    "vscode": "^1.118.0"
   },
   "enabledApiProposals": [
     "chatParticipantAdditions",
@@ -158,6 +158,11 @@
     "vitest": "^4.1.5"
   },
   "dependencies": {
-    "@opencode-ai/sdk": "^1.15.10"
+    "@ai-sdk/anthropic": "^3.0.81",
+    "@ai-sdk/google": "^3.0.80",
+    "@ai-sdk/openai": "^3.0.67",
+    "@ai-sdk/openai-compatible": "^2.0.48",
+    "@opencode-ai/sdk": "^1.15.10",
+    "ai": "^6.0.193"
   }
 }
