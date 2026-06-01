@@ -1,13 +1,15 @@
 import * as vscode from 'vscode';
 import { writeFileSync, unlinkSync, existsSync } from 'fs';
 import { execSync, exec } from 'child_process';
-import type { Model, Provider } from '@opencode-ai/sdk';
 import type { ExtensionState } from '../types';
 import type {
   ChatToolResourcesInvocationData,
   ChatTerminalToolInvocationData,
   ChatSimpleToolResultData,
+  ChatToolInvocationPart,
+  ChatSubagentToolInvocationData,
 } from '../types/vscode-proposed-additions';
+import { ChatQuestion, ChatQuestionType } from '../types/vscode-proposed-additions';
 import { ErrorMessages } from './errors';
 import { ensureServer } from './handler';
 import { ExternalEditTracker } from './external-edit-tracker';
@@ -58,6 +60,9 @@ export async function routeCommand(
     case 'test-thinking':
       await handleTestThinkingCommand(stream, _token);
       break;
+    case 'test-question':
+      await handleTestQuestionCommand(stream, _token);
+      break;
     default:
       stream.markdown(
         `⚠️ Unknown command '/${command}'. Use **/help** to see available commands.`,
@@ -71,7 +76,7 @@ async function handleNewCommand(
   stream: vscode.ChatResponseStream,
 ): Promise<void> {
   const ready = await ensureServer(state, stream);
-  if (!ready) return;
+  if (!ready) {return;}
   try {
     const result = await state.backend.sessions.create();
     const sessionId = result.data?.id;
@@ -103,6 +108,7 @@ function handleHelpCommand(stream: vscode.ChatResponseStream): void {
       '- **/test-file-read-stream** — Run file-bubble lifecycle experiment matrix',
       '- **/test-stream-latency** — Measure streaming delta latency from backend (batch detection + timing)',
       '- **/test-thinking** — Diagnostic: verify thinkingProgress API and reasoning/text boundary rendering',
+      '- **/test-question** — Test questionCarousel UI flow',
       '',
       'Just type your message to chat with OpenCode!',
     ].join('\n'),
@@ -114,7 +120,7 @@ async function handleModelCommand(
   stream: vscode.ChatResponseStream,
 ): Promise<void> {
   const ready = await ensureServer(state, stream);
-  if (!ready) return;
+  if (!ready) {return;}
   try {
     const modelsResp = await state.backend.config.models();
     const modelList = modelsResp.data ?? [];
@@ -255,14 +261,14 @@ function waitForVscodeFileChange(uri: vscode.Uri, timeoutMs: number): Promise<bo
     let settled = false;
 
     const done = (result: boolean) => {
-      if (settled) return;
+      if (settled) {return;}
       settled = true;
       clearTimeout(timer);
       sub.dispose();
       resolve(result);
     };
 
-    const timer = setTimeout(() => done(false), timeoutMs);
+    const timer = setTimeout(() => { done(false); }, timeoutMs);
 
     const sub = vscode.workspace.onDidChangeTextDocument((e) => {
       if (e.document.uri.toString() === uri.toString()) {
@@ -272,7 +278,7 @@ function waitForVscodeFileChange(uri: vscode.Uri, timeoutMs: number): Promise<bo
 
     // Also watch for file system changes (file may not be open as text doc)
     const fsWatcher = vscode.workspace.createFileSystemWatcher(uri.fsPath);
-    fsWatcher.onDidChange(() => done(true));
+    fsWatcher.onDidChange(() => { done(true); });
   });
 }
 
@@ -364,8 +370,8 @@ async function handleTestExternalEditRealCommand(
           { windowsHide: true },
         );
         const childExitPromise = new Promise<void>((resolve) => {
-          child.on('close', () => resolve());
-          child.on('error', () => resolve());
+          child.on('close', () => { resolve(); });
+          child.on('error', () => { resolve(); });
         });
 
         roundStream.markdown(
@@ -546,7 +552,7 @@ async function handleTestExternalEditE2ECommand(
   stream.markdown('🧪 **E2E Test: real OpenCode prompt → file edit → externalEdit**\n\n');
   stream.markdown('1️⃣ Starting OpenCode server...\n\n');
   const ready = await ensureServer(state, stream);
-  if (!ready) return;
+  if (!ready) {return;}
   const directory = workspaceFolders[0].uri.fsPath;
 
   // 2. Create temp file for the edit target
@@ -562,7 +568,7 @@ async function handleTestExternalEditE2ECommand(
   try {
       const sessionResp = await state.backend.sessions.create({ directory });
       sessionId = sessionResp.data?.id ?? '';
-    if (!sessionId) throw new Error('empty session id');
+    if (!sessionId) {throw new Error('empty session id');}
     stream.markdown(`   Session: \`${sessionId}\`\n\n`);
   } catch (err) {
     stream.markdown(`❌ Failed to create session: ${err}\n\n`);
@@ -609,7 +615,7 @@ async function handleTestExternalEditE2ECommand(
 
   try {
     for await (const evt of eventStream.stream) {
-      if (token.isCancellationRequested) break;
+      if (token.isCancellationRequested) {break;}
       eventCount++;
       const evtType = evt.type;
 
@@ -623,7 +629,7 @@ async function handleTestExternalEditE2ECommand(
           `filepath=${filepath || '(empty)'}\n`,
         );
         // If filepath matches target, parallel trackEdit + "once"
-        if (typeof filepath === 'string' && filepath && tmpPath && filepath.toLowerCase() === tmpPath.toLowerCase()) {
+        if (typeof filepath === 'string' && filepath?.toLowerCase() === tmpPath?.toLowerCase()) {
           editCallID = callID;
           stream.markdown(`     🎯 Matched target file — parallel trackEdit + "once"\n`);
           await Promise.all([
@@ -775,7 +781,7 @@ function pushProgressiveCard(
     (part as any).enablePartialUpdate = true;
     part.isComplete = false;
     part.invocationMessage = invocationMessage;
-    (stream as any).push(part as unknown as vscode.ChatResponsePart);
+    (stream as any).push(part);
   }
 }
 
@@ -801,7 +807,7 @@ function pushSubagentCard(
     if (VS.ChatSubagentToolInvocationData) {
       part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt, result);
     }
-    (stream as any).push(part as unknown as vscode.ChatResponsePart);
+    (stream as any).push(part);
   }
 }
 
@@ -814,7 +820,7 @@ function pushChildTool(
   toolSpecificData?: Record<string, unknown>,
 ): void {
   if (stream.beginToolInvocation) {
-    stream.beginToolInvocation(callId, toolName, { subagentInvocationId } as any);
+    stream.beginToolInvocation(callId, toolName, { subagentInvocationId });
   }
   if (VS.ChatToolInvocationPart && (stream as any).push) {
     const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callId);
@@ -825,7 +831,7 @@ function pushChildTool(
     if (toolSpecificData) {
       (part as any).toolSpecificData = toolSpecificData;
     }
-    (stream as any).push(part as unknown as vscode.ChatResponsePart);
+    (stream as any).push(part);
   }
 }
 
@@ -851,7 +857,7 @@ function pushResultTool(
   if (stream.beginToolInvocation) {
     stream.beginToolInvocation(resultCallId, toolName, {
       subagentInvocationId,
-    } as any);
+    });
   }
 
   // Push completed result card grouped under the subagent
@@ -866,7 +872,7 @@ function pushResultTool(
       input: 'subagent execution',
       output: resultText,
     } satisfies ChatSimpleToolResultData;
-    (stream as any).push(part as unknown as vscode.ChatResponsePart);
+    (stream as any).push(part);
   }
 }
 
@@ -888,7 +894,7 @@ async function handleTestSubagentSingleBlockingCommand(
   token: vscode.CancellationToken,
 ): Promise<void> {
   const s = checkSubagentApi(stream);
-  if (!s) return;
+  if (!s) {return;}
 
   const callId = uid();
   const description = 'Explore codebase structure';
@@ -917,10 +923,10 @@ async function handleTestSubagentSingleBlockingCommand(
           prompt,
         );
       }
-      (stream as any).push(part as unknown as vscode.ChatResponsePart);
+      (stream as any).push(part);
     }
     await delay(500);
-    if (token.isCancellationRequested) return;
+    if (token.isCancellationRequested) {return;}
 
     // Phase 3: Push child tools with subAgentInvocationId = parent task callId.
     // VSCode groups child tools under the parent subagent by matching
@@ -929,7 +935,7 @@ async function handleTestSubagentSingleBlockingCommand(
       values: [vscode.Uri.file('package.json')],
     } satisfies ChatToolResourcesInvocationData);
     await delay(300);
-    if (token.isCancellationRequested) return;
+    if (token.isCancellationRequested) {return;}
 
     pushChildTool(s, uid(), 'bash', callId, 'npm test', {
       commandLine: { original: 'npm test' },
@@ -938,7 +944,7 @@ async function handleTestSubagentSingleBlockingCommand(
       state: { exitCode: 0, duration: 1200 },
     } satisfies ChatTerminalToolInvocationData);
     await delay(300);
-    if (token.isCancellationRequested) return;
+    if (token.isCancellationRequested) {return;}
 
     // Public-API-friendly plain text output: render a generic child tool
     // with ChatSimpleToolResultData instead of relying on subagent result page.
@@ -962,7 +968,7 @@ async function handleTestSubagentSingleBlockingCommand(
           prompt,
         );
       }
-      (stream as any).push(part as unknown as vscode.ChatResponsePart);
+      (stream as any).push(part);
     }
   } catch (err) {
     stream.markdown(`\n❌ **Error:** ${err instanceof Error ? err.message : String(err)}\n`);
@@ -978,7 +984,7 @@ async function handleTestSubagentMultiBlockingCommand(
   token: vscode.CancellationToken,
 ): Promise<void> {
   const s = checkSubagentApi(stream);
-  if (!s) return;
+  if (!s) {return;}
 
   stream.markdown('# 🟢 Multi Subagent (Sequential Blocking)\n\n');
 
@@ -1001,15 +1007,15 @@ async function handleTestSubagentMultiBlockingCommand(
         if (VS.ChatSubagentToolInvocationData) {
           part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt);
         }
-        (stream as any).push(part as unknown as vscode.ChatResponsePart);
+        (stream as any).push(part);
       }
       await delay(400);
-      if (token.isCancellationRequested) return;
+      if (token.isCancellationRequested) {return;}
 
       pushChildTool(s, uid(), 'read', callId, 'src/models/user.ts');
       pushChildTool(s, uid(), 'read', callId, 'src/models/post.ts');
       await delay(300);
-      if (token.isCancellationRequested) return;
+      if (token.isCancellationRequested) {return;}
 
       pushChildTool(s, uid(), 'summary', callId, '5 models found, relationships mapped', {
         input: 'subagent summary',
@@ -1025,12 +1031,12 @@ async function handleTestSubagentMultiBlockingCommand(
         if (VS.ChatSubagentToolInvocationData) {
           part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt);
         }
-        (stream as any).push(part as unknown as vscode.ChatResponsePart);
+        (stream as any).push(part);
       }
     }
 
     await delay(200);
-    if (token.isCancellationRequested) return;
+    if (token.isCancellationRequested) {return;}
 
     // Second subagent
     {
@@ -1050,16 +1056,16 @@ async function handleTestSubagentMultiBlockingCommand(
         if (VS.ChatSubagentToolInvocationData) {
           part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt);
         }
-        (stream as any).push(part as unknown as vscode.ChatResponsePart);
+        (stream as any).push(part);
       }
       await delay(400);
-      if (token.isCancellationRequested) return;
+      if (token.isCancellationRequested) {return;}
 
       pushChildTool(s, uid(), 'write', callId, 'src/api/users.ts');
       pushChildTool(s, uid(), 'write', callId, 'src/api/posts.ts');
       pushChildTool(s, uid(), 'bash', callId, 'npm run lint');
       await delay(300);
-      if (token.isCancellationRequested) return;
+      if (token.isCancellationRequested) {return;}
 
       pushChildTool(s, uid(), 'summary', callId, '15 API endpoints created', {
         input: 'subagent summary',
@@ -1075,7 +1081,7 @@ async function handleTestSubagentMultiBlockingCommand(
         if (VS.ChatSubagentToolInvocationData) {
           part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt);
         }
-        (stream as any).push(part as unknown as vscode.ChatResponsePart);
+        (stream as any).push(part);
       }
     }
   } catch (err) {
@@ -1092,7 +1098,7 @@ async function handleTestSubagentSingleParallelCommand(
   token: vscode.CancellationToken,
 ): Promise<void> {
   const s = checkSubagentApi(stream);
-  if (!s) return;
+  if (!s) {return;}
 
   const callId = uid();
   const description = 'Search for TODO patterns';
@@ -1114,7 +1120,7 @@ async function handleTestSubagentSingleParallelCommand(
       if (VS.ChatSubagentToolInvocationData) {
         part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt);
       }
-      (stream as any).push(part as unknown as vscode.ChatResponsePart);
+      (stream as any).push(part);
     }
 
     // Main agent continues — output text while subagent runs
@@ -1124,12 +1130,12 @@ async function handleTestSubagentSingleParallelCommand(
     // Subagent completes asynchronously (ACP callback pattern)
     const asyncComplete = (async () => {
       await delay(800);
-      if (token.isCancellationRequested) return;
+      if (token.isCancellationRequested) {return;}
 
       pushChildTool(s, uid(), 'grep', callId, 'TODO comments');
 
       await delay(400);
-      if (token.isCancellationRequested) return;
+      if (token.isCancellationRequested) {return;}
 
       pushChildTool(s, uid(), 'summary', callId, '5 TODOs found', {
         input: 'subagent summary',
@@ -1145,7 +1151,7 @@ async function handleTestSubagentSingleParallelCommand(
         if (VS.ChatSubagentToolInvocationData) {
           part.toolSpecificData = new VS.ChatSubagentToolInvocationData(description, agentName, prompt);
         }
-        (stream as any).push(part as unknown as vscode.ChatResponsePart);
+        (stream as any).push(part);
       }
     })();
 
@@ -1170,7 +1176,7 @@ async function handleTestSubagentMultiParallelCommand(
   token: vscode.CancellationToken,
 ): Promise<void> {
   const s = checkSubagentApi(stream);
-  if (!s) return;
+  if (!s) {return;}
 
   stream.markdown('# 🔴 Multi Subagent (All Parallel)\n\n');
 
@@ -1216,19 +1222,19 @@ async function handleTestSubagentMultiParallelCommand(
         if (VS.ChatSubagentToolInvocationData) {
           part.toolSpecificData = new VS.ChatSubagentToolInvocationData(agent.desc, agent.name, agent.prompt);
         }
-        (stream as any).push(part as unknown as vscode.ChatResponsePart);
+        (stream as any).push(part);
       }
 
       const delayMs = 600 + i * 400;
       await delay(delayMs);
-      if (token.isCancellationRequested) return;
+      if (token.isCancellationRequested) {return;}
 
       for (const child of agent.childTools) {
         pushChildTool(s, uid(), child.name, callId, child.title);
       }
 
       await delay(300);
-      if (token.isCancellationRequested) return;
+      if (token.isCancellationRequested) {return;}
 
       pushChildTool(s, uid(), 'summary', callId, agent.summary, {
         input: 'subagent summary',
@@ -1244,7 +1250,7 @@ async function handleTestSubagentMultiParallelCommand(
         if (VS.ChatSubagentToolInvocationData) {
           part.toolSpecificData = new VS.ChatSubagentToolInvocationData(agent.desc, agent.name, agent.prompt);
         }
-        (stream as any).push(part as unknown as vscode.ChatResponsePart);
+        (stream as any).push(part);
       }
     });
 
@@ -1286,7 +1292,7 @@ async function handleTestFileReadStreamCommand(
   }
 
   const s = checkSubagentApi(stream);
-  if (!s) return;
+  if (!s) {return;}
 
   // Create a temp file with sample content
   const tmpUri = vscode.Uri.joinPath(
@@ -1356,7 +1362,7 @@ async function handleTestFileReadStreamCommand(
         values: [readLocation(options.resourcesRange.start, options.resourcesRange.end)],
       } satisfies ChatToolResourcesInvocationData;
     }
-    (stream as any).push(part as unknown as vscode.ChatResponsePart);
+    (stream as any).push(part);
   };
 
   const beginReadInvocation = (callId: string): void => {
@@ -1391,7 +1397,7 @@ async function handleTestFileReadStreamCommand(
           beginReadInvocation(callId);
           pushPartial(callId, bubbleMarkdown(1, totalLines));
           await delay(400);
-          if (token.isCancellationRequested) return;
+          if (token.isCancellationRequested) {return;}
           if (s.updateToolInvocation) {
             s.updateToolInvocation(callId, {
               invocationMessage: `Reading ${fileName} lines 1-${chunkSize} (updated plain text)`,
@@ -1407,7 +1413,7 @@ async function handleTestFileReadStreamCommand(
           beginReadInvocation(callId);
           pushPartial(callId, bubbleMarkdown(1, totalLines));
           await delay(400);
-          if (token.isCancellationRequested) return;
+          if (token.isCancellationRequested) {return;}
           pushPartial(callId, `Read ${fileName}`, {
             isComplete: true,
             pastTenseMessage: `Read ${fileName}`,
@@ -1424,7 +1430,7 @@ async function handleTestFileReadStreamCommand(
             resourcesRange: { start: 1, end: totalLines },
           });
           await delay(300);
-          if (token.isCancellationRequested) return;
+          if (token.isCancellationRequested) {return;}
           pushPartial(callId, `Read ${fileName}`, {
             isComplete: true,
             pastTenseMessage: `Read ${fileName}`,
@@ -1440,7 +1446,7 @@ async function handleTestFileReadStreamCommand(
           beginReadInvocation(callId);
           pushPartial(callId, bubbleMarkdown(1, totalLines));
           await delay(400);
-          if (token.isCancellationRequested) return;
+          if (token.isCancellationRequested) {return;}
           pushPartial(callId, bubbleMarkdown(1, totalLines), {
             isComplete: true,
           });
@@ -1454,7 +1460,7 @@ async function handleTestFileReadStreamCommand(
           beginReadInvocation(callId);
           pushPartial(callId, bubbleMarkdown(1, totalLines));
           await delay(400);
-          if (token.isCancellationRequested) return;
+          if (token.isCancellationRequested) {return;}
           pushPartial(callId, bubbleMarkdown(1, totalLines), {
             isComplete: true,
             pastTenseMessage: bubbleMarkdown(1, totalLines),
@@ -1464,7 +1470,7 @@ async function handleTestFileReadStreamCommand(
     ] as const;
 
     for (const item of cases) {
-      if (token.isCancellationRequested) return;
+      if (token.isCancellationRequested) {return;}
       stream.markdown(`## ${item.title}\n\n`);
       stream.markdown(`${item.description}\n\n`);
       await item.run();
@@ -1529,7 +1535,7 @@ async function handleTestStreamLatencyCommand(
   token: vscode.CancellationToken,
 ): Promise<void> {
   const ready = await ensureServer(state, stream);
-  if (!ready) return;
+  if (!ready) {return;}
 
   // The prompt must trigger a long reasoning/thinking response.
   // We ask the model to think step-by-step about a complex topic.
@@ -1585,7 +1591,7 @@ async function handleTestStreamLatencyCommand(
     const promptStart = perfNow();
     const promptPromise = state.backend.sessions
       .prompt(sessionId, THINKING_PROMPT)
-      .then((result) => {
+      .then((result: { error?: unknown; data?: unknown }) => {
         if (result.error) {
           state.outputChannel.appendLine(
             `[stream-latency] Prompt error: ${String(result.error)}`,
@@ -1623,7 +1629,7 @@ async function handleTestStreamLatencyCommand(
 
     const collectPromise = (async () => {
       for await (const event of eventStream.stream) {
-        if (token.isCancellationRequested) break;
+        if (token.isCancellationRequested) {break;}
 
         const now = perfNow();
         const eventType = event.type;
@@ -1703,11 +1709,11 @@ async function handleTestStreamLatencyCommand(
       if (deltas[i].gapMs < 1) {
         currentBurst++;
       } else {
-        if (currentBurst > 1) burstSizes.push(currentBurst);
+        if (currentBurst > 1) {burstSizes.push(currentBurst);}
         currentBurst = 1;
       }
     }
-    if (currentBurst > 1) burstSizes.push(currentBurst);
+    if (currentBurst > 1) {burstSizes.push(currentBurst);}
 
     // Batch detection: gaps > 50ms (likely server-side buffering)
     const batchGaps = gaps.filter((g) => g > 50).length;
@@ -1856,7 +1862,7 @@ async function handleTestThinkingCommand(
 
   const thinkingId1 = 'test-1';
   for (let i = 1; i <= 10; i++) {
-    if (token.isCancellationRequested) break;
+    if (token.isCancellationRequested) {break;}
     extendedStream.thinkingProgress!({
       text: `[${i}/10] This is thinking delta #${i}. Analyzing the problem step by step...\n`,
       id: thinkingId1,
@@ -1934,7 +1940,7 @@ async function handleTestThinkingCommand(
   stream.markdown('_Pushing 50 rapid deltas into a single thinking block (id=`test-4`) with no delays..._\n\n');
 
   for (let i = 1; i <= 50; i++) {
-    if (token.isCancellationRequested) break;
+    if (token.isCancellationRequested) {break;}
     extendedStream.thinkingProgress!({
       text: `[${i}] `,
       id: 'test-4',
@@ -1956,4 +1962,131 @@ async function handleTestThinkingCommand(
     '- [ ] **Phase 5**: All 50 rapid deltas aggregated into one thinking block (not 50 separate ones)\n\n' +
     'If any of these fail, report which phase and what you saw vs. what you expected.\n',
   );
+}
+
+// ---------------------------------------------------------------------------
+// /test-question — Test questionCarousel UI flow
+// ---------------------------------------------------------------------------
+
+async function handleTestQuestionCommand(
+  stream: vscode.ChatResponseStream,
+  token: vscode.CancellationToken,
+): Promise<void> {
+  const s = stream as vscode.ChatResponseStream & {
+    questionCarousel?(questions: ChatQuestion[], allowSkip?: boolean): Thenable<Record<string, unknown> | undefined>;
+  };
+
+  if (typeof s.questionCarousel !== 'function') {
+    stream.markdown('⚠️ `questionCarousel` API not available. This requires VSCode proposed API `chatParticipantAdditions`.\n');
+    return;
+  }
+
+  stream.markdown('# 🧪 Question Carousel Test\n\n');
+
+  // Phase 1: Single-select question
+  stream.markdown('### Phase 1: Single-Select Question\n\n');
+  const q1 = new ChatQuestion(
+    'q1',
+    ChatQuestionType.SingleSelect,
+    'Choose a language',
+    {
+      message: 'Which programming language do you prefer?',
+      options: [
+        { id: 'ts', label: 'TypeScript', value: 'TypeScript', detail: 'Typed JavaScript superset' },
+        { id: 'py', label: 'Python', value: 'Python', detail: 'General purpose scripting' },
+        { id: 'go', label: 'Go', value: 'Go', detail: 'Compiled systems language' },
+        { id: 'rs', label: 'Rust', value: 'Rust', detail: 'Memory-safe systems language' },
+      ],
+    },
+  );
+
+  try {
+    const result1 = await s.questionCarousel([q1], true);
+    stream.markdown(`✅ **Phase 1 result**: ${JSON.stringify(result1)}\n\n`);
+  } catch (err) {
+    stream.markdown(`❌ **Phase 1 error**: ${err}\n\n`);
+  }
+
+  if (token.isCancellationRequested) {return;}
+
+  // Phase 2: Multi-select question
+  stream.markdown('### Phase 2: Multi-Select Question\n\n');
+  const q2 = new ChatQuestion(
+    'q2',
+    ChatQuestionType.MultiSelect,
+    'Select features',
+    {
+      message: 'Which features do you want?',
+      options: [
+        { id: 'auth', label: 'Authentication', value: 'Authentication' },
+        { id: 'cache', label: 'Caching', value: 'Caching' },
+        { id: 'log', label: 'Logging', value: 'Logging' },
+        { id: 'test', label: 'Testing', value: 'Testing' },
+      ],
+    },
+  );
+
+  try {
+    const result2 = await s.questionCarousel([q2], true);
+    stream.markdown(`✅ **Phase 2 result**: ${JSON.stringify(result2)}\n\n`);
+  } catch (err) {
+    stream.markdown(`❌ **Phase 2 error**: ${err}\n\n`);
+  }
+
+  if (token.isCancellationRequested) {return;}
+
+  // Phase 3: Text input question
+  stream.markdown('### Phase 3: Text Input Question\n\n');
+  const q3 = new ChatQuestion(
+    'q3',
+    ChatQuestionType.Text,
+    'Project name',
+    {
+      message: 'What should we name the project?',
+      placeholder: 'my-awesome-project',
+    },
+  );
+
+  try {
+    const result3 = await s.questionCarousel([q3], true);
+    stream.markdown(`✅ **Phase 3 result**: ${JSON.stringify(result3)}\n\n`);
+  } catch (err) {
+    stream.markdown(`❌ **Phase 3 error**: ${err}\n\n`);
+  }
+
+  // Phase 4: Multiple questions at once (carousel)
+  if (token.isCancellationRequested) {return;}
+
+  stream.markdown('### Phase 4: Multi-Question Carousel\n\n');
+  const q4a = new ChatQuestion(
+    'q4a',
+    ChatQuestionType.SingleSelect,
+    'Deployment target',
+    {
+      message: 'Where do you want to deploy?',
+      options: [
+        { id: 'azure', label: 'Azure', value: 'Azure' },
+        { id: 'aws', label: 'AWS', value: 'AWS' },
+        { id: 'gcp', label: 'GCP', value: 'GCP' },
+      ],
+    },
+  );
+  const q4b = new ChatQuestion(
+    'q4b',
+    ChatQuestionType.Text,
+    'Region',
+    {
+      message: 'Which region?',
+      placeholder: 'e.g., eastus, us-west-2',
+    },
+  );
+
+  try {
+    const result4 = await s.questionCarousel([q4a, q4b], true);
+    stream.markdown(`✅ **Phase 4 result**: ${JSON.stringify(result4)}\n\n`);
+  } catch (err) {
+    stream.markdown(`❌ **Phase 4 error**: ${err}\n\n`);
+  }
+
+  stream.markdown('---\n✅ Question carousel test complete.\n');
 }

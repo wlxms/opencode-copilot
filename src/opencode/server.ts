@@ -1,7 +1,7 @@
-import { createOpencode } from '@opencode-ai/sdk';
+import { createOpencode } from '@opencode-ai/sdk/v2';
 import { existsSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
-import type { OpenCodeClient, OpenCodeServerController } from '../types';
+import type { OpenCodeClient, OpenCodeServerController } from '../backends/opencode/sdk-types';
 
 export type ServerStatus = 'stopped' | 'starting' | 'running' | 'error';
 
@@ -80,9 +80,12 @@ export class OpenCodeServerManager implements OpenCodeServerController {
       const instance = await createOpencode({
         port: 0,
       });
+      // Cast at the architectural boundary: SDK v2 OpencodeClient → our typed contract.
+      // The shapes are compatible at runtime; the type mismatch is due to SDK's complex
+      // ServerSentEventsResult / RequestResult generics vs our simpler SdkResponse wrapper.
       this.instance = {
         server: instance.server,
-        client: instance.client,
+        client: instance.client as unknown as OpenCodeClient,
       };
       this.serverUrl = instance.server.url;
       this.status = 'running';

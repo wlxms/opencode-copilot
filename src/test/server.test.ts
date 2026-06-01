@@ -27,11 +27,11 @@ const mockInstance = {
   client: mockClient,
 };
 
-vi.mock('@opencode-ai/sdk', () => ({
+vi.mock('@opencode-ai/sdk/v2', () => ({
   createOpencode: vi.fn(),
 }));
 
-import { createOpencode } from '@opencode-ai/sdk';
+import { createOpencode } from '@opencode-ai/sdk/v2';
 import { OpenCodeServerManager } from '../opencode/server';
 
 // ---------------------------------------------------------------------------

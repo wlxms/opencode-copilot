@@ -17,7 +17,7 @@ export interface SubagentScope {
   completed: boolean;
   /** Child session ID (from task tool metadata), if available */
   childSessionId?: string;
-  /** True once the child session has emitted session.idle */
+  /** True once the child session AND all its descendants have emitted session.idle */
   childIdle?: boolean;
   /**
    * Unique ID for this subagent invocation — set at task:completed when the
@@ -36,6 +36,19 @@ export interface SubagentScope {
   output?: string;
   /** Wall-clock time when the subagent truly finished (child session.idle) */
   timeEnd?: number;
+  /**
+   * Set of descendant session IDs (child, grandchild, etc.).
+   * Used to track which sessions belong to this subagent so that
+   * grandchild events can be routed to the correct scope and
+   * completion propagates upward correctly.
+   */
+  descendantSessionIds: Set<string>;
+  /**
+   * Last meaningful LLM text output from the subagent's child session.
+   * Collected throughout the subagent lifecycle and used as the summary
+   * when the subagent completes.
+   */
+  lastText?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -53,7 +66,7 @@ export function formatSubagentProgress(scope: SubagentScope): string {
       counts.set(tc.name, (counts.get(tc.name) ?? 0) + 1);
     }
   }
-  if (counts.size === 0) return '';
+  if (counts.size === 0) {return '';}
   const parts: string[] = [];
   for (const [name, count] of counts) {
     parts.push(count > 1 ? `${count}× ${name}` : name);

@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import type {
   AcpEvent,
+  AcpResult,
   AcpStreamPart,
   AcpTextPart,
   AcpReasoningPart,
@@ -13,6 +14,8 @@ import type {
   AcpSessionDiffEvent,
   AcpFileDiff,
   AcpPermissionRequestEvent,
+  AcpQuestionRequestEvent,
+  AcpSessionLifecycleEvent,
 } from '../acp/types';
 import type {
   ChatTerminalToolInvocationData,
@@ -29,16 +32,19 @@ import type {
   ChatResponseMultiDiffPart,
   ChatResponseWorkspaceEditPart,
 } from '../types/vscode-proposed-additions';
-import { ChatTodoStatus } from '../types/vscode-proposed-additions';
-import { ExternalEditTracker } from './external-edit-tracker';
+import { ChatTodoStatus, ChatQuestion, ChatQuestionType } from '../types/vscode-proposed-additions';
+import { type ExternalEditTracker } from './external-edit-tracker';
 import type { AcpEventStream } from '../acp/backend';
-import { SubagentScope, formatSubagentProgress } from './subagent';
+import { type SubagentScope, formatSubagentProgress } from './subagent';
 
 /** Extended stream with proposed API methods */
 type Stream = vscode.ChatResponseStream & {
   thinkingProgress?(delta: { text?: string | string[]; id?: string; metadata?: { readonly [key: string]: unknown } }): void;
   beginToolInvocation?(callId: string, name: string, data?: ChatToolInvocationStreamData): void;
   updateToolInvocation?(callId: string, data: ChatToolInvocationStreamData): void;
+  questionCarousel?(questions: ChatQuestion[], allowSkip?: boolean): Thenable<Record<string, unknown> | undefined>;
+  /** Proposed API: push a ChatResponsePart directly to the stream */
+  push?(part: unknown): void;
 };
 
 type ProposedVscode = typeof vscode & {
@@ -87,7 +93,20 @@ interface StreamBridgeOptions {
     permissionId: string,
     response: 'once' | 'always' | 'reject',
     directory?: string,
-  ) => Promise<unknown>;
+  ) => Promise<void>;
+  /** Reply callback for question.asked */
+  replyToQuestion?: (
+    sessionId: string,
+    requestId: string,
+    answers: Array<Array<string>>,
+    directory?: string,
+  ) => Promise<AcpResult<boolean>>;
+  /** Reject callback for question.asked (user skipped/rejected) */
+  rejectQuestion?: (
+    sessionId: string,
+    requestId: string,
+    directory?: string,
+  ) => Promise<AcpResult<boolean>>;
   /** Workspace directory for API calls */
   directory?: string;
   /** Check if any child sessions are still running (busy). Returns true if at least one child is busy. */
@@ -144,6 +163,8 @@ export class StreamBridge {
   /** Active subagent scopes — filters child events from rendering as independent cards */
   private activeSubagentScopes: Map<string, SubagentScope> = new Map();
   /** Whether at least one subagent (task) tool completed during this bridge session */
+  /** Backend-generated session title captured from session.updated events */
+  private sessionTitle: string | undefined;
   private hadSubagentTasks = false;
   /** Whether a session.idle event was received (and deferred due to active subagents) */
   private deferredIdle = false;
@@ -159,6 +180,8 @@ export class StreamBridge {
   private knownFileUris: Set<string>;
   private readonly tracker?: ExternalEditTracker;
   private readonly replyToPermission?: StreamBridgeOptions['replyToPermission'];
+  private readonly replyToQuestion?: StreamBridgeOptions['replyToQuestion'];
+  private readonly rejectQuestion?: StreamBridgeOptions['rejectQuestion'];
   private readonly directory?: string;
   private readonly checkChildSessionsRunning?: StreamBridgeOptions['checkChildSessionsRunning'];
   private readonly findAncestorScope?: StreamBridgeOptions['findAncestorScope'];
@@ -170,6 +193,8 @@ export class StreamBridge {
     this.knownFileUris = options.knownFileUris ?? new Set();
     this.tracker = options.tracker;
     this.replyToPermission = options.replyToPermission;
+    this.replyToQuestion = options.replyToQuestion;
+    this.rejectQuestion = options.rejectQuestion;
     this.directory = options.directory;
     this.checkChildSessionsRunning = options.checkChildSessionsRunning;
     this.findAncestorScope = options.findAncestorScope;
@@ -186,6 +211,12 @@ export class StreamBridge {
    *  whether to send a continuation prompt after bridge stop. */
   getHadSubagentTasks(): boolean {
     return this.hadSubagentTasks;
+  }
+
+  /** Backend-generated session title captured from session.updated events.
+   *  Returns the most recent non-placeholder title, or undefined if none. */
+  getSessionTitle(): string | undefined {
+    return this.sessionTitle;
   }
 
   /**
@@ -229,6 +260,7 @@ export class StreamBridge {
         }
 
         // Race between next event and force-stop signal
+        this.log('[lifecycle] waiting for next event...');
         const nextP = iter.next();
         const result = await Promise.race([
           nextP.then((r) => ({ event: r, stopped: false })),
@@ -242,14 +274,29 @@ export class StreamBridge {
 
         if (result.event) {
           const { value: event, done } = result.event;
-          if (done) break;
-          if (!event) break;
+          if (done) {
+            this.log('[lifecycle] iterator returned done=true, exiting bridge loop');
+            break;
+          }
+          if (!event) {
+            this.log('[lifecycle] iterator returned null event, exiting bridge loop');
+            break;
+          }
+
+          this.log(`[lifecycle] received event type=${event.type}`);
 
           const tEnter = Date.now();
           // Handle permission.asked as sync barrier (async, blocks loop until baseline captured + auto-reply)
           if (event.type === 'permission.asked') {
             await this.handlePermissionAsked(event, stream);
             this.logTag('timing', `permission.asked took ${Date.now() - tEnter}ms`);
+            continue;
+          }
+          // Handle question.asked as sync barrier (async, blocks loop until user answers)
+          if (event.type === 'question.asked') {
+            await this.handleQuestionAsked(event, s);
+            this.logTag('timing', `question.asked took ${Date.now() - tEnter}ms`);
+            this.log('[lifecycle] question.asked completed, continuing bridge loop to wait for next event');
             continue;
           }
           const dispatched = this.processEvent(event, s);
@@ -366,7 +413,7 @@ export class StreamBridge {
                   this.clearDeferredIdleTimer();
                   // Clean up child scopes to avoid "leaked scope" warning
                   for (const [callId, s] of this.activeSubagentScopes) {
-                    if (s.childIdle) this.activeSubagentScopes.delete(callId);
+                    if (s.childIdle) {this.activeSubagentScopes.delete(callId);}
                   }
                   this.logTag('subagent', 'all child sessions idle — waiting for parent orchestrator to continue');
                   return { stop: false, rendered: false };
@@ -414,7 +461,7 @@ export class StreamBridge {
             // Uses pushToolInvocation() for full toolSpecificData rendering.
             if (matchingScope.subAgentInvocationId) {
               if (childStatus === 'completed' || childStatus === 'error') {
-                if (this.hasToolUI && VS.ChatToolInvocationPart && stream.push) {
+                if (this.hasToolUI && VS.ChatToolInvocationPart && typeof stream.push === 'function') {
                   try {
                     if (stream.beginToolInvocation) {
                       stream.beginToolInvocation(childCallId, childToolName, {
@@ -459,6 +506,17 @@ export class StreamBridge {
       return { stop: false, rendered: false };
     }
 
+    // Pre-register part IDs before subagent filtering so that parent-level
+    // parts (e.g. AI response text arriving after subagent completion)
+    // are not incorrectly classified as subagent-internal.
+    if (event.type === 'part.updated' && event.part) {
+      const p = event.part as { type?: string; id?: string };
+      if (p.type === 'text' && p.id && !this.partKinds.has(p.id)) {
+        // Tentatively register — handlePartUpdated may refine later
+        this.partKinds.set(p.id, 'text');
+      }
+    }
+
     // Filter subagent-internal events: suppress rendering, capture for progress summary
     if (this.isSubagentInternalEvent(event)) {
       // Any subagent-internal event means the subagent is still active — reset safety timer
@@ -496,17 +554,45 @@ export class StreamBridge {
           return { stop: false, rendered: false };
         }
         return { stop: true, rendered: false };
+      case 'session.updated': {
+        // Backend may auto-generate a meaningful title and broadcast it via
+        // session.updated. Capture it so the handler can update the session list.
+        const lifecycle = event as AcpSessionLifecycleEvent;
+        const rawTitle = lifecycle.title;
+        const trimmedTitle = rawTitle?.trim();
+        this.logTag(
+          'title',
+          `session.updated: sessionId=${lifecycle.sessionId}, rawTitle=${JSON.stringify(rawTitle)}, trimmed=${JSON.stringify(trimmedTitle)}`,
+        );
+        if (trimmedTitle) {
+          this.sessionTitle = trimmedTitle;
+        }
+        return { stop: false, rendered: false };
+      }
       case 'session.diff':
         return { stop: false, rendered: this.handleSessionDiff(event, stream) };
+      case 'session.error': {
+        const message = 'error' in event && typeof event.error === 'string'
+          ? event.error
+          : 'Unknown session error';
+        this.logTag('error', `session.error: ${message}`);
+        stream.markdown(`⚠️ ${message}`);
+        return { stop: false, rendered: true };
+      }
       // permission.asked is handled directly in run() (async)
       case 'permission.asked':
+        return { stop: false, rendered: false };
+      // question.asked is handled directly in run() (async)
+      case 'question.asked':
+      case 'question.replied':
+      case 'question.rejected':
         return { stop: false, rendered: false };
     }
     return { stop: false, rendered: false };
   }
 
   private shouldProcessEvent(evt: AcpEvent): boolean {
-    if (!this.sessionId) return true;
+    if (!this.sessionId) {return true;}
 
     switch (evt.type) {
       case 'part.updated':
@@ -516,7 +602,7 @@ export class StreamBridge {
         // Child routing block (processEvent) handles matching/scoping;
         // filtering here would drop child tool events that arrive before
         // task:completed (when childSessionId is not yet on the scope).
-        if (!eventSessionId || eventSessionId === this.sessionId) return true;
+        if (!eventSessionId || eventSessionId === this.sessionId) {return true;}
         return true;
       }
       // session.idle and session.status from child sessions should be processed
@@ -583,16 +669,212 @@ export class StreamBridge {
   }
 
   // -------------------------------------------------------------------
+  // question.asked — sync barrier for questionCarousel
+  // -------------------------------------------------------------------
+
+  private async handleQuestionAsked(event: AcpQuestionRequestEvent, stream: Stream): Promise<boolean> {
+    const questionId = event.questionId;
+    const sessionId = event.sessionId;
+    const questions = event.questions;
+
+    this.log(
+      `question.asked: id=${questionId}, sessionID=${sessionId}, questions=${questions.length}`,
+    );
+
+    // Try VSCode proposed API questionCarousel first
+    if (typeof stream.questionCarousel === 'function') {
+      try {
+        // Map OpenCode QuestionInfo → VSCode ChatQuestion
+        const vscodeQuestions: ChatQuestion[] = questions.map((q, i) => {
+          const hasOptions = q.options && q.options.length > 0;
+          const isMultiple = q.multiple ?? false;
+          const isCustom = q.custom ?? false;
+
+          const chatQuestion = new ChatQuestion(
+            `q_${i}`,
+            !hasOptions
+              ? ChatQuestionType.Text
+              : isMultiple
+                ? ChatQuestionType.MultiSelect
+                : ChatQuestionType.SingleSelect,
+            q.header ?? q.question,
+            {
+              message: q.question,
+              options: q.options?.map((o, j) => ({
+                id: `opt_${j}`,
+                label: o.label,
+                value: o.label,
+                detail: o.description,
+              })),
+            },
+          );
+
+          // Allow freeform input if custom=true
+          if (isCustom && hasOptions) {
+            chatQuestion.placeholder = 'Type your own answer...';
+          }
+
+          return chatQuestion;
+        });
+
+        this.log(`question.asked: showing questionCarousel with ${vscodeQuestions.length} questions`);
+        const result = await stream.questionCarousel(vscodeQuestions, true);
+        this.log(`question.asked: questionCarousel resolved, result=${JSON.stringify(result)}`);
+
+        if (result === undefined) {
+          // User skipped / cancelled
+          if (this.rejectQuestion && sessionId && questionId) {
+            try {
+              await this.rejectQuestion(sessionId, questionId, this.directory);
+              this.logTag('question', `rejected question ${questionId} (user skipped)`);
+            } catch (err) {
+              this.logTag('question', `reject failed for question ${questionId}: ${err}`);
+            }
+          }
+        } else {
+          // User answered — map VSCode answers back to OpenCode format
+          // VSCode questionCarousel returns Record<string, IChatQuestionAnswerValue>:
+          //   - Text: string (direct value)
+          //   - SingleSelect: { selectedValue: unknown, freeformValue?: string }
+          //   - MultiSelect: { selectedValues: unknown[], freeformValue?: string }
+          const answers: Array<Array<string>> = questions.map((q, i) => {
+            const key = `q_${i}`;
+            const answer = result[key];
+
+            if (answer === undefined || answer === null) {
+              return [];
+            }
+
+            // Text answer — direct string
+            if (typeof answer === 'string') {
+              return [answer];
+            }
+
+            if (typeof answer === 'object' && answer !== null) {
+              const obj = answer as Record<string, unknown>;
+
+              // SingleSelect: { selectedValue: unknown, freeformValue?: string }
+              if ('selectedValue' in obj) {
+                // Prefer freeformValue if user typed a custom answer
+                if (obj.freeformValue && typeof obj.freeformValue === 'string') {
+                  return [obj.freeformValue];
+                }
+                const val = obj.selectedValue;
+                if (val !== undefined && val !== null) {
+                  return [String(val)];
+                }
+                return [];
+              }
+
+              // MultiSelect: { selectedValues: unknown[], freeformValue?: string }
+              if ('selectedValues' in obj && Array.isArray(obj.selectedValues)) {
+                const selected = (obj.selectedValues as unknown[]).map(v =>
+                  v !== undefined && v !== null ? String(v) : '',
+                ).filter(v => v !== '');
+                // Also include freeformValue if present
+                if (obj.freeformValue && typeof obj.freeformValue === 'string') {
+                  selected.push(obj.freeformValue);
+                }
+                return selected;
+              }
+            }
+
+            return [];
+          });
+
+          if (this.replyToQuestion && sessionId && questionId) {
+            try {
+              this.logTag('question', `sending reply to question ${questionId}: sessionId=${sessionId}, answers=${JSON.stringify(answers)}, directory=${this.directory ?? 'none'}`);
+              await this.replyToQuestion(sessionId, questionId, answers, this.directory);
+              this.logTag('question', `replied to question ${questionId} successfully, answers=${JSON.stringify(answers)}`);
+            } catch (err) {
+              this.logTag('question', `reply FAILED for question ${questionId}: ${err}`);
+            }
+          } else {
+            this.logTag('question', `WARNING: cannot reply — replyToQuestion=${!!this.replyToQuestion}, sessionId=${sessionId}, questionId=${questionId}`);
+          }
+        }
+
+        return false; // questionCarousel handles its own UI
+      } catch (err) {
+        this.logTag('question', `questionCarousel error: ${err}`);
+        // Fall through to fallback
+      }
+    }
+
+    // Fallback: use vscode.window.showQuickPick for single-question scenarios
+    if (questions.length > 0) {
+      try {
+        const q = questions[0];
+        if (q.options && q.options.length > 0) {
+          const picks = q.options.map(o => ({
+            label: o.label,
+            description: o.description,
+          }));
+          const selected = await vscode.window.showQuickPick(picks, {
+            placeHolder: q.question,
+            canPickMany: q.multiple ?? false,
+          });
+
+          if (selected) {
+            const answers: Array<Array<string>> = [];
+            if (Array.isArray(selected)) {
+              answers.push(selected.map(s => s.label));
+            } else {
+              answers.push([selected.label]);
+            }
+
+            if (this.replyToQuestion && sessionId && questionId) {
+              await this.replyToQuestion(sessionId, questionId, answers, this.directory);
+            }
+          } else {
+            if (this.rejectQuestion && sessionId && questionId) {
+              await this.rejectQuestion(sessionId, questionId, this.directory);
+            }
+          }
+        } else {
+          // Text input question
+          const answer = await vscode.window.showInputBox({
+            prompt: q.question,
+            placeHolder: q.header,
+          });
+
+          if (answer !== undefined) {
+            const answers: Array<Array<string>> = [[answer]];
+            if (this.replyToQuestion && sessionId && questionId) {
+              await this.replyToQuestion(sessionId, questionId, answers, this.directory);
+            }
+          } else {
+            if (this.rejectQuestion && sessionId && questionId) {
+              await this.rejectQuestion(sessionId, questionId, this.directory);
+            }
+          }
+        }
+      } catch (err) {
+        this.logTag('question', `fallback UI error: ${err}`);
+        // Last resort: reject the question so the server doesn't hang
+        if (this.rejectQuestion && sessionId && questionId) {
+          try {
+            await this.rejectQuestion(sessionId, questionId, this.directory);
+          } catch { /* ignore */ }
+        }
+      }
+    }
+
+    return false;
+  }
+
+  // -------------------------------------------------------------------
   // part.updated
   // -------------------------------------------------------------------
 
   private handlePartUpdated(event: AcpPartUpdatedEvent, stream: Stream): boolean {
     const part = event.part;
-    if (!part) return false;
+    if (!part) {return false;}
 
     switch (part.type) {
       case 'text': {
-        const textPart = part as AcpTextPart;
+        const textPart = part;
         const msgId = textPart.messageId;
         if (!this.assistantPhaseStarted && !this.userMessageId && textPart.text && textPart.text.length > 0 && msgId) {
           this.userMessageId = msgId;
@@ -607,13 +889,13 @@ export class StreamBridge {
       }
       case 'reasoning': {
         this.assistantPhaseStarted = true;
-        const reasoningPart = part as AcpReasoningPart;
+        const reasoningPart = part;
         this.partKinds.set(reasoningPart.id, 'reasoning');
         return false;
       }
       case 'tool': {
         this.assistantPhaseStarted = true;
-        const toolPart = part as AcpToolPart;
+        const toolPart = part;
         this.partKinds.set(toolPart.id, 'tool');
         return this.handleToolState(toolPart, stream);
       }
@@ -635,7 +917,7 @@ export class StreamBridge {
     event: AcpPartDeltaEvent,
     stream: Stream,
   ): boolean {
-    if (!event.delta) return false;
+    if (!event.delta) {return false;}
 
     const partID = event.partId;
     const delta = event.delta;
@@ -664,7 +946,7 @@ export class StreamBridge {
 
   private handleSessionDiff(event: AcpSessionDiffEvent, stream: Stream): boolean {
     const diffs = event.diffs;
-    if (!diffs?.length) return false;
+    if (!diffs?.length) {return false;}
 
     if (!VS.ChatResponseMultiDiffPart || !stream.push) {
       return false;
@@ -685,7 +967,7 @@ export class StreamBridge {
         return entry;
       });
 
-    if (!entries.length) return false;
+    if (!entries.length) {return false;}
 
     try {
       const diffPart = new VS.ChatResponseMultiDiffPart(entries, 'File Changes', true);
@@ -703,7 +985,7 @@ export class StreamBridge {
 
   private handleToolState(part: AcpToolPart, stream: Stream): boolean {
     const state = part.state;
-    if (!state) return false;
+    if (!state) {return false;}
 
     const toolName = part.toolName ?? 'unknown';
     const callID = part.callId ?? part.id;
@@ -786,7 +1068,7 @@ export class StreamBridge {
                 description,
                 agentName,
                 prompt,
-              ) as ChatSubagentToolInvocationData;
+              );
             }
             stream.push(part as unknown as vscode.ChatResponsePart);
             this.progressivePushed.add(callID);
@@ -1193,7 +1475,7 @@ export class StreamBridge {
             agentName,
             prompt,
             result,
-          ) as ChatSubagentToolInvocationData satisfies ChatSubagentToolInvocationData;
+          ) satisfies ChatSubagentToolInvocationData;
         }
         return {
           description,
@@ -1447,7 +1729,7 @@ export class StreamBridge {
       : '';
 
     stream.markdown(`\n🔧 **${display}** \`${toolName}\``);
-    if (inputLine) stream.markdown(` — ${inputLine}`);
+    if (inputLine) {stream.markdown(` — ${inputLine}`);}
     if (output) {
       stream.markdown(`\n\`\`\`\n${truncate(output, 300)}\n\`\`\`\n`);
     }
@@ -1467,20 +1749,20 @@ export class StreamBridge {
   private findScopeForSession(sessionId: string): SubagentScope | undefined {
     // 1. Direct match: this session is a known childSessionId
     for (const scope of this.activeSubagentScopes.values()) {
-      if (scope.childSessionId === sessionId) return scope;
+      if (scope.childSessionId === sessionId) {return scope;}
     }
 
     // 2. Descendant match: walk up parent chain to find which scope owns this session
     if (this.findAncestorScope) {
       const childSessionIds = new Set<string>();
       for (const scope of this.activeSubagentScopes.values()) {
-        if (scope.childSessionId) childSessionIds.add(scope.childSessionId);
+        if (scope.childSessionId) {childSessionIds.add(scope.childSessionId);}
       }
       if (childSessionIds.size > 0) {
         const ancestorId = this.findAncestorScope(sessionId, childSessionIds);
         if (ancestorId) {
           for (const scope of this.activeSubagentScopes.values()) {
-            if (scope.childSessionId === ancestorId) return scope;
+            if (scope.childSessionId === ancestorId) {return scope;}
           }
         }
       }
@@ -1502,11 +1784,11 @@ export class StreamBridge {
    * starts while the subagent is still running).
    */
   private isSubagentInternalEvent(event: AcpEvent): boolean {
-    if (this.activeSubagentScopes.size === 0) return false;
+    if (this.activeSubagentScopes.size === 0) {return false;}
 
     if (event.type === 'part.updated') {
       const part = event.part;
-      if (!part) return false;
+      if (!part) {return false;}
       // Structural parent parts are never subagent-internal
       if (part.type === 'reasoning' ||
           part.type === 'step-start' || part.type === 'step-finish') {
@@ -1521,11 +1803,11 @@ export class StreamBridge {
       // Parent-level task/subagent tool invocations are NOT subagent-internal.
       // Without this, a second parallel task tool would be captured instead of rendered.
       if (part.type === 'tool') {
-        const toolName = (part as AcpToolPart).toolName;
-        if (toolName === 'task' || toolName === 'subagent') return false;
+        const toolName = (part).toolName;
+        if (toolName === 'task' || toolName === 'subagent') {return false;}
       }
       // Already-known parent part → not subagent
-      if (this.partKinds.has(part.id)) return false;
+      if (this.partKinds.has(part.id)) {return false;}
       // New part during active subagent → subagent internal
       return true;
     }
@@ -1541,7 +1823,7 @@ export class StreamBridge {
   /** Returns true if the given sessionId matches any active subagent scope's childSessionId. */
   private isChildSessionEvent(sessionId: string): boolean {
     for (const scope of this.activeSubagentScopes.values()) {
-      if (scope.childSessionId === sessionId) return true;
+      if (scope.childSessionId === sessionId) {return true;}
     }
     return false;
   }
@@ -1558,7 +1840,7 @@ export class StreamBridge {
     title: string | undefined,
     status: string,
   ): void {
-    if (!this.hasToolUI || !stream.updateToolInvocation) return;
+    if (!this.hasToolUI || !stream.updateToolInvocation) {return;}
 
     const label = title ?? toolName;
     const verb = status === 'completed' ? '✓' : status === 'error' ? '✗' : '⋯';
@@ -1579,7 +1861,7 @@ export class StreamBridge {
    * the child session to build a complete ChatSubagentToolInvocationData.
    */
    private pushFinalSubagentUpdate(stream: Stream, scope: SubagentScope): void {
-    if (!this.hasToolUI || !VS.ChatToolInvocationPart || !stream.push) return;
+    if (!this.hasToolUI || !VS.ChatToolInvocationPart || !stream.push) {return;}
 
     const meta = scope.toolMeta;
     const toolName = meta?.toolName ?? 'task';
@@ -1621,7 +1903,7 @@ export class StreamBridge {
           agentName,
           prompt,
           truncate(result, 4000),
-        ) as ChatSubagentToolInvocationData;
+        );
       } else {
         part.toolSpecificData = {
           description,
@@ -1656,7 +1938,7 @@ export class StreamBridge {
   private captureSubagentEvent(event: AcpEvent, stream?: Stream): void {
     // Handle text delta events from subagent — stream text into the subagent card
     if (event.type === 'part.delta') {
-      const deltaEvent = event as AcpPartDeltaEvent;
+      const deltaEvent = event;
       const delta = deltaEvent.delta;
       if (delta) {
         for (const scope of this.activeSubagentScopes.values()) {
@@ -1674,7 +1956,7 @@ export class StreamBridge {
       return;
     }
 
-    if (event.type !== 'part.updated' || !event.part) return;
+    if (event.type !== 'part.updated' || !event.part) {return;}
 
     // Collect text output from subagent and push to subagent card
     if (event.part.type === 'text') {
@@ -1694,11 +1976,11 @@ export class StreamBridge {
       return;
     }
 
-    if (event.part.type !== 'tool') return;
+    if (event.part.type !== 'tool') {return;}
 
-    const toolPart = event.part as AcpToolPart;
+    const toolPart = event.part;
     const state = toolPart.state;
-    if (!state) return;
+    if (!state) {return;}
 
     const toolName = toolPart.toolName ?? 'unknown';
     const title = state.title;
@@ -1735,7 +2017,7 @@ export class StreamBridge {
           if (this.hasToolUI && stream.push && VS.ChatToolInvocationPart) {
             try {
               const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callId);
-              part.subAgentInvocationId = scope.subAgentInvocationId as any;
+              part.subAgentInvocationId = scope.subAgentInvocationId;
               part.isComplete = true;
               part.isError = status === 'error';
               part.invocationMessage = status === 'error' ? `✗ ${toolName}` : `✓ ${toolName}: ${title ?? ''}`;
@@ -1818,7 +2100,8 @@ export class StreamBridge {
    * session.children + session.status APIs) to detect busy children.
    */
   private checkChildSessionsAndMaybeStop(): void {
-    if (!this.checkChildSessionsRunning) {
+    const checkChildSessionsRunning = this.checkChildSessionsRunning;
+    if (!checkChildSessionsRunning) {
       // No polling callback available — fall back to immediate stop
       this.clearDeferredIdleTimer();
       this.logTag('subagent', 'bridge stop: all subagents completed (no child polling callback)');
@@ -1833,7 +2116,7 @@ export class StreamBridge {
     // Poll child sessions after a short delay
     const pollTimer = setTimeout(async () => {
       try {
-        const childrenRunning = await this.checkChildSessionsRunning();
+        const childrenRunning = await checkChildSessionsRunning();
         if (!childrenRunning) {
           this.deferredIdle = false;
           this.clearDeferredIdleTimer();
@@ -1890,13 +2173,13 @@ interface ToolMeta {
 
 /** Truncate text to maxLen characters, appending '…' if truncated */
 function truncate(text: string, maxLen: number): string {
-  if (!text || text.length <= maxLen) return text;
+  if (!text || text.length <= maxLen) {return text;}
   return text.substring(0, maxLen) + '…';
 }
 
 /** Format tool input as a human-readable string */
 function formatInput(input: Record<string, unknown>, fallback: string): string {
-  if (!input || Object.keys(input).length === 0) return fallback;
+  if (!input || Object.keys(input).length === 0) {return fallback;}
   return Object.entries(input)
     .map(([k, v]) => `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
     .join('\n');

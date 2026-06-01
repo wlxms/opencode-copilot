@@ -4,11 +4,12 @@
   "version": "0.1.0",
   "description": "AI coding assistant powered by OpenCode",
   "engines": {
-    "vscode": "^1.95.0"
+    "vscode": "^1.110.0"
   },
   "enabledApiProposals": [
     "chatParticipantAdditions",
-    "chatParticipantPrivate"
+    "chatParticipantPrivate",
+    "chatSessionsProvider"
   ],
   "categories": [
     "Other"
@@ -18,6 +19,22 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "icons": {
+      "opencode-logo": {
+        "description": "OpenCode brand logomark",
+        "default": {
+          "fontPath": "./resources/font-icons/opencode-icon.woff",
+          "fontCharacter": "\\E001"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "opencode.openSettings",
+        "title": "ACP: Open Settings",
+        "category": "ACP"
+      }
+    ],
     "configuration": {
       "title": "OpenCode",
       "properties": {
@@ -28,13 +45,21 @@
         }
       }
     },
-    "chatParticipants": [
+    "chatSessions": [
       {
-        "id": "opencode-copilot.opencode",
-        "fullName": "OpenCode",
+        "type": "opencode-copilot.opencode",
         "name": "opencode",
-        "description": "AI coding assistant powered by OpenCode",
-        "isSticky": true,
+        "displayName": "OpenCode",
+        "description": "AI coding agent powered by OpenCode",
+        "icon": "$(opencode-logo)",
+        "inputPlaceholder": "Ask OpenCode anything...",
+        "canDelegate": true,
+        "requiresCustomModels": true,
+        "capabilities": {
+          "supportsFileAttachments": true,
+          "supportsToolAttachments": true,
+          "supportsImageAttachments": true
+        },
         "commands": [
           {
             "name": "new",
@@ -74,7 +99,7 @@
           },
           {
             "name": "test-subagent-multi-parallel",
-            "description": "Diagnostic: multiple subagents, all parallel"
+            "description": "Diagnostic: multi subagents, all parallel"
           },
           {
             "name": "test-file-read-stream",
@@ -87,8 +112,22 @@
           {
             "name": "test-thinking",
             "description": "Diagnostic: verify thinkingProgress API and reasoning/text boundary rendering"
+          },
+          {
+            "name": "test-question",
+            "description": "Diagnostic: test questionCarousel UI flow (single-select, multi-select, text input)"
+          },
+          {
+            "name": "test-question-full",
+            "description": "Test questionCarousel UI flow (single-select, multi-select, text input)"
           }
         ]
+      }
+    ],
+    "languageModelChatProviders": [
+      {
+        "vendor": "opencode",
+        "displayName": "OpenCode"
       }
     ]
   },
@@ -96,15 +135,26 @@
     "compile": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
     "watch": "npm run compile -- --sourcemap --watch",
     "lint": "tsc --noEmit",
+    "lint:eslint": "eslint src/",
+    "lint:all": "tsc --noEmit && eslint src/",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:integration": "vitest run -c vitest.integration.config.ts"
+    "test:integration": "vitest run -c vitest.integration.config.ts",
+    "generate-font": "node scripts/generate-font.cjs",
+    "vscode:prepublish": "npm run generate-font && npm run compile"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^20.19.40",
     "@types/vscode": "^1.118.0",
+    "@typescript-eslint/eslint-plugin": "^8.60.0",
+    "@typescript-eslint/parser": "^8.60.0",
     "esbuild": "^0.24.2",
+    "eslint": "^10.4.0",
+    "fantasticon": "^4.1.0",
+    "glob": "^13.0.6",
     "typescript": "^5.9.3",
+    "typescript-eslint": "^8.60.0",
     "vitest": "^4.1.5"
   },
   "dependencies": {

@@ -2,11 +2,132 @@ import * as vscode from 'vscode';
 import { StreamBridge } from './streaming';
 import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
+import { isPlaceholderSessionTitle } from '../surfaces/vscode/experimental-session';
 
 import type { ExtensionState, TurnMapping } from '../types';
-import type { AcpChildSessionInfo, AcpSessionStatus } from '../acp/types';
+import type { AcpChildSessionInfo, AcpSessionStatus, AcpResult, AcpModel } from '../acp/types';
 import { ExternalEditTracker } from './external-edit-tracker';
 import { collectOpenFileUris } from './checkpoint';
+import { extractAttachmentsFromReferences } from './references';
+
+// ---------------------------------------------------------------------------
+// Native model sync
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the model to use for a prompt, preferring the VS Code native
+ * language-model selection (`request.model`) over the extension's own
+ * SelectionStore state.
+ *
+ * The VS Code Chat Participant API (stable) exposes `request.model:
+ * LanguageModelChat` — an object carrying `.id`, `.vendor`, `.family`,
+ * `.version` — which reflects whichever model the user picked in VS Code's
+ * built-in model dropdown.  Prior to this function the extension only used
+ * its own `SelectionStore` (populated by the experimental session-provider
+ * option groups) which can go stale when the user changes the *native*
+ * picker without touching the extension's own model dropdown.
+ *
+ * Resolution order:
+ *  1. If `request.model` is present, attempt a fuzzy match against the
+ *     backend model catalogue (by `model.id`, then `model.family`, then
+ *     `model.name`).
+ *  2. On match, sync the match into `SelectionStore` so the custom UI
+ *     (status bar, option groups) stays consistent with the native picker.
+ *  3. On no match, fall back to the existing `SelectionStore` model.
+ *
+ * LIMITATION: `LanguageModelChat.id` is an opaque identifier assigned by
+ * the model contributor (e.g. `"gpt-4o"`).  It does NOT carry a provider
+ * prefix, so we cannot distinguish between identically-named models from
+ * different providers.  The heuristic matches the first backend model whose
+ * `id` or `name` overlaps.  If the heuristic cannot resolve a unique match
+ * we keep the SelectionStore value unchanged rather than guessing.
+ */
+export async function resolvePromptModel(
+  request: vscode.ChatRequest,
+  state: ExtensionState,
+): Promise<{ providerID: string; modelID: string } | undefined> {
+  const nativeModel = request.model;
+
+  // Fast path: no native model → use custom store
+  if (!nativeModel) {
+    return state.selection.get().model;
+  }
+
+  // Fetch the backend model catalogue for matching.
+  // Errors are non-fatal — fall back to SelectionStore on failure.
+  const modelsResult = await state.backend.config.models();
+  const backendModels: AcpModel[] = modelsResult.data ?? [];
+
+  if (backendModels.length === 0) {
+    // No catalogue to match against — use SelectionStore
+    return state.selection.get().model;
+  }
+
+  // Attempt matching: native model.id → backend model.id
+  // LanguageModelChat.id is opaque but often matches the model's common ID.
+  // We also try .family and .name as fallbacks.
+  type ModelRef = { providerID: string; modelID: string };
+  const candidates: ModelRef[] = [];
+
+  for (const bm of backendModels) {
+    const providerID = bm.provider ?? 'default';
+    // Match by id (exact)
+    if (bm.id === nativeModel.id) {
+      candidates.push({ providerID, modelID: bm.id });
+    }
+    // Match by name (exact, case-insensitive)
+    else if (bm.name && bm.name.toLowerCase() === nativeModel.id.toLowerCase()) {
+      candidates.push({ providerID, modelID: bm.id });
+    }
+    // Match by family (exact, case-insensitive)
+    else if (bm.id.toLowerCase() === (nativeModel as vscode.LanguageModelChat).family?.toLowerCase()) {
+      candidates.push({ providerID, modelID: bm.id });
+    }
+    // Partial match: native id is a substring of backend model id (or vice versa)
+    else if (
+      nativeModel.id.length >= 3 &&
+      (bm.id.toLowerCase().includes(nativeModel.id.toLowerCase()) ||
+       nativeModel.id.toLowerCase().includes(bm.id.toLowerCase()))
+    ) {
+      candidates.push({ providerID, modelID: bm.id });
+    }
+  }
+
+  // Deduplicate candidates (same providerID + modelID)
+  const unique = new Map<string, ModelRef>();
+  for (const c of candidates) {
+    unique.set(`${c.providerID}/${c.modelID}`, c);
+  }
+
+  const uniqueCandidates = [...unique.values()];
+
+  if (uniqueCandidates.length === 1) {
+    // Unique match — sync to SelectionStore and return
+    const match = uniqueCandidates[0];
+    const sel = state.selection.get();
+    // Only sync if different from current selection
+    if (!sel.model || sel.model.providerID !== match.providerID || sel.model.modelID !== match.modelID) {
+      await state.selection.setModel(match.providerID, match.modelID);
+    }
+    return match;
+  }
+
+  if (uniqueCandidates.length > 1) {
+    // Ambiguous match — cannot safely pick one.
+    // Fall back to SelectionStore to avoid silently switching providers.
+    // Log for diagnostics.
+    state.outputChannel.appendLine(
+      `[handler] Native model "${nativeModel.id}" matched ${uniqueCandidates.length} backend models — ` +
+      `falling back to SelectionStore to avoid ambiguity`,
+    );
+    return state.selection.get().model;
+  }
+
+  // No match at all — native model not in backend catalogue.
+  // Fall back to SelectionStore. This can happen when the native picker shows
+  // models that the backend doesn't serve (e.g. Copilot-only models).
+  return state.selection.get().model;
+}
 
 /**
  * Get the VSCode workspace root path for the first workspace folder.
@@ -32,17 +153,17 @@ export async function ensureServer(
   }
 
   if (status === 'starting') {
-    stream.progress('OpenCode is starting...');
+    stream.progress(`${state.backend.name} is starting...`);
     return false;
   }
 
   try {
-    stream.progress('Starting OpenCode server...');
+    stream.progress(`Starting ${state.backend.name} server...`);
     const workspacePath = getWorkspaceDirectory();
     const result = await state.backend.start(workspacePath);
     if (result.error || !result.data) {
       const msg = typeof result.error === 'string' ? result.error : 'Unknown error';
-      stream.markdown(`⚠️ Failed to start OpenCode: ${msg}`);
+      stream.markdown(`⚠️ Failed to start backend: ${msg}`);
       return false;
     }
     state.outputChannel.appendLine(`[handler] Server started at ${result.data.url}`);
@@ -50,7 +171,7 @@ export async function ensureServer(
     return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
-    stream.markdown(`⚠️ Failed to start OpenCode: ${msg}`);
+    stream.markdown(`⚠️ Failed to start backend: ${msg}`);
     return false;
   }
 }
@@ -76,15 +197,51 @@ function recoverFromHistory(context: vscode.ChatContext): RecoveredHistory {
     const turn = history[i];
     // ChatResponseTurn is a proposed API — access metadata via type assertion
     const metadata = (turn as unknown as { metadata?: Record<string, unknown> })?.metadata;
-    if (!metadata) continue;
+    if (!metadata) {continue;}
 
     const sessionId = metadata.sessionId as string | undefined;
-    const turnMapRaw = metadata.turnMap as Array<{ vscodeTurn: number; opencodeMessageId: string }> | undefined;
+    const turnMapRaw = metadata.turnMap as Array<{ vscodeTurn: number; messageId: string }> | undefined;
     if (sessionId && turnMapRaw && Array.isArray(turnMapRaw)) {
       return { sessionId, turnMap: turnMapRaw };
     }
   }
   return { sessionId: null, turnMap: [] };
+}
+
+function getSessionResourceKey(request: vscode.ChatRequest): string | undefined {
+  const sessionResource = request.sessionResource;
+  if (!sessionResource) {
+    return undefined;
+  }
+
+  try {
+    return sessionResource.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function aliasSessionState(
+  state: ExtensionState,
+  sourceKey: string | undefined,
+  targetKey: string | undefined,
+): void {
+  if (!sourceKey || !targetKey || sourceKey === targetKey) {
+    return;
+  }
+
+  const existing = state.sessions.get(sourceKey);
+  if (existing && !state.sessions.has(targetKey)) {
+    state.sessions.set(targetKey, existing);
+  }
+}
+
+function getInitialSessionTitle(vscodeSessionId: string): string {
+  if (vscodeSessionId.includes('/untitled-')) {
+    return 'New OpenCode Session';
+  }
+
+  return `OpenCode Session ${vscodeSessionId.slice(0, 8)}`;
 }
 
 /**
@@ -105,17 +262,17 @@ async function resolveSession(
   directory?: string,
 ): Promise<string | null> {
   // Get or create per-VSCode-chat state
-  let chatState = state.sessionMap.get(vscodeSessionId);
+  let chatState = state.sessions.get(vscodeSessionId);
   if (!chatState) {
-    chatState = { opencodeSessionId: '', turnMap: [] };
-    state.sessionMap.set(vscodeSessionId, chatState);
+    chatState = { sessionId: '', turnMap: [] };
+    state.sessions.set(vscodeSessionId, chatState);
   }
 
   // Check for metadata recovery (VSCode restart / tab restore)
-  if (!chatState.opencodeSessionId) {
+  if (!chatState.sessionId) {
     const recovered = recoverFromHistory(context);
     if (recovered.sessionId) {
-      chatState.opencodeSessionId = recovered.sessionId;
+      chatState.sessionId = recovered.sessionId;
       chatState.turnMap = recovered.turnMap;
       state.outputChannel.appendLine(
         `[handler] Recovered session from history: ${recovered.sessionId} (${recovered.turnMap.length} turns)`,
@@ -130,32 +287,34 @@ async function resolveSession(
   const currentTurnIndex = requestTurns.length;
 
   // --- Case 1: New chat (no prior session) ---
-  if (!chatState.opencodeSessionId) {
+  if (!chatState.sessionId) {
     stream.progress('Creating new session...');
     const result = await state.backend.sessions.create({
-      title: `Chat ${vscodeSessionId.slice(0, 8)}`,
+      title: getInitialSessionTitle(vscodeSessionId),
       directory,
     });
     if (result.error || !result.data) {
-      stream.markdown('⚠️ Failed to create OpenCode session.');
+      stream.markdown('⚠️ Failed to create session.');
       return null;
     }
-    chatState.opencodeSessionId = result.data.id;
+    chatState.sessionId = result.data.id;
+    chatState.title = result.data.title;
+    chatState.createdAt = result.data.createdAt;
     stream.progress('Session ready');
     state.outputChannel.appendLine(
-      `[handler] Created new OpenCode session ${chatState.opencodeSessionId} for VSCode chat ${vscodeSessionId}`,
+      `[handler] Created new session ${chatState.sessionId} for VSCode chat ${vscodeSessionId}`,
     );
-    return chatState.opencodeSessionId;
+    return chatState.sessionId;
   }
 
   // --- Case 2: Continue (same turn count) ---
   if (currentTurnIndex === chatState.turnMap.length) {
     stream.progress('Reusing existing session...');
     state.outputChannel.appendLine(
-      `[handler] Reusing OpenCode session ${chatState.opencodeSessionId} for VSCode chat ${vscodeSessionId} (turn ${currentTurnIndex}) ` +
+      `[handler] Reusing session ${chatState.sessionId} for VSCode chat ${vscodeSessionId} (turn ${currentTurnIndex}) ` +
       `turnMap=${chatState.turnMap.length}`,
     );
-    return chatState.opencodeSessionId;
+    return chatState.sessionId;
   }
 
   // --- Case 3: Rewind (fewer turns than recorded) → revert ---
@@ -164,7 +323,7 @@ async function resolveSession(
     if (currentTurnIndex > 0) {
       stream.progress('Rewinding conversation...');
       state.outputChannel.appendLine(
-        `[handler] Rewind detected: reverting session ${chatState.opencodeSessionId} from turn ${currentTurnIndex} ` +
+        `[handler] Rewind detected: reverting session ${chatState.sessionId} from turn ${currentTurnIndex} ` +
         `(turnMap had ${chatState.turnMap.length} entries, keeping ${priorTurnMap.length})`,
       );
       // Revert each extraneous message from back to front (oldest first)
@@ -172,17 +331,17 @@ async function resolveSession(
       let revertCount = 0;
       for (let i = chatState.turnMap.length - 1; i >= currentTurnIndex; i--) {
         const entry = chatState.turnMap[i];
-        if (entry?.opencodeMessageId) {
+        if (entry?.messageId) {
           const revertResult = await state.backend.sessions.revert(
-            chatState.opencodeSessionId,
-            entry.opencodeMessageId,
+            chatState.sessionId,
+            entry.messageId,
             undefined,
             directory,
           );
           revertCount++;
           if (revertResult.error) {
             state.outputChannel.appendLine(
-              `[handler] Revert failed for message ${entry.opencodeMessageId}: ${JSON.stringify(revertResult.error)}`,
+              `[handler] Revert failed for message ${entry.messageId}: ${JSON.stringify(revertResult.error)}`,
             );
             allSucceeded = false;
             break;
@@ -200,26 +359,28 @@ async function resolveSession(
           directory,
         });
         if (createResult.error || !createResult.data) {
-          stream.markdown('⚠️ Failed to create OpenCode session after revert failure.');
+          stream.markdown('⚠️ Failed to create session after revert failure.');
           return null;
         }
-        chatState.opencodeSessionId = createResult.data.id;
+        chatState.sessionId = createResult.data.id;
         chatState.turnMap = [];
-        return chatState.opencodeSessionId;
+        chatState.title = createResult.data.title;
+        chatState.createdAt = createResult.data.createdAt;
+        return chatState.sessionId;
       }
     } else {
       // Rewound to the beginning — no prior message to revert to
       state.outputChannel.appendLine(
-        `[handler] Full rewind for session ${chatState.opencodeSessionId} — no revert needed`,
+        `[handler] Full rewind for session ${chatState.sessionId} — no revert needed`,
       );
     }
     chatState.turnMap = priorTurnMap;
   }
   state.outputChannel.appendLine(
-    `[handler] Reusing OpenCode session ${chatState.opencodeSessionId} for VSCode chat ${vscodeSessionId} (turn ${currentTurnIndex}) ` +
+    `[handler] Reusing session ${chatState.sessionId} for VSCode chat ${vscodeSessionId} (turn ${currentTurnIndex}) ` +
     `turnMap=${chatState.turnMap.length}`,
   );
-  return chatState.opencodeSessionId;
+  return chatState.sessionId;
 }
 
 /**
@@ -266,7 +427,7 @@ export function createParticipantHandler(
 
       // 4. Start server if needed
       const ready = await ensureServer(state, stream);
-      if (!ready) return { metadata: {} };
+      if (!ready) {return { metadata: {} };}
 
       // 4b. Compute workspace directory for session/prompt API calls
       const directory = getWorkspaceDirectory();
@@ -274,8 +435,23 @@ export function createParticipantHandler(
       // 5. Resolve session (handles rewind via revert)
       // request.sessionId from chatParticipantPrivate identifies the VSCode chat
       const vscodeSessionId = request.sessionId ?? 'unknown';
+      const sessionResourceKey = getSessionResourceKey(request);
+
+      // Session-target switches can restore state under the provider resource URI
+      // before the first follow-up prompt arrives with a VSCode chat sessionId.
+      // Alias that restored state so the request handler reuses the selected
+      // session instead of creating a detached one.
+      aliasSessionState(state, sessionResourceKey, vscodeSessionId);
+
       const sessionId = await resolveSession(state, context, stream, vscodeSessionId, directory);
-      if (!sessionId) return { metadata: {} };
+      if (!sessionId) {return { metadata: {} };}
+
+      aliasSessionState(state, vscodeSessionId, sessionResourceKey);
+
+      const activeChatState = state.sessions.get(vscodeSessionId);
+      if (activeChatState) {
+        activeChatState.createdAt = activeChatState.createdAt ?? new Date();
+      }
 
       const executeTurnWithBridge = async (): Promise<void> => {
         stream.progress('Connecting to event stream...');
@@ -286,35 +462,111 @@ export function createParticipantHandler(
         state.outputChannel.appendLine(
           `[handler] Prompting session ${sessionId} with: ${request.prompt.substring(0, 50)}`,
         );
+
+        // Debug: log available request properties and toolReferences for attachment debugging
+        const reqKeys = Object.keys(request).filter(k => !k.startsWith('_')).join(',');
+        state.outputChannel.appendLine(`[handler] request keys: ${reqKeys}`);
+        const toolRefs = (request as { toolReferences?: readonly unknown[] }).toolReferences;
+        state.outputChannel.appendLine(
+          `[handler] toolReferences: ${toolRefs?.length ?? 0} items`,
+        );
+        if (toolRefs?.length) {
+          for (let ti = 0; ti < toolRefs.length; ti++) {
+            const tr = toolRefs[ti] as Record<string, unknown>;
+            state.outputChannel.appendLine(
+              `[handler]  toolRef[${ti}] name="${tr.name}" keys=${Object.keys(tr).join(',')}`,
+            );
+          }
+        }
+
+        // Also check for any attachments-like property on the request
+        const maybeAttachments = (request as { attachments?: unknown }).attachments;
+        state.outputChannel.appendLine(
+          `[handler] request.attachments: ${maybeAttachments === undefined ? 'undefined' : Array.isArray(maybeAttachments) ? `array[${maybeAttachments.length}]` : typeof maybeAttachments}`,
+        );
+
+        // Extract file/image attachments from VSCode chat references
+        const attachments = extractAttachmentsFromReferences(request.references, state.outputChannel);
+        if (attachments.length > 0) {
+          state.outputChannel.appendLine(
+            `[handler] Extracted ${attachments.length} attachment(s) from request references`,
+          );
+        }
+
+        // Build prompt options from agent selection, native model sync, and attachments.
+        // Model resolution prefers request.model (native VS Code picker) over the
+        // extension's own SelectionStore to avoid stale custom state.
+        const promptOptions: {
+          model?: { providerID: string; modelID: string };
+          agent?: string;
+          attachments?: typeof attachments;
+        } = {};
+        const sel = state.selection.get();
+        if (sel.agent) {
+          promptOptions.agent = sel.agent;
+        }
+        // Resolve model: native VS Code picker → backend match → SelectionStore fallback
+        const resolvedModel = await resolvePromptModel(request, state);
+        if (resolvedModel) {
+          promptOptions.model = resolvedModel;
+        }
+        if (attachments.length > 0) {
+          promptOptions.attachments = attachments;
+        }
+        state.outputChannel.appendLine(
+          `[handler] Prompt options: ${JSON.stringify({ ...promptOptions, attachments: attachments.length > 0 ? `[${attachments.length} items]` : undefined })}`,
+        );
+
         const promptPromise = state.backend.sessions.prompt(
           sessionId,
           request.prompt,
           directory,
-        ).then((result) => {
+          promptOptions,
+        ).then((result: { error?: unknown; data?: unknown }) => {
           if (result.error) {
             state.outputChannel.appendLine(`[handler] Prompt error: ${String(result.error)}`);
+          } else {
+            state.outputChannel.appendLine('[handler] Prompt accepted by backend');
           }
         }).catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : 'Prompt failed';
           state.outputChannel.appendLine(`[handler] Prompt error: ${msg}`);
         });
 
-        // 7b. Cancel → abort OpenCode session (shared across all bridge runs)
+        // 7b. Cancel → abort OpenCode session + all descendant sessions
         let aborted = false;
         const cancelDisposable = token.onCancellationRequested(() => {
-          if (aborted) return;
+          if (aborted) {return;}
           aborted = true;
           state.outputChannel.appendLine(
-            `[handler] Cancellation requested, aborting OpenCode session ${sessionId}`,
+            `[handler] Cancellation requested, aborting session ${sessionId} and descendants`,
           );
-          state.backend.sessions.abort(sessionId, directory).then((result) => {
+          // Abort the parent session
+          state.backend.sessions.abort(sessionId, directory).then((result: { data?: unknown }) => {
             state.outputChannel.appendLine(
-              `[handler] Abort result: ${JSON.stringify(result?.data)}`,
+              `[handler] Abort parent result: ${JSON.stringify(result?.data)}`,
             );
           }).catch((err: unknown) => {
             const msg = err instanceof Error ? err.message : String(err);
-            state.outputChannel.appendLine(`[handler] Abort error: ${msg}`);
+            state.outputChannel.appendLine(`[handler] Abort parent error: ${msg}`);
           });
+          // Abort all descendant sessions (children, grandchildren, etc.)
+          const descendants = state.backend.sessions.descendants(sessionId);
+          for (const childId of descendants) {
+            state.backend.sessions.abort(childId, directory).then((result: { data?: unknown }) => {
+              state.outputChannel.appendLine(
+                `[handler] Abort descendant ${childId} result: ${JSON.stringify(result?.data)}`,
+              );
+            }).catch((err: unknown) => {
+              const msg = err instanceof Error ? err.message : String(err);
+              state.outputChannel.appendLine(`[handler] Abort descendant ${childId} error: ${msg}`);
+            });
+          }
+          if (descendants.length > 0) {
+            state.outputChannel.appendLine(
+              `[handler] Cascade-abort: ${descendants.length} descendant session(s) [${descendants.join(', ')}]`,
+            );
+          }
         });
 
         // Collect known file URIs for new-file detection (once per turn)
@@ -330,6 +582,7 @@ export function createParticipantHandler(
         // bridge again until no more subagent tasks are detected.
         let userMessageId: string | null = null;
         let needsContinue = true;
+        let sessionTitleFromBridge: string | undefined;
 
         try {
           while (needsContinue && !token.isCancellationRequested) {
@@ -350,28 +603,75 @@ export function createParticipantHandler(
                   permissionDirectory,
                 )
               ),
+              replyToQuestion: (questionSessionId, requestId, answers, questionDirectory) => (
+                state.backend.questions.reply(
+                  questionSessionId,
+                  requestId,
+                  answers,
+                  questionDirectory,
+                ).then((result: { data?: boolean; error?: string }) => {
+                  state.outputChannel.appendLine(`[handler] question reply result: ${JSON.stringify(result)}`);
+                  return result;
+                }).catch((err: unknown) => {
+                  state.outputChannel.appendLine(`[handler] question reply error: ${err instanceof Error ? err.message : String(err)}`);
+                  return { error: err instanceof Error ? err.message : String(err) };
+                })
+              ),
+              rejectQuestion: (questionSessionId, requestId, questionDirectory) => (
+                state.backend.questions.reject(
+                  questionSessionId,
+                  requestId,
+                  questionDirectory,
+                ).then((result: { data?: boolean; error?: string }) => {
+                  state.outputChannel.appendLine(`[handler] question reject result: ${JSON.stringify(result)}`);
+                  return result;
+                }).catch((err: unknown) => {
+                  state.outputChannel.appendLine(`[handler] question reject error: ${err instanceof Error ? err.message : String(err)}`);
+                  return { error: err instanceof Error ? err.message : String(err) };
+                })
+              ),
               directory,
               tracker,
               checkChildSessionsRunning: async () => {
                 try {
                   const statusResult = await state.backend.sessions.status(directory);
-                  if (statusResult.error || !statusResult.data) return false;
+                  if (statusResult.error || !statusResult.data) {return false;}
                   return await hasBusyDescendant(
                     sessionId, directory, new Set(), statusResult.data,
+                    state.backend.sessions.children,
                   );
                 } catch {
                   return false;
                 }
               },
+              findAncestorScope: (sid: string, candidates: Set<string>) =>
+                state.backend.sessions.findAncestor(sid, candidates),
+              getParentSession: (sid: string) =>
+                state.backend.sessions.parent(sid),
             });
 
+            state.outputChannel.appendLine('[handler] bridge.run() starting...');
             await bridge.run(events.stream, stream, token);
+            state.outputChannel.appendLine(`[handler] bridge.run() completed. hadSubagentTasks=${bridge.getHadSubagentTasks()}, cancellationRequested=${token.isCancellationRequested}`);
 
             state.backend.events.closeSessionStream(sessionId);
 
             // Capture userMessageId from the first bridge run
             if (!userMessageId) {
               userMessageId = bridge.getUserMessageId();
+            }
+
+            // Capture backend-generated session title from the first bridge run.
+            // session.updated events fire during streaming; the bridge stores the
+            // most recent non-placeholder title.
+            if (!sessionTitleFromBridge) {
+              const title = bridge.getSessionTitle();
+              state.outputChannel.appendLine(
+                `[handler] bridge.getSessionTitle() = ${JSON.stringify(title)}`,
+              );
+              if (title) {
+                sessionTitleFromBridge = title;
+              }
             }
 
             // After subagent tasks completed, send continuation prompt and loop
@@ -391,19 +691,97 @@ export function createParticipantHandler(
         await promptPromise;
 
         // 10. Record user message ID
-        const chatState = state.sessionMap.get(vscodeSessionId);
+        const chatState = state.sessions.get(vscodeSessionId);
         state.outputChannel.appendLine(
           `[handler] User message ID for turn: ${!!chatState && !!userMessageId} (${userMessageId})`,
         );
+        let wasFirstTurn = false;
         if (chatState && userMessageId) {
+          wasFirstTurn = chatState.turnMap.length === 0;
           chatState.turnMap.push({
             vscodeTurn: chatState.turnMap.length,
-            opencodeMessageId: userMessageId,
+            messageId: userMessageId,
           });
           state.outputChannel.appendLine(
             `[handler] Recorded turn ${chatState.turnMap.length - 1}: messageID=${userMessageId} (total turns=${chatState.turnMap.length})`,
           );
+
+          // Derive session title from first prompt (matches experimental-session logic)
+          if (wasFirstTurn) {
+            state.outputChannel.appendLine(
+              `[handler] First turn completed for session ${sessionId}`,
+            );
+          }
         }
+
+        // Resolve session title. Priority:
+        // 1. Backend auto-generates title (via session.updated event)
+        // 2. sessions.get() returns a meaningful title
+        // 3. Derive from first prompt + push to backend via sessions.update()
+        let resolvedTitle = sessionTitleFromBridge;
+
+        if (!resolvedTitle || isPlaceholderSessionTitle(resolvedTitle)) {
+          try {
+            const sessionInfo = await state.backend.sessions.get(sessionId, directory);
+            const backendTitle = sessionInfo.data?.title?.trim() ?? '';
+            if (backendTitle && !isPlaceholderSessionTitle(backendTitle)) {
+              resolvedTitle = backendTitle;
+              state.outputChannel.appendLine(
+                `[handler] Title from sessions.get(): "${backendTitle}"`,
+              );
+            }
+          } catch (err: unknown) {
+            state.outputChannel.appendLine(
+              `[handler] sessions.get() for title failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+
+        // If still no meaningful title, derive from first prompt and push to backend.
+        // The backend's auto-title generation is model-dependent (e.g. doesn't work
+        // with GLM 5, requires GPT-5-nano via Zen), so we use sessions.update()
+        // as a reliable fallback for all providers.
+        // Skip if chatState already has a non-placeholder title (e.g. from a
+        // previous turn or manual rename).
+        const existingChatTitle = chatState?.title;
+        const hasExistingGoodTitle = existingChatTitle && !isPlaceholderSessionTitle(existingChatTitle);
+        const shouldDeriveTitle = (!resolvedTitle || isPlaceholderSessionTitle(resolvedTitle))
+          && wasFirstTurn
+          && !isPlaceholderSessionTitle(request.prompt)
+          && !hasExistingGoodTitle;
+        if (shouldDeriveTitle) {
+          const derived = request.prompt.length > 60
+            ? `${request.prompt.slice(0, 57).trimEnd()}…`
+            : request.prompt;
+          if (derived && !isPlaceholderSessionTitle(derived)) {
+            try {
+              const updateResult = await state.backend.sessions.update(sessionId, {
+                title: derived,
+                directory,
+              });
+              resolvedTitle = updateResult.data?.title ?? derived;
+              state.outputChannel.appendLine(
+                `[handler] Title pushed via sessions.update(): "${resolvedTitle}"`,
+              );
+            } catch (err: unknown) {
+              state.outputChannel.appendLine(
+                `[handler] sessions.update() for title failed: ${err instanceof Error ? err.message : String(err)}`,
+              );
+              resolvedTitle = derived; // use derived title in sessionMap even if update fails
+            }
+          }
+        }
+
+        // Persist resolved title to sessionMap (only if existing title is placeholder)
+        if (resolvedTitle && !isPlaceholderSessionTitle(resolvedTitle)) {
+          const chatState = state.sessions.get(vscodeSessionId);
+          if (chatState && isPlaceholderSessionTitle(chatState.title)) {
+            chatState.title = resolvedTitle;
+          }
+        }
+
+        state.outputChannel.appendLine(`[handler] Refreshing Session list for session ${sessionId}`);
+        state.bus.emit('session-list-changed', void 0);
       };
 
       // 11. Execute turn with per-edit externalEdit lifecycle managed via tracker
@@ -413,7 +791,7 @@ export function createParticipantHandler(
       return {
         metadata: {
           sessionId,
-          turnMap: state.sessionMap.get(vscodeSessionId)?.turnMap ?? [],
+          turnMap: state.sessions.get(vscodeSessionId)?.turnMap ?? [],
         },
       };
     } catch (err) {
@@ -437,19 +815,19 @@ async function hasBusyDescendant(
   directory: string | undefined,
   visited: Set<string>,
   statuses: Record<string, AcpSessionStatus>,
-  childrenFn: (id: string, dir?: string) => Promise<import('../acp/backend').AcpResult<import('../acp/types').AcpChildSessionInfo[]>>,
+  childrenFn: (id: string, dir?: string) => Promise<AcpResult<AcpChildSessionInfo[]>>,
 ): Promise<boolean> {
-  if (visited.has(parentId)) return false;
+  if (visited.has(parentId)) {return false;}
   visited.add(parentId);
 
   const childrenResult = await childrenFn(parentId, directory);
-  if (childrenResult.error || !childrenResult.data) return false;
+  if (childrenResult.error || !childrenResult.data) {return false;}
 
   for (const child of childrenResult.data) {
-    if (visited.has(child.id)) continue;
+    if (visited.has(child.id)) {continue;}
 
     const status = statuses[child.id];
-    if (status?.type === 'busy') return true;
+    if (status?.type === 'busy') {return true;}
 
     if (await hasBusyDescendant(child.id, directory, visited, statuses, childrenFn)) {
       return true;

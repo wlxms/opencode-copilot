@@ -277,6 +277,132 @@ export class ChatResponseMultiDiffPart {
 }
 
 // ---------------------------------------------------------------------------
+// ChatQuestion — question types for questionCarousel API
+// ---------------------------------------------------------------------------
+
+/**
+ * The type of a question displayed in a question carousel.
+ */
+export enum ChatQuestionType {
+  Text = 1,
+  SingleSelect = 2,
+  MultiSelect = 3,
+}
+
+/**
+ * An option for a question in a carousel.
+ */
+export interface ChatQuestionOption {
+  /**
+   * Unique identifier for the option.
+   */
+  id: string;
+  /**
+   * Display label for the option.
+   */
+  label: string;
+  /**
+   * The value returned when this option is selected.
+   * This is what VSCode puts in selectedValue/selectedValues in the answer.
+   */
+  value: unknown;
+  /**
+   * Optional detail text.
+   */
+  detail?: string;
+  /**
+   * Whether this option is initially checked.
+   */
+  checked?: boolean;
+}
+
+/**
+ * A question to be displayed in a question carousel.
+ */
+export class ChatQuestion {
+  /**
+   * Unique identifier for the question.
+   */
+  id: string;
+  /**
+   * The type of question.
+   */
+  type: ChatQuestionType;
+  /**
+   * The title/header of the question.
+   */
+  title: string;
+  /**
+   * Optional detailed message or description.
+   */
+  message?: string | MarkdownString;
+  /**
+   * Options for singleSelect or multiSelect questions.
+   */
+  options?: ChatQuestionOption[];
+  /**
+   * The id(s) of the default selected option(s).
+   */
+  selectedOptionIds?: string | string[];
+  /**
+   * Placeholder text for text input.
+   */
+  placeholder?: string;
+  /**
+   * Validation message.
+   */
+  validationMessage?: string;
+  /**
+   * Whether the input is invalid.
+   */
+  isInvalid?: boolean;
+  /**
+   * Whether to show the input as a password field.
+   */
+  password?: boolean;
+
+  constructor(
+    id: string,
+    type: ChatQuestionType,
+    title: string,
+    options?: {
+      message?: string | MarkdownString;
+      options?: ChatQuestionOption[];
+      selectedOptionIds?: string | string[];
+      placeholder?: string;
+    },
+  ) {
+    this.id = id;
+    this.type = type;
+    this.title = title;
+    this.message = options?.message;
+    this.options = options?.options;
+    this.selectedOptionIds = options?.selectedOptionIds;
+    this.placeholder = options?.placeholder;
+  }
+}
+
+/**
+ * A carousel view for presenting multiple questions inline in the chat.
+ * Users can navigate between questions and submit their answers.
+ */
+export class ChatResponseQuestionCarouselPart {
+  /**
+   * The questions to display in the carousel.
+   */
+  questions: ChatQuestion[];
+  /**
+   * Whether users can skip answering the questions.
+   */
+  allowSkip: boolean;
+
+  constructor(questions: ChatQuestion[], allowSkip?: boolean) {
+    this.questions = questions;
+    this.allowSkip = allowSkip ?? false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // ExtendedChatResponseParts — lists all proposed chat response parts
 // ---------------------------------------------------------------------------
 
@@ -299,7 +425,7 @@ export interface ExtendedChatResponseParts {
   ChatResponseMultiDiffPart: ChatResponseMultiDiffPart;
   ChatResponseThinkingProgressPart: unknown;
   ChatResponseExternalEditPart: ChatResponseExternalEditPart;
-  ChatResponseQuestionCarouselPart: unknown;
+  ChatResponseQuestionCarouselPart: ChatResponseQuestionCarouselPart;
 }
 
 /**

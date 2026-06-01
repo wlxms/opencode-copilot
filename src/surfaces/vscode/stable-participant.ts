@@ -32,6 +32,8 @@
 import * as vscode from 'vscode';
 import type { ExtensionState } from '../../types';
 import { AcpRenderer, renderToolFallback } from './acp-renderer';
+import { extractAttachmentsFromReferences } from '../../participant/references';
+import { resolvePromptModel } from '../../participant/handler';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -92,14 +94,39 @@ export function createStableHandler(
       return { metadata: { error: 'Session creation failed' } };
     }
 
-    // 3. Send prompt
-    const promptResult = await state.backend.sessions.prompt(sessionId, request.prompt, getWorkspaceDirectory());
+    // 3. Extract file/image attachments from VSCode chat references
+    const attachments = extractAttachmentsFromReferences(request.references, logger);
+    if (attachments.length > 0) {
+      logger.appendLine(`[stable-participant] Extracted ${attachments.length} attachment(s) from references`);
+    }
+
+    // 4. Build prompt options (agent/model + attachments) and send prompt.
+    // Model resolution prefers request.model (native VS Code picker) over the
+    // extension's own SelectionStore to avoid stale custom state.
+    const promptOptions: {
+      model?: { providerID: string; modelID: string };
+      agent?: string;
+      attachments?: typeof attachments;
+    } = {};
+    const sel = state.selection.get();
+    if (sel.agent) {promptOptions.agent = sel.agent;}
+    // Resolve model: native VS Code picker → backend match → SelectionStore fallback
+    const resolvedModel = await resolvePromptModel(request, state);
+    if (resolvedModel) {promptOptions.model = resolvedModel;}
+    if (attachments.length > 0) {promptOptions.attachments = attachments;}
+
+    const promptResult = await state.backend.sessions.prompt(
+      sessionId,
+      request.prompt,
+      getWorkspaceDirectory(),
+      promptOptions,
+    );
     if (promptResult.error) {
       stream.markdown('⚠️ Failed to send prompt.');
       return { metadata: { error: 'Prompt failed' } };
     }
 
-    // 4. Open event stream for this session
+    // 5. Open event stream for this session
     const eventStream = state.backend.events.openSessionStream(sessionId);
 
     // 5. Render events via the stable renderer
@@ -188,10 +215,10 @@ async function resolveSession(
   // Try to reuse existing session from sessionMap
   const vscodeSessionId = _request.sessionId;
   if (vscodeSessionId) {
-    const existing = state.sessionMap.get(vscodeSessionId);
-    if (existing?.opencodeSessionId) {
-      logger.appendLine(`[stable-participant] Reusing session ${existing.opencodeSessionId}`);
-      return existing.opencodeSessionId;
+    const existing = state.sessions.get(vscodeSessionId);
+    if (existing?.sessionId) {
+      logger.appendLine(`[stable-participant] Reusing session ${existing.sessionId}`);
+      return existing.sessionId;
     }
   }
 
@@ -200,21 +227,21 @@ async function resolveSession(
     const result = await state.backend.sessions.create({
       directory: getWorkspaceDirectory(),
     });
-    const opencodeSessionId = result.data?.id ?? null;
-    if (!opencodeSessionId) {
+    const sessionId = result.data?.id ?? null;
+    if (!sessionId) {
       stream.markdown('⚠️ Failed to create session.');
       return null;
     }
 
     if (vscodeSessionId) {
-      state.sessionMap.set(vscodeSessionId, {
-        opencodeSessionId,
+      state.sessions.set(vscodeSessionId, {
+        sessionId,
         turnMap: [],
       });
     }
 
-    logger.appendLine(`[stable-participant] Created session ${opencodeSessionId}`);
-    return opencodeSessionId;
+    logger.appendLine(`[stable-participant] Created session ${sessionId}`);
+    return sessionId;
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown';
     logger.appendLine(`[stable-participant] Session creation error: ${msg}`);

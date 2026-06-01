@@ -1,4 +1,4 @@
-import type { OpenCodeClient } from '../../types';
+import type { OpenCodeClient } from './sdk-types';
 import type { OpenCodeEvent, OpenCodeEventStream, OpenCodeStreamEvent } from './sdk-events';
 
 interface LoggerLike {
@@ -24,7 +24,7 @@ class BufferedSessionChannel implements SessionChannel {
   private idle = false;
 
   push(event: OpenCodeStreamEvent): void {
-    if (this.closed) return;
+    if (this.closed) {return;}
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter({ value: event, done: false });
@@ -34,7 +34,7 @@ class BufferedSessionChannel implements SessionChannel {
   }
 
   close(): void {
-    if (this.closed) return;
+    if (this.closed) {return;}
     this.closed = true;
     while (this.waiters.length > 0) {
       const waiter = this.waiters.shift();
@@ -109,7 +109,7 @@ export class GlobalEventBroker {
 
   closeSessionStream(sessionId: string): void {
     const channel = this.sessionChannels.get(sessionId);
-    if (!channel) return;
+    if (!channel) {return;}
     channel.close();
     this.sessionChannels.delete(sessionId);
     this.clearSessionParts(sessionId);
@@ -123,19 +123,47 @@ export class GlobalEventBroker {
   }
 
   private async connect(client: OpenCodeClient): Promise<void> {
-    const events = await client.global.event();
-    this.log('subscribed to /global/event SSE stream');
-
-    this.pumpPromise = this.pump(events);
+    this.log('connecting to /global/event SSE stream');
+    this.pumpPromise = this.pumpWithReconnect(client).catch(() => {
+      // Rejection is expected when the client/stream throws (e.g. during tests or shutdown).
+      // The error is logged inside pumpWithReconnect; no need to propagate further.
+    });
   }
 
-  private async pump(events: OpenCodeEventStream): Promise<void> {
+  /**
+   * Pump events from the global SSE stream with automatic reconnection.
+   * When the stream ends normally (server closes connection), reconnect
+   * after a short delay to continue receiving events (e.g. after question replies).
+   * On error, close all session streams and reset state.
+   */
+  private async pumpWithReconnect(client: OpenCodeClient): Promise<void> {
+    let reconnectDelay = 1000; // start with 1s, exponential backoff
+    const maxDelay = 30_000;
+
     try {
-      for await (const rawEvent of events.stream) {
-        this.dispatch(rawEvent);
+      while (true) {
+        const events = (await client.global.event()) as { stream: AsyncIterable<OpenCodeStreamEvent> };
+        this.log('subscribed to /global/event SSE stream');
+        reconnectDelay = 1000; // reset on successful connect
+
+        for await (const rawEvent of events.stream) {
+          this.dispatch(rawEvent);
+        }
+
+        // Stream ended normally — server closed the connection.
+        // Don't close session channels; instead reconnect to receive
+        // subsequent events (e.g. after a question.asked reply).
+        this.log(`global event stream completed, reconnecting in ${reconnectDelay}ms...`);
+
+        // Only reconnect if there are still active consumers
+        if (this.sessionChannels.size === 0) {
+          this.log('no active session channels after stream end, stopping');
+          break;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, reconnectDelay));
+        reconnectDelay = Math.min(reconnectDelay * 2, maxDelay);
       }
-      this.log('global event stream completed');
-      this.closeAllSessionStreams();
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       this.log(`global event stream error: ${msg}`);
@@ -151,6 +179,7 @@ export class GlobalEventBroker {
   private dispatch(rawEvent: OpenCodeStreamEvent): void {
     const event = unwrapStreamEvent(rawEvent);
     const sessionId = this.getSessionId(event);
+    this.log(`dispatch: type=${event.type}, sessionId=${sessionId ?? 'none'}, channels=${this.sessionChannels.size}`);
     if (!sessionId) {
       return;
     }
@@ -165,7 +194,7 @@ export class GlobalEventBroker {
       while (currentId && !visited.has(currentId)) {
         visited.add(currentId);
         const parentId = this.childToParent.get(currentId);
-        if (!parentId) break;
+        if (!parentId) {break;}
         channel = this.sessionChannels.get(parentId);
         if (channel) {
           this.log(`forwarding descendant event: childSessionId=${sessionId} → parentId=${parentId}, type=${event.type}`);
@@ -206,13 +235,19 @@ export class GlobalEventBroker {
         return event.properties?.sessionID;
       case 'permission.replied':
         return event.properties?.sessionID;
+      case 'question.asked':
+        return event.properties?.sessionID;
+      case 'question.replied':
+        return event.properties.sessionID;
+      case 'question.rejected':
+        return event.properties.sessionID;
       case 'session.created':
       case 'session.updated':
       case 'session.deleted': {
         // properties.info.id contains the session ID (from SDK Session type)
-        const info = (event as any).properties?.info;
-        const id = info?.id as string | undefined;
-        if (id && event.type === 'session.created' && info?.parentID) {
+        const { info } = event.properties;
+        const id: string = info.id;
+        if (event.type === 'session.created' && info.parentID) {
           // Auto-detect child sessions from parentID field
           this.childToParent.set(id, info.parentID);
           this.log(`child session detected: childId=${id}, parentId=${info.parentID}`);
@@ -220,7 +255,7 @@ export class GlobalEventBroker {
         return id;
       }
       case 'session.status':
-        return (event as any).properties?.sessionID;
+        return event.properties.sessionID;
       default:
         return getEventSessionIdFromProperties(event);
     }
@@ -238,7 +273,7 @@ export class GlobalEventBroker {
 
   private clearSessionParts(sessionId: string): void {
     const parts = this.sessionParts.get(sessionId);
-    if (!parts) return;
+    if (!parts) {return;}
     for (const partId of parts) {
       this.partSessions.delete(partId);
     }
@@ -256,6 +291,81 @@ export class GlobalEventBroker {
   private log(message: string): void {
     this.logger?.appendLine(`[broker] ${message}`);
   }
+
+  // -------------------------------------------------------------------
+  // Public query methods for session hierarchy
+  // -------------------------------------------------------------------
+
+  /**
+   * Check whether `sessionId` is a descendant of `ancestorId` in the
+   * child→parent session hierarchy.
+   * Walks up the childToParent chain until it finds `ancestorId` or runs out.
+   */
+  isDescendantOf(sessionId: string, ancestorId: string): boolean {
+    let current = sessionId;
+    const visited = new Set<string>();
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      const parent = this.childToParent.get(current);
+      if (!parent) {break;}
+      if (parent === ancestorId) {return true;}
+      current = parent;
+    }
+    return false;
+  }
+
+  /**
+   * Find the parent session ID for a given session, or undefined if none.
+   */
+  getParentSession(sessionId: string): string | undefined {
+    return this.childToParent.get(sessionId);
+  }
+
+  /**
+   * Walk up the parent chain from `sessionId` and return the first session ID
+   * that appears in `candidateIds`. Used by StreamBridge to find which scope
+   * a grandchild event belongs to.
+   */
+  findAncestorIn(sessionId: string, candidateIds: Set<string>): string | undefined {
+    let current = sessionId;
+    const visited = new Set<string>();
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      if (candidateIds.has(current)) {return current;}
+      const parent = this.childToParent.get(current);
+      if (!parent) {break;}
+      current = parent;
+    }
+    return undefined;
+  }
+
+  /**
+   * Return all session IDs that are descendants of `parentId` in the
+   * child→parent hierarchy (children, grandchildren, etc.).
+   * Used for cascade-abort when the user cancels a parent session.
+   */
+  getDescendantSessions(parentId: string): string[] {
+    const descendants: string[] = [];
+    // Build reverse index: parent → children
+    const parentToChildren = new Map<string, string[]>();
+    for (const [childId, pid] of this.childToParent.entries()) {
+      let children = parentToChildren.get(pid);
+      if (!children) {
+        children = [];
+        parentToChildren.set(pid, children);
+      }
+      children.push(childId);
+    }
+    // BFS from parentId
+    const queue = parentToChildren.get(parentId) ?? [];
+    while (queue.length > 0) {
+      const id = queue.shift()!;
+      descendants.push(id);
+      const kids = parentToChildren.get(id);
+      if (kids) {queue.push(...kids);}
+    }
+    return descendants;
+  }
 }
 
 function unwrapStreamEvent(event: OpenCodeStreamEvent): OpenCodeEvent {
@@ -263,8 +373,22 @@ function unwrapStreamEvent(event: OpenCodeStreamEvent): OpenCodeEvent {
 }
 
 function getEventSessionIdFromProperties(event: OpenCodeEvent): string | undefined {
-  const withProperties = event as OpenCodeEvent & {
-    properties?: { sessionID?: string; info?: { sessionID?: string } };
-  };
-  return withProperties.properties?.sessionID ?? withProperties.properties?.info?.sessionID;
+  if (!('properties' in event)) {return undefined;}
+  const props = event.properties;
+  if (!props || typeof props !== 'object') {return undefined;}
+
+  const propsObj = props as Record<string, unknown>;
+
+  if (typeof propsObj.sessionID === 'string') {
+    return propsObj.sessionID;
+  }
+
+  if (propsObj.info && typeof propsObj.info === 'object') {
+    const info = propsObj.info as Record<string, unknown>;
+    if (typeof info.sessionID === 'string') {
+      return info.sessionID;
+    }
+  }
+
+  return undefined;
 }

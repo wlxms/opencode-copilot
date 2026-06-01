@@ -227,7 +227,7 @@ describe('OpenCodeBackend live integration', () => {
 
       // Check filepath in metadata if present (path is absolute, check basename)
       if (perm.metadata?.filepath) {
-        const fp = perm.metadata!.filepath as string;
+        const fp = perm.metadata.filepath as string;
         expect(fp.replace(/\\/g, '/')).toContain(targetFile.replace(/\\/g, '/'));
       }
 
@@ -265,7 +265,7 @@ describe('OpenCodeBackend live integration', () => {
     );
     const toolCompletedParts = finalEvents.filter(
       (e): e is Extract<AcpEvent, { type: 'part.updated' }> =>
-        e.type === 'part.updated' && e.part.type === 'tool' && (e.part as AcpToolPart).state.status === 'completed',
+        e.type === 'part.updated' && e.part.type === 'tool' && (e.part).state.status === 'completed',
     );
 
     const fullPath = join(projectDir, targetFile);

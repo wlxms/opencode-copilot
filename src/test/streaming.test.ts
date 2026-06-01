@@ -42,7 +42,7 @@ function mockToken(isCancelled = false): vscode.CancellationToken {
 
 function eventStream(events: AcpEvent[]): { stream: AsyncIterable<AcpEvent> } {
   async function* gen(): AsyncIterable<AcpEvent> {
-    for (const e of events) yield e;
+    for (const e of events) {yield e;}
   }
   return { stream: gen() };
 }
@@ -154,10 +154,16 @@ describe('StreamBridge', () => {
     await bridge.bridgeEventsToStream(events, stream, mockToken());
     expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_rd', 'read');
     expect(stream.push).toHaveBeenCalled();
-    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls[1][0];
-    expect(pushed.isComplete).toBe(true);
-    expect(pushed.toolName).toBe('read');
-    expect(pushed.pastTenseMessage).toMatch(/Read.*main\.ts/);
+    // read tool uses hiddenAfterComplete and no toolSpecificData
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
+    const readPart = pushed.find((call: unknown[]) => {
+      const p = call[0] as { toolName?: string; isComplete?: boolean };
+      return p?.toolName === 'read' && p?.isComplete === true;
+    });
+    expect(readPart).toBeDefined();
+    const part = readPart![0] as { pastTenseMessage?: string | { toString(): string }; toolSpecificData?: unknown };
+    expect(String(part.pastTenseMessage)).toMatch(/Read.*main\.ts/);
+    expect(part.toolSpecificData).toBeUndefined();
   });
 
   // --- Tool: bash → TerminalToolData ---
@@ -252,7 +258,7 @@ describe('StreamBridge', () => {
     });
     expect(readPart).toBeDefined();
     // Child tools should carry the subAgentInvocationId for grouping
-    const readObj = readPart![0] as any;
+    const readObj = readPart![0];
     expect(readObj.subAgentInvocationId).toBeDefined();
 
     const bashPart = pushed.find((call: unknown[]) => {
@@ -260,7 +266,7 @@ describe('StreamBridge', () => {
       return p?.toolName === 'bash';
     });
     expect(bashPart).toBeDefined();
-    const bashObj = bashPart![0] as any;
+    const bashObj = bashPart![0];
     expect(bashObj.subAgentInvocationId).toBeDefined();
 
     // AI text should still be rendered
@@ -450,7 +456,15 @@ describe('StreamBridge', () => {
     await bridge.bridgeEventsToStream(eventStream(fullTurnEvents({ tools: toolEvents({ toolName: 'read', callId: 'call_a', output: 'a' }) })), s1, mockToken());
     const s2 = mockStream();
     await bridge.bridgeEventsToStream(eventStream(fullTurnEvents({ tools: toolEvents({ toolName: 'read', callId: 'call_b', output: 'b' }) })), s2, mockToken());
-    expect((s2.push as ReturnType<typeof vi.fn>).mock.calls[1][0].toolSpecificData.output).toBe('b');
+    // read tool uses hiddenAfterComplete and returns undefined for toolSpecificData
+    const s2Pushed = (s2.push as ReturnType<typeof vi.fn>).mock.calls;
+    const readPart = s2Pushed.find((call: unknown[]) => {
+      const p = call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean };
+      return p?.toolName === 'read' && p?.toolCallId === 'call_b' && p?.isComplete === true;
+    });
+    expect(readPart).toBeDefined();
+    // Without filePath input, read tool falls back to generic format: 'read (0.1s)'
+    expect(String((readPart![0] as { pastTenseMessage?: string | { toString(): string } }).pastTenseMessage)).toMatch(/read/);
   });
 
   // --- Edge cases ---
@@ -719,7 +733,7 @@ describe('StreamBridge', () => {
               status: 'modified' as const,
             },
           ],
-        } as AcpSessionDiffEvent,
+        },
         deltaEvent(' world'),
         idleEvent(),
       ]);
@@ -745,7 +759,7 @@ describe('StreamBridge', () => {
               status: 'deleted' as const,
             },
           ],
-        } as AcpSessionDiffEvent,
+        },
         deltaEvent('Hello'),
         idleEvent(),
       ]);
@@ -790,7 +804,7 @@ describe('StreamBridge', () => {
           patterns: [],
           metadata: {},
           always: [],
-        } as AcpPermissionRequestEvent,
+        },
         idleEvent(),
         deltaEvent('IGNORED_AFTER_IDLE'),
       ]);

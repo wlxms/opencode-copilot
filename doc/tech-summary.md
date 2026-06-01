@@ -32,7 +32,7 @@
 ┌─────────────────────▼───────────────────────────────┐
 │ src/opencode/server.ts                              │
 │  createOpencode({ port: 0 }) → server + client       │
-│  @opencode-ai/sdk v1.14.41                          │
+│  @opencode-ai/sdk v1.15.10 (v1 client, v2 available)                          │
 └─────────────────────┬───────────────────────────────┘
                       │ HTTP + SSE
 ┌─────────────────────▼───────────────────────────────┐
@@ -50,7 +50,7 @@ src/
 ├── participant/
 │   ├── handler.ts        # ChatRequestHandler 主流程
 │   ├── streaming.ts      # StreamBridge (SSE→Chat UI)
-│   ├── commands.ts       # /new, /help, /model 路由
+│   ├── commands.ts       # /new, /help, /model, /test-question 路由
 │   └── errors.ts         # 错误常量 + 空提示检测
 ├── types/
 │   ├── index.ts          # ExtensionState, SessionInfo
@@ -62,7 +62,11 @@ src/
     ├── commands.test.ts  # 11 个命令测试
     ├── server.test.ts    # 12 个服务器测试
     ├── client.test.ts    # 15 个客户端测试
-    └── extension.test.ts # 1 个激活测试
+    ├── extension.test.ts # 1 个激活测试
+    └── integration/
+        ├── helpers/live-opencode.ts
+        ├── opencode-backend.integration.test.ts
+        └── question-flow.integration.test.ts  # question 端到端测试 (3 tests)
 ```
 
 ---

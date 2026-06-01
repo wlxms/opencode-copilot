@@ -23,8 +23,18 @@ export interface AcpServerInfo {
 export interface AcpModel {
   id: string;
   name?: string;
+  /** Provider ID (used for API calls) */
   provider?: string;
+  /** Human-readable provider name (used for UI only) */
+  providerName?: string;
+  /** Top-level truthy capability keys (legacy flat view, e.g. ["toolcall", "attachment"]) */
   capabilities?: string[];
+  /** Nested capability info: `input.image` indicates vision support */
+  capabilitiesRaw?: Record<string, unknown>;
+  /** Max input / context tokens (from SDK `limit.context`) */
+  maxInputTokens?: number;
+  /** Max output tokens (from SDK `limit.output`) */
+  maxOutputTokens?: number;
 }
 
 export interface AcpProvider {
@@ -81,6 +91,26 @@ export interface AcpToolState {
   endTime?: number;
 }
 
+// ===========================================================================
+// Prompt attachments
+// ===========================================================================
+
+/**
+ * A file attachment included with a prompt (image, document, etc.).
+ * Protocol-agnostic — each backend adapter maps this to its SDK type.
+ */
+export interface AcpFileAttachment {
+  /** MIME type (e.g. "image/png", "text/plain", "application/pdf") */
+  mime: string;
+  /** Optional display filename */
+  filename?: string;
+  /**
+   * URL pointing to the file content.
+   * May be a `file://` URI for local files or a `data:` URI for inline content.
+   */
+  url: string;
+}
+
 export interface AcpBasePart {
   id: string;
   type: AcpPartType;
@@ -132,6 +162,9 @@ export type AcpEventType =
   | 'session.error'
   | 'permission.asked'
   | 'permission.replied'
+  | 'question.asked'
+  | 'question.replied'
+  | 'question.rejected'
   | 'server.connected'
   | 'server.heartbeat';
 
@@ -192,6 +225,43 @@ export interface AcpPermissionReplyEvent {
   response: string;
 }
 
+// ===========================================================================
+// Question events
+// ===========================================================================
+
+export interface AcpQuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface AcpQuestionInfo {
+  question: string;
+  header: string;
+  options: Array<AcpQuestionOption>;
+  multiple?: boolean;
+  custom?: boolean;
+}
+
+export interface AcpQuestionRequestEvent {
+  type: 'question.asked';
+  questionId: string;
+  sessionId: string;
+  questions: Array<AcpQuestionInfo>;
+  tool?: { messageId: string; callId: string };
+}
+
+export interface AcpQuestionReplyEvent {
+  type: 'question.replied';
+  sessionId: string;
+  requestId: string;
+}
+
+export interface AcpQuestionRejectedEvent {
+  type: 'question.rejected';
+  sessionId: string;
+  requestId: string;
+}
+
 export interface AcpServerLifecycleEvent {
   type: 'server.connected' | 'server.heartbeat';
 }
@@ -211,6 +281,9 @@ export type AcpEvent =
   | AcpSessionStatusEvent
   | AcpPermissionRequestEvent
   | AcpPermissionReplyEvent
+  | AcpQuestionRequestEvent
+  | AcpQuestionReplyEvent
+  | AcpQuestionRejectedEvent
   | AcpServerLifecycleEvent;
 
 // ===========================================================================
@@ -223,7 +296,163 @@ export interface AcpResult<T, E = string> {
 }
 
 // ===========================================================================
+// Message history (for session history restoration)
+// ===========================================================================
+
+export interface AcpHistoryMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  /** Extracted text content (from parts for user, or joined text parts for assistant) */
+  text: string;
+  /** Tool call summaries for assistant messages */
+  toolCalls?: Array<{ toolName: string; callId?: string }>;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AcpMessageHistory {
+  items: AcpHistoryMessage[];
+}
+
+// ===========================================================================
 // Permission responses
 // ===========================================================================
 
 export type AcpPermissionResponse = 'once' | 'always' | 'reject';
+
+// ===========================================================================
+// Agents
+// ===========================================================================
+
+export interface AcpAgent {
+  id: string;
+  name?: string;
+  description?: string;
+  model?: string | { modelID: string; providerID: string };
+  mode?: 'subagent' | 'primary' | 'all';
+  hidden?: boolean;
+}
+
+/**
+ * Returns true if an agent should appear in user-selectable pickers.
+ * Excludes hidden agents and subagent-mode agents so users only see
+ * agents they can intentionally invoke.
+ */
+export function isUserSelectableAgent(agent: AcpAgent): boolean {
+  return !agent.hidden && agent.mode !== 'subagent';
+}
+
+// ===========================================================================
+// Configuration
+// ===========================================================================
+
+export interface AcpAgentConfig {
+  model?: string;
+  variant?: string;
+  temperature?: number;
+  top_p?: number;
+  prompt?: string;
+  tools?: Record<string, boolean>;
+  disable?: boolean;
+  description?: string;
+  mode?: 'subagent' | 'primary' | 'all';
+  hidden?: boolean;
+  steps?: number;
+  maxSteps?: number;
+}
+
+export interface AcpProviderConfig {
+  api?: string;
+  name?: string;
+  id?: string;
+  options?: {
+    apiKey?: string;
+    baseURL?: string;
+  };
+  models?: Record<string, { name?: string }>;
+}
+
+export interface AcpConfig {
+  model?: string;
+  small_model?: string;
+  default_agent?: string;
+  disabled_providers?: string[];
+  enabled_providers?: string[];
+  agent?: Record<string, AcpAgentConfig>;
+  provider?: Record<string, AcpProviderConfig>;
+}
+
+export interface AcpModelSelection {
+  providerID: string;
+  modelID: string;
+  variant?: string;
+}
+
+// ===========================================================================
+// Backend Settings Descriptor (pluggable settings UI)
+// ===========================================================================
+
+export interface TextField {
+  type: 'text';
+  key: string;
+  label: string;
+  description?: string;
+  placeholder?: string;
+}
+
+export interface SelectField {
+  type: 'select';
+  key: string;
+  label: string;
+  description?: string;
+  options: Array<{ value: string; label: string }>;
+}
+
+export interface ToggleField {
+  type: 'toggle';
+  key: string;
+  label: string;
+  description?: string;
+}
+
+export interface InfoCardsField {
+  type: 'info-cards';
+  key: string;
+  items: Array<{
+    title: string;
+    details: Array<{ label: string; value: string }>;
+  }>;
+}
+
+/**
+ * A map field: each item gets the same set of sub-fields.
+ * Values are stored as: { [mapKey]: { [itemId]: { [subFieldKey]: value } } }
+ */
+export interface MapField {
+  type: 'map';
+  key: string;
+  label: string;
+  description?: string;
+  items: Array<{ id: string; label: string; description?: string }>;
+  fields: Array<TextField | SelectField | ToggleField>;
+}
+
+export type SettingsField = TextField | SelectField | ToggleField | InfoCardsField | MapField;
+
+export interface SettingsFieldGroup {
+  key: string;
+  title?: string;
+  description?: string;
+  collapsible?: boolean;
+  fields: SettingsField[];
+}
+
+export interface BackendSettingsTab {
+  id: string;
+  title: string;
+  groups: SettingsFieldGroup[];
+}
+
+export interface BackendSettingsDescriptor {
+  tabs: BackendSettingsTab[];
+  values: Record<string, unknown>;
+}

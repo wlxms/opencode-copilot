@@ -7,6 +7,11 @@
 
 import type { OpenCodeEvent, OpenCodeStreamEvent, StreamPart } from './sdk-events';
 import type {
+  PermissionAskedEvent,
+  QuestionAskedEvent,
+  SessionDiffEvent,
+} from './sdk-events';
+import type {
   AcpEvent,
   AcpStreamPart,
   AcpTextPart,
@@ -21,10 +26,12 @@ import type {
   AcpFileDiff,
   AcpPermissionRequestEvent,
   AcpPermissionReplyEvent,
+  AcpQuestionRequestEvent,
+  AcpQuestionReplyEvent,
+  AcpQuestionRejectedEvent,
   AcpSessionLifecycleEvent,
   AcpSessionStatusEvent,
 } from '../../acp/types';
-
 import type {
   TextStreamPart,
   ReasoningStreamPart,
@@ -33,8 +40,6 @@ import type {
   StreamToolState,
   StepStartStreamPart,
   StepFinishStreamPart,
-  PermissionAskedEvent,
-  SessionDiffEvent,
 } from './sdk-events';
 
 // ===========================================================================
@@ -55,7 +60,7 @@ function normalizeToolState(state: StreamToolState): AcpToolState {
         ...base,
         status: 'running',
         title: state.title,
-        metadata: state.metadata as Record<string, unknown> | undefined,
+        metadata: state.metadata,
         startTime: state.time?.start,
       };
     case 'completed':
@@ -64,7 +69,7 @@ function normalizeToolState(state: StreamToolState): AcpToolState {
         status: 'completed',
         output: state.output,
         title: state.title,
-        metadata: state.metadata as Record<string, unknown> | undefined,
+        metadata: state.metadata,
         startTime: state.time?.start,
         endTime: state.time?.end,
       };
@@ -73,7 +78,7 @@ function normalizeToolState(state: StreamToolState): AcpToolState {
         ...base,
         status: 'error',
         error: state.error,
-        metadata: state.metadata as Record<string, unknown> | undefined,
+        metadata: state.metadata,
         startTime: state.time?.start,
         endTime: state.time?.end,
       };
@@ -93,7 +98,7 @@ function normalizeStreamPart(part: StreamPart): AcpStreamPart {
         ...base,
         type: 'text',
         text: part.text,
-        synthetic: (part as TextStreamPart).synthetic,
+        synthetic: (part).synthetic,
       };
       return text;
     }
@@ -110,14 +115,14 @@ function normalizeStreamPart(part: StreamPart): AcpStreamPart {
         ...base,
         type: 'tool',
         toolName: part.tool,
-        callId: (part as StreamToolPart).callID,
-        state: normalizeToolState((part as StreamToolPart).state),
+        callId: (part).callID,
+        state: normalizeToolState((part).state),
       };
       return tool;
     }
     case 'step-start':
     case 'step-finish': {
-      const stepPart = part as StepStartStreamPart | StepFinishStreamPart;
+      const stepPart = part;
       const step: AcpStepPart = {
         ...base,
         type: stepPart.type,
@@ -142,7 +147,7 @@ function normalizeStreamPart(part: StreamPart): AcpStreamPart {
 // ===========================================================================
 
 interface RawFileDiff {
-  file: string;
+  file?: string;
   patch?: string;
   before?: string;
   after?: string;
@@ -152,9 +157,10 @@ interface RawFileDiff {
 }
 
 function toAcpFileDiff(d: RawFileDiff): AcpFileDiff {
+  const file = d.file ?? '';
   return {
-    file: d.file,
-    patch: d.patch ?? `--- a/${d.file}\n+++ b/${d.file}\n`,
+    file,
+    patch: d.patch ?? `--- a/${file}\n+++ b/${file}\n`,
     additions: d.additions,
     deletions: d.deletions,
     status: d.status,
@@ -177,6 +183,27 @@ function normalizePermissionAsked(ev: PermissionAskedEvent): AcpPermissionReques
     tool: ev.properties.tool
       ? { messageId: ev.properties.tool.messageID, callId: ev.properties.tool.callID }
       : undefined,
+  };
+}
+
+// ===========================================================================
+// QuestionAskedEvent → AcpQuestionRequestEvent
+// ===========================================================================
+
+function normalizeQuestionAsked(ev: QuestionAskedEvent): AcpQuestionRequestEvent {
+  const props = ev.properties;
+  return {
+    type: 'question.asked',
+    questionId: props.id,
+    sessionId: props.sessionID,
+    questions: props.questions.map(q => ({
+      question: q.question,
+      header: q.header,
+      options: q.options.map(o => ({ label: o.label, description: o.description })),
+      multiple: q.multiple,
+      custom: q.custom,
+    })),
+    tool: props.tool ? { messageId: props.tool.messageID, callId: props.tool.callID } : undefined,
   };
 }
 
@@ -211,7 +238,7 @@ export function normalizeEvent(event: OpenCodeEvent): AcpEvent[] {
     case 'session.updated': {
       const props = event.properties as { info?: { id?: string; title?: string; parentID?: string } };
       return [{
-        type: event.type as 'session.created' | 'session.updated',
+        type: event.type,
         sessionId: props?.info?.id ?? '',
         title: props?.info?.title,
       }];
@@ -244,7 +271,7 @@ export function normalizeEvent(event: OpenCodeEvent): AcpEvent[] {
 
     // ---- Session diff ----
     case 'session.diff':
-      return [normalizeSessionDiff(event as { properties: { sessionID: string; diff: RawFileDiff[] } })];
+      return [normalizeSessionDiff(event)];
 
     // ---- Message parts ----
     case 'message.part.updated': {
@@ -274,7 +301,7 @@ export function normalizeEvent(event: OpenCodeEvent): AcpEvent[] {
 
     // ---- Permissions ----
     case 'permission.asked':
-      return [normalizePermissionAsked(event as PermissionAskedEvent)];
+      return [normalizePermissionAsked(event)];
 
     case 'permission.replied': {
       // SDK v2 EventPermissionReplied uses requestID/reply (not permissionID/response)
@@ -286,6 +313,30 @@ export function normalizeEvent(event: OpenCodeEvent): AcpEvent[] {
         response: props.reply,
       };
       return [replied];
+    }
+
+    // ---- Questions ----
+    case 'question.asked':
+      return [normalizeQuestionAsked(event)];
+
+    case 'question.replied': {
+      const qProps = event.properties as { sessionID: string; requestID: string };
+      const qReplied: AcpQuestionReplyEvent = {
+        type: 'question.replied',
+        sessionId: qProps.sessionID,
+        requestId: qProps.requestID,
+      };
+      return [qReplied];
+    }
+
+    case 'question.rejected': {
+      const qProps = event.properties;
+      const qRejected: AcpQuestionRejectedEvent = {
+        type: 'question.rejected',
+        sessionId: qProps.sessionID,
+        requestId: qProps.requestID,
+      };
+      return [qRejected];
     }
 
     // ---- Session status ----
@@ -312,5 +363,5 @@ export function normalizeStreamEvent(event: OpenCodeStreamEvent): AcpEvent[] {
     // Global event envelope — unwrap
     return normalizeEvent(event.payload);
   }
-  return normalizeEvent(event as OpenCodeEvent);
+  return normalizeEvent(event);
 }

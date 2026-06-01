@@ -22,7 +22,13 @@ const mockSdkClient = {
   event: {
     subscribe: vi.fn(),
   },
-  postSessionIdPermissionsPermissionId: vi.fn(),
+  permission: {
+    reply: vi.fn(),
+  },
+  question: {
+    reply: vi.fn(),
+    reject: vi.fn(),
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -33,7 +39,8 @@ import * as vscode from 'vscode';
 import { createParticipantHandler } from '../participant/handler';
 import type { OpenCodeEvent } from '../backends/opencode/sdk-events';
 import type { AcpServerStatus } from '../acp/types';
-import type { ExtensionState } from '../types';
+import type { ExtensionState, SessionState } from '../types';
+import { AppEventBus } from '../acp/app-event-bus';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -68,7 +75,7 @@ function createRequest(
 // ---------------------------------------------------------------------------
 
 describe('createParticipantHandler', () => {
-  let state: ExtensionState;
+  let state: ExtensionState & { sessionMap: Map<string, SessionState> };
   let stream: vscode.ChatResponseStream;
   let token: vscode.CancellationToken;
   let backendStatus: AcpServerStatus;
@@ -76,6 +83,7 @@ describe('createParticipantHandler', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     backendStatus = 'stopped';
+    const sessionStore = new Map<string, SessionState>();
 
     const backend: AcpBackend = {
       name: 'opencode',
@@ -90,25 +98,26 @@ describe('createParticipantHandler', () => {
       sessions: {
         create: vi.fn(async (options?: { title?: string; directory?: string }) => {
           const result = await mockSdkClient.session.create({
-            body: options?.title ? { title: options.title } : undefined,
-            query: options?.directory ? { directory: options.directory } : undefined,
+            directory: options?.directory,
+            title: options?.title,
           });
           return { data: result.data ? { id: result.data.id ?? '', title: result.data.title ?? '', createdAt: new Date() } : undefined, error: result.error };
         }),
         get: vi.fn(async () => ({ data: undefined })),
         prompt: vi.fn(async (id: string, text: string, directory?: string) => {
           const result = await mockSdkClient.session.prompt({
-            path: { id },
-            body: { parts: [{ type: 'text', text }] },
-            query: directory ? { directory } : undefined,
+            sessionID: id,
+            directory,
+            parts: [{ type: 'text', text }],
           });
           return { data: result };
         }),
         revert: vi.fn(async (id: string, messageId: string, partId?: string, directory?: string) => {
           const result = await mockSdkClient.session.revert({
-            path: { id },
-            body: { messageID: messageId, ...(partId ? { partID: partId } : {}) },
-            query: directory ? { directory } : undefined,
+            sessionID: id,
+            directory,
+            messageID: messageId,
+            partID: partId,
           });
           if (result && typeof result === 'object' && 'error' in result) {
             return { error: String(result.error) };
@@ -117,15 +126,25 @@ describe('createParticipantHandler', () => {
         }),
         abort: vi.fn(async (id: string, directory?: string) => {
           const result = await mockSdkClient.session.abort({
-            path: { id },
-            query: directory ? { directory } : undefined,
+            sessionID: id,
+            directory,
           });
           return { data: result.data };
         }),
         list: vi.fn(async () => ({ data: [] })),
+        update: vi.fn(async () => ({ data: { id: 'updated-session', title: 'Updated Title', createdAt: new Date() } })),
+        children: vi.fn(),
+        status: vi.fn(),
+        descendants: vi.fn(() => []),
+        findAncestor: vi.fn(),
+        parent: vi.fn(),
+        messages: vi.fn(),
       },
       config: {
         models: vi.fn(async () => ({ data: [] })),
+        agents: vi.fn(),
+        get: vi.fn(),
+        update: vi.fn(),
       },
       events: {
         openSessionStream: vi.fn((sessionId: string) => ({
@@ -161,6 +180,10 @@ describe('createParticipantHandler', () => {
       permissions: {
         reply: vi.fn(async () => undefined),
       },
+      questions: {
+        reply: vi.fn(),
+        reject: vi.fn(),
+      },
     };
 
     state = {
@@ -175,7 +198,20 @@ describe('createParticipantHandler', () => {
         hide: vi.fn(),
         dispose: vi.fn(),
       } as unknown as vscode.OutputChannel,
-      sessionMap: new Map(),
+      sessions: {
+        get: vi.fn((key: string) => sessionStore.get(key)),
+        has: vi.fn((key: string) => sessionStore.has(key)),
+        set: vi.fn((key: string, value: SessionState) => { sessionStore.set(key, value); }),
+        values: vi.fn(() => sessionStore.values()),
+      } as unknown as ExtensionState['sessions'],
+      sessionMap: sessionStore,
+      statusBar: {} as ExtensionState['statusBar'],
+      selection: {
+        get: vi.fn(() => ({ agent: undefined, model: undefined })),
+        setModel: vi.fn(async () => {}),
+        setAgent: vi.fn(async () => {}),
+      } as unknown as ExtensionState['selection'],
+      bus: new AppEventBus(),
     };
 
     stream = {
@@ -187,7 +223,7 @@ describe('createParticipantHandler', () => {
     token = {
       isCancellationRequested: false,
       onCancellationRequested: vi.fn(() => ({ dispose: vi.fn() })),
-    } as unknown as vscode.CancellationToken;
+    };
 
     // Default abort mock — resolves to prevent handler crash on cancellation
     mockSdkClient.session.abort.mockResolvedValue({ data: true });
@@ -318,22 +354,20 @@ describe('createParticipantHandler', () => {
 
     // Session was created with workspace directory and title
     expect(mockSdkClient.session.create).toHaveBeenCalledWith({
-      body: { title: 'Chat chat-1' },
-      query: { directory: '/test/workspace' },
+      directory: '/test/workspace',
+      title: 'OpenCode Session chat-1',
     });
     // Session stored in sessionMap under the vscode chat session ID
-    expect(state.sessionMap.get('chat-1')?.opencodeSessionId).toBe('session-1');
+    expect(state.sessionMap.get('chat-1')?.sessionId).toBe('session-1');
 
     // Events subscribed
     expect(state.backend.events.ensureStarted).toHaveBeenCalledOnce();
 
-    // Prompt sent with correct format (path/body/query)
+    // Prompt sent with correct format (v2 flat params)
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      path: { id: 'session-1' },
-      body: {
-        parts: [{ type: 'text', text: 'write a test' }],
-      },
-      query: { directory: '/test/workspace' },
+      sessionID: 'session-1',
+      parts: [{ type: 'text', text: 'write a test' }],
+      directory: '/test/workspace',
     });
 
     // Progress was reported
@@ -353,7 +387,7 @@ describe('createParticipantHandler', () => {
     backendStatus = 'running';
     // Pre-populate sessionMap with existing session
     state.sessionMap.set('chat-1', {
-      opencodeSessionId: 'existing-session',
+      sessionId: 'existing-session',
       turnMap: [],
     });
 
@@ -377,13 +411,81 @@ describe('createParticipantHandler', () => {
     expect(mockSdkClient.session.create).not.toHaveBeenCalled();
     // Should send message to existing session with directory query
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      path: { id: 'existing-session' },
-      body: {
-        parts: [{ type: 'text', text: 'follow up' }],
-      },
-      query: { directory: '/test/workspace' },
+      sessionID: 'existing-session',
+      parts: [{ type: 'text', text: 'follow up' }],
+      directory: '/test/workspace',
     });
     expect(result!.metadata).toHaveProperty('sessionId', 'existing-session');
+  });
+
+  it('should reuse restored target session when state exists under sessionResource', async () => {
+    backendStatus = 'running';
+    const resourceKey = 'opencode-copilot.opencode:///session-existing';
+    const restoredState = {
+      sessionId: 'existing-session',
+      turnMap: [],
+    };
+    state.sessionMap.set(resourceKey, restoredState);
+
+    const handler = createParticipantHandler(state);
+
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
+    const result = await handler(
+      createRequest({
+        prompt: 'continue restored chat',
+        sessionId: 'chat-from-target',
+        sessionResource: {
+          toString: () => resourceKey,
+          fsPath: '/test/chat',
+        } as vscode.Uri,
+      }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    expect(mockSdkClient.session.create).not.toHaveBeenCalled();
+    expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
+      sessionID: 'existing-session',
+      parts: [{ type: 'text', text: 'continue restored chat' }],
+      directory: '/test/workspace',
+    });
+    expect(state.sessionMap.get('chat-from-target')).toBe(restoredState);
+    expect(state.sessionMap.get(resourceKey)).toBe(restoredState);
+    expect(result!.metadata).toHaveProperty('sessionId', 'existing-session');
+  });
+
+  it('should create provider untitled sessions with New OpenCode Session title', async () => {
+    backendStatus = 'running';
+    const handler = createParticipantHandler(state);
+
+    mockSdkClient.session.create.mockResolvedValue({
+      data: { id: 'session-provider-1', title: 'New OpenCode Session' },
+    });
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+    mockSdkClient.session.prompt.mockResolvedValue(undefined);
+
+    await handler(
+      createRequest({
+        prompt: 'provider start',
+        sessionId: 'opencode-copilot.opencode:/untitled-123',
+        sessionResource: { toString: () => 'opencode-copilot.opencode:/untitled-123', fsPath: '/test/chat' } as vscode.Uri,
+      }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    expect(mockSdkClient.session.create).toHaveBeenCalledWith({
+      directory: '/test/workspace',
+      title: 'New OpenCode Session',
+    });
   });
 
   // -----------------------------------------------------------------------
@@ -394,10 +496,10 @@ describe('createParticipantHandler', () => {
     backendStatus = 'running';
     // Simulate 2 completed turns: turnMap has 2 entries
     state.sessionMap.set('chat-revert-1', {
-      opencodeSessionId: 'revert-session',
+      sessionId: 'revert-session',
       turnMap: [
-        { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
-        { vscodeTurn: 1, opencodeMessageId: 'msg-1' },
+        { vscodeTurn: 0, messageId: 'msg-0' },
+        { vscodeTurn: 1, messageId: 'msg-1' },
       ],
     });
 
@@ -421,9 +523,9 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Should revert msg-1 (the extraneous turn, from back to front)
     expect(mockSdkClient.session.revert).toHaveBeenCalledTimes(1);
     expect(mockSdkClient.session.revert).toHaveBeenCalledWith({
-      path: { id: 'revert-session' },
-      body: { messageID: 'msg-1' },
-      query: { directory: '/test/workspace' },
+      sessionID: 'revert-session',
+      messageID: 'msg-1',
+      directory: '/test/workspace',
     });
 
     // Should NOT create a new session
@@ -432,14 +534,14 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // TurnMap should be trimmed to keep only the first entry
     const chatState = state.sessionMap.get('chat-revert-1')!;
     expect(chatState.turnMap).toEqual([
-      { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
+      { vscodeTurn: 0, messageId: 'msg-0' },
     ]);
 
     // Should prompt on the same reverted session
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      path: { id: 'revert-session' },
-      body: { parts: [{ type: 'text', text: 'edited follow-up' }] },
-      query: { directory: '/test/workspace' },
+      sessionID: 'revert-session',
+      parts: [{ type: 'text', text: 'edited follow-up' }],
+      directory: '/test/workspace',
     });
     expect(result!.metadata).toHaveProperty('sessionId', 'revert-session');
   });
@@ -448,11 +550,11 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     backendStatus = 'running';
     // Simulate 3 completed turns
     state.sessionMap.set('chat-revert-3', {
-      opencodeSessionId: 'revert-session-3',
+      sessionId: 'revert-session-3',
       turnMap: [
-        { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
-        { vscodeTurn: 1, opencodeMessageId: 'msg-1' },
-        { vscodeTurn: 2, opencodeMessageId: 'msg-2' },
+        { vscodeTurn: 0, messageId: 'msg-0' },
+        { vscodeTurn: 1, messageId: 'msg-1' },
+        { vscodeTurn: 2, messageId: 'msg-2' },
       ],
     });
 
@@ -475,20 +577,20 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Should revert msg-2 first (back to front), then msg-1
     expect(mockSdkClient.session.revert).toHaveBeenCalledTimes(2);
     expect(mockSdkClient.session.revert).toHaveBeenNthCalledWith(1, {
-      path: { id: 'revert-session-3' },
-      body: { messageID: 'msg-2' },
-      query: { directory: '/test/workspace' },
+      sessionID: 'revert-session-3',
+      messageID: 'msg-2',
+      directory: '/test/workspace',
     });
     expect(mockSdkClient.session.revert).toHaveBeenNthCalledWith(2, {
-      path: { id: 'revert-session-3' },
-      body: { messageID: 'msg-1' },
-      query: { directory: '/test/workspace' },
+      sessionID: 'revert-session-3',
+      messageID: 'msg-1',
+      directory: '/test/workspace',
     });
 
     // TurnMap should keep only msg-0
     const chatState = state.sessionMap.get('chat-revert-3')!;
     expect(chatState.turnMap).toEqual([
-      { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
+      { vscodeTurn: 0, messageId: 'msg-0' },
     ]);
     expect(result!.metadata).toHaveProperty('sessionId', 'revert-session-3');
   });
@@ -497,10 +599,10 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     backendStatus = 'running';
     // Simulate 2 completed turns
     state.sessionMap.set('chat-revert-full', {
-      opencodeSessionId: 'full-rewind-session',
+      sessionId: 'full-rewind-session',
       turnMap: [
-        { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
-        { vscodeTurn: 1, opencodeMessageId: 'msg-1' },
+        { vscodeTurn: 0, messageId: 'msg-0' },
+        { vscodeTurn: 1, messageId: 'msg-1' },
       ],
     });
 
@@ -526,19 +628,19 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
 
     // Should prompt on the same session
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      path: { id: 'full-rewind-session' },
-      body: { parts: [{ type: 'text', text: 'start fresh' }] },
-      query: { directory: '/test/workspace' },
+      sessionID: 'full-rewind-session',
+      parts: [{ type: 'text', text: 'start fresh' }],
+      directory: '/test/workspace',
     });
   });
 
   it('should fall back to new session on revert failure', async () => {
     backendStatus = 'running';
     state.sessionMap.set('chat-revert-fail', {
-      opencodeSessionId: 'fail-session',
+      sessionId: 'fail-session',
       turnMap: [
-        { vscodeTurn: 0, opencodeMessageId: 'msg-0' },
-        { vscodeTurn: 1, opencodeMessageId: 'msg-1' },
+        { vscodeTurn: 0, messageId: 'msg-0' },
+        { vscodeTurn: 1, messageId: 'msg-1' },
       ],
     });
 
@@ -567,14 +669,14 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
 
     // Should fall back by creating a new session
     expect(mockSdkClient.session.create).toHaveBeenCalledWith({
-      query: { directory: '/test/workspace' },
+      directory: '/test/workspace',
     });
 
     // Should prompt on the fallback session
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      path: { id: 'fallback-session' },
-      body: { parts: [{ type: 'text', text: 'after revert fail' }] },
-      query: { directory: '/test/workspace' },
+      sessionID: 'fallback-session',
+      parts: [{ type: 'text', text: 'after revert fail' }],
+      directory: '/test/workspace',
     });
 
     // TurnMap should be reset
@@ -599,7 +701,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     );
 
     expect(stream.markdown).toHaveBeenCalledWith(
-      expect.stringContaining('Failed to start OpenCode'),
+      expect.stringContaining('Failed to start backend'),
     );
   });
 
@@ -621,7 +723,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     );
 
     expect(stream.markdown).toHaveBeenCalledWith(
-      expect.stringContaining('Failed to start OpenCode'),
+      expect.stringContaining('Failed to start backend'),
     );
     expect(stream.markdown).toHaveBeenCalledWith(
       expect.stringContaining('not found'),
@@ -662,7 +764,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     );
 
     expect(stream.markdown).toHaveBeenCalledWith(
-      expect.stringContaining('Failed to start OpenCode'),
+      expect.stringContaining('Failed to start backend'),
     );
   });
 
@@ -674,7 +776,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     backendStatus = 'running';
     // Pre-populate sessionMap so session is reused
     state.sessionMap.set('chat-running', {
-      opencodeSessionId: 'existing-id',
+      sessionId: 'existing-id',
       turnMap: [],
     });
 
@@ -695,11 +797,9 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     expect(state.backend.start).not.toHaveBeenCalled();
     expect(mockSdkClient.session.create).not.toHaveBeenCalled();
     expect(mockSdkClient.session.prompt).toHaveBeenCalledWith({
-      path: { id: 'existing-id' },
-      body: {
-        parts: [{ type: 'text', text: 'question' }],
-      },
-      query: { directory: '/test/workspace' },
+      sessionID: 'existing-id',
+      parts: [{ type: 'text', text: 'question' }],
+      directory: '/test/workspace',
     });
   });
 
@@ -755,8 +855,8 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Verify abort was called with the correct session ID
     expect(mockSdkClient.session.abort).toHaveBeenCalledWith(
       expect.objectContaining({
-        path: { id: 'session-abort-test' },
-        query: { directory: '/test/workspace' },
+        sessionID: 'session-abort-test',
+        directory: '/test/workspace',
       }),
     );
   });
@@ -797,7 +897,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Set up full flow mocks
     backendStatus = 'running';
     state.sessionMap.set('chat-cp-1', {
-      opencodeSessionId: 'existing-session',
+      sessionId: 'existing-session',
       turnMap: [],
     });
 
@@ -833,7 +933,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Set up full flow mocks
     backendStatus = 'running';
     state.sessionMap.set('chat-cp-2', {
-      opencodeSessionId: 'existing-session',
+      sessionId: 'existing-session',
       turnMap: [],
     });
 
@@ -862,7 +962,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Set up so that the handler starts but prompt throws
     backendStatus = 'running';
     state.sessionMap.set('chat-cp-3', {
-      opencodeSessionId: 'existing-session',
+      sessionId: 'existing-session',
       turnMap: [],
     });
 
@@ -886,5 +986,203 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     expect(state.outputChannel.appendLine).toHaveBeenCalledWith(
       expect.stringContaining('Prompt error'),
     );
+  });
+
+  it('should update sessionMap title from backend after turn completes', async () => {
+    const handler = createParticipantHandler(state);
+
+    backendStatus = 'running';
+    state.sessionMap.set('chat-title-test', {
+      sessionId: 'ses-title-123',
+      turnMap: [],
+      title: 'New OpenCode Session',
+    });
+
+    // Backend returns an auto-generated title
+    vi.mocked(state.backend.sessions.get).mockResolvedValue({
+      data: { id: 'ses-title-123', title: 'How to implement OAuth', createdAt: new Date() },
+    });
+
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+
+    const result = await handler(
+      createRequest({ prompt: 'how to implement oauth', sessionId: 'chat-title-test' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    // Handler should complete normally
+    expect(result!.metadata).toHaveProperty('sessionId');
+
+    // sessionMap should be updated with the backend title
+    const chatState = state.sessionMap.get('chat-title-test');
+    expect(chatState?.title).toBe('How to implement OAuth');
+  });
+
+  it('should not overwrite existing non-placeholder title with backend placeholder', async () => {
+    const handler = createParticipantHandler(state);
+
+    backendStatus = 'running';
+    state.sessionMap.set('chat-title-keep', {
+      sessionId: 'ses-title-456',
+      turnMap: [],
+      title: 'Existing Good Title',
+    });
+
+    // Backend returns a placeholder title
+    vi.mocked(state.backend.sessions.get).mockResolvedValue({
+      data: { id: 'ses-title-456', title: 'Session 001', createdAt: new Date() },
+    });
+
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+
+    const result = await handler(
+      createRequest({ prompt: 'test keeping title', sessionId: 'chat-title-keep' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    expect(result!.metadata).toHaveProperty('sessionId');
+
+    // sessionMap should keep the existing non-placeholder title
+    const chatState = state.sessionMap.get('chat-title-keep');
+    expect(chatState?.title).toBe('Existing Good Title');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolvePromptModel — native model sync tests
+// ---------------------------------------------------------------------------
+
+import { resolvePromptModel } from '../participant/handler';
+
+describe('resolvePromptModel', () => {
+  let state: ExtensionState;
+  let backend: AcpBackend;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+
+    backend = {
+      config: {
+        models: vi.fn(async () => ({ data: [] })),
+      },
+    } as unknown as AcpBackend;
+
+    state = {
+      backend,
+      outputChannel: {
+        appendLine: vi.fn(),
+      } as any,
+      selection: {
+        get: vi.fn(() => ({ agent: undefined, model: { providerID: 'openai', modelID: 'gpt-4' } })),
+        setModel: vi.fn(async () => {}),
+      },
+    } as unknown as ExtensionState;
+  });
+
+  it('should fall back to SelectionStore when request.model is undefined', async () => {
+    const request = createRequest({ prompt: 'test' });
+    // request.model is undefined by default in createRequest
+    const result = await resolvePromptModel(request, state);
+
+    expect(result).toEqual({ providerID: 'openai', modelID: 'gpt-4' });
+    expect(state.selection.setModel).not.toHaveBeenCalled();
+  });
+
+  it('should fall back to SelectionStore when backend model list is empty', async () => {
+    const request = createRequest({
+      prompt: 'test',
+      model: { id: 'gpt-4o', name: 'GPT-4o', vendor: 'openai', family: 'gpt-4o', version: '1' } as any,
+    });
+
+    const result = await resolvePromptModel(request, state);
+
+    expect(result).toEqual({ providerID: 'openai', modelID: 'gpt-4' });
+    expect(state.selection.setModel).not.toHaveBeenCalled();
+  });
+
+  it('should match native model id to backend model and sync selection', async () => {
+    (backend.config.models as ReturnType<typeof vi.fn>).mockResolvedValue({
+      data: [
+        { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai' },
+        { id: 'claude-3', name: 'Claude 3', provider: 'anthropic' },
+      ],
+    });
+    // SelectionStore has a different model
+    (state.selection.get as ReturnType<typeof vi.fn>).mockReturnValue({
+      agent: undefined,
+      model: { providerID: 'anthropic', modelID: 'claude-3' },
+    });
+
+    const request = createRequest({
+      prompt: 'test',
+      model: { id: 'gpt-4o', name: 'GPT-4o', vendor: 'openai', family: 'gpt-4o', version: '1' } as any,
+    });
+
+    const result = await resolvePromptModel(request, state);
+
+    expect(result).toEqual({ providerID: 'openai', modelID: 'gpt-4o' });
+    // Should sync to SelectionStore since it differs from current
+    expect(state.selection.setModel).toHaveBeenCalledWith('openai', 'gpt-4o');
+  });
+
+  it('should not re-sync when native model matches current selection', async () => {
+    (backend.config.models as ReturnType<typeof vi.fn>).mockResolvedValue({
+      data: [{ id: 'gpt-4', name: 'GPT-4', provider: 'openai' }],
+    });
+
+    const request = createRequest({
+      prompt: 'test',
+      model: { id: 'gpt-4', name: 'GPT-4', vendor: 'openai', family: 'gpt-4', version: '1' } as any,
+    });
+
+    const result = await resolvePromptModel(request, state);
+
+    expect(result).toEqual({ providerID: 'openai', modelID: 'gpt-4' });
+    // Same as current — no sync needed
+    expect(state.selection.setModel).not.toHaveBeenCalled();
+  });
+
+  it('should fall back to SelectionStore on ambiguous match (multiple candidates)', async () => {
+    (backend.config.models as ReturnType<typeof vi.fn>).mockResolvedValue({
+      data: [
+        { id: 'gpt-4', name: 'GPT-4', provider: 'openai' },
+        { id: 'gpt-4', name: 'GPT-4 Custom', provider: 'custom' },
+      ],
+    });
+
+    const request = createRequest({
+      prompt: 'test',
+      model: { id: 'gpt-4', name: 'GPT-4', vendor: 'openai', family: 'gpt-4', version: '1' } as any,
+    });
+
+    const result = await resolvePromptModel(request, state);
+
+    // Ambiguous — should fall back to SelectionStore
+    expect(result).toEqual({ providerID: 'openai', modelID: 'gpt-4' });
+    expect(state.selection.setModel).not.toHaveBeenCalled();
+  });
+
+  it('should fall back to SelectionStore when native model not in backend catalogue', async () => {
+    (backend.config.models as ReturnType<typeof vi.fn>).mockResolvedValue({
+      data: [{ id: 'claude-3', name: 'Claude 3', provider: 'anthropic' }],
+    });
+
+    const request = createRequest({
+      prompt: 'test',
+      model: { id: 'copilot-model-x', name: 'Copilot X', vendor: 'copilot', family: 'unknown', version: '1' } as any,
+    });
+
+    const result = await resolvePromptModel(request, state);
+
+    // No match — fall back to SelectionStore
+    expect(result).toEqual({ providerID: 'openai', modelID: 'gpt-4' });
   });
 });

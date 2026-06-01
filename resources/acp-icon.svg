@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- ACP logomark — simplified geometric mark for 16×16 status bar -->
+  <g fill="currentColor">
+    <!-- Outer angular frame (A-shape body) -->
+    <path d="M8 1L15 14H1L8 1Z" fill-opacity="0.25"/>
+    <!-- Inner accent — forward-leaning interlock -->
+    <path d="M8 3.5L12 11.5H4L8 3.5Z" fill-opacity="0.6"/>
+    <!-- Connector bridge — the horizontal link -->
+    <rect x="5" y="10.5" width="6" height="1.5" rx="0.5"/>
+  </g>
+</svg>

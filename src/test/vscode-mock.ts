@@ -35,6 +35,13 @@ export class ThemeColor {
     constructor(public id: string) {}
 }
 
+export enum ChatSessionStatus {
+    Failed = 0,
+    Completed = 1,
+    InProgress = 2,
+    NeedsInput = 3,
+}
+
 export class OutputChannel {
     public readonly lines: string[] = [];
 
@@ -65,6 +72,29 @@ export class OutputChannel {
     }
 }
 
+export class EventEmitter<T> {
+    private listeners: Array<(value: T) => unknown> = [];
+
+    readonly event = (listener: (value: T) => unknown): { dispose(): void } => {
+        this.listeners.push(listener);
+        return {
+            dispose: () => {
+                this.listeners = this.listeners.filter(l => l !== listener);
+            },
+        };
+    };
+
+    fire(value: T): void {
+        for (const listener of this.listeners) {
+            listener(value);
+        }
+    }
+
+    dispose(): void {
+        this.listeners = [];
+    }
+}
+
 export class ChatParticipant {
     public iconPath: ThemeIcon | { light: ThemeIcon; dark: ThemeIcon } | undefined;
     private _feedbackListeners: Array<(e: ChatResultFeedback) => unknown> = [];
@@ -84,6 +114,36 @@ export class ChatParticipant {
     dispose(): void {
         this._feedbackListeners = [];
     }
+}
+
+export class LanguageModelTextPart {
+    constructor(public readonly value: string) {}
+}
+
+export interface LanguageModelChatCapabilities {
+    readonly imageInput?: boolean;
+    readonly toolCalling?: boolean | number;
+}
+
+export interface LanguageModelChatInformation {
+    readonly id: string;
+    readonly name: string;
+    readonly family: string;
+    readonly version: string;
+    readonly maxInputTokens: number;
+    readonly maxOutputTokens: number;
+    readonly capabilities: LanguageModelChatCapabilities;
+    readonly targetChatSessionType?: string;
+    readonly isUserSelectable?: boolean;
+    readonly isDefault?: boolean | Record<string, boolean>;
+}
+
+export interface LanguageModelChat {
+    readonly id: string;
+    readonly family: string;
+    readonly vendor?: string;
+    readonly name?: string;
+    readonly version?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +182,18 @@ export class Uri {
     }
 
     static parse(value: string): Uri {
-        // basic parse — enough for tests
+        if (/^[a-zA-Z][a-zA-Z\d+.-]*:\//.test(value)) {
+            const parsed = new URL(value);
+            return new Uri(
+                parsed.protocol.slice(0, -1),
+                parsed.host,
+                parsed.pathname,
+                parsed.search.startsWith('?') ? parsed.search.slice(1) : parsed.search,
+                parsed.hash.startsWith('#') ? parsed.hash.slice(1) : parsed.hash,
+            );
+        }
+
+        // basic fallback — enough for tests
         return new Uri('file', '', value, '', '');
     }
 
@@ -135,7 +206,7 @@ export class Uri {
         this.fsPath = path.replace(/\//g, '\\');
     }
 
-    with(_change: unknown): Uri {
+    with(_change: unknown): this {
         return this;
     }
 
@@ -170,6 +241,20 @@ export interface ChatRequest {
 
 export interface ChatContext {
     history: Array<unknown>;
+}
+
+/**
+ * Minimal MarkdownString mock — needed by streaming.ts formatPastTenseMsg / formatFileBubbleMessage.
+ * The real class concatenates markdown; for tests a plain string container suffices.
+ */
+export class MarkdownString {
+    value: string;
+    constructor(value: string) { this.value = value; }
+    toString() { return this.value; }
+}
+
+export class ChatResponseMarkdownPart {
+    constructor(public readonly value: MarkdownString | string) {}
 }
 
 /**
@@ -222,6 +307,17 @@ export interface ChatResult {
     metadata: Record<string, unknown>;
 }
 
+export interface ChatSessionItem {
+    readonly resource: Uri;
+    label: string;
+    iconPath?: unknown;
+    description?: string;
+    badge?: string;
+    status?: ChatSessionStatus;
+    tooltip?: string;
+    timing?: { readonly created: number };
+}
+
 export interface ChatResultFeedback {
     readonly kind: ChatResultFeedbackKind;
     readonly result: ChatResult;
@@ -243,6 +339,59 @@ export const chat = {
         handler: ChatRequestHandler,
     ): ChatParticipant {
         return new ChatParticipant(id, handler);
+    },
+    createChatSessionItemController(
+        id: string,
+        refreshHandler: (token: CancellationToken) => Promise<void> | Thenable<void>,
+    ) {
+        const items = new Map<string, ChatSessionItem>();
+        return {
+            id,
+            refreshHandler,
+            items: {
+                get size() {
+                    return items.size;
+                },
+                replace(iterable: Iterable<ChatSessionItem>) {
+                    items.clear();
+                    for (const item of iterable) {
+                        items.set(item.resource.toString(), item);
+                    }
+                },
+                add(item: ChatSessionItem) {
+                    items.set(item.resource.toString(), item);
+                },
+                delete(resource: Uri) {
+                    items.delete(resource.toString());
+                },
+                get(resource: Uri) {
+                    return items.get(resource.toString());
+                },
+                [Symbol.iterator]() {
+                    return Array.from(items.values(), item => [item.resource, item] as const)[Symbol.iterator]();
+                },
+            },
+            createChatSessionItem(resource: Uri, label: string): ChatSessionItem {
+                return { resource, label };
+            },
+            createChatSessionInputState(groups: unknown[]) {
+                return {
+                    sessionResource: undefined,
+                    groups,
+                    onDidDispose: () => ({ dispose() {} }),
+                    onDidChange: () => ({ dispose() {} }),
+                };
+            },
+            dispose() {
+                items.clear();
+            },
+        };
+    },
+};
+
+export const lm = {
+    registerLanguageModelChatProvider(_vendor: string, _provider: unknown) {
+        return { dispose() {} };
     },
 };
 

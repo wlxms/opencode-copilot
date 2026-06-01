@@ -18,7 +18,7 @@ export class CheckpointManager {
    * Call at the start of a turn to arm the checkpoint.
    */
   createIdlePromise(): void {
-    if (this.idlePromise) return; // already created
+    if (this.idlePromise) {return;} // already created
     this.idlePromise = new Promise<void>((resolve) => {
       this.idleResolve = resolve;
     });
