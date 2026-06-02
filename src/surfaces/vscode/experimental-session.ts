@@ -1018,6 +1018,19 @@ export function createSessionContentProvider(
           responses.push(new vscode.ChatResponseMarkdownPart(msg.text));
         }
 
+        // VS Code's chat renderer rejects ChatResponseTurn with an empty
+        // response array. When an assistant turn has no text (e.g. a pure
+        // tool-execution turn), insert a placeholder so the turn is rendered
+        // instead of being silently dropped.
+        if (responses.length === 0) {
+          const toolInfo = msg.toolCalls?.length
+            ? ` (${msg.toolCalls.length} tool${msg.toolCalls.length > 1 ? 's' : ''})`
+            : '';
+          responses.push(new vscode.ChatResponseMarkdownPart(
+            `*Tool execution${toolInfo}*`,
+          ));
+        }
+
         // Build turn metadata for session recovery
         const turnMetadata: Record<string, unknown> = {
           sessionId,
@@ -1038,7 +1051,9 @@ export function createSessionContentProvider(
     }
 
     logger.appendLine(
-      `[session-provider] Restored ${history.length} turns for session ${sessionId}`,
+      `[session-provider] Restored ${history.length} turns for session ${sessionId} ` +
+      `(${history.filter(t => t instanceof vscode.ChatRequestTurn).length} requests, ` +
+      `${history.filter(t => t instanceof vscode.ChatResponseTurn).length} responses)`,
     );
     return history;
   }
@@ -1344,28 +1359,41 @@ export async function renderWithExperimentalSurface(
 // ---------------------------------------------------------------------------
 
 /**
+ * The participant ID used to construct ChatRequestTurn / ChatResponseTurn
+ * objects. Must match the ID passed to `vscode.chat.createChatParticipant()`.
+ */
+const PARTICIPANT_ID = 'opencode-copilot.opencode';
+
+/**
  * Create a ChatRequestTurn for session history restoration.
  *
- * VSCode's stable types mark the constructor as @hidden/private, but the
- * proposed chatSessionsProvider API allows extensions to construct these objects.
- * We use a type-safe factory to avoid `as any` at call sites.
+ * VSCode's internal ChatRequestTurn constructor requires 5 arguments:
+ *   (prompt, command, references, participant, toolReferences)
+ * The stable @types/vscode hides the constructor, but the proposed
+ * chatSessionsProvider API permits construction at runtime.
  */
 function createRequestTurn(
   prompt: string,
   command: string | undefined,
   references: readonly vscode.ChatPromptReference[],
 ): vscode.ChatRequestTurn {
-  // The proposed API exposes the constructor at runtime despite @types marking it private.
   const Ctor = vscode.ChatRequestTurn as unknown as new (
     p: string,
     c: string | undefined,
     r: readonly vscode.ChatPromptReference[],
+    participant: string,
+    toolReferences: readonly vscode.ChatLanguageModelToolReference[],
   ) => vscode.ChatRequestTurn;
-  return new Ctor(prompt, command, references);
+  return new Ctor(prompt, command, references, PARTICIPANT_ID, []);
 }
 
 /**
  * Create a ChatResponseTurn for session history restoration.
+ *
+ * VSCode's internal ChatResponseTurn constructor requires 3–4 arguments:
+ *   (response, result, participant, command?)
+ * Missing the `participant` parameter causes VS Code to reject or silently
+ * drop the turn during rendering.
  */
 function createResponseTurn(
   response: readonly vscode.ChatResponseMarkdownPart[],
@@ -1374,8 +1402,10 @@ function createResponseTurn(
   const Ctor = vscode.ChatResponseTurn as unknown as new (
     r: readonly vscode.ChatResponseMarkdownPart[],
     res: vscode.ChatResult,
+    participant: string,
+    command?: string,
   ) => vscode.ChatResponseTurn;
-  return new Ctor(response, result);
+  return new Ctor(response, result, PARTICIPANT_ID);
 }
 
 function getTitle(state: { title?: string }): string | undefined {
