@@ -75,16 +75,12 @@ export function hasRegisterLanguageModelChatProvider(): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * Create and return a `LanguageModelChatProvider` wired to ExtensionState.
- *
- * The provider:
- * - Fetches models from `state.backend.config.models()`
- * - Maps image capability from backend model capabilities
- * - Streams text responses via the backend event stream
- * - Refreshes on `backend-ready` and `selection-changed` events
+ * Create a LanguageModelChatProvider for a specific vendor.
+ * Each vendor instance only returns models that belong to it.
  */
 export function createLanguageModelChatProvider(
   state: ExtensionState,
+  vendorId: string,
 ): { provider: vscode.LanguageModelChatProvider<OpenCodeLanguageModelChatInformation>; dispose: () => void } {
   const logger = state.outputChannel;
   const onChangeEmitter = new vscode.EventEmitter<void>();
@@ -101,6 +97,11 @@ export function createLanguageModelChatProvider(
     onChangeEmitter.fire();
   });
 
+  // providerID for routing: map vendor name → backend ID
+  //   opencode-cli → opencode
+  //   opencode-zen → opencode
+  const routeProviderID = vendorId.startsWith('opencode-') ? 'opencode' : vendorId;
+
   const provider: vscode.LanguageModelChatProvider<OpenCodeLanguageModelChatInformation> = {
     onDidChangeLanguageModelChatInformation: onChangeEmitter.event,
 
@@ -110,33 +111,34 @@ export function createLanguageModelChatProvider(
     ): Promise<OpenCodeLanguageModelChatInformation[]> {
       try {
         if (!state.backend.isRunning()) {
-          logger.appendLine('[lm-provider] Backend not running — returning cached/empty model list');
+          logger.appendLine(`[lm-provider:${vendorId}] Backend not running — returning cached/empty model list`);
           return cachedModels;
         }
 
-        // Use ACPModels exposure list — already filtered to exclude
-        // models that Copilot has, and includes OpenCode-unique models.
-        const exposed = state.acpModels?.getModelsForExposure() ?? [];
-        const entries: OpenCodeLanguageModelChatInformation[] = exposed.map((r, i) => ({
-          id: `${r.vendor}/${r.modelId}`,
-          name: r.displayName,
-          family: r.vendor,
-          version: '1',
-          maxInputTokens: r.maxInputTokens,
-          maxOutputTokens: r.maxOutputTokens,
-          capabilities: r.capabilities,
-          isUserSelectable: true,
-          isDefault: i === 0 ? true : undefined,
-          providerID: r.vendor,
-        }));
+        // Only return models matching THIS vendor
+        const all = state.acpModels?.getModelsForExposure() ?? [];
+        const entries: OpenCodeLanguageModelChatInformation[] = all
+          .filter((r) => r.vendor === vendorId)
+          .map((r, i) => ({
+            id: `${r.vendor}/${r.modelId}`,
+            name: r.displayName,
+            // family controls the vendor group name in the model picker
+            family: vendorId === 'opencode-zen' ? 'OpenCode Zen' : 'OpenCode CLI',
+            version: '1',
+            maxInputTokens: r.maxInputTokens,
+            maxOutputTokens: r.maxOutputTokens,
+            capabilities: r.capabilities,
+            isUserSelectable: true,
+            isDefault: i === 0 ? true : undefined,
+            targetChatSessionType: r.sessionOnly ? 'opencode-copilot.opencode' : undefined,
+            providerID: routeProviderID,
+          }));
 
         cachedModels = entries;
-        logger.appendLine(
-          `[lm-provider] Reported ${cachedModels.length} models from ACPModels exposure list.`,
-        );
+        logger.appendLine(`[lm-provider:${vendorId}] Reported ${cachedModels.length} models`);
         return cachedModels;
       } catch (err) {
-        logger.appendLine(`[lm-provider] Error in provideLanguageModelChatInformation: ${err instanceof Error ? err.message : String(err)}`);
+        logger.appendLine(`[lm-provider:${vendorId}] Error: ${err instanceof Error ? err.message : String(err)}`);
         return cachedModels;
       }
     },
@@ -226,8 +228,10 @@ export function createLanguageModelChatProvider(
 // ---------------------------------------------------------------------------
 
 /**
- * Register the OpenCode language model chat provider if the API is available.
- * Returns the Disposable, or `undefined` if the API is unavailable.
+ * Register the OpenCode language model chat providers.
+ * Registers two vendors (both declared in package.json languageModelChatProviders):
+ *   - "opencode"     → models for @opencode only
+ *   - "opencode-zen" → models for all targets (Copilot use)
  */
 export function registerLanguageModelChatProvider(
   state: ExtensionState,
@@ -237,15 +241,21 @@ export function registerLanguageModelChatProvider(
     return undefined;
   }
 
-  const { provider, dispose } = createLanguageModelChatProvider(state);
-  const registration = vscode.lm.registerLanguageModelChatProvider(VENDOR_ID, provider);
+  const registrations: vscode.Disposable[] = [];
+  const disposables: (() => void)[] = [];
 
-  state.outputChannel.appendLine(`[lm-provider] Registered language model chat provider (vendor="${VENDOR_ID}")`);
+  // Create a separate provider instance per vendor, each filtering its own models
+  for (const vendor of ['opencode-cli', 'opencode-zen']) {
+    const { provider, dispose } = createLanguageModelChatProvider(state, vendor);
+    registrations.push(vscode.lm.registerLanguageModelChatProvider(vendor, provider));
+    disposables.push(dispose);
+    state.outputChannel.appendLine(`[lm-provider] Registered LM provider (vendor="${vendor}")`);
+  }
 
   return {
     dispose: () => {
-      registration.dispose();
-      dispose();
+      for (const r of registrations) r.dispose();
+      for (const d of disposables) d();
     },
   };
 }
