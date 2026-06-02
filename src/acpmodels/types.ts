@@ -108,6 +108,8 @@ export interface CopilotModelRegistration {
   vendor: string;
   modelId: string;
   displayName: string;
+  /** Display group in the model picker (e.g. "OpenCode CLI", "OpenCode Zen") */
+  family?: string;
   maxInputTokens: number;
   maxOutputTokens: number;
   capabilities: LanguageModelChatCapabilities;

@@ -32,6 +32,13 @@ export interface SyncEngineOptions {
   authReader: AuthReader;
   /** Output logger */
   logger: vscode.OutputChannel;
+  /**
+   * When true, ACP backend-specific models are registered under their own vendor
+   * (e.g. "opencode"), while non-specific models are registered under "{backend}-only".
+   * When false, all models are registered under "{backend}-only" vendor.
+   * Default: true
+   */
+  backendModelSupport?: boolean;
 }
 
 /**

@@ -1,17 +1,9 @@
 /**
- * ACPModels — bidirectional model registry bridging Copilot and ACP backends.
+ * ACPModels — model registry for ACP backends.
  *
- * Architecture:
- *   Layer 1 — ACP Backend models (what each backend provides)
- *   Layer 2 — Copilot models (what VS Code already knows about)
- *   Layer 3 — ACPModels provider mapping (which providers are bridged)
- *
- * Exposure rule:
- *   If a backend model IS in Copilot AND has a supported mapping → hidden.
- *   If a backend model is NOT in Copilot AND has a supported mapping → exposed.
- *
- * Resolution is always done against the FULL model set so session-target
- * picks work regardless of exposure state.
+ * Exposes models through LM provider vendors:
+ *   - "opencode-cli"  (OpenCode CLI) — ALL models, always, @opencode only
+ *   - "opencode-zen"  (OpenCode Zen) — ALL models, only when BMS ON, all targets
  *
  * @module
  */
@@ -21,7 +13,6 @@ import type { AcpBackend } from '../acp/backend';
 import { AuthReader } from './auth-reader';
 import { runSync, applyInjections } from './sync-engine';
 import { resolve as resolveModel } from './resolver';
-import { enumerateCopilotModels } from './copilot-reader';
 import { providerRegistry } from './provider-registry';
 import type {
   SyncResult,
@@ -34,27 +25,10 @@ import type {
 // ===========================================================================
 
 export interface AcpModels {
-  /** Run full bidirectional sync (enumerate → normalise → diff) */
   sync(): Promise<void>;
-
-  /**
-   * Resolve a Copilot model reference (vendor + id) to a backend route.
-   * Uses the FULL model set including Copilot-side entries so session-target
-   * picks always find their match.
-   */
   resolve(copilotVendor: string, copilotModelId: string): ResolutionResult;
-
-  /**
-   * Models to expose via vscode.lm provider.
-   * Backend models already in Copilot are excluded (Layer 1 ∩ Layer 2 filter).
-   * Only models with a supported mapping (Layer 3) are included.
-   */
   getModelsForExposure(): CopilotModelRegistration[];
-
-  /** Trigger re-sync */
   refresh(): Promise<void>;
-
-  /** Dispose cached state */
   dispose(): void;
 }
 
@@ -66,6 +40,8 @@ export interface CreateAcpModelsOptions {
   backends: Map<string, AcpBackend>;
   authReader: AuthReader;
   logger: vscode.OutputChannel;
+  /** When true, also register "opencode-zen" vendor for Copilot use */
+  backendModelSupport?: boolean;
 }
 
 export function createAcpModels(opts: CreateAcpModelsOptions): AcpModels {
@@ -73,21 +49,33 @@ export function createAcpModels(opts: CreateAcpModelsOptions): AcpModels {
   let copilotModelIds: Set<string> = new Set();
 
   const { backends, authReader, logger } = opts;
+  const bms = opts.backendModelSupport !== false;
+
+  const CLI_DISPLAY = 'OpenCode CLI';
+  const ZEN_DISPLAY = 'OpenCode Zen';
+
+  // Models that are OpenCode-specific (not generic proxies).
+  // These are the only models that go into the "opencode-zen" vendor when BMS is ON.
+  const ZEN_EXCLUSIVE_MODELS = new Set([
+    'big-pickle',
+    'minimax-m3-free',
+    'mimo-v2.5-free',
+    'nemotron-3-super-free',
+    // Add more OpenCode-native models here as needed
+  ]);
 
   const instance: AcpModels = {
     async sync(): Promise<void> {
       await authReader.load();
 
-      // ── Layer 2: cache Copilot-side model IDs ─────────
+      // Cache Copilot-side model IDs for resolve()
       try {
         const cpModels = await enumerateCopilotModels();
         copilotModelIds = new Set(cpModels.map((m) => `${m.vendor}/${m.id}`));
-        logger.appendLine(`[acpmodels] Cached ${copilotModelIds.size} Copilot model IDs`);
       } catch {
         copilotModelIds = new Set();
       }
 
-      // ── Full sync (Layer 1 + 3) ─────────────────────
       const result = await runSync({ backends, authReader, logger });
       await applyInjections(result.providersToInject, backends, logger);
       lastSync = result;
@@ -102,32 +90,36 @@ export function createAcpModels(opts: CreateAcpModelsOptions): AcpModels {
       if (!lastSync) return [];
 
       const registrations: CopilotModelRegistration[] = [];
+      // Deduplicate by the final LM registration key (vendor/modelId) to avoid
+      // registering the same model twice when it appears under multiple providers.
       const seen = new Set<string>();
 
       for (const model of lastSync.allModels) {
-        for (const bp of model.backendPresence) {
-          const key = `${bp.backendId}/${bp.providerID}/${model.modelId}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
+        // Skip models with no backend presence — they cannot be routed
+        if (model.backendPresence.length === 0) continue;
 
-          // Build candidate Copilot-style keys for dedup
-          const directKey = `${bp.providerID}/${model.modelId}`;
-          const aliasKey = model.copilotVendor
-            ? `${model.copilotVendor}/${model.copilotModelId ?? model.modelId}`
-            : directKey;
+        // opencode-cli: one registration per unique modelId
+        const cliKey = `opencode-cli/${model.modelId}`;
+        if (!seen.has(cliKey)) {
+          seen.add(cliKey);
+          registrations.push({
+            vendor: 'opencode-cli',
+            modelId: model.modelId,
+            displayName: model.displayName,
+            maxInputTokens: model.maxInputTokens,
+            maxOutputTokens: model.maxOutputTokens,
+            capabilities: model.capabilities,
+            sessionOnly: true,
+          });
+        }
 
-          const existsInCopilot =
-            copilotModelIds.has(directKey) ||
-            copilotModelIds.has(aliasKey) ||
-            copilotModelIds.has(model.modelId);
-
-          // Layer 3: only expose if provider config table supports this mapping
-          const meta = providerRegistry.get(model.providerMetaId);
-          const hasSupportedMapping = !!meta;
-
-          if (!existsInCopilot && hasSupportedMapping) {
+        // opencode-zen: only OpenCode-specific models when BMS is ON
+        if (bms && ZEN_EXCLUSIVE_MODELS.has(model.modelId)) {
+          const zenKey = `opencode-zen/${model.modelId}`;
+          if (!seen.has(zenKey)) {
+            seen.add(zenKey);
             registrations.push({
-              vendor: bp.providerID,
+              vendor: 'opencode-zen',
               modelId: model.modelId,
               displayName: model.displayName,
               maxInputTokens: model.maxInputTokens,
@@ -140,8 +132,8 @@ export function createAcpModels(opts: CreateAcpModelsOptions): AcpModels {
       }
 
       logger.appendLine(
-        `[acpmodels] Exposure: ${registrations.length} models ` +
-        `(Copilot had ${copilotModelIds.size}, sync had ${lastSync.allModels.length})`,
+        `[acpmodels] Exposure: ${registrations.length} registrations ` +
+        `(bms=${bms}, sync=${lastSync.allModels.length})`,
       );
       return registrations;
     },
