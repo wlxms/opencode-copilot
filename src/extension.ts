@@ -77,10 +77,12 @@ export function activate(context: vscode.ExtensionContext) {
   const selection = new SelectionStore(backend, bus);
   const sessions = new SessionManager(backend, bus);
   const authReader = new AuthReader();
+  const backendModelSupport = vscode.workspace.getConfiguration('opencode').get('experimental.acpBackendModelSupport', true);
   const acpModels = createAcpModels({
     backends: new Map([['opencode', backend]]),
     authReader,
     logger: outputChannel,
+    backendModelSupport,
   });
 
   state = {

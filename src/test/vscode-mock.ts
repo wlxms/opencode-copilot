@@ -120,6 +120,22 @@ export class LanguageModelTextPart {
     constructor(public readonly value: string) {}
 }
 
+export class LanguageModelThinkingPart {
+    constructor(
+        public readonly value: string,
+        public readonly id?: string,
+        public readonly metadata?: { readonly [key: string]: unknown },
+    ) {}
+}
+
+export class LanguageModelToolCallPart {
+    constructor(
+        public readonly callId: string,
+        public readonly name: string,
+        public readonly input: Record<string, unknown>,
+    ) {}
+}
+
 export interface LanguageModelChatCapabilities {
     readonly imageInput?: boolean;
     readonly toolCalling?: boolean | number;
