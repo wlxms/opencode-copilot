@@ -53,6 +53,32 @@ export async function resolvePromptModel(
     return state.selection.get().model;
   }
 
+  // ── ACPModels primary resolution ──────────────────────
+  const vendor = (nativeModel as vscode.LanguageModelChat).vendor;
+  if (vendor && state.acpModels) {
+    // Strip our "vendor/modelId" prefix if present (the LM provider
+    // registers models as "opencode/big-pickle", but the resolver
+    // expects the bare modelId "big-pickle").
+    let modelId = nativeModel.id;
+    if (modelId.startsWith(vendor + '/')) {
+      modelId = modelId.substring(vendor.length + 1);
+    }
+    const resolution = state.acpModels.resolve(vendor, modelId);
+    if (resolution.kind === 'backend' && resolution.providerID && resolution.modelID) {
+      // Unique match — sync to SelectionStore and return
+      const sel = state.selection.get();
+      if (!sel.model ||
+          sel.model.providerID !== resolution.providerID ||
+          sel.model.modelID !== resolution.modelID) {
+        await state.selection.setModel(resolution.providerID, resolution.modelID);
+      }
+      return { providerID: resolution.providerID, modelID: resolution.modelID };
+    }
+  }
+
+  // ── Legacy: fuzzy match against backend model catalogue ────
+  // Falls through if ACPModels didn't resolve (passthrough / not-found / no sync)
+
   // Fetch the backend model catalogue for matching.
   // Errors are non-fatal — fall back to SelectionStore on failure.
   const modelsResult = await state.backend.config.models();
@@ -136,6 +162,23 @@ export async function resolvePromptModel(
 function getWorkspaceDirectory(): string | undefined {
   const workspaceFolders = vscode.workspace.workspaceFolders;
   return workspaceFolders?.[0]?.uri?.fsPath;
+}
+
+/**
+ * Prepend a short, machine-friendly header listing the non-image paths
+ * the user referenced, so the model knows which files exist without us
+ * having to inline their contents.
+ */
+function prependReferencedPaths(
+  prompt: string,
+  paths: readonly string[],
+  logger?: { appendLine(m: string): void },
+): string {
+  if (paths.length === 0) {return prompt;}
+  const list = paths.map((p) => `- ${p}`).join('\n');
+  const header = `The user has referenced the following paths:\n${list}\n\n`;
+  logger?.appendLine(`[handler] Prepended ${paths.length} path reference(s) to prompt`);
+  return header + prompt;
 }
 
 /**
@@ -485,11 +528,25 @@ export function createParticipantHandler(
           `[handler] request.attachments: ${maybeAttachments === undefined ? 'undefined' : Array.isArray(maybeAttachments) ? `array[${maybeAttachments.length}]` : typeof maybeAttachments}`,
         );
 
-        // Extract file/image attachments from VSCode chat references
-        const attachments = extractAttachmentsFromReferences(request.references, state.outputChannel);
+        // Extract image attachments and non-image path references from
+        // VSCode chat references.  Images become binary attachments that
+        // the backend embeds; non-image files/dirs are surfaced as plain
+        // paths in the prompt text so the model can read them with tools
+        // instead of having the backend slurp the bytes and base64-encode
+        // them.
+        const { attachments, paths } = extractAttachmentsFromReferences(
+          request.references,
+          directory,
+          state.outputChannel,
+        );
         if (attachments.length > 0) {
           state.outputChannel.appendLine(
-            `[handler] Extracted ${attachments.length} attachment(s) from request references`,
+            `[handler] Extracted ${attachments.length} image attachment(s) from request references`,
+          );
+        }
+        if (paths.length > 0) {
+          state.outputChannel.appendLine(
+            `[handler] Extracted ${paths.length} path reference(s) from request references`,
           );
         }
 
@@ -517,9 +574,15 @@ export function createParticipantHandler(
           `[handler] Prompt options: ${JSON.stringify({ ...promptOptions, attachments: attachments.length > 0 ? `[${attachments.length} items]` : undefined })}`,
         );
 
+        // Inject referenced paths into the prompt so the model knows about
+        // them without us having to ship their bytes.
+        const promptText = paths.length > 0
+          ? prependReferencedPaths(request.prompt, paths, state.outputChannel)
+          : request.prompt;
+
         const promptPromise = state.backend.sessions.prompt(
           sessionId,
-          request.prompt,
+          promptText,
           directory,
           promptOptions,
         ).then((result: { error?: unknown; data?: unknown }) => {

@@ -193,6 +193,10 @@ export interface OpenCodeClient {
   };
   global: {
     event(): Promise<OpenCodeEventStream>;
+    config: {
+      get(options?: Record<string, unknown>): Promise<SdkResponse<SdkConfigData>>;
+      update(parameters: { config?: unknown }): Promise<SdkResponse<unknown>>;
+    };
   };
   event: {
     subscribe(): Promise<OpenCodeEventStream>;
@@ -212,6 +216,15 @@ export interface OpenCodeClient {
     update(parameters?: {
       directory?: string;
       config?: unknown;
+    }): Promise<SdkResponse<unknown>>;
+  };
+  auth: {
+    set(parameters: {
+      providerID: string;
+      auth: { type: string; key?: string; access?: string; refresh?: string; expires?: number };
+    }): Promise<SdkResponse<unknown>>;
+    remove(parameters: {
+      providerID: string;
     }): Promise<SdkResponse<unknown>>;
   };
   permission: {

@@ -13,6 +13,8 @@ import { AppEventBus } from './acp/app-event-bus';
 import { SelectionStore } from './acp/selection-store';
 import { SessionManager } from './acp/session-manager';
 import type { ExtensionState } from './types';
+import { createAcpModels } from './acpmodels/index';
+import { AuthReader } from './acpmodels/auth-reader';
 
 const KNOWN_PROVIDERS = [
   { id: 'openai', name: 'OpenAI', description: 'GPT-4o, GPT-4o-mini', requiresBaseURL: false, isOpenAICompatible: false, icon: '\ud83d\udfe2' },
@@ -74,9 +76,18 @@ export function activate(context: vscode.ExtensionContext) {
   const bus = new AppEventBus();
   const selection = new SelectionStore(backend, bus);
   const sessions = new SessionManager(backend, bus);
+  const authReader = new AuthReader();
+  const backendModelSupport = vscode.workspace.getConfiguration('opencode').get('experimental.acpBackendModelSupport', true);
+  const acpModels = createAcpModels({
+    backends: new Map([['opencode', backend]]),
+    authReader,
+    logger: outputChannel,
+    backendModelSupport,
+  });
 
   state = {
     backend,
+    acpModels,
     selection,
     sessions,
     bus,
@@ -103,6 +114,16 @@ export function activate(context: vscode.ExtensionContext) {
     // Persist whatever resolveDefaults resolved (e.g. backend defaults
     // when there's no persisted override yet).
     savePersistedSettingsState(context, selection.get());
+
+    // Run ACPModels bidirectional sync (Copilot ↔ OpenCode)
+    outputChannel.appendLine('[extension] Running ACPModels sync...');
+    try {
+      await state!.acpModels.sync();
+      outputChannel.appendLine('[extension] ACPModels sync complete');
+    } catch (syncErr) {
+      outputChannel.appendLine(`[extension] ACPModels sync error: ${syncErr instanceof Error ? syncErr.message : String(syncErr)}`);
+    }
+
     // Notify session provider that backend is ready so it can refresh
     // option groups and session list (avoids polling while offline).
     state!.bus.emit('backend-ready', void 0);

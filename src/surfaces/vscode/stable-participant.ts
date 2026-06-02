@@ -94,10 +94,22 @@ export function createStableHandler(
       return { metadata: { error: 'Session creation failed' } };
     }
 
-    // 3. Extract file/image attachments from VSCode chat references
-    const attachments = extractAttachmentsFromReferences(request.references, logger);
+    // 3. Extract image attachments and non-image path references from
+    // VSCode chat references.  Images become binary attachments that the
+    // backend embeds; non-image files/dirs are surfaced as plain paths
+    // in the prompt text so the model can read them with tools instead
+    // of having the backend slurp the bytes and base64-encode them.
+    const workspaceDirectory = getWorkspaceDirectory();
+    const { attachments, paths } = extractAttachmentsFromReferences(
+      request.references,
+      workspaceDirectory,
+      logger,
+    );
     if (attachments.length > 0) {
-      logger.appendLine(`[stable-participant] Extracted ${attachments.length} attachment(s) from references`);
+      logger.appendLine(`[stable-participant] Extracted ${attachments.length} image attachment(s) from references`);
+    }
+    if (paths.length > 0) {
+      logger.appendLine(`[stable-participant] Extracted ${paths.length} path reference(s) from references`);
     }
 
     // 4. Build prompt options (agent/model + attachments) and send prompt.
@@ -115,10 +127,16 @@ export function createStableHandler(
     if (resolvedModel) {promptOptions.model = resolvedModel;}
     if (attachments.length > 0) {promptOptions.attachments = attachments;}
 
+    // Inject referenced paths into the prompt so the model knows about
+    // them without us shipping their bytes.
+    const promptText = paths.length > 0
+      ? prependReferencedPaths(request.prompt, paths, logger)
+      : request.prompt;
+
     const promptResult = await state.backend.sessions.prompt(
       sessionId,
-      request.prompt,
-      getWorkspaceDirectory(),
+      promptText,
+      workspaceDirectory,
       promptOptions,
     );
     if (promptResult.error) {
@@ -252,6 +270,23 @@ async function resolveSession(
 function getWorkspaceDirectory(): string | undefined {
   const folders = vscode.workspace.workspaceFolders;
   return folders?.[0]?.uri?.fsPath;
+}
+
+/**
+ * Prepend a short, machine-friendly header listing the non-image paths
+ * the user referenced, so the model knows which files exist without us
+ * having to inline their contents.
+ */
+function prependReferencedPaths(
+  prompt: string,
+  paths: readonly string[],
+  logger?: { appendLine(message: string): void },
+): string {
+  if (paths.length === 0) {return prompt;}
+  const list = paths.map((p) => `- ${p}`).join('\n');
+  const header = `The user has referenced the following paths:\n${list}\n\n`;
+  logger?.appendLine(`[stable-participant] Prepended ${paths.length} path reference(s) to prompt`);
+  return header + prompt;
 }
 
 async function yieldToEventLoop(): Promise<void> {

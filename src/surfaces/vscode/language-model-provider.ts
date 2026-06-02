@@ -32,7 +32,9 @@
 
 import * as vscode from 'vscode';
 import type { ExtensionState } from '../../types';
-import type { AcpEvent, AcpModel } from '../../acp/types';
+import { streamViaProvider } from './streaming-client';
+import { providerRegistry } from '../../acpmodels/provider-registry';
+import { AuthReader } from '../../acpmodels/auth-reader';
 
 // ---------------------------------------------------------------------------
 // Extended model info carrying backend metadata
@@ -40,7 +42,7 @@ import type { AcpEvent, AcpModel } from '../../acp/types';
 
 /**
  * Language model information enriched with backend routing data.
- * The extra `provider` / `providerID` fields let us route a chat request
+ * The extra `providerID` field lets us route a chat request
  * to the correct backend model when VS Code invokes `provideLanguageModelChatResponse`.
  */
 export interface OpenCodeLanguageModelChatInformation
@@ -55,76 +57,6 @@ export interface OpenCodeLanguageModelChatInformation
 
 /** Vendor identifier used for `vscode.lm.registerLanguageModelChatProvider` */
 const VENDOR_ID = 'opencode';
-const TARGET_SESSION_TYPE = 'opencode-copilot.opencode';
-
-// ---------------------------------------------------------------------------
-// Capability mapping
-// ---------------------------------------------------------------------------
-
-/**
- * Map ACP model capabilities to VS Code LanguageModelChatCapabilities.
- *
- * The OpenCode backend SDK returns capability data in two layers:
- *   Top-level keys:  `toolcall` (boolean), `attachment` (boolean), `reasoning`, …
- *   Nested `input`:  `{ text, audio, image, video, pdf }` — each boolean.
- *
- * Image support is determined by `capabilities.input.image === true`
- * (the most precise indicator), falling back to `attachment === true`.
- * Tool calling is `capabilities.toolcall === true`.
- */
-function toLmCapabilities(acp: AcpModel): vscode.LanguageModelChatCapabilities {
-  const raw = acp.capabilitiesRaw as Record<string, unknown> | undefined;
-  if (!raw) {
-    return {};
-  }
-
-  // Image / vision — prefer `input.image`, fall back to `attachment`.
-  let hasImage = false;
-  const inputCaps = raw.input as Record<string, unknown> | undefined;
-  if (inputCaps && typeof inputCaps.image === 'boolean') {
-    hasImage = inputCaps.image === true;
-  } else if (typeof raw.attachment === 'boolean') {
-    hasImage = raw.attachment === true;
-  }
-
-  // Tool calling — `toolcall` boolean.
-  const hasTool = raw.toolcall === true;
-
-  return {
-    imageInput: hasImage || undefined,
-    toolCalling: hasTool || undefined,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Model → LM information
-// ---------------------------------------------------------------------------
-
-/**
- * Convert an AcpModel to an OpenCodeLanguageModelChatInformation.
- *
- * Uses provider + model ID to build a unique-but-stable `id`.
- * Token limits come from the backend's `limit.context` / `limit.output`.
- * If the backend doesn't provide limits, use safe defaults.
- */
-function toLmModel(m: AcpModel, isFirst: boolean): OpenCodeLanguageModelChatInformation {
-  const providerID = m.provider ?? 'default';
-  const caps = toLmCapabilities(m);
-  return {
-    id: `${providerID}/${m.id}`,
-    name: m.name ?? m.id,
-    family: m.providerName ?? providerID,
-    version: '1',
-    // Use real limits from backend or fall back to reasonable defaults.
-    maxInputTokens: m.maxInputTokens ?? 128_000,
-    maxOutputTokens: m.maxOutputTokens ?? 16_384,
-    capabilities: caps,
-    targetChatSessionType: TARGET_SESSION_TYPE,
-    isUserSelectable: true,
-    isDefault: isFirst ? true : undefined,
-    providerID,
-  };
-}
 
 // ---------------------------------------------------------------------------
 // Capability check
@@ -143,16 +75,12 @@ export function hasRegisterLanguageModelChatProvider(): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * Create and return a `LanguageModelChatProvider` wired to ExtensionState.
- *
- * The provider:
- * - Fetches models from `state.backend.config.models()`
- * - Maps image capability from backend model capabilities
- * - Streams text responses via the backend event stream
- * - Refreshes on `backend-ready` and `selection-changed` events
+ * Create a LanguageModelChatProvider for a specific vendor.
+ * Each vendor instance only returns models that belong to it.
  */
 export function createLanguageModelChatProvider(
   state: ExtensionState,
+  vendorId: string,
 ): { provider: vscode.LanguageModelChatProvider<OpenCodeLanguageModelChatInformation>; dispose: () => void } {
   const logger = state.outputChannel;
   const onChangeEmitter = new vscode.EventEmitter<void>();
@@ -164,6 +92,16 @@ export function createLanguageModelChatProvider(
   const unsubBackendReady = state.bus.on('backend-ready', () => {
     onChangeEmitter.fire();
   });
+
+  const unsubSelectionChanged = state.bus.on('selection-changed', () => {
+    onChangeEmitter.fire();
+  });
+
+  // providerID for routing: map vendor name → backend ID
+  //   opencode-cli → opencode
+  //   opencode-zen → opencode
+  const routeProviderID = vendorId.startsWith('opencode-') ? 'opencode' : vendorId;
+
   const provider: vscode.LanguageModelChatProvider<OpenCodeLanguageModelChatInformation> = {
     onDidChangeLanguageModelChatInformation: onChangeEmitter.event,
 
@@ -173,28 +111,34 @@ export function createLanguageModelChatProvider(
     ): Promise<OpenCodeLanguageModelChatInformation[]> {
       try {
         if (!state.backend.isRunning()) {
-          logger.appendLine('[lm-provider] Backend not running — returning cached/empty model list');
+          logger.appendLine(`[lm-provider:${vendorId}] Backend not running — returning cached/empty model list`);
           return cachedModels;
         }
 
-        const result = await state.backend.config.models();
-        if (result.error) {
-          logger.appendLine(`[lm-provider] Failed to fetch models: ${result.error}`);
-          return cachedModels;
-        }
+        // Only return models matching THIS vendor
+        const all = state.acpModels?.getModelsForExposure() ?? [];
+        const entries: OpenCodeLanguageModelChatInformation[] = all
+          .filter((r) => r.vendor === vendorId)
+          .map((r, i) => ({
+            id: `${r.vendor}/${r.modelId}`,
+            name: r.displayName,
+            // family controls the vendor group name in the model picker
+            family: vendorId === 'opencode-zen' ? 'OpenCode Zen' : 'OpenCode CLI',
+            version: '1',
+            maxInputTokens: r.maxInputTokens,
+            maxOutputTokens: r.maxOutputTokens,
+            capabilities: r.capabilities,
+            isUserSelectable: true,
+            isDefault: i === 0 ? true : undefined,
+            targetChatSessionType: r.sessionOnly ? 'opencode-copilot.opencode' : undefined,
+            providerID: routeProviderID,
+          }));
 
-        const acpModels = result.data ?? [];
-        cachedModels = acpModels.map((m, i) => toLmModel(m, i === 0));
-
-        // Log capability keys present in backend models (for debugging mismatches)
-        const allCaps = new Set(acpModels.flatMap((m) => m.capabilities ?? []));
-        logger.appendLine(
-          `[lm-provider] Reported ${cachedModels.length} models to VS Code. ` +
-          `Capability keys seen: [${[...allCaps].join(', ') || 'none'}]`,
-        );
+        cachedModels = entries;
+        logger.appendLine(`[lm-provider:${vendorId}] Reported ${cachedModels.length} models`);
         return cachedModels;
       } catch (err) {
-        logger.appendLine(`[lm-provider] Error in provideLanguageModelChatInformation: ${err instanceof Error ? err.message : String(err)}`);
+        logger.appendLine(`[lm-provider:${vendorId}] Error: ${err instanceof Error ? err.message : String(err)}`);
         return cachedModels;
       }
     },
@@ -203,81 +147,49 @@ export function createLanguageModelChatProvider(
       model: OpenCodeLanguageModelChatInformation,
       messages: readonly vscode.LanguageModelChatRequestMessage[],
       _options: vscode.ProvideLanguageModelChatResponseOptions,
-      progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+      progress: vscode.Progress<vscode.LanguageModelResponsePart2>,
       token: vscode.CancellationToken,
     ): Promise<void> {
-      // Flatten messages into a single text prompt for the backend.
-      // A full chat-to-ACP message mapping is out of scope for this PoC;
-      // we concatenate text parts to form the user prompt.
-      const lastUserMsg = messages[messages.length - 1];
-      const textParts: string[] = [];
-      if (lastUserMsg) {
-        for (const part of lastUserMsg.content) {
-          if (part instanceof vscode.LanguageModelTextPart) {
-            textParts.push(part.value);
-          }
-        }
-      }
-      const promptText = textParts.join('\n');
+      const bareId = model.id.includes('/') ? model.id.split('/').pop()! : model.id;
+      const providerID = model.providerID;
 
-      if (!promptText) {
+      const providerMeta = providerRegistry.get(providerID);
+      if (!providerMeta) {
+        error(progress, `Unknown provider "${providerID}"`);
         return;
       }
 
-      // Create a temporary session for this request
-      const sessionResult = await state.backend.sessions.create({ title: 'LM Provider Chat' });
-      if (sessionResult.error || !sessionResult.data) {
-        logger.appendLine(`[lm-provider] Failed to create session: ${sessionResult.error}`);
+      // Resolve API key: use "public" for free providers, auth.json for paid ones.
+      let apiKey: string | undefined;
+      if (isFreeProvider(providerID)) {
+        apiKey = 'public';
+      } else {
+        const authReader = new AuthReader();
+        await authReader.load();
+        apiKey = authReader.getApiKey(providerID);
+      }
+
+      if (!apiKey) {
+        error(progress, `No API key configured for provider "${providerID}". Add it via \`opencode /connect ${providerID}\` or set the ${providerID.toUpperCase()}_API_KEY environment variable.`);
         return;
       }
 
-      const sessionId = sessionResult.data.id;
+      logger.appendLine(`[lm-provider] Streaming via ${providerMeta.npm} ${providerMeta.baseURL} model="${bareId}"`);
 
-      // Set up cancellation → abort
-      token.onCancellationRequested(() => {
-        state.backend.sessions.abort(sessionId).catch(() => { /* best effort */ });
-      });
-
-      // Open event stream before sending the prompt
-      const eventStream = state.backend.events.openSessionStream(sessionId);
-
-      // Send prompt with model selection from the targeted model info
-      await state.backend.sessions.prompt(sessionId, promptText, undefined, {
-        model: { providerID: model.providerID, modelID: model.id.split('/').pop() ?? model.id },
-      });
-
-      // Stream text events to VS Code via ACP event stream
       try {
-        for await (const event of eventStream.stream as AsyncIterable<AcpEvent>) {
-          if (token.isCancellationRequested) { break; }
-
-          // Part delta: incremental text from the model
-          if (event.type === 'part.delta') {
-            progress.report(new vscode.LanguageModelTextPart(event.delta));
-          }
-
-          // Part updated with a text part: full/snapshot text (skip if already
-          // streaming deltas — deltas are preferred for latency)
-          if (event.type === 'part.updated' && event.part.type === 'text' && !event.delta) {
-            progress.report(new vscode.LanguageModelTextPart(event.part.text));
-          }
-
-          // Session went idle — response complete
-          if (event.type === 'session.idle') {
-            break;
-          }
-
-          // Session error — stop streaming
-          if (event.type === 'session.error') {
-            logger.appendLine(`[lm-provider] Session error: ${event.error ?? 'unknown'}`);
-            break;
-          }
-        }
+        await streamViaProvider({
+          providerMeta,
+          apiKey,
+          modelId: bareId,
+          messages,
+          tools: _options.tools,
+          progress,
+          token,
+        });
       } catch (err) {
-        if (token.isCancellationRequested) { return; }
-        logger.appendLine(`[lm-provider] Stream error: ${err instanceof Error ? err.message : String(err)}`);
-      } finally {
-        state.backend.events.closeSessionStream(sessionId);
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.appendLine(`[lm-provider] Provider stream error: ${msg}`);
+        error(progress, `Provider error: ${msg}`);
       }
     },
 
@@ -305,6 +217,7 @@ export function createLanguageModelChatProvider(
     provider,
     dispose: () => {
       unsubBackendReady();
+      unsubSelectionChanged();
       onChangeEmitter.dispose();
     },
   };
@@ -315,8 +228,10 @@ export function createLanguageModelChatProvider(
 // ---------------------------------------------------------------------------
 
 /**
- * Register the OpenCode language model chat provider if the API is available.
- * Returns the Disposable, or `undefined` if the API is unavailable.
+ * Register the OpenCode language model chat providers.
+ * Registers two vendors (both declared in package.json languageModelChatProviders):
+ *   - "opencode"     → models for @opencode only
+ *   - "opencode-zen" → models for all targets (Copilot use)
  */
 export function registerLanguageModelChatProvider(
   state: ExtensionState,
@@ -326,15 +241,32 @@ export function registerLanguageModelChatProvider(
     return undefined;
   }
 
-  const { provider, dispose } = createLanguageModelChatProvider(state);
-  const registration = vscode.lm.registerLanguageModelChatProvider(VENDOR_ID, provider);
+  const registrations: vscode.Disposable[] = [];
+  const disposables: (() => void)[] = [];
 
-  state.outputChannel.appendLine(`[lm-provider] Registered language model chat provider (vendor="${VENDOR_ID}")`);
+  // Create a separate provider instance per vendor, each filtering its own models
+  for (const vendor of ['opencode-cli', 'opencode-zen']) {
+    const { provider, dispose } = createLanguageModelChatProvider(state, vendor);
+    registrations.push(vscode.lm.registerLanguageModelChatProvider(vendor, provider));
+    disposables.push(dispose);
+    state.outputChannel.appendLine(`[lm-provider] Registered LM provider (vendor="${vendor}")`);
+  }
 
   return {
     dispose: () => {
-      registration.dispose();
-      dispose();
+      for (const r of registrations) r.dispose();
+      for (const d of disposables) d();
     },
   };
+}
+
+// ── Helpers ────────────────────────────────────────────────────
+
+/** Providers that use "public" auth (free tier, no key required) */
+function isFreeProvider(providerID: string): boolean {
+  return providerID === 'opencode' || providerID === 'ollama';
+}
+
+function error(progress: vscode.Progress<vscode.LanguageModelResponsePart>, msg: string): void {
+  progress.report(new vscode.LanguageModelTextPart(`❌ ${msg}`));
 }

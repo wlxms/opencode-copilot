@@ -68,6 +68,8 @@ export interface PersistedSettingsState {
 export interface ExtensionState {
   /** ACP-compatible backend abstraction used by all surfaces */
   backend: AcpBackend;
+  /** ACPModels bidirectional model registry (Copilot ↔ ACP backends) */
+  acpModels: import('../acpmodels/index').AcpModels;
   /** Output channel for logging */
   outputChannel: vscode.OutputChannel;
   /** Status bar controller (shows backend / agent / model) */
