@@ -35,6 +35,18 @@
         "category": "ACP"
       }
     ],
+    "languageModelChatProviders": [
+      {
+        "vendor": "opencode-cli",
+        "displayName": "OpenCode CLI",
+        "managementCommand": "opencode.openSettings"
+      },
+      {
+        "vendor": "opencode-zen",
+        "displayName": "OpenCode Zen",
+        "managementCommand": "opencode.openSettings"
+      }
+    ],
     "configuration": {
       "title": "OpenCode",
       "properties": {
@@ -42,6 +54,16 @@
           "type": "boolean",
           "default": false,
           "description": "Enable the experimental ACP-compatible VS Code chat session provider surface when the runtime exposes the required proposed API."
+        },
+        "opencode.experimental.acpBackendModelSupport": {
+          "type": "boolean",
+          "default": true,
+          "description": "When enabled, ACP backend-specific models (e.g. OpenCode Zen/Go) are registered with sessionOnly=false so they appear in all Copilot session targets. Non-specific models get sessionOnly=true (opencode target only). When disabled, all models get sessionOnly=true."
+        },
+        "opencode.experimental.acpModelBridge": {
+          "type": "boolean",
+          "default": false,
+          "description": "[Experimental] Enable ACP Model Bridge — bridges ACP backend models into Copilot's native model picker with full vendor isolation. (Not yet implemented)"
         }
       }
     },
@@ -122,12 +144,6 @@
             "description": "Test questionCarousel UI flow (single-select, multi-select, text input)"
           }
         ]
-      }
-    ],
-    "languageModelChatProviders": [
-      {
-        "vendor": "opencode",
-        "displayName": "OpenCode"
       }
     ]
   },
