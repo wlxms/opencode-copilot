@@ -70,7 +70,7 @@ export async function streamViaProvider(opts: PerProviderCallOptions): Promise<v
   // Convert VS Code tools → AI SDK tools
   const aiTools = convertTools(tools) as any;
 
-  // ── OpenCode Zen: multi-endpoint routing ──
+  // ── OpenCode Zen: multi-endpoint routing by apiMode ──
   if (providerMeta.id === 'opencode' || providerMeta.id === 'opencode-zen') {
     const key = apiKey || 'public';
     if (modelId.startsWith('claude-')) {
@@ -79,8 +79,11 @@ export async function streamViaProvider(opts: PerProviderCallOptions): Promise<v
       await streamOpenCodeResponses(key, providerMeta.baseURL, modelId, aiMessages, progress, abortController);
     } else if (modelId.startsWith('gemini-')) {
       await streamOpenCodeGemini(key, providerMeta.baseURL, modelId, aiMessages, progress, abortController);
+    } else if (getZenModelConfig(modelId).apiMode === 'anthropic') {
+      // Anthropic Messages API format — structured thinking blocks
+      await streamOpenCodeAnthropic(key, providerMeta.baseURL, modelId, aiMessages, progress, abortController);
     } else {
-      // Free / OpenAI-compatible models → raw fetch for reliability
+      // OpenAI Chat Completions format — delta.reasoning_content
       await streamOpenCodeOAI(key, providerMeta.baseURL, modelId, aiMessages, progress, abortController);
     }
     return;
@@ -163,8 +166,32 @@ async function streamResultToProgress(
 }
 
 // ===========================================================================
-// Per-provider implementations
+// OpenCode Zen model config — per-model apiMode and thinking mode
 // ===========================================================================
+// Based on opencode-go-copilot's zenModels.ts reference.
+// apiMode determines which endpoint and wire format to use:
+//   "openai"    → /zen/v1/chat/completions (delta.reasoning_content)
+//   "anthropic" → /zen/v1/messages (Anthropic SSE with thinking blocks)
+
+type ZenApiMode = 'openai' | 'anthropic';
+
+interface ZenModelConfig {
+  apiMode: ZenApiMode;
+  thinkingMode?: 'always' | 'switchable' | 'adaptive';
+  vision?: boolean;
+}
+
+const ZEN_MODEL_CONFIGS: Record<string, ZenModelConfig> = {
+  'big-pickle':              { apiMode: 'openai',    thinkingMode: 'always' },
+  'deepseek-v4-flash-free':  { apiMode: 'openai',    thinkingMode: 'switchable' },
+  'mimo-v2.5-free':          { apiMode: 'openai',    thinkingMode: 'switchable' },
+  'minimax-m3-free':         { apiMode: 'anthropic', thinkingMode: 'adaptive', vision: true },
+  'nemotron-3-super-free':   { apiMode: 'openai',    thinkingMode: 'switchable' },
+};
+
+function getZenModelConfig(modelId: string): ZenModelConfig {
+  return ZEN_MODEL_CONFIGS[modelId] ?? { apiMode: 'openai' };
+}
 
 // Change all internal function signatures to accept `any` for messages
 // (handles both plain-text and multimodal content arrays)
@@ -296,24 +323,36 @@ async function streamOpenCodeOAI(
     throw new Error(`Zen /chat/completions ${response.status}: ${errText.slice(0, 400)}`);
   }
 
-  // Parse SSE stream with  response tag handling.
-  // OpenCode Zen returns thinking content inline in delta.content,
-  // wrapped in  response tags. We track the tag state
-  // and report thinking vs text accordingly.
+  // Parse SSE stream using structured delta fields.
+  // Zen gateway follows standard OpenAI Chat Completions SSE format.
+  //
+  // KEY FINDING from integration tests:
+  //   Free Zen models (deepseek-v4-flash-free, big-pickle, etc.)
+  //   put ALL output in delta.reasoning_content and NONE in delta.content.
+  //   Paid models (Claude, GPT-4) put thinking in reasoning_content
+  //   and final text in delta.content.
+  //
+  // Strategy: track whether we ever see delta.content. If we do,
+  // treat reasoning_content as thinking blocks. If we don't (stream end),
+  // flush all reasoning_content as text output.
   const reader = response.body?.getReader();
   if (!reader) throw new Error('No response body');
-
-  const TAGS = [
-    /<tool_call>/gi, /<\/tool_call>/gi,
-    /<tool_name>/gi, /<\/tool_name>/gi,
-    /<argument>.*?<\/argument>/gis,
-  ];
 
   const decoder = new TextDecoder();
   let rawBuffer = '';
   let thinkingActive = false;
   let thinkingId: string | undefined;
   let textBuffer = '';
+  let sawContent = false;          // Did we ever see delta.content with text?
+  let reasoningBuffer = '';        // Accumulated reasoning if content hasn't appeared yet
+  let hasFlushedReasoning = false; // Whether we've promoted reasoning→text
+
+  // Debounced thinking flush (from opencode-go-copilot reference)
+  let thinkingFlushBuffer = '';    // Buffer for thinking chunks after content mode determined
+  let thinkingFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Tool call accumulator: map index → accumulated call state
+  const toolCallAccs = new Map<number, { id: string; name: string; args: string; emitted: boolean }>();
 
   function flushText() {
     if (textBuffer) {
@@ -322,17 +361,76 @@ async function streamOpenCodeOAI(
     }
   }
 
+  /** Flush debounced thinking buffer to VS Code (called by timer or explicitly) */
+  function flushThinkingBuffer() {
+    if (thinkingFlushTimer) {
+      clearTimeout(thinkingFlushTimer);
+      thinkingFlushTimer = null;
+    }
+    if (thinkingFlushBuffer && thinkingId) {
+      progress.report(new vscode.LanguageModelThinkingPart(thinkingFlushBuffer, thinkingId));
+      thinkingFlushBuffer = '';
+    }
+  }
+
+  /** Buffer thinking content and schedule a debounced flush (100ms debounce like opencode-go-copilot) */
+  function bufferThinkingChunk(text: string) {
+    thinkingFlushBuffer += text;
+    if (!thinkingFlushTimer) {
+      thinkingFlushTimer = setTimeout(() => flushThinkingBuffer(), 100);
+    }
+  }
+
+  /** Flush all pending thinking and clear timer state */
+  function flushAllThinking() {
+    flushThinkingBuffer();
+    if (thinkingFlushTimer) {
+      clearTimeout(thinkingFlushTimer);
+      thinkingFlushTimer = null;
+    }
+  }
+
+  /** Promote all buffered reasoning to text output (used when no delta.content ever appears) */
+  function flushReasoningAsText() {
+    if (reasoningBuffer && !hasFlushedReasoning) {
+      hasFlushedReasoning = true;
+      progress.report(new vscode.LanguageModelTextPart(reasoningBuffer));
+      reasoningBuffer = '';
+    }
+  }
+
   function startThinking() {
     flushText();
-    thinkingId = `think-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    thinkingActive = true;
+    // If we had buffered reasoning, convert it to thinking block now
+    if (reasoningBuffer) {
+      const id = `think-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      progress.report(new vscode.LanguageModelThinkingPart(reasoningBuffer, id));
+      reasoningBuffer = '';
+      thinkingId = id;
+      thinkingActive = true;
+    } else {
+      thinkingId = `think-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      thinkingActive = true;
+    }
   }
 
   function endThinking() {
+    flushAllThinking();
     if (thinkingActive) {
       progress.report(new vscode.LanguageModelThinkingPart('', thinkingId, { vscode_reasoning_done: true } as any));
       thinkingActive = false;
       thinkingId = undefined;
+    }
+  }
+
+  function emitToolCalls() {
+    for (const [, acc] of toolCallAccs) {
+      if (!acc.emitted) {
+        acc.emitted = true;
+        let parsed: Record<string, unknown> = {};
+        try { parsed = JSON.parse(acc.args || '{}'); } catch { /* keep empty */ }
+        progress.report(new vscode.LanguageModelToolCallPart(acc.id, acc.name, parsed));
+      }
     }
   }
 
@@ -342,107 +440,138 @@ async function streamOpenCodeOAI(
       if (done) break;
       rawBuffer += decoder.decode(value, { stream: true });
 
-      // Process complete SSE lines
       const lines = rawBuffer.split('\n');
       rawBuffer = lines.pop() ?? '';
 
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         const data = line.slice(6).trim();
-        if (data === '[DONE]') { endThinking(); flushText(); return; }
+        if (data === '[DONE]') {
+          // Stream ended — flush remaining state
+          // If we never saw delta.content, reasoning IS the text
+          if (!sawContent) flushReasoningAsText();
+          else endThinking();
+          flushText();
+          emitToolCalls();
+          return;
+        }
 
         try {
           const parsed = JSON.parse(data);
-          const delta = parsed.choices?.[0]?.delta;
+          const choice = parsed.choices?.[0];
+          const delta = choice?.delta;
+          if (!delta) continue;
 
-          // Also try reasoning_content if present (some providers use it)
-          if (delta?.reasoning_content) {
-            if (!thinkingActive) startThinking();
-            progress.report(new vscode.LanguageModelThinkingPart(String(delta.reasoning_content), thinkingId));
+          // ── Reasoning / thinking ──
+          // Detection chain (from opencode-go-copilot reference):
+          //   choice.thinking → delta.thinking → delta.reasoning → delta.reasoning_content
+          const rawThinking =
+            (choice as Record<string, unknown> | undefined)?.thinking ??
+            (delta as Record<string, unknown> | undefined)?.thinking ??
+            (delta as Record<string, unknown> | undefined)?.reasoning ??
+            delta.reasoning_content;
+          const reasoning = typeof rawThinking === 'string' ? rawThinking
+            : (rawThinking && typeof rawThinking === 'object')
+              ? String((rawThinking as Record<string, string>)['text'] ?? JSON.stringify(rawThinking))
+              : undefined;
+          const content = delta.content;
+
+          // ── Content appears → we're in "split" mode ──
+          if (typeof content === 'string' && content.length > 0) {
+            sawContent = true;
+            // Content appeared after reasoning → flush reasoning as thinking block
+            if (!hasFlushedReasoning && reasoningBuffer) {
+              // Create thinking block from buffered reasoning
+              const id = `think-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+              progress.report(new vscode.LanguageModelThinkingPart(reasoningBuffer, id));
+              progress.report(new vscode.LanguageModelThinkingPart('', id, { vscode_reasoning_done: true } as any));
+              reasoningBuffer = '';
+              hasFlushedReasoning = true;
+            }
+            endThinking();
+            textBuffer += content;
+            flushText();
             continue;
           }
 
-          // Handle delta.content — may contain  response tags
-          if (delta?.content) {
-            let chunk = String(delta.content);
-            let pos = 0;
-
-            while (pos < chunk.length) {
-              // Find next  or  or  response or  or ]
-              const nextThink = chunk.indexOf('<think>', pos);
-              const nextEndThink = chunk.indexOf('</think>', pos);
-              const nextResponse = chunk.indexOf('<response>', pos);
-              const nextEndResponse = chunk.indexOf('</response>', pos);
-              const candidates = [
-                nextThink, nextEndThink, nextResponse, nextEndResponse,
-                chunk.indexOf('<thinking>', pos), chunk.indexOf('</thinking>', pos),
-                chunk.indexOf('<thought>', pos), chunk.indexOf('</thought>', pos),
-                chunk.indexOf('[thinking]', pos), chunk.indexOf('[/thinking]', pos),
-              ].filter(c => c >= 0);
-              const nextTag = candidates.length > 0 ? Math.min(...candidates) : -1;
-
-              if (nextTag < 0) {
-                // No more tags — emit remaining text
-                const remaining = chunk.slice(pos);
-                if (remaining) {
-                  if (thinkingActive)
-                    progress.report(new vscode.LanguageModelThinkingPart(remaining, thinkingId));
-                  else
-                    textBuffer += remaining;
-                }
-                break;
-              }
-
-              // Emit text before the tag
-              if (nextTag > pos) {
-                const before = chunk.slice(pos, nextTag);
-                if (thinkingActive)
-                  progress.report(new vscode.LanguageModelThinkingPart(before, thinkingId));
-                else
-                  textBuffer += before;
-              }
-
-              // Determine which tag and its length
-              let tagLen = 0;
-              let isStart = false;
-              let isEnd = false;
-              if (nextThink === nextTag) { tagLen = '<think>'.length; isStart = true; }
-              else if (nextEndThink === nextTag) { tagLen = '</think>'.length; isEnd = true; }
-              else if (nextResponse === nextTag) { tagLen = '<response>'.length; isStart = true; }
-              else if (nextEndResponse === nextTag) { tagLen = '</response>'.length; isEnd = true; }
-              else if (chunk.startsWith('<thinking>', nextTag)) { tagLen = '<thinking>'.length; isStart = true; }
-              else if (chunk.startsWith('</thinking>', nextTag)) { tagLen = '</thinking>'.length; isEnd = true; }
-              else if (chunk.startsWith('<thought>', nextTag)) { tagLen = '<thought>'.length; isStart = true; }
-              else if (chunk.startsWith('</thought>', nextTag)) { tagLen = '</thought>'.length; isEnd = true; }
-              else if (chunk.startsWith('[thinking]', nextTag)) { tagLen = '[thinking]'.length; isStart = true; }
-              else if (chunk.startsWith('[/thinking]', nextTag)) { tagLen = '[/thinking]'.length; isEnd = true; }
-
-              if (tagLen > 0) {
-                if (isStart && !thinkingActive) startThinking();
-                if ((isEnd || isStart) && thinkingActive) {
-                  if (isEnd) endThinking();
-                }
-              }
-
-              pos = nextTag + tagLen;
+          // ── Reasoning content (no content seen yet) ──
+          if (typeof reasoning === 'string' && reasoning.length > 0) {
+            if (sawContent) {
+              // We're in split mode — buffer and flush with debounce (like opencode-go-copilot)
+              if (!thinkingActive) startThinking();
+              bufferThinkingChunk(reasoning);
+            } else {
+              // Don't know yet if this is thinking or text — buffer it
+              reasoningBuffer += reasoning;
             }
+            continue;
           }
 
-          // Handle tool calls
-          if (delta?.tool_calls) {
+          // ── Tool calls ──
+          if (delta.tool_calls) {
+            if (!sawContent) {
+              // Tool call arrived before any content → reasoning WAS the text
+              flushReasoningAsText();
+            } else {
+              endThinking();
+            }
             flushText();
-            endThinking();
             for (const tc of delta.tool_calls) {
-              if (tc.function) {
-                progress.report(new vscode.LanguageModelToolCallPart(
-                  tc.id ?? tc.index ?? 'unknown',
-                  tc.function.name ?? 'unknown',
-                  safeParseJson(tc.function.arguments ?? '{}'),
-                ));
+              if (!tc.function) continue;
+              const idx = tc.index ?? 0;
+              let acc = toolCallAccs.get(idx);
+              if (!acc) {
+                acc = { id: tc.id ?? '', name: '', args: '', emitted: false };
+                toolCallAccs.set(idx, acc);
               }
+              if (tc.id) acc.id = tc.id;
+              if (tc.function.name) acc.name = tc.function.name;
+              if (tc.function.arguments) acc.args += tc.function.arguments;
             }
           }
-        } catch { /* skip malformed */ }
+        } catch { /* skip malformed JSON */ }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  // Stream ended without [DONE] — flush remaining state
+  if (!sawContent) flushReasoningAsText();
+  else endThinking();
+  flushText();
+  emitToolCalls();
+}
+
+// ===========================================================================
+// SSE streaming utility
+// ===========================================================================
+
+/**
+ * Read an SSE stream line by line, calling onData for each `data: ...` line.
+ * Returns when [DONE] is received or the stream ends.
+ */
+async function readSSEStream(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  onData: (data: string) => void,
+): Promise<void> {
+  const decoder = new TextDecoder();
+  let buffer = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        if (trimmed.startsWith('data: ')) {
+          const data = trimmed.slice(6);
+          if (data === '[DONE]') return;
+          onData(data);
+        }
       }
     }
   } finally {
@@ -450,10 +579,10 @@ async function streamOpenCodeOAI(
   }
 }
 
-function safeParseJson(input: string): Record<string, unknown> {
-  try { return JSON.parse(input); } catch { return {}; }
-}
-
+/**
+ * Fetch and stream the /responses endpoint.
+ * OpenAI Responses API format: { delta?: string, content?: Array<{type, text}> }
+ */
 async function streamOpenCodeResponses(
   apiKey: string, baseURL: string, modelId: string,
   messages: any[],
@@ -468,11 +597,12 @@ async function streamOpenCodeResponses(
     signal: abortController.signal,
   });
   if (!resp.ok) throw new Error(`OpenCode GPT /responses returned ${resp.status}`);
-  const text = await resp.text();
-  for (const line of text.split('\n')) {
-    if (!line.startsWith('data: ')) continue;
+  const reader = resp.body?.getReader();
+  if (!reader) throw new Error('No response body');
+
+  await readSSEStream(reader, (data) => {
     try {
-      const d = JSON.parse(line.slice(6));
+      const d = JSON.parse(data);
       if (d.delta) progress.report(new vscode.LanguageModelTextPart(d.delta));
       if (Array.isArray(d.content)) {
         for (const p of d.content) {
@@ -480,9 +610,13 @@ async function streamOpenCodeResponses(
         }
       }
     } catch { /* skip */ }
-  }
+  });
 }
 
+/**
+ * Fetch and stream the Gemini-compatible endpoint.
+ * Google SSE format: { candidates: [{ content: { parts: [{ text }] } }] }
+ */
 async function streamOpenCodeGemini(
   apiKey: string, baseURL: string, modelId: string,
   messages: any[],
@@ -502,11 +636,12 @@ async function streamOpenCodeGemini(
     signal: abortController.signal,
   });
   if (!resp.ok) throw new Error(`OpenCode Gemini returned ${resp.status}`);
-  const text = await resp.text();
-  for (const line of text.split('\n')) {
-    if (!line.startsWith('data: ')) continue;
+  const reader = resp.body?.getReader();
+  if (!reader) throw new Error('No response body');
+
+  await readSSEStream(reader, (data) => {
     try {
-      const d = JSON.parse(line.slice(6));
+      const d = JSON.parse(data);
       const parts = d.candidates?.[0]?.content?.parts;
       if (parts) {
         for (const p of parts) {
@@ -514,5 +649,205 @@ async function streamOpenCodeGemini(
         }
       }
     } catch { /* skip */ }
+  });
+}
+
+// ===========================================================================
+// Anthropic Messages API streaming for Zen models with apiMode: "anthropic"
+// ===========================================================================
+//
+// SSE event format:
+//   event: content_block_start
+//   data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"..."}}
+//
+//   event: content_block_delta
+//   data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"..."}}
+//
+//   event: content_block_stop
+//   data: {"type":"content_block_stop","index":0}
+//
+//   event: content_block_start
+//   data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+//
+// Thinking blocks are properly structured (not XML tags), and signature_delta can be ignored.
+// ===========================================================================
+
+/**
+ * Header used for Anthropic Messages API calls to Zen gateway.
+ * Models like minimax-m3-free use apiMode: "anthropic" and require this format.
+ */
+async function streamOpenCodeAnthropic(
+  apiKey: string, baseURL: string, modelId: string,
+  messages: any[],
+  progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+  abortController: AbortController,
+) {
+  // Convert messages from aiMessages format to Anthropic format.
+  // aiMessages roles are already strings ('user'/'assistant') from streamViaProvider,
+  // but content may be string or array — flatten to string for Anthropic.
+  const anthropicMessages: Array<{ role: string; content: string }> = [];
+  for (const m of messages) {
+    const role = typeof m.role === 'number' ? (m.role === 1 ? 'user' : 'assistant') : (m.role || 'user');
+    const content = typeof m.content === 'string'
+      ? m.content
+      : (Array.isArray(m.content)
+          ? m.content.map((p: any) => p.type === 'text' ? (p.text ?? '') : '').join('\n').trim()
+          : String(m.content ?? ''));
+    if (content) {
+      anthropicMessages.push({ role, content });
+    }
   }
+
+  const resp = await fetch(`${baseURL}/messages`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: modelId,
+      max_tokens: 4096,
+      messages: anthropicMessages,
+      stream: true,
+    }),
+    signal: abortController.signal,
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => '');
+    throw new Error(`Zen /messages ${resp.status}: ${errText.slice(0, 400)}`);
+  }
+
+  const reader = resp.body?.getReader();
+  if (!reader) throw new Error('No response body');
+
+  const decoder = new TextDecoder();
+  let rawBuffer = '';
+  let currentEvent = '';
+  let thinkingId: string | undefined;
+  let thinkingActive = false;
+  let thinkingFlushBuffer = '';
+  let thinkingFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  let textBuffer = '';
+
+  // Debounced thinking flush (same pattern as streamOpenCodeOAI)
+  function flushThinkingBuffer() {
+    if (thinkingFlushTimer) clearTimeout(thinkingFlushTimer);
+    thinkingFlushTimer = null;
+    if (thinkingFlushBuffer && thinkingId) {
+      progress.report(new vscode.LanguageModelThinkingPart(thinkingFlushBuffer, thinkingId));
+      thinkingFlushBuffer = '';
+    }
+  }
+
+  function bufferThinking(text: string) {
+    thinkingFlushBuffer += text;
+    if (!thinkingFlushTimer) {
+      thinkingFlushTimer = setTimeout(() => flushThinkingBuffer(), 100);
+    }
+  }
+
+  function flushAllThinking() {
+    flushThinkingBuffer();
+    if (thinkingFlushTimer) clearTimeout(thinkingFlushTimer);
+    thinkingFlushTimer = null;
+  }
+
+  function flushText() {
+    if (textBuffer) {
+      progress.report(new vscode.LanguageModelTextPart(textBuffer));
+      textBuffer = '';
+    }
+  }
+
+  function endThinking() {
+    flushAllThinking();
+    if (thinkingActive) {
+      progress.report(new vscode.LanguageModelThinkingPart('', thinkingId, { vscode_reasoning_done: true } as any));
+      thinkingActive = false;
+      thinkingId = undefined;
+    }
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      rawBuffer += decoder.decode(value, { stream: true });
+
+      const lines = rawBuffer.split('\n');
+      rawBuffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        if (trimmed.startsWith('event: ')) {
+          currentEvent = trimmed.slice(7);
+          continue;
+        }
+
+        if (!trimmed.startsWith('data: ')) continue;
+        const data = trimmed.slice(6);
+        if (data === '[DONE]') continue;
+
+        try {
+          const parsed = JSON.parse(data);
+          const eventType = parsed.type ?? currentEvent;
+
+          switch (eventType) {
+            case 'content_block_start': {
+              const block = parsed.content_block as Record<string, unknown> | undefined;
+              if (block?.type === 'thinking') {
+                // Thinking block begins
+                flushText();
+                thinkingId = `think-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+                thinkingActive = true;
+                // Initial empty thinking string — skip
+              } else if (block?.type === 'text') {
+                // Text block begins after thinking
+                endThinking();
+              }
+              break;
+            }
+
+            case 'content_block_delta': {
+              const delta = parsed.delta as Record<string, unknown> | undefined;
+              if (!delta) break;
+              if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+                bufferThinking(delta.thinking);
+              } else if (delta.type === 'text_delta' && typeof delta.text === 'string') {
+                textBuffer += delta.text;
+                flushText();
+              }
+              // signature_delta → ignore
+              break;
+            }
+
+            case 'content_block_stop': {
+              // End of current block — handled by the next content_block_start
+              break;
+            }
+
+            case 'message_start':
+            case 'ping':
+              // No action needed
+              break;
+
+            case 'message_delta':
+            case 'message_stop':
+              // Stream ending
+              break;
+          }
+        } catch { /* skip malformed JSON */ }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  // Stream ended
+  endThinking();
+  flushText();
 }
