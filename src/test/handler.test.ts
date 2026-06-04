@@ -189,6 +189,16 @@ describe('createParticipantHandler', () => {
         reply: vi.fn(),
         reject: vi.fn(),
       },
+      createBridge: vi.fn(() => ({
+        setStream: vi.fn(),
+        setCallbacks: vi.fn(),
+        setTracker: vi.fn(),
+        processEvent: vi.fn(),
+        run: vi.fn().mockResolvedValue(true),
+        getUserMessageId: vi.fn().mockReturnValue(null),
+        getSessionTitle: vi.fn().mockReturnValue(null),
+        getHadSubagentTasks: vi.fn().mockReturnValue(false),
+      })) as unknown as AcpBackend['createBridge'],
     };
 
     state = {
@@ -224,6 +234,12 @@ describe('createParticipantHandler', () => {
         refresh: vi.fn(async () => {}),
         dispose: vi.fn(),
       } as unknown as ExtensionState['acpModels'],
+      sessionStore: {
+        getTurnsPath: vi.fn().mockReturnValue(''),
+        getSessionDir: vi.fn().mockReturnValue(''),
+        initialize: vi.fn().mockResolvedValue(undefined),
+        writeMeta: vi.fn().mockResolvedValue(undefined),
+      } as any,
     };
 
     stream = {

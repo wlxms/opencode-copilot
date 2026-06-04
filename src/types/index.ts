@@ -78,6 +78,8 @@ export interface ExtensionState {
   selection: import('../acp/selection-store').SelectionStore;
   /** Centralised session mapping (VSCode chat → backend session) */
   sessions: import('../acp/session-manager').SessionManager;
+  /** Filesystem-backed persistent session store */
+  sessionStore: import('../acp/streaming/session-store').SessionStore;
   /** Application-level typed event bus */
   bus: import('../acp/app-event-bus').AppEventBus;
 }

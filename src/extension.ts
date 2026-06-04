@@ -12,6 +12,7 @@ import { loadPersistedSettingsState, savePersistedSettingsState } from './settin
 import { AppEventBus } from './acp/app-event-bus';
 import { SelectionStore } from './acp/selection-store';
 import { SessionManager } from './acp/session-manager';
+import { SessionStore } from './acp/streaming/session-store';
 import type { ExtensionState } from './types';
 import { createAcpModels } from './acpmodels/index';
 import { AuthReader } from './acpmodels/auth-reader';
@@ -85,11 +86,14 @@ export function activate(context: vscode.ExtensionContext) {
     backendModelSupport,
   });
 
+  const workspacePath = getWorkspaceDirectory();
+
   state = {
     backend,
     acpModels,
     selection,
     sessions,
+    sessionStore: new SessionStore({ workspaceRoot: workspacePath ?? '', backendName: 'opencode' }),
     bus,
     outputChannel,
     statusBar,
@@ -101,7 +105,6 @@ export function activate(context: vscode.ExtensionContext) {
   selection.hydrate(persisted);
 
   // Start backend immediately on activation
-  const workspacePath = getWorkspaceDirectory();
   backend.start(workspacePath).then(async (result) => {
     if (result.error) {
       outputChannel.appendLine(`[extension] Backend start failed: ${String(result.error)}`);

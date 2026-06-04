@@ -10,6 +10,7 @@ import { OpenCodeServerManager } from '../../opencode/server';
 import { GlobalEventBroker } from './event-broker';
 import type {
   AcpBackend,
+  AcpBridge,
   AcpSessionOperations,
   AcpConfigOperations,
   AcpEventOperations,
@@ -36,6 +37,7 @@ import type {
 import { normalizeStreamEvent } from './events';
 import type { OpenCodeEventStream } from './sdk-events';
 import type { OpenCodeClient, SdkAgentData } from './sdk-types';
+import { OpenCodeBridge } from './opencode-bridge';
 import { OpenCodeSettingsProvider } from './settings';
 
 // ===========================================================================
@@ -170,6 +172,15 @@ export class OpenCodeBackend implements AcpBackend {
 
   isRunning(): boolean {
     return this.serverManager.isRunning();
+  }
+
+  /** @inheritdoc */
+  createBridge(sessionId: string, directory?: string, knownFileUris?: Set<string>): AcpBridge {
+    const bridge = new OpenCodeBridge(this.sessions, this.permissions, this.questions);
+    bridge.setSessionId(sessionId);
+    if (directory) bridge.setDirectory(directory);
+    if (knownFileUris) bridge.setKnownFileUris(knownFileUris);
+    return bridge;
   }
 
   // =======================================================================

@@ -131,10 +131,10 @@ export function createAcpModels(opts: CreateAcpModelsOptions): AcpModels {
         }
       }
 
-      logger.appendLine(
-        `[acpmodels] Exposure: ${registrations.length} registrations ` +
-        `(bms=${bms}, sync=${lastSync.allModels.length})`,
-      );
+      // [debug] logger.appendLine(
+      //   `[acpmodels] Exposure: ${registrations.length} registrations ` +
+      //   `(bms=${bms}, sync=${lastSync.allModels.length})`,
+      // );
       return registrations;
     },
 

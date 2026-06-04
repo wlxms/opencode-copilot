@@ -69,6 +69,10 @@ import {
   hasFullProposedSurface,
 } from './capabilities';
 
+import { CollectorStream } from '../../acp/streaming/collector-stream';
+import { readSessionEvents } from '../../acp/serializable/serializer';
+import { readCheckpoints } from '../../acp/checkpoint/checkpoint-store';
+
 // ---------------------------------------------------------------------------
 // Internal types for session content rendering (not part of the VS Code API)
 // ---------------------------------------------------------------------------
@@ -622,96 +626,20 @@ export function createSessionContentProvider(
 
     sessionRefreshInFlight = true;
     try {
-      const sessionsResult = await state.backend.sessions.list(directory);
-      const runtimeSessions = collectRuntimeSessions();
+      // Use filesystem-backed SessionStore (single source of truth)
+      const sessions = await state.sessionStore.listSessions();
 
       logger.appendLine(
-        `[session-provider] Refreshing Session list (directory=${directory ?? 'none'}, ` +
-        `listError=${sessionsResult.error ?? 'none'}, listCount=${sessionsResult.data?.length ?? 0}, runtimeCount=${runtimeSessions.length})`,
+        `[session-provider] Refreshing Session list from SessionStore (count=${sessions.length})`,
       );
 
-      if (sessionsResult.error) {
-        logger.appendLine(`[session-provider] Session list source error: ${sessionsResult.error}`);
-      }
+      const items = sessions.map(s => ({
+        id: s.id,
+        title: s.title ?? s.id,
+        createdAt: new Date(s.createdAt ?? Date.now()),
+      }));
 
-      const listedSessions = sessionsResult.data ?? [];
-      let mergedSessions = mergeSessions(listedSessions, runtimeSessions);
-
-      logger.appendLine(
-        `[session-provider] Session list merged result: ${mergedSessions.map(s => `${s.id}:${getSessionLabel(s)}`).join(', ') || '(empty)'}`,
-      );
-
-      // ---- Cache-as-floor protection ----
-      // The daemon's session.list() may be unreliable for directory-scoped
-      // queries (observed to return 0 even when sessions exist and their
-      // history is retrievable).  When the daemon returns fewer sessions than
-      // the cache, supplement missing entries from the cache.  This is always
-      // safe because the cache is updated every time we publish — if a session
-      // were legitimately deleted, the next daemon-scoped refresh would include
-      // it in the cache update, and eventually the stale entry ages out.
-      let cached: CachedSessionItem[] | undefined;
-      try {
-        cached = context.globalState.get<CachedSessionItem[]>(SESSION_CACHE_KEY);
-      } catch {
-        cached = undefined;
-      }
-
-      // Determine if the daemon returned suspiciously few sessions.
-      // "Suspicious" means: runs gave back 0 sessions but the cache or runtime
-      // has sessions — this indicates the daemon's list API is broken.
-      const daemonReturnedZero = listedSessions.length === 0;
-      const hasSourceOfTruth = (cached && cached.length > 0) || runtimeSessions.length > 0;
-      const shouldSupplement = daemonReturnedZero && hasSourceOfTruth;
-
-      if (shouldSupplement && cached && cached.length > mergedSessions.length) {
-        const mergedIds = new Set(mergedSessions.map(s => s.id));
-        const missingFromCache = cached
-          .filter(c => !mergedIds.has(c.id))
-          .map(c => ({
-            id: c.id, title: c.title, createdAt: new Date(c.createdAt),
-          }));
-        if (missingFromCache.length > 0) {
-          logger.appendLine(
-            `[session-provider] Daemon returned 0 sessions — supplementing ${missingFromCache.length} session(s) from cache ` +
-            `(runtime=${runtimeSessions.length}, cache=${cached.length})`,
-          );
-          mergedSessions = [...mergedSessions, ...missingFromCache]
-            .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-        }
-      } else if (isRace && cached && cached.length > mergedSessions.length) {
-        // Race-specific fallback: daemon returned some sessions but may be
-        // incomplete due to concurrent turn processing.
-        const mergedIds = new Set(mergedSessions.map(s => s.id));
-        const missingFromCache = cached
-          .filter(c => !mergedIds.has(c.id))
-          .map(c => ({
-            id: c.id, title: c.title, createdAt: new Date(c.createdAt),
-          }));
-        if (missingFromCache.length > 0) {
-          logger.appendLine(
-            `[session-provider] Race detected — supplementing ${missingFromCache.length} session(s) from cache ` +
-            `(daemon returned ${mergedSessions.length}, cache has ${cached.length})`,
-          );
-          mergedSessions = [...mergedSessions, ...missingFromCache]
-            .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-        }
-      }
-
-      // Daemon has no sessions and sessionMap is empty → restore from cache
-      if (mergedSessions.length === 0 && runtimeSessions.length === 0) {
-        if (cached && cached.length > 0) {
-          const restored = cached.map(c => ({
-            id: c.id, title: c.title, createdAt: new Date(c.createdAt),
-          }));
-          logger.appendLine(`[session-provider] Restored ${restored.length} session(s) from local cache`);
-          publishSessionItems(controller, restored);
-          return;
-        }
-        logger.appendLine('[session-provider] Skipping publish — no sessions available');
-        return;
-      }
-
-      publishSessionItems(controller, mergedSessions);
+      publishSessionItems(controller, items);
     } finally {
       sessionRefreshInFlight = false;
     }
@@ -798,7 +726,7 @@ export function createSessionContentProvider(
       // this inputState so the picker text updates in real time.
       const syncListener = onDidChangeOptionsEmitter.event(() => {
         if (currentInputState && !isPlaceholderGroups(cachedOptionGroups)) {
-          logger.appendLine('[session-provider] Pushing updated groups to current inputState');
+          // [debug] logger.appendLine('[session-provider] Pushing updated groups to current inputState');
           currentInputState.groups = cachedOptionGroups;
         }
       });
@@ -806,10 +734,10 @@ export function createSessionContentProvider(
       // Subscribe to changes — update selection in real-time.
       inputState.onDidChange(() => {
         const groups = inputState.groups ?? [];
-        logger.appendLine(
-          `[session-provider] Picker changed: ${groups.length} groups` +
-          groups.map(g => ` [${g.id}] selected=${g.selected?.id ?? '(none)'}`).join(''),
-        );
+        // [debug] logger.appendLine(
+        //   `[session-provider] Picker changed: ${groups.length} groups` +
+        //   groups.map(g => ` [${g.id}] selected=${g.selected?.id ?? '(none)'}`).join(''),
+        // );
 
         for (const group of groups) {
           const selected = group.selected;
@@ -817,7 +745,7 @@ export function createSessionContentProvider(
 
           // Skip placeholder items — they shouldn't leak into state
           if (selected.id.endsWith('-connecting')) {
-            logger.appendLine(`[session-provider] Picker ignored placeholder selection: ${selected.id}`);
+            // [debug] logger.appendLine(`[session-provider] Picker ignored placeholder selection: ${selected.id}`);
             continue;
           }
 
@@ -826,7 +754,7 @@ export function createSessionContentProvider(
             state.selection.setAgent(agentId).catch((err: unknown) => {
               logger.appendLine(`[session-provider] Failed to set agent: ${err}`);
             });
-            logger.appendLine(`[session-provider] Picker set currentAgent=${agentId}`);
+            // [debug] logger.appendLine(`[session-provider] Picker set currentAgent=${agentId}`);
           }
         }
       });
@@ -983,78 +911,77 @@ export function createSessionContentProvider(
 
   /**
    * Fetch message history from the backend and map to VSCode turn format.
+   *
+   * Replays persisted ACP events through a CollectorStream + bridge instead of
+   * fetching from the backend API directly. This ensures the restored session
+   * matches the original rendering exactly.
    */
   async function fetchSessionHistory(
     sessionId: string,
     token: vscode.CancellationToken,
   ): Promise<(vscode.ChatRequestTurn | vscode.ChatResponseTurn)[]> {
-    const result = await state.backend.sessions.messages(sessionId);
-    if (result.error || !result.data) {
-      logger.appendLine(
-        `[session-provider] Failed to fetch history for ${sessionId}: ${result.error ?? 'no data'}`,
-      );
+    const turnsPath = state.sessionStore.getTurnsPath(sessionId);
+    const sessionDir = state.sessionStore.getSessionDir(sessionId);
+
+    // 1. Read events and snapshots
+    const events = await readSessionEvents<AcpEvent>(turnsPath);
+    const snapshots = await readCheckpoints(sessionDir);
+
+    logger.appendLine(
+      `[session-provider] fetchSessionHistory: read ${events.length} events + ${snapshots.length} snapshots from ${turnsPath}`,
+    );
+
+    if (events.length === 0) {
       return [];
     }
 
-    const messages = result.data.items;
-    const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
-    const turnMap: Array<{ vscodeTurn: number; messageId: string }> = [];
-    let turnIndex = 0;
+    // 2. Create CollectorStream for replay
+    const collector = new CollectorStream();
 
-    for (const msg of messages) {
-      if (token.isCancellationRequested) { break; }
+    // 3. Create bridge via backend factory (same factory used for live rendering)
+    const bridge = state.backend.createBridge(sessionId);
+    bridge.setStream(collector);
 
-      if (msg.role === 'user') {
-        history.push(createRequestTurn(
-          msg.text,
-          undefined, // command
-          [],        // references
-        ));
-      } else if (msg.role === 'assistant') {
-        const responses: vscode.ChatResponseMarkdownPart[] = [];
+    // 4. Replay events
+    let userTurn: vscode.ChatRequestTurn | null = null;
 
-        // Add text as markdown response
-        if (msg.text) {
-          responses.push(new vscode.ChatResponseMarkdownPart(msg.text));
+    for (const event of events) {
+      if (token.isCancellationRequested) break;
+
+      // Detect user message from the first text event
+      if (event.type === 'part.updated' && event.part.type === 'text' && !userTurn) {
+        const textPart = event.part as { text?: string };
+        if (textPart.text && textPart.text.length > 0) {
+          userTurn = new (vscode.ChatRequestTurn as unknown as new (
+            prompt: string, command: string | undefined, references: unknown[], participant: string
+          ) => vscode.ChatRequestTurn)(
+            textPart.text,
+            undefined,
+            [],
+            'opencode-copilot.opencode',
+          );
         }
-
-        // VS Code's chat renderer rejects ChatResponseTurn with an empty
-        // response array. When an assistant turn has no text (e.g. a pure
-        // tool-execution turn), insert a placeholder so the turn is rendered
-        // instead of being silently dropped.
-        if (responses.length === 0) {
-          const toolInfo = msg.toolCalls?.length
-            ? ` (${msg.toolCalls.length} tool${msg.toolCalls.length > 1 ? 's' : ''})`
-            : '';
-          responses.push(new vscode.ChatResponseMarkdownPart(
-            `*Tool execution${toolInfo}*`,
-          ));
-        }
-
-        // Build turn metadata for session recovery
-        const turnMetadata: Record<string, unknown> = {
-          sessionId,
-          turnMap: [...turnMap],
-        };
-
-        history.push(createResponseTurn(
-          responses,
-          { metadata: turnMetadata },
-        ));
-
-        turnMap.push({
-          vscodeTurn: turnIndex,
-          messageId: msg.id,
-        });
-        turnIndex++;
+        // Don't replay the user message as assistant output
+        continue;
       }
+
+      // Replay event through bridge → CollectorStream captures rendered output
+      bridge.processEvent(event);
     }
 
+    // 5. Build turn from captured parts
+    const assistantTurn = collector.buildTurn();
+
+    const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
+    if (userTurn) {
+      history.push(userTurn);
+    }
+    history.push(assistantTurn);
+
     logger.appendLine(
-      `[session-provider] Restored ${history.length} turns for session ${sessionId} ` +
-      `(${history.filter(t => t instanceof vscode.ChatRequestTurn).length} requests, ` +
-      `${history.filter(t => t instanceof vscode.ChatResponseTurn).length} responses)`,
+      `[session-provider] Restored ${history.length} turns for session ${sessionId}`,
     );
+
     return history;
   }
 

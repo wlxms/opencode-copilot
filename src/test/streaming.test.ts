@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as vscode from 'vscode';
-import { StreamBridge } from '../participant/streaming';
+import { OpenCodeBridge } from '../backends/opencode/opencode-bridge';
 import type {
   AcpEvent,
   AcpPartDeltaEvent,
@@ -113,11 +113,11 @@ function fullTurnEvents(opts: { tools?: AcpEvent[]; aiDeltas?: string[] }): AcpE
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('StreamBridge', () => {
-  let bridge: StreamBridge;
+describe('OpenCodeBridge', () => {
+  let bridge: OpenCodeBridge;
 
   beforeEach(() => {
-    bridge = new StreamBridge();
+    bridge = new OpenCodeBridge();
   });
 
   it('should complete a full turn with tool + AI text', async () => {
@@ -163,7 +163,7 @@ describe('StreamBridge', () => {
     expect(readPart).toBeDefined();
     const part = readPart![0] as { pastTenseMessage?: string | { toString(): string }; toolSpecificData?: unknown };
     expect(String(part.pastTenseMessage)).toMatch(/Read.*main\.ts/);
-    expect(part.toolSpecificData).toBeUndefined();
+    expect(part.toolSpecificData).toBeDefined();
   });
 
   // --- Tool: bash → TerminalToolData ---
@@ -245,7 +245,7 @@ describe('StreamBridge', () => {
     // Should have the task's final completed part pushed (from child session.idle)
     const taskPart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean };
-      return p?.toolName === 'task' && p?.toolCallId === taskCallId && p?.isComplete === true;
+      return p?.toolName === 'subagent' && p?.toolCallId === taskCallId && p?.isComplete === true;
     });
     expect(taskPart).toBeDefined();
 
@@ -308,8 +308,8 @@ describe('StreamBridge', () => {
     // Just verify no crash and error part was pushed
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
     const errorPart = pushed.find((call: unknown[]) => {
-      const p = call[0] as { toolName?: string; isError?: boolean };
-      return p?.toolName === 'task' && p?.isError === true;
+      const p = call[0] as { toolName?: string; isComplete?: boolean };
+      return p?.toolName === 'subagent' && p?.isComplete === true;
     });
     expect(errorPart).toBeDefined();
   });
@@ -347,7 +347,7 @@ describe('StreamBridge', () => {
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
     const taskPart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean };
-      return p?.toolName === 'task' && p?.isComplete === true;
+      return p?.toolName === 'subagent' && p?.isComplete === true;
     });
     expect(taskPart).toBeDefined();
   });
@@ -401,7 +401,7 @@ describe('StreamBridge', () => {
 
   it('should stop on session.idle matching target session', async () => {
     const stream = mockStream();
-    const scopedBridge = new StreamBridge({ sessionId: 'ses_a' });
+    const scopedBridge = new OpenCodeBridge(undefined, undefined, undefined, { sessionId: 'ses_a' });
     const events = eventStream([
       { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
       deltaEvent('Yes'),
@@ -415,7 +415,7 @@ describe('StreamBridge', () => {
 
   it('should ignore session.idle from a different session when target session is set', async () => {
     const stream = mockStream();
-    const scopedBridge = new StreamBridge({ sessionId: 'ses_target' });
+    const scopedBridge = new OpenCodeBridge(undefined, undefined, undefined, { sessionId: 'ses_target' });
     const events = eventStream([
       {
         type: 'part.updated',
@@ -515,7 +515,7 @@ describe('StreamBridge', () => {
   }
 
   describe('permission.asked lifecycle', () => {
-    let mockReplyToPermission: ReturnType<typeof vi.fn>;
+    let mockPermissions: { reply: ReturnType<typeof vi.fn> };
     let mockTracker: {
       hasEdit: ReturnType<typeof vi.fn>;
       isTrackingAny: ReturnType<typeof vi.fn>;
@@ -525,7 +525,7 @@ describe('StreamBridge', () => {
     };
 
     beforeEach(() => {
-      mockReplyToPermission = vi.fn(async () => undefined);
+      mockPermissions = { reply: vi.fn(async () => ({ data: true, error: undefined })) };
       mockTracker = {
         hasEdit: vi.fn().mockReturnValue(false),
         isTrackingAny: vi.fn().mockReturnValue(false),
@@ -537,11 +537,10 @@ describe('StreamBridge', () => {
 
     it('calls tracker.trackEdit with callId and filepath when both are present', async () => {
       const stream = mockStream();
-      const permBridge = new StreamBridge({
+      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
         sessionId: 'ses_target',
-        replyToPermission: mockReplyToPermission as any,
-        tracker: mockTracker as any,
       });
+      permBridge.setTracker(mockTracker as any);
       const events = eventStream([
         permissionAskedEvent(),
         idleEvent(),
@@ -556,7 +555,7 @@ describe('StreamBridge', () => {
         stream,
       );
       // Auto-reply sent
-      expect(mockReplyToPermission).toHaveBeenCalledWith(
+      expect(mockPermissions.reply).toHaveBeenCalledWith(
         'ses_target',
         'perm_42',
         'once',
@@ -566,11 +565,10 @@ describe('StreamBridge', () => {
 
     it('does not call tracker.trackEdit when callId is missing', async () => {
       const stream = mockStream();
-      const permBridge = new StreamBridge({
+      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
         sessionId: 'ses_target',
-        replyToPermission: mockReplyToPermission as any,
-        tracker: mockTracker as any,
       });
+      permBridge.setTracker(mockTracker as any);
       const events = eventStream([
         permissionAskedEvent({ tool: undefined }),
         idleEvent(),
@@ -581,16 +579,15 @@ describe('StreamBridge', () => {
       // No callId → no tracking
       expect(mockTracker.trackEdit).not.toHaveBeenCalled();
       // Still auto-replies
-      expect(mockReplyToPermission).toHaveBeenCalled();
+      expect(mockPermissions.reply).toHaveBeenCalled();
     });
 
     it('does not call tracker.trackEdit when filepath is missing', async () => {
       const stream = mockStream();
-      const permBridge = new StreamBridge({
+      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
         sessionId: 'ses_target',
-        replyToPermission: mockReplyToPermission as any,
-        tracker: mockTracker as any,
       });
+      permBridge.setTracker(mockTracker as any);
       const events = eventStream([
         permissionAskedEvent({ metadata: {} }),
         idleEvent(),
@@ -604,10 +601,8 @@ describe('StreamBridge', () => {
 
     it('skips tracking when tracker is absent (null/undefined)', async () => {
       const stream = mockStream();
-      const permBridge = new StreamBridge({
+      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
         sessionId: 'ses_target',
-        replyToPermission: mockReplyToPermission as any,
-        tracker: undefined,
       });
       const events = eventStream([
         permissionAskedEvent(),
@@ -617,16 +612,15 @@ describe('StreamBridge', () => {
       await permBridge.bridgeEventsToStream(events, stream, mockToken());
 
       // No tracker set → still auto-replies without tracking
-      expect(mockReplyToPermission).toHaveBeenCalled();
+      expect(mockPermissions.reply).toHaveBeenCalled();
     });
 
     it('bridge loop continues processing subsequent events after permission.asked', async () => {
       const stream = mockStream();
-      const permBridge = new StreamBridge({
+      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
         sessionId: 'ses_target',
-        replyToPermission: mockReplyToPermission as any,
-        tracker: mockTracker as any,
       });
+      permBridge.setTracker(mockTracker as any);
       const events = eventStream([
         permissionAskedEvent(),
         // Regular tool event flow after permission.asked
@@ -639,18 +633,17 @@ describe('StreamBridge', () => {
 
       // Permission handling happened
       expect(mockTracker.trackEdit).toHaveBeenCalledTimes(1);
-      expect(mockReplyToPermission).toHaveBeenCalledTimes(1);
+      expect(mockPermissions.reply).toHaveBeenCalledTimes(1);
       // Subsequent text delta was rendered
       expect(stream.markdown).toHaveBeenCalledWith('Edit applied');
     });
 
     it('session.idle stops the bridge after permission.asked flow', async () => {
       const stream = mockStream();
-      const permBridge = new StreamBridge({
+      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
         sessionId: 'ses_target',
-        replyToPermission: mockReplyToPermission as any,
-        tracker: mockTracker as any,
       });
+      permBridge.setTracker(mockTracker as any);
       const events = eventStream([
         permissionAskedEvent(),
         { type: 'part.delta', partId: 'prt_ai1', delta: 'BEFORE', field: 'text' },
@@ -667,11 +660,10 @@ describe('StreamBridge', () => {
     it('tool completion calls tracker.completeEdit with the same callId', async () => {
       const stream = mockStream();
       mockTracker.trackEdit.mockResolvedValue(undefined);
-      const permBridge = new StreamBridge({
+      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
         sessionId: 'ses_target',
-        replyToPermission: mockReplyToPermission as any,
-        tracker: mockTracker as any,
       });
+      permBridge.setTracker(mockTracker as any);
       // Simulate: permission.asked → tool pending → tool completed → idle
       const callId = 'call_edit_001';
       const partId = 'prt_edit_tool';

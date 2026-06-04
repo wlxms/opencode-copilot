@@ -273,6 +273,14 @@ export class ChatResponseMarkdownPart {
     constructor(public readonly value: MarkdownString | string) {}
 }
 
+export class ChatResponseThinkingProgressPart {
+    constructor(
+        public readonly value: string | string[],
+        public readonly id?: string,
+        public readonly metadata?: { readonly [key: string]: any },
+    ) {}
+}
+
 /**
  * Mock for proposed API: ChatToolInvocationPart
  * This is NOT in @types/vscode — available at runtime with chatParticipantAdditions.

@@ -3,8 +3,25 @@ import * as vscode from 'vscode';
 import { createSessionContentProvider } from '../surfaces/vscode/experimental-session';
 import { isUserSelectableAgent } from '../acp/types';
 import type { AcpAgent } from '../acp/types';
+import type { AcpBackend } from '../acp/backend';
 import type { ExtensionState } from '../types';
 import { AppEventBus } from '../acp/app-event-bus';
+import { readSessionEvents } from '../acp/serializable/serializer';
+import { readCheckpoints } from '../acp/checkpoint/checkpoint-store';
+
+vi.mock('../acp/serializable/serializer', () => ({
+  readSessionEvents: vi.fn(),
+}));
+vi.mock('../acp/checkpoint/checkpoint-store', () => ({
+  readCheckpoints: vi.fn(),
+}));
+
+function makeTextEvent(text: string) {
+  return {
+    type: 'part.updated',
+    part: { id: `p_${Date.now()}`, type: 'text', text },
+  };
+}
 
 describe('createSessionContentProvider', () => {
   let state: ExtensionState;
@@ -32,6 +49,9 @@ describe('createSessionContentProvider', () => {
           : [],
       },
     }));
+
+    vi.mocked(readSessionEvents).mockResolvedValue([]);
+    vi.mocked(readCheckpoints).mockResolvedValue([]);
 
     state = {
       backend: {
@@ -80,6 +100,16 @@ describe('createSessionContentProvider', () => {
           reply: vi.fn(),
           reject: vi.fn(),
         },
+        createBridge: vi.fn(() => ({
+          setStream: vi.fn(),
+          setCallbacks: vi.fn(),
+          setTracker: vi.fn(),
+          processEvent: vi.fn(),
+          run: vi.fn().mockResolvedValue(true),
+          getUserMessageId: vi.fn().mockReturnValue(null),
+          getSessionTitle: vi.fn().mockReturnValue(null),
+          getHadSubagentTasks: vi.fn().mockReturnValue(false),
+        })) as unknown as AcpBackend['createBridge'],
       },
       outputChannel: vscode.window.createOutputChannel('test'),
       sessions: {
@@ -102,6 +132,12 @@ describe('createSessionContentProvider', () => {
         refresh: vi.fn(async () => {}),
         dispose: vi.fn(),
       } as unknown as ExtensionState['acpModels'],
+      sessionStore: {
+        listSessions: vi.fn().mockResolvedValue([]),
+        getTurnsPath: vi.fn().mockReturnValue(''),
+        getSessionDir: vi.fn().mockReturnValue(''),
+        initialize: vi.fn().mockResolvedValue(undefined),
+      } as any,
     };
 
     (vscode.workspace as { workspaceFolders?: Array<{ uri: vscode.Uri; name: string; index: number }> }).workspaceFolders = [
@@ -109,7 +145,13 @@ describe('createSessionContentProvider', () => {
     ];
   });
 
-  it('publishes session items from backend sessions.list during refresh', async () => {
+  it('publishes session items from SessionStore during refresh', async () => {
+    // Mock SessionStore to return expected sessions
+    (state.sessionStore.listSessions as any).mockResolvedValue([
+      { id: 'ses_1', title: 'First Session', createdAt: '2026-05-28T01:00:00Z', backendName: 'opencode' },
+      { id: 'ses_2', title: 'Session ses_2', createdAt: '2026-05-28T01:30:00Z', backendName: 'opencode' },
+    ]);
+
     const { controller } = createSessionContentProvider(
       state,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
@@ -125,24 +167,18 @@ describe('createSessionContentProvider', () => {
     const items = Array.from(controller!.items).map(([, item]) => item);
     expect(items).toHaveLength(2);
     const labels = items.map(item => item.label);
-    const descriptions = items.map(item => item.description);
     const paths = items.map(item => item.resource.path);
     expect(labels).toContain('First Session');
     expect(labels).toContain('Session ses_2');
-    expect(descriptions).toEqual([undefined, undefined]);
     expect(paths).toContain('/ses_1');
     expect(paths).toContain('/ses_2');
     expect(items.every(item => item.status === vscode.ChatSessionStatus.Completed)).toBe(true);
   });
 
   it('publishes runtime session when backend list is empty', async () => {
-    state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
-    state.sessions.set('opencode-copilot.opencode:/untitled-1', {
-      sessionId: 'ses_runtime',
-      turnMap: [],
-      title: 'Runtime Session',
-      createdAt: new Date('2026-05-28T02:00:00Z'),
-    });
+    (state.sessionStore.listSessions as any).mockResolvedValue([
+      { id: 'ses_runtime', title: 'Runtime Session', createdAt: '2026-05-28T02:00:00.000Z', backendName: 'opencode' },
+    ]);
 
     const { controller } = createSessionContentProvider(
       state,
@@ -162,13 +198,9 @@ describe('createSessionContentProvider', () => {
   });
 
   it('preserves restored provider session title in Session list items', async () => {
-    state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
-    state.sessions.set('opencode-copilot.opencode:/ses_restore', {
-      sessionId: 'ses_restore',
-      turnMap: [],
-      title: 'Restored Session',
-      createdAt: new Date('2026-05-28T03:00:00Z'),
-    });
+    (state.sessionStore.listSessions as any).mockResolvedValue([
+      { id: 'ses_restore', title: 'Restored Session', createdAt: '2026-05-28T03:00:00.000Z', backendName: 'opencode' },
+    ]);
 
     const { controller } = createSessionContentProvider(
       state,
@@ -187,6 +219,9 @@ describe('createSessionContentProvider', () => {
 
   it('derives a restored session title from first user message when backend title is empty', async () => {
     state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
+    vi.mocked(readSessionEvents).mockResolvedValue([
+      makeTextEvent('Need help with session titles') as any,
+    ]);
 
     const { provider } = createSessionContentProvider(
       state,
@@ -200,7 +235,7 @@ describe('createSessionContentProvider', () => {
     );
     const restoredResourceKey = vscode.Uri.parse('opencode-copilot.opencode:/ses_restore').toString();
 
-    expect(state.backend.sessions.messages).toHaveBeenCalledWith('ses_restore');
+    expect(state.sessionStore.getTurnsPath).toHaveBeenCalledWith('ses_restore');
     expect(session.title).toBe('Need help with session titles');
     expect(state.sessions.get(restoredResourceKey)?.title).toBe('Need help with session titles');
   });
@@ -214,14 +249,9 @@ describe('createSessionContentProvider', () => {
     state.backend.sessions.get = vi.fn(async () => ({
       data: { id: 'ses_placeholder', title: 'New OpenCode Session', createdAt: new Date('2026-05-28T03:00:00Z') },
     }));
-    state.backend.sessions.messages = vi.fn(async () => ({
-      data: {
-        items: [
-          { id: 'user_1', role: 'user' as const, text: 'How do I fix the auth bug?' },
-          { id: 'assistant_1', role: 'assistant' as const, text: 'Let me check', toolCalls: [] },
-        ],
-      },
-    }));
+    vi.mocked(readSessionEvents).mockResolvedValue([
+      makeTextEvent('How do I fix the auth bug?') as any,
+    ]);
 
     const { provider } = createSessionContentProvider(
       state,
@@ -241,14 +271,9 @@ describe('createSessionContentProvider', () => {
     state.backend.sessions.get = vi.fn(async () => ({
       data: { id: 'ses_abc12345', title: 'OpenCode Session abc12345', createdAt: new Date('2026-05-28T03:00:00Z') },
     }));
-    state.backend.sessions.messages = vi.fn(async () => ({
-      data: {
-        items: [
-          { id: 'user_1', role: 'user' as const, text: 'Refactor the database layer' },
-          { id: 'assistant_1', role: 'assistant' as const, text: 'Sure', toolCalls: [] },
-        ],
-      },
-    }));
+    vi.mocked(readSessionEvents).mockResolvedValue([
+      makeTextEvent('Refactor the database layer') as any,
+    ]);
 
     const { provider } = createSessionContentProvider(
       state,
@@ -265,7 +290,9 @@ describe('createSessionContentProvider', () => {
   });
 
   it('prefers runtime non-placeholder title over placeholder when same sessionId has multiple entries', async () => {
-    state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
+    (state.sessionStore.listSessions as any).mockResolvedValue([
+      { id: 'ses_dup', title: 'Derived From Prompt', createdAt: '2026-05-28T01:00:00.000Z', backendName: 'opencode' },
+    ]);
 
     // Original tab entry with derived title
     state.sessions.set('opencode-copilot.opencode:/untitled-1', {

@@ -1,11 +1,13 @@
 import * as vscode from 'vscode';
-import { StreamBridge } from './streaming';
 import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
 import { isPlaceholderSessionTitle } from '../surfaces/vscode/experimental-session';
+import { SerializableSessionStream } from '../acp/streaming/session-stream';
+import type { SerializableSessionMeta } from '../acp/serializable/types';
 
 import type { ExtensionState, TurnMapping } from '../types';
 import type { AcpChildSessionInfo, AcpSessionStatus, AcpResult, AcpModel } from '../acp/types';
+import type { AcpEvent } from '../acp/types';
 import { ExternalEditTracker } from './external-edit-tracker';
 import { collectOpenFileUris } from './checkpoint';
 import { extractAttachmentsFromReferences } from './references';
@@ -344,6 +346,13 @@ async function resolveSession(
     chatState.title = result.data.title;
     chatState.createdAt = result.data.createdAt;
     stream.progress('Session ready');
+    // Write session metadata to filesystem for session list
+    state.sessionStore.writeMeta(result.data.id, {
+      id: result.data.id,
+      title: result.data.title ?? getInitialSessionTitle(vscodeSessionId),
+      createdAt: result.data.createdAt?.toISOString() ?? new Date().toISOString(),
+      backendName: state.backend.name,
+    }).catch(err => state.outputChannel.appendLine(`[handler] writeMeta failed: ${err}`));
     state.outputChannel.appendLine(
       `[handler] Created new session ${chatState.sessionId} for VSCode chat ${vscodeSessionId}`,
     );
@@ -647,6 +656,27 @@ export function createParticipantHandler(
         let needsContinue = true;
         let sessionTitleFromBridge: string | undefined;
 
+        // ── JSONL event persistence (once per session) ────────────────────
+        const workspaceRoot = getWorkspaceDirectory() ?? '';
+        const meta: SerializableSessionMeta = {
+          id: sessionId,
+          title: getInitialSessionTitle(vscodeSessionId),
+          createdAt: new Date().toISOString(),
+          backendName: state.backend.name,
+        };
+        state.outputChannel.appendLine(`[handler] workspaceRoot="${workspaceRoot}" backend="${state.backend.name}" sessionId="${sessionId}"`);
+        const sessionStream = new SerializableSessionStream(
+          workspaceRoot, state.backend.name, sessionId, meta,
+        );
+        await sessionStream.initialize();
+        state.outputChannel.appendLine(`[handler] SessionStream initialized`);
+        // Write the user prompt as a turn-start (event format)
+        sessionStream.onEvent({
+          type: 'part.updated',
+          part: { type: 'text' as any, id: `user-${sessionId}`, text: request.prompt },
+        } as AcpEvent);
+        state.outputChannel.appendLine(`[handler] User event queued`);
+
         try {
           while (needsContinue && !token.isCancellationRequested) {
             state.outputChannel.appendLine(`[handler] bridge run start for session ${sessionId}`);
@@ -654,68 +684,16 @@ export function createParticipantHandler(
 
             const events = state.backend.events.openSessionStream(sessionId);
 
-            const bridge = new StreamBridge({
-              logger: state.outputChannel,
-              sessionId,
-              knownFileUris: new Set(knownFileUris),
-              replyToPermission: (permissionSessionId, permissionId, response, permissionDirectory) => (
-                state.backend.permissions.reply(
-                  permissionSessionId,
-                  permissionId,
-                  response,
-                  permissionDirectory,
-                )
-              ),
-              replyToQuestion: (questionSessionId, requestId, answers, questionDirectory) => (
-                state.backend.questions.reply(
-                  questionSessionId,
-                  requestId,
-                  answers,
-                  questionDirectory,
-                ).then((result: { data?: boolean; error?: string }) => {
-                  state.outputChannel.appendLine(`[handler] question reply result: ${JSON.stringify(result)}`);
-                  return result;
-                }).catch((err: unknown) => {
-                  state.outputChannel.appendLine(`[handler] question reply error: ${err instanceof Error ? err.message : String(err)}`);
-                  return { error: err instanceof Error ? err.message : String(err) };
-                })
-              ),
-              rejectQuestion: (questionSessionId, requestId, questionDirectory) => (
-                state.backend.questions.reject(
-                  questionSessionId,
-                  requestId,
-                  questionDirectory,
-                ).then((result: { data?: boolean; error?: string }) => {
-                  state.outputChannel.appendLine(`[handler] question reject result: ${JSON.stringify(result)}`);
-                  return result;
-                }).catch((err: unknown) => {
-                  state.outputChannel.appendLine(`[handler] question reject error: ${err instanceof Error ? err.message : String(err)}`);
-                  return { error: err instanceof Error ? err.message : String(err) };
-                })
-              ),
-              directory,
-              tracker,
-              checkChildSessionsRunning: async () => {
-                try {
-                  const statusResult = await state.backend.sessions.status(directory);
-                  if (statusResult.error || !statusResult.data) {return false;}
-                  return await hasBusyDescendant(
-                    sessionId, directory, new Set(), statusResult.data,
-                    state.backend.sessions.children,
-                  );
-                } catch {
-                  return false;
-                }
-              },
-              findAncestorScope: (sid: string, candidates: Set<string>) =>
-                state.backend.sessions.findAncestor(sid, candidates),
-              getParentSession: (sid: string) =>
-                state.backend.sessions.parent(sid),
-            });
+            const bridge = state.backend.createBridge(sessionId, directory, new Set(knownFileUris));
+            bridge.setStream(stream);
+            bridge.setCallbacks(sessionStream);
+            bridge.setTracker(tracker);
+            state.outputChannel.appendLine(`[handler] Bridge created, callbacks set`);
 
             state.outputChannel.appendLine('[handler] bridge.run() starting...');
-            await bridge.run(events.stream, stream, token);
-            state.outputChannel.appendLine(`[handler] bridge.run() completed. hadSubagentTasks=${bridge.getHadSubagentTasks()}, cancellationRequested=${token.isCancellationRequested}`);
+            await bridge.run(events.stream, token);
+            await sessionStream.flush();
+            state.outputChannel.appendLine(`[handler] bridge.run() completed.`);
 
             state.backend.events.closeSessionStream(sessionId);
 
