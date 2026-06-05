@@ -18,12 +18,16 @@ export interface FileSnapshotRecord {
   uri: string;
   /** Full file content at this snapshot */
   content: string;
+  /** Whether this is the file state before or after a tool edit */
+  phase?: 'before' | 'after';
   /** Monotonically increasing edit index within the session */
   editIndex: number;
   /** The tool call ID that produced this edit */
   toolCallId: string;
   /** ISO-8601 timestamp of the snapshot */
   timestamp: string;
+  /** True when the file did not exist at this phase */
+  missing?: boolean;
 }
 
 // ===========================================================================
@@ -119,4 +123,12 @@ export interface SerializableSessionMeta {
   title?: string;
   createdAt?: string;
   backendName?: string;
+  description?: string;
+  changeSummary?: {
+    files: number;
+    additions?: number;
+    deletions?: number;
+    paths?: string[];
+  };
+  status?: 'completed' | 'inProgress' | 'needsInput' | 'failed';
 }

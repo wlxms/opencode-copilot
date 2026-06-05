@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { createSessionContentProvider } from '../surfaces/vscode/experimental-session';
 import { isUserSelectableAgent } from '../acp/types';
@@ -137,6 +140,7 @@ describe('createSessionContentProvider', () => {
         getTurnsPath: vi.fn().mockReturnValue(''),
         getSessionDir: vi.fn().mockReturnValue(''),
         initialize: vi.fn().mockResolvedValue(undefined),
+        writeMeta: vi.fn().mockResolvedValue(undefined),
       } as any,
     };
 
@@ -217,6 +221,37 @@ describe('createSessionContentProvider', () => {
     expect(items[0]?.description).toBeUndefined();
   });
 
+  it('shows persisted session changes in Session list item descriptions', async () => {
+    (state.sessionStore.listSessions as any).mockResolvedValue([
+      { id: 'ses_changes', title: 'Changed Session', createdAt: '2026-05-28T04:00:00.000Z', backendName: 'opencode' },
+    ]);
+    vi.mocked(readSessionEvents).mockResolvedValue([
+      {
+        type: 'session.diff',
+        sessionId: 'ses_changes',
+        diffs: [
+          { file: '/workspace/a.ts', patch: '', additions: 3, deletions: 1, status: 'modified' },
+          { file: '/workspace/b.ts', patch: '', additions: 10, deletions: 0, status: 'added' },
+        ],
+      } as any,
+    ]);
+
+    const { controller } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    await controller!.refreshHandler({
+      isCancellationRequested: false,
+      onCancellationRequested: () => ({ dispose() {} }),
+    });
+
+    const items = Array.from(controller!.items).map(([, item]) => item);
+    expect(items[0]?.label).toBe('Changed Session');
+    expect(items[0]?.status).toBe(vscode.ChatSessionStatus.Completed);
+    expect(items[0]?.description).toBe('2 files changed +13 -1');
+  });
+
   it('derives a restored session title from first user message when backend title is empty', async () => {
     state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
     vi.mocked(readSessionEvents).mockResolvedValue([
@@ -238,6 +273,78 @@ describe('createSessionContentProvider', () => {
     expect(state.sessionStore.getTurnsPath).toHaveBeenCalledWith('ses_restore');
     expect(session.title).toBe('Need help with session titles');
     expect(state.sessions.get(restoredResourceKey)?.title).toBe('Need help with session titles');
+    expect(state.sessionStore.writeMeta).toHaveBeenCalledWith(
+      'ses_restore',
+      expect.objectContaining({
+        id: 'ses_restore',
+        title: 'Need help with session titles',
+        backendName: 'opencode',
+      }),
+    );
+  });
+
+  it('does not publish a session-list change just from restoring content', async () => {
+    const sessionListChanged = vi.fn();
+    state.bus.on('session-list-changed', sessionListChanged);
+    vi.mocked(readSessionEvents).mockResolvedValue([
+      makeTextEvent('Need help with session titles') as any,
+    ]);
+
+    const { provider } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    await provider.provideChatSessionContent(
+      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+      { inputState: {} as vscode.ChatSessionInputState },
+    );
+
+    expect(sessionListChanged).not.toHaveBeenCalled();
+  });
+
+  it('does not resume a completed restored session just to replay checkpoints', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-restore-replay-'));
+    const file = path.join(dir, 'file.txt');
+    fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
+    const uri = vscode.Uri.file(file);
+
+    vi.mocked(readSessionEvents).mockResolvedValue([
+      makeTextEvent('Restore edited file') as any,
+    ]);
+    vi.mocked(readCheckpoints).mockResolvedValue([
+      {
+        uri: uri.fsPath,
+        content: 'a\nb\nc\n',
+        phase: 'before',
+        editIndex: 1,
+        toolCallId: 'tool-1',
+        timestamp: '2026-06-05T00:00:00.000Z',
+      },
+      {
+        uri: uri.fsPath,
+        content: 'a\nB\nc\n',
+        phase: 'after',
+        editIndex: 1,
+        toolCallId: 'tool-1',
+        timestamp: '2026-06-05T00:00:01.000Z',
+      },
+    ]);
+
+    const { provider } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    const session = await provider.provideChatSessionContent(
+      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+      { inputState: {} as vscode.ChatSessionInputState },
+    );
+
+    expect(session.activeResponseCallback).toBeUndefined();
+    expect(fs.readFileSync(file, 'utf-8')).toBe('a\nb\nc\n');
   });
 
   // =========================================================================
@@ -323,6 +430,33 @@ describe('createSessionContentProvider', () => {
     const items = Array.from(controller!.items).map(([, item]) => item);
     expect(items).toHaveLength(1);
     expect(items[0]?.label).toBe('Derived From Prompt');
+  });
+
+  it('merges runtime renamed titles over SessionStore placeholders', async () => {
+    (state.sessionStore.listSessions as any).mockResolvedValue([
+      { id: 'ses_renamed', title: 'New OpenCode Session', createdAt: '2026-05-28T01:00:00.000Z', backendName: 'opencode' },
+    ]);
+
+    state.sessions.set('opencode-copilot.opencode:/untitled-rename', {
+      sessionId: 'ses_renamed',
+      turnMap: [],
+      title: 'Runtime Rename Title',
+      createdAt: new Date('2026-05-28T01:00:00Z'),
+    });
+
+    const { controller } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    await controller!.refreshHandler({
+      isCancellationRequested: false,
+      onCancellationRequested: () => ({ dispose() {} }),
+    });
+
+    const items = Array.from(controller!.items).map(([, item]) => item);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.label).toBe('Runtime Rename Title');
   });
 
   it('restoring existing session reuses non-placeholder title from another sessionMap entry', async () => {

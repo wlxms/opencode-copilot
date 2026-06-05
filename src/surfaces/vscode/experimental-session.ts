@@ -48,6 +48,7 @@ import * as vscode from 'vscode';
 import type { ExtensionState } from '../../types';
 import type { AcpEvent } from '../../acp/types';
 import type { AcpEventStream } from '../../acp/backend';
+import type { FileSnapshotRecord, SerializableSessionMeta } from '../../acp/serializable/types';
 import { createParticipantHandler } from '../../participant/handler';
 import { isUserSelectableAgent } from '../../acp/types';
 
@@ -72,6 +73,7 @@ import {
 import { CollectorStream } from '../../acp/streaming/collector-stream';
 import { readSessionEvents } from '../../acp/serializable/serializer';
 import { readCheckpoints } from '../../acp/checkpoint/checkpoint-store';
+import { applySessionTitle } from '../../participant/session-title';
 
 // ---------------------------------------------------------------------------
 // Internal types for session content rendering (not part of the VS Code API)
@@ -110,6 +112,19 @@ export interface SessionDiffEntry {
   additions?: number;
   deletions?: number;
   status: 'added' | 'modified';
+}
+
+interface RestoredSessionHistory {
+  history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[];
+  snapshots: FileSnapshotRecord[];
+}
+
+interface SessionListEntry {
+  id: string;
+  title: string;
+  createdAt: Date;
+  description?: string;
+  status?: vscode.ChatSessionStatus;
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +386,9 @@ export function createSessionContentProvider(
   let cachedOptionGroups: vscode.ChatSessionProviderOptionGroup[] = [];
   /** Guard against re-entrant refreshOptionGroups() calls (e.g. event fire → VSCode re-query loop) */
   let optionGroupsRefreshInFlight: Promise<void> | null = null;
+  let backendStartInFlight: Promise<void> | null = null;
+  let loggedOfflineOptionGroups = false;
+  let loggedOfflineSessionRefresh = false;
   /**
    * Reference to the most recently created inputState.
    * VSCode's provideChatSessionProviderOptions only affects NEW sessions;
@@ -380,16 +398,18 @@ export function createSessionContentProvider(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let currentInputState: any = undefined;
 
+  const CONNECTING_OPTION_GROUPS: vscode.ChatSessionProviderOptionGroup[] = [
+    {
+      id: 'agents',
+      name: 'Agent',
+      items: [{ id: 'agent-connecting', name: '--', description: 'Waiting for backend' }],
+      selected: { id: 'agent-connecting', name: '--', description: 'Waiting for backend' },
+    },
+  ];
+
   /** Placeholder option groups shown while the backend is not yet running */
   function buildConnectingOptionGroups(): vscode.ChatSessionProviderOptionGroup[] {
-    return [
-      {
-        id: 'agents',
-        name: 'Agent',
-        items: [{ id: 'agent-connecting', name: '--', description: 'Waiting for backend' }],
-        selected: { id: 'agent-connecting', name: '--', description: 'Waiting for backend' },
-      },
-    ];
+    return CONNECTING_OPTION_GROUPS;
   }
 
   /** Check whether cached option groups are still placeholder/stub groups */
@@ -426,10 +446,15 @@ export function createSessionContentProvider(
         if (prevGroups !== cachedOptionGroups) {
           onDidChangeOptionsEmitter.fire();
         }
+        if (loggedOfflineOptionGroups) {
+          return;
+        }
+        loggedOfflineOptionGroups = true;
         logger.appendLine('[session-provider] Backend not running — showing "Connecting…" option groups');
         return;
       }
 
+      loggedOfflineOptionGroups = false;
       logger.appendLine(`[session-provider] Refreshing option groups (backend running=true)...`);
 
       // Fetch agents (model selection is delegated to VS Code's native model picker)
@@ -479,11 +504,42 @@ export function createSessionContentProvider(
     if (state.backend.getStatus() === 'running') {
       return;
     }
-
-    const result = await state.backend.start(directory);
-    if (result.error) {
-      throw new Error(typeof result.error === 'string' ? result.error : 'Failed to start backend');
+    if (state.backend.getStatus() === 'starting' && backendStartInFlight) {
+      return backendStartInFlight;
     }
+    if (backendStartInFlight) {
+      return backendStartInFlight;
+    }
+
+    backendStartInFlight = (async () => {
+      const result = await state.backend.start(directory);
+      if (result.error) {
+        throw new Error(typeof result.error === 'string' ? result.error : 'Failed to start backend');
+      }
+    })();
+
+    try {
+      await backendStartInFlight;
+    } finally {
+      backendStartInFlight = null;
+    }
+  }
+
+  function kickBackendStart(reason: string): void {
+    const status = state.backend.getStatus();
+    if (status === 'running' || status === 'starting') {
+      return;
+    }
+
+    logger.appendLine(`[session-provider] Backend ${status}; starting backend (${reason})`);
+    ensureBackendRunning()
+      .then(() => {
+        logger.appendLine('[session-provider] Backend ready from provider startup');
+        state.bus.emit('backend-ready', void 0);
+      })
+      .catch((err) => {
+        logger.appendLine(`[session-provider] Backend provider startup failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
   }
 
   function createSessionLabelFromPrompt(prompt: string | undefined, sessionId: string): string {
@@ -505,8 +561,8 @@ export function createSessionContentProvider(
     return createSessionLabelFromPrompt(firstRequest?.prompt, sessionId);
   }
 
-  function collectRuntimeSessions(): Array<{ id: string; title: string; createdAt: Date }> {
-    const runtimeSessions = new Map<string, { id: string; title: string; createdAt: Date }>();
+  function collectRuntimeSessions(): SessionListEntry[] {
+    const runtimeSessions = new Map<string, SessionListEntry>();
 
     for (const chatState of state.sessions.values()) {
       if (!chatState.sessionId) {
@@ -545,15 +601,190 @@ export function createSessionContentProvider(
     return title.length > 0 ? title : `Session ${session.id.slice(0, 8)}`;
   }
 
-  function getSessionDescription(_session: { id: string; title: string }): string | undefined {
-    return undefined;
+  function getSessionDescription(session: SessionListEntry): string | undefined {
+    return session.description;
+  }
+
+  function toChatSessionStatus(status: SerializableSessionMeta['status']): vscode.ChatSessionStatus | undefined {
+    switch (status) {
+      case 'inProgress':
+        return vscode.ChatSessionStatus.InProgress;
+      case 'needsInput':
+        return vscode.ChatSessionStatus.NeedsInput;
+      case 'failed':
+        return vscode.ChatSessionStatus.Failed;
+      case 'completed':
+        return vscode.ChatSessionStatus.Completed;
+      default:
+        return undefined;
+    }
+  }
+
+  function normalizeChangePath(value: string): string {
+    try {
+      const uri = value.startsWith('file:') ? vscode.Uri.parse(value) : vscode.Uri.file(value);
+      return uri.fsPath || value;
+    } catch {
+      return value;
+    }
+  }
+
+  function summarizeChangeFiles(
+    files: ReadonlySet<string>,
+    additions?: number,
+    deletions?: number,
+  ): string | undefined {
+    if (files.size === 0) {
+      return undefined;
+    }
+    const parts = [`${files.size} file${files.size === 1 ? '' : 's'} changed`];
+    if ((additions ?? 0) > 0) {
+      parts.push(`+${additions}`);
+    }
+    if ((deletions ?? 0) > 0) {
+      parts.push(`-${deletions}`);
+    }
+    return parts.join(' ');
+  }
+
+  function summarizeSnapshots(snapshots: readonly FileSnapshotRecord[]): string | undefined {
+    const files = new Set<string>();
+    for (const snapshot of snapshots) {
+      if (snapshot.phase === 'after' && snapshot.uri) {
+        files.add(normalizeChangePath(snapshot.uri));
+      }
+    }
+    return summarizeChangeFiles(files);
+  }
+
+  function createRestoredDiffPart(snapshots: readonly FileSnapshotRecord[]): unknown | undefined {
+    if (!hasChatResponseMultiDiffPart()) {
+      return undefined;
+    }
+
+    const Ctor = (vscode as unknown as {
+      ChatResponseMultiDiffPart?: new (
+        value: Array<{
+          originalUri?: vscode.Uri;
+          modifiedUri?: vscode.Uri;
+          goToFileUri?: vscode.Uri;
+        }>,
+        title: string,
+        readOnly?: boolean,
+      ) => unknown;
+    }).ChatResponseMultiDiffPart;
+
+    if (!Ctor) {
+      return undefined;
+    }
+
+    const beforeByKey = new Map<string, FileSnapshotRecord>();
+    for (const snapshot of snapshots) {
+      if (snapshot.phase !== 'before' || !snapshot.toolCallId || !snapshot.uri) {
+        continue;
+      }
+      beforeByKey.set(`${snapshot.toolCallId}\n${snapshot.uri}`, snapshot);
+    }
+
+    const entries = new Map<string, {
+      originalUri?: vscode.Uri;
+      modifiedUri?: vscode.Uri;
+      goToFileUri?: vscode.Uri;
+    }>();
+
+    for (const snapshot of snapshots) {
+      if (snapshot.phase !== 'after' || !snapshot.uri) {
+        continue;
+      }
+      try {
+        const uri = snapshot.uri.startsWith('file:')
+          ? vscode.Uri.parse(snapshot.uri)
+          : vscode.Uri.file(snapshot.uri);
+        const before = beforeByKey.get(`${snapshot.toolCallId}\n${snapshot.uri}`);
+        entries.set(uri.toString(), {
+          originalUri: before?.missing ? undefined : uri,
+          modifiedUri: snapshot.missing ? undefined : uri,
+          goToFileUri: uri,
+        });
+      } catch {
+        // Ignore malformed persisted URIs; the list summary still covers them.
+      }
+    }
+
+    if (entries.size === 0) {
+      return undefined;
+    }
+
+    try {
+      return new Ctor(Array.from(entries.values()), 'File Changes', true);
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function summarizePersistedSessionChanges(sessionId: string): Promise<string | undefined> {
+    const files = new Set<string>();
+    let additions = 0;
+    let deletions = 0;
+
+    try {
+      const events = await readSessionEvents<AcpEvent>(state.sessionStore.getTurnsPath(sessionId));
+      for (const event of events) {
+        if (event.type !== 'session.diff') {
+          continue;
+        }
+        for (const diff of event.diffs ?? []) {
+          if (diff.file) {
+            files.add(normalizeChangePath(diff.file));
+          }
+          additions += diff.additions ?? 0;
+          deletions += diff.deletions ?? 0;
+        }
+      }
+    } catch (err) {
+      logger.appendLine(
+        `[session-provider] Failed to summarize diff events for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    const diffSummary = summarizeChangeFiles(files, additions, deletions);
+    if (diffSummary) {
+      return diffSummary;
+    }
+
+    try {
+      return summarizeSnapshots(await readCheckpoints(state.sessionStore.getSessionDir(sessionId)));
+    } catch (err) {
+      logger.appendLine(
+        `[session-provider] Failed to summarize checkpoints for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return undefined;
+    }
+  }
+
+  async function toSessionListEntry(meta: SerializableSessionMeta): Promise<SessionListEntry> {
+    const description = meta.description
+      ?? summarizeChangeFiles(
+        new Set((meta.changeSummary?.paths ?? []).map(normalizeChangePath)),
+        meta.changeSummary?.additions,
+        meta.changeSummary?.deletions,
+      )
+      ?? await summarizePersistedSessionChanges(meta.id);
+
+    return {
+      id: meta.id,
+      title: meta.title ?? meta.id,
+      createdAt: new Date(meta.createdAt ?? Date.now()),
+      description,
+      status: toChatSessionStatus(meta.status) ?? vscode.ChatSessionStatus.Completed,
+    };
   }
 
   function mergeSessions(
-    listedSessions: readonly { id: string; title: string; createdAt: Date }[],
-    runtimeSessions: readonly { id: string; title: string; createdAt: Date }[],
-  ): Array<{ id: string; title: string; createdAt: Date }> {
-    const merged = new Map<string, { id: string; title: string; createdAt: Date }>();
+    listedSessions: readonly SessionListEntry[],
+    runtimeSessions: readonly SessionListEntry[],
+  ): SessionListEntry[] {
+    const merged = new Map<string, SessionListEntry>();
 
     for (const session of listedSessions) {
       merged.set(session.id, session);
@@ -570,20 +801,22 @@ export function createSessionContentProvider(
         id: session.id,
         title: !isPlaceholderSessionTitle(existing.title) ? existing.title : session.title,
         createdAt: existing.createdAt ?? session.createdAt,
+        description: existing.description ?? session.description,
+        status: existing.status ?? session.status,
       });
     }
 
     return Array.from(merged.values()).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
   }
 
-  function publishSessionItems(controller: vscode.ChatSessionItemController, sessions: readonly { id: string; title: string; createdAt: Date }[]): void {
+  function publishSessionItems(controller: vscode.ChatSessionItemController, sessions: readonly SessionListEntry[]): void {
     const sessionThemeIcon = new vscode.ThemeIcon('opencode-logo');
     const items = sessions.map((session) => {
       const resource = createSessionResource(session.id);
       const item = controller.createChatSessionItem(resource, getSessionLabel(session));
       item.iconPath = sessionThemeIcon;
       item.description = getSessionDescription(session);
-      item.status = vscode.ChatSessionStatus.Completed;
+      item.status = session.status ?? vscode.ChatSessionStatus.Completed;
       item.timing = { created: session.createdAt.getTime() };
       item.tooltip = session.id;
       return item;
@@ -633,11 +866,8 @@ export function createSessionContentProvider(
         `[session-provider] Refreshing Session list from SessionStore (count=${sessions.length})`,
       );
 
-      const items = sessions.map(s => ({
-        id: s.id,
-        title: s.title ?? s.id,
-        createdAt: new Date(s.createdAt ?? Date.now()),
-      }));
+      const listedItems = await Promise.all(sessions.map(toSessionListEntry));
+      const items = mergeSessions(listedItems, collectRuntimeSessions());
 
       publishSessionItems(controller, items);
     } finally {
@@ -919,7 +1149,7 @@ export function createSessionContentProvider(
   async function fetchSessionHistory(
     sessionId: string,
     token: vscode.CancellationToken,
-  ): Promise<(vscode.ChatRequestTurn | vscode.ChatResponseTurn)[]> {
+  ): Promise<RestoredSessionHistory> {
     const turnsPath = state.sessionStore.getTurnsPath(sessionId);
     const sessionDir = state.sessionStore.getSessionDir(sessionId);
 
@@ -932,7 +1162,7 @@ export function createSessionContentProvider(
     );
 
     if (events.length === 0) {
-      return [];
+      return { history: [], snapshots };
     }
 
     // 2. Create CollectorStream for replay
@@ -970,6 +1200,10 @@ export function createSessionContentProvider(
     }
 
     // 5. Build turn from captured parts
+    const restoredDiffPart = createRestoredDiffPart(snapshots);
+    if (restoredDiffPart) {
+      collector.push(restoredDiffPart);
+    }
     const assistantTurn = collector.buildTurn();
 
     const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
@@ -982,7 +1216,7 @@ export function createSessionContentProvider(
       `[session-provider] Restored ${history.length} turns for session ${sessionId}`,
     );
 
-    return history;
+    return { history, snapshots };
   }
 
   // -- The Provider --------------------------------------------------------
@@ -1007,6 +1241,8 @@ export function createSessionContentProvider(
       if (cachedOptionGroups.length > 0 && !isPlaceholderGroups(cachedOptionGroups)) {
         return Promise.resolve({ optionGroups: cachedOptionGroups });
       }
+
+      kickBackendStart('provider options requested');
 
       // If a refresh is already in-flight, return the in-flight promise.
       // This prevents re-entrant loops where fire() → VSCode re-query → refresh again.
@@ -1078,7 +1314,7 @@ export function createSessionContentProvider(
             try {
               await ensureBackendRunning();
 
-              const history = await fetchSessionHistory(chatState.sessionId, token);
+              const { history } = await fetchSessionHistory(chatState.sessionId, token);
 
               // Determine title with priority:
               // 1. Non-placeholder chatState title (already fetched from backend earlier)
@@ -1095,14 +1331,28 @@ export function createSessionContentProvider(
                   const backendTitle = sessionInfo.data?.title?.trim() ?? '';
                   if (!isPlaceholderSessionTitle(backendTitle)) {
                     title = backendTitle;
-                    // Persist to sessions so subsequent tab switches skip the fetch
-                    chatState.title = backendTitle;
+                    await applySessionTitle(state, {
+                      sessionId: chatState.sessionId,
+                      title: backendTitle,
+                      overwrite: false,
+                      emitListChanged: false,
+                      source: 'restore-backend',
+                    });
                   } else {
                     title = getHistoryDerivedSessionTitle(history, chatState.sessionId);
                   }
                 } catch {
                   title = getHistoryDerivedSessionTitle(history, chatState.sessionId);
                 }
+              }
+              if (!isPlaceholderSessionTitle(title)) {
+                await applySessionTitle(state, {
+                  sessionId: chatState.sessionId,
+                  title,
+                  overwrite: false,
+                  emitListChanged: false,
+                  source: 'restore',
+                });
               }
 
               return {
@@ -1143,7 +1393,7 @@ export function createSessionContentProvider(
           const sessionInfo = await state.backend.sessions.get(sessionId);
 
           // Fetch message history
-          const history = await fetchSessionHistory(sessionId, token);
+          const { history } = await fetchSessionHistory(sessionId, token);
           const backendTitle = sessionInfo.data?.title?.trim() ?? '';
           // Use backend title only if it's a meaningful (non-placeholder) title;
           // otherwise derive from the first user message in history.
@@ -1179,6 +1429,17 @@ export function createSessionContentProvider(
               turnMap: [],
               title: bestTitle,
               createdAt: sessionInfo.data?.createdAt ?? new Date(),
+            });
+          }
+
+          if (!isPlaceholderSessionTitle(bestTitle)) {
+            await applySessionTitle(state, {
+              sessionId,
+              title: bestTitle,
+              createdAt: sessionInfo.data?.createdAt,
+              overwrite: false,
+              emitListChanged: false,
+              source: 'restore-existing',
             });
           }
 
