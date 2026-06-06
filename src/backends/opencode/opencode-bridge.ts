@@ -137,7 +137,6 @@ export class OpenCodeBridge implements AcpBridge {
   private tracker?: ExternalEditTracker;
   private userMessageId: string | null = null;
   private partKinds: Map<string, PartKind> = new Map();
-  private editCounter: number = 0;
   /** partID → toolCallID */
   private toolCallIds: Map<string, string> = new Map();
   /** callID → tool metadata accumulated during streaming */
@@ -147,6 +146,8 @@ export class OpenCodeBridge implements AcpBridge {
   private assistantPhaseStarted: boolean = false;
   /** Tracks which tool callIDs have received a progressive push (isComplete=false) part */
   private progressivePushed: Set<string> = new Set();
+  /** Tool callIDs represented by VS Code ExternalEditPart instead of tool cards. */
+  private externalEditCallIds: Set<string> = new Set();
   /** Timestamp of last processed delta (for inter-delta gap measurement) */
   private lastDeltaTime: number = 0;
   /** Active subagent scopes — filters child events from rendering as independent cards */
@@ -693,21 +694,15 @@ export class OpenCodeBridge implements AcpBridge {
       // Skip if this callID is already tracked, or if the file already has an active
       // ExternalEditPart (VSCode only supports one per file at a time).
       if (this.tracker.hasEdit(callID)) {
+        this.externalEditCallIds.add(callID);
         this.logTag('edit', `trackEdit skipped — callID=${callID} already tracked`);
       } else if (this.tracker.isTrackingAny([fileUri])) {
         this.logTag('edit', `trackEdit skipped — file ${filepath} already has an active edit, callID=${callID}`);
       } else {
         try {
           await this.tracker.trackEdit(callID, [fileUri], stream);
+          this.externalEditCallIds.add(callID);
           this.logTag('edit', `tracked edit callID=${callID}, file=${filepath}`);
-          // Emit snapshot after tracking
-          this.callbacks?.onSnapshot({
-            uri: filepath,
-            content: '',
-            editIndex: this.editCounter++,
-            toolCallId: callID,
-            timestamp: new Date().toISOString(),
-          });
         } catch (err) {
           this.logTag('edit', `trackEdit error for callID=${callID}: ${err}`);
         }
@@ -1062,6 +1057,11 @@ export class OpenCodeBridge implements AcpBridge {
         timeEnd: undefined,
       });
 
+      if (this.isExternalEditToolCall(toolName, callID)) {
+        this.logTag('edit', `suppressing ${toolName}:pending tool card for externalEdit callID=${callID}`);
+        return true;
+      }
+
       if (this.hasToolUI && stream.beginToolInvocation) {
         stream.beginToolInvocation(callID, toolName);
       } else {
@@ -1106,6 +1106,11 @@ export class OpenCodeBridge implements AcpBridge {
       const title = getToolTitle(state) ?? meta2?.title ?? toolName;
       const invocationMsg = this.formatInvocationMsg(toolName, state.input ?? {}, title);
       this.logTag('tool', `running: callID=${callID}, toolName=${toolName}, hasToolUI=${this.hasToolUI}`);
+
+      if (this.isExternalEditToolCall(toolName, callID)) {
+        this.logTag('edit', `suppressing ${toolName}:running tool card for externalEdit callID=${callID}`);
+        return true;
+      }
 
       // Full toolSpecificData rendering via pushToolInvocation
       // or legacy updateToolInvocation for backward compatibility.
@@ -1176,11 +1181,21 @@ export class OpenCodeBridge implements AcpBridge {
         return true;
       }
 
+      const externalEditTool = this.isExternalEditToolCall(toolName, callID);
+
       // Complete tracker edit if this is a tracked tool
       if (this.tracker && typeof this.tracker.completeEdit === 'function') {
         try {
           this.tracker.completeEdit(callID);
         } catch { /* best-effort */ }
+      }
+
+      if (externalEditTool) {
+        this.externalEditCallIds.delete(callID);
+        this.toolMetas.delete(callID);
+        this.toolCallIds.delete(part.id);
+        this.logTag('edit', `suppressing ${toolName}:${status} tool card for externalEdit callID=${callID}`);
+        return true;
       }
 
       // Non-subagent tool completion: push the final tool invocation part
@@ -1200,6 +1215,10 @@ export class OpenCodeBridge implements AcpBridge {
   ): Promise<void> {
     // Snapshot was already taken during permission.asked via tracker.trackEdit.
     // This is a no-op now since permission.asked already emits the snapshot.
+  }
+
+  private isExternalEditToolCall(toolName: string, callID: string): boolean {
+    return isEditTool(toolName) && this.externalEditCallIds.has(callID);
   }
 
   // -------------------------------------------------------------------
@@ -1231,6 +1250,7 @@ export class OpenCodeBridge implements AcpBridge {
 
       // Create ChatToolInvocationPart
       const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callID, isError ? (state.error ?? 'Error') : undefined);
+      part.enablePartialUpdate = true;
       part.isComplete = !subAgentInvocationId || state.status === 'completed' || state.status === 'error';
       if (state.status === 'pending' || (state.status === 'running' && !this.progressivePushed.has(callID))) {
         part.isComplete = false;
@@ -1242,14 +1262,23 @@ export class OpenCodeBridge implements AcpBridge {
         const msg = this.formatInvocationMsg(toolName, input, title);
         part.invocationMessage = typeof msg === 'string' ? msg : msg.value;
       } else if (state.status === 'completed' || state.status === 'error') {
-        const pastMsg = this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input);
-        part.pastTenseMessage = typeof pastMsg === 'string' ? pastMsg : pastMsg.value;
+        if (toolName === 'read') {
+          const msg = this.formatInvocationMsg(toolName, input, title);
+          part.invocationMessage = typeof msg === 'string' ? msg : msg.value;
+        } else {
+          const pastMsg = this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input);
+          part.pastTenseMessage = typeof pastMsg === 'string' ? pastMsg : pastMsg.value;
+        }
       }
 
       // toolSpecificData: rich type-specific rendering
       const specific = this.buildToolSpecificData(toolName, input, output, title);
       if (specific) {
         part.toolSpecificData = specific as ChatToolSpecificData;
+      }
+
+      if (isTransientFileTool(toolName)) {
+        part.presentation = 'hiddenAfterComplete';
       }
 
       // subAgentInvocationId: group child tools under a subagent card
@@ -1301,6 +1330,9 @@ export class OpenCodeBridge implements AcpBridge {
     }
 
     if (state.status === 'completed' || state.status === 'error') {
+      if (toolName === 'read') {
+        return;
+      }
       const pastMsg = this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input);
       try {
         stream.updateToolInvocation?.(callID, {
@@ -1338,19 +1370,11 @@ export class OpenCodeBridge implements AcpBridge {
 
     switch (toolName) {
       case 'read':
+        return undefined;
+
       case 'write':
-      case 'edit': {
-        const filePath = (input.filePath as string) ?? (input.path as string) ?? '';
-        const offset = input.offset as number | undefined;
-        const limit = input.limit as number | undefined;
-        if (filePath) {
-          return { values: [vscode.Uri.file(filePath)] } satisfies ChatToolResourcesInvocationData;
-        }
-        return {
-          input: formatInput(input, title),
-          output: truncate(output, 2000),
-        } satisfies ChatSimpleToolResultData;
-      }
+      case 'edit':
+        return undefined;
 
       case 'bash': {
         const command = (input.command as string) ?? (input.script as string) ?? formatInput(input, title);
@@ -2014,6 +2038,7 @@ export class OpenCodeBridge implements AcpBridge {
     this.toolCallIds.clear();
     this.toolMetas.clear();
     this.progressivePushed.clear();
+    this.externalEditCallIds.clear();
     this.activeSubagentScopes.clear();
     this.deferredIdle = false;
     this.clearDeferredIdleTimer();
@@ -2095,6 +2120,19 @@ function truncate(value: string, maxLength: number): string {
 
 function stateOutputHasExitCode(output: string): boolean {
   return /exitCode:\s*-?\d+/.test(output);
+}
+
+function isTransientFileTool(toolName: string): boolean {
+  return toolName === 'read'
+    || toolName === 'write'
+    || toolName === 'edit'
+    || toolName === 'internal'
+    || toolName === 'step-start'
+    || toolName === 'step-finish';
+}
+
+function isEditTool(toolName: string): boolean {
+  return toolName === 'edit' || toolName === 'write';
 }
 
 function getToolTitle(state: AcpToolState): string | undefined {

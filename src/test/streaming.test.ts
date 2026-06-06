@@ -154,16 +154,24 @@ describe('OpenCodeBridge', () => {
     await bridge.bridgeEventsToStream(events, stream, mockToken());
     expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_rd', 'read');
     expect(stream.push).toHaveBeenCalled();
-    // read tool uses hiddenAfterComplete and no toolSpecificData
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
     const readPart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; isComplete?: boolean };
       return p?.toolName === 'read' && p?.isComplete === true;
     });
     expect(readPart).toBeDefined();
-    const part = readPart![0] as { pastTenseMessage?: string | { toString(): string }; toolSpecificData?: unknown };
-    expect(String(part.pastTenseMessage)).toMatch(/Read.*main\.ts/);
-    expect(part.toolSpecificData).toBeDefined();
+    const part = readPart![0] as {
+      pastTenseMessage?: string | { toString(): string };
+      invocationMessage?: string | { toString(): string };
+      presentation?: string;
+      enablePartialUpdate?: boolean;
+      toolSpecificData?: unknown;
+    };
+    expect(String(part.invocationMessage)).toMatch(/Read.*main\.ts/);
+    expect(part.pastTenseMessage).toBeUndefined();
+    expect(part.presentation).toBe('hiddenAfterComplete');
+    expect(part.enablePartialUpdate).toBe(true);
+    expect(part.toolSpecificData).toBeUndefined();
   });
 
   // --- Tool: bash → TerminalToolData ---
@@ -179,13 +187,27 @@ describe('OpenCodeBridge', () => {
 
   // --- Tool: write → ToolResourcesInvocationData ---
 
-  it('should push write tool as ChatToolResourcesInvocationData', async () => {
+  it('should push write tool as a transient hidden-after-complete card', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({
       tools: toolEvents({ toolName: 'write', callId: 'call_wr', input: { filePath: '/src/new.ts' }, output: 'written', title: 'new.ts' }),
     }));
     await bridge.bridgeEventsToStream(events, stream, mockToken());
     expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_wr', 'write');
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
+    const writePart = pushed.find((call: unknown[]) => {
+      const p = call[0] as { toolName?: string; isComplete?: boolean };
+      return p?.toolName === 'write' && p?.isComplete === true;
+    });
+    expect(writePart).toBeDefined();
+    const part = writePart![0] as {
+      presentation?: string;
+      enablePartialUpdate?: boolean;
+      toolSpecificData?: unknown;
+    };
+    expect(part.presentation).toBe('hiddenAfterComplete');
+    expect(part.enablePartialUpdate).toBe(true);
+    expect(part.toolSpecificData).toBeUndefined();
   });
 
   // --- Tool: task → SubagentToolInvocationData ---
@@ -463,8 +485,7 @@ describe('OpenCodeBridge', () => {
       return p?.toolName === 'read' && p?.toolCallId === 'call_b' && p?.isComplete === true;
     });
     expect(readPart).toBeDefined();
-    // Without filePath input, read tool falls back to generic format: 'read (0.1s)'
-    expect(String((readPart![0] as { pastTenseMessage?: string | { toString(): string } }).pastTenseMessage)).toMatch(/read/);
+    expect(String((readPart![0] as { invocationMessage?: string | { toString(): string } }).invocationMessage)).toMatch(/Running read/);
   });
 
   // --- Edge cases ---
@@ -698,6 +719,17 @@ describe('OpenCodeBridge', () => {
       expect(mockTracker.trackEdit).toHaveBeenCalledWith(callId, expect.anything(), stream);
       // completeEdit was called when tool completed with the same callId
       expect(mockTracker.completeEdit).toHaveBeenCalledWith(callId);
+      expect(stream.beginToolInvocation).not.toHaveBeenCalledWith(callId, 'edit');
+      const editParts = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+        .map((call: unknown[]) => call[0] as {
+          toolName?: string;
+          isComplete?: boolean;
+          presentation?: string;
+          enablePartialUpdate?: boolean;
+          toolSpecificData?: unknown;
+        })
+        .filter((p) => p?.toolName === 'edit');
+      expect(editParts).toHaveLength(0);
     });
   });
 
