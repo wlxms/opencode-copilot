@@ -66,13 +66,14 @@ import {
   hasThinkingProgress,
   hasToolUI,
   hasChatToolInvocationPart,
-  hasChatResponseMultiDiffPart,
   hasFullProposedSurface,
 } from './capabilities';
 
 import { CollectorStream } from '../../acp/streaming/collector-stream';
-import { readSessionEvents } from '../../acp/serializable/serializer';
+import { readSessionEvents, readSessionTurnEvents } from '../../acp/serializable/serializer';
 import { readCheckpoints } from '../../acp/checkpoint/checkpoint-store';
+import { getCheckpointApproval, snapshotTurnIndex } from '../../acp/checkpoint/approval-state';
+import { replaySnapshotsToWorkspace } from '../../acp/checkpoint/replay';
 import { applySessionTitle } from '../../participant/session-title';
 
 // ---------------------------------------------------------------------------
@@ -93,8 +94,6 @@ export interface SessionFrameContent {
   hasReasoning?: boolean;
   /** Reasoning text content, if any */
   reasoningText?: string;
-  /** File diffs from this response */
-  diffs?: SessionDiffEntry[];
 }
 
 export interface SessionToolInvocation {
@@ -107,16 +106,10 @@ export interface SessionToolInvocation {
   isComplete?: boolean;
 }
 
-export interface SessionDiffEntry {
-  file: string;
-  additions?: number;
-  deletions?: number;
-  status: 'added' | 'modified';
-}
-
 interface RestoredSessionHistory {
   history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[];
   snapshots: FileSnapshotRecord[];
+  pendingReplaySnapshots: FileSnapshotRecord[];
 }
 
 interface SessionListEntry {
@@ -125,6 +118,10 @@ interface SessionListEntry {
   createdAt: Date;
   description?: string;
   status?: vscode.ChatSessionStatus;
+  changeApprovalState?: SerializableSessionMeta['changeApprovalState'];
+  resource?: vscode.Uri;
+  source: 'persisted' | 'runtime';
+  hasLiveTurns?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,7 +162,7 @@ export class ExperimentalChatSession {
         this.handlePartDelta(evt);
         break;
       case 'session.diff':
-        this.handleSessionDiff(evt);
+        break;
         break;
       case 'session.idle':
         this.flushFrame();
@@ -228,25 +225,6 @@ export class ExperimentalChatSession {
     }
   }
 
-  private handleSessionDiff(evt: AcpEvent): void {
-    if (evt.type !== 'session.diff') {return;}
-    const diffs = evt.diffs;
-    if (!diffs?.length) {return;}
-
-    const entries: SessionDiffEntry[] = diffs
-      .filter((d) => d.status !== 'deleted')
-      .map((d) => ({
-        file: d.file,
-        additions: d.additions,
-        deletions: d.deletions,
-        status: d.status === 'added' ? 'added' as const : 'modified' as const,
-      }));
-
-    if (entries.length > 0) {
-      this.currentFrame.diffs = entries;
-    }
-  }
-
   private handleToolState(toolPart: {
     callID?: string;
     tool?: string;
@@ -296,8 +274,7 @@ export class ExperimentalChatSession {
     if (
       this.currentFrame.markdown ||
       this.currentFrame.toolInvocations ||
-      this.currentFrame.hasReasoning ||
-      this.currentFrame.diffs
+      this.currentFrame.hasReasoning
     ) {
       this.frames.push(this.currentFrame);
     }
@@ -564,13 +541,17 @@ export function createSessionContentProvider(
   function collectRuntimeSessions(): SessionListEntry[] {
     const runtimeSessions = new Map<string, SessionListEntry>();
 
-    for (const chatState of state.sessions.values()) {
+    for (const [stateKey, chatState] of state.sessions.entries()) {
       if (!chatState.sessionId) {
         continue;
       }
+      const resource = stateKey.startsWith('opencode-copilot.opencode:')
+        ? vscode.Uri.parse(stateKey)
+        : createSessionResource(stateKey);
 
       const existing = runtimeSessions.get(chatState.sessionId);
       const newTitle = chatState.title ?? '';
+      const hasLiveTurns = chatState.turnMap.length > 0;
 
       // Prefer non-placeholder titles when multiple sessionMap entries share
       // the same sessionId (e.g. untitled-N vs opencode-copilot.opencode:/ses_xxx).
@@ -582,13 +563,21 @@ export function createSessionContentProvider(
             id: chatState.sessionId,
             title: newTitle,
             createdAt: chatState.createdAt ?? existing.createdAt,
+            resource,
+            source: 'runtime',
+            hasLiveTurns,
           });
+        } else if (hasLiveTurns && !existing.hasLiveTurns) {
+          existing.hasLiveTurns = true;
         }
       } else {
         runtimeSessions.set(chatState.sessionId, {
           id: chatState.sessionId,
           title: newTitle,
           createdAt: chatState.createdAt ?? new Date(),
+          resource,
+          source: 'runtime',
+          hasLiveTurns,
         });
       }
     }
@@ -620,163 +609,96 @@ export function createSessionContentProvider(
     }
   }
 
-  function normalizeChangePath(value: string): string {
-    try {
-      const uri = value.startsWith('file:') ? vscode.Uri.parse(value) : vscode.Uri.file(value);
-      return uri.fsPath || value;
-    } catch {
-      return value;
+  function maxSnapshotTurn(snapshots: readonly FileSnapshotRecord[]): number | undefined {
+    if (snapshots.length === 0) {
+      return undefined;
     }
+    return Math.max(...snapshots.map(snapshotTurnIndex));
   }
 
-  function summarizeChangeFiles(
-    files: ReadonlySet<string>,
-    additions?: number,
-    deletions?: number,
-  ): string | undefined {
-    if (files.size === 0) {
-      return undefined;
-    }
-    const parts = [`${files.size} file${files.size === 1 ? '' : 's'} changed`];
-    if ((additions ?? 0) > 0) {
-      parts.push(`+${additions}`);
-    }
-    if ((deletions ?? 0) > 0) {
-      parts.push(`-${deletions}`);
-    }
-    return parts.join(' ');
+  function getRestoreReplaySnapshots(
+    snapshots: readonly FileSnapshotRecord[],
+    meta?: SerializableSessionMeta,
+  ): FileSnapshotRecord[] {
+    const replayedThroughTurn = meta?.checkpointCursor?.replayedThroughTurn;
+    const acceptedThroughTurn = meta?.checkpointCursor?.acceptedThroughTurn;
+    const lastReplayed = typeof replayedThroughTurn === 'number' && Number.isFinite(replayedThroughTurn)
+      ? replayedThroughTurn
+      : -1;
+    const lastAccepted = typeof acceptedThroughTurn === 'number' && Number.isFinite(acceptedThroughTurn)
+      ? acceptedThroughTurn
+      : -1;
+    const restoreFloor = Math.max(lastReplayed, lastAccepted);
+    return snapshots.filter(snapshot => snapshotTurnIndex(snapshot) > restoreFloor);
   }
 
-  function summarizeSnapshots(snapshots: readonly FileSnapshotRecord[]): string | undefined {
-    const files = new Set<string>();
-    for (const snapshot of snapshots) {
-      if (snapshot.phase === 'after' && snapshot.uri) {
-        files.add(normalizeChangePath(snapshot.uri));
-      }
-    }
-    return summarizeChangeFiles(files);
-  }
-
-  function createRestoredDiffPart(snapshots: readonly FileSnapshotRecord[]): unknown | undefined {
-    if (!hasChatResponseMultiDiffPart()) {
-      return undefined;
+  async function replayPendingSnapshotsForSession(
+    sessionId: string,
+    pendingSnapshots: readonly FileSnapshotRecord[],
+    stream: vscode.ChatResponseStream,
+    token: vscode.CancellationToken,
+  ): Promise<void> {
+    if (pendingSnapshots.length === 0) {
+      return;
     }
 
-    const Ctor = (vscode as unknown as {
-      ChatResponseMultiDiffPart?: new (
-        value: Array<{
-          originalUri?: vscode.Uri;
-          modifiedUri?: vscode.Uri;
-          goToFileUri?: vscode.Uri;
-        }>,
-        title: string,
-        readOnly?: boolean,
-      ) => unknown;
-    }).ChatResponseMultiDiffPart;
-
-    if (!Ctor) {
-      return undefined;
-    }
-
-    const beforeByKey = new Map<string, FileSnapshotRecord>();
-    for (const snapshot of snapshots) {
-      if (snapshot.phase !== 'before' || !snapshot.toolCallId || !snapshot.uri) {
-        continue;
-      }
-      beforeByKey.set(`${snapshot.toolCallId}\n${snapshot.uri}`, snapshot);
-    }
-
-    const entries = new Map<string, {
-      originalUri?: vscode.Uri;
-      modifiedUri?: vscode.Uri;
-      goToFileUri?: vscode.Uri;
-    }>();
-
-    for (const snapshot of snapshots) {
-      if (snapshot.phase !== 'after' || !snapshot.uri) {
-        continue;
-      }
-      try {
-        const uri = snapshot.uri.startsWith('file:')
-          ? vscode.Uri.parse(snapshot.uri)
-          : vscode.Uri.file(snapshot.uri);
-        const before = beforeByKey.get(`${snapshot.toolCallId}\n${snapshot.uri}`);
-        entries.set(uri.toString(), {
-          originalUri: before?.missing ? undefined : uri,
-          modifiedUri: snapshot.missing ? undefined : uri,
-          goToFileUri: uri,
-        });
-      } catch {
-        // Ignore malformed persisted URIs; the list summary still covers them.
-      }
-    }
-
-    if (entries.size === 0) {
-      return undefined;
-    }
+    const result = await replaySnapshotsToWorkspace(pendingSnapshots, logger, {
+      stream,
+      token,
+      preferExternalEdit: true,
+      redoAlreadyApplied: true,
+    });
+    const maxTurn = maxSnapshotTurn(pendingSnapshots);
+    const hasConflicts = result.conflicts.length > 0;
+    const update: Partial<SerializableSessionMeta> = {
+      changeApprovalState: hasConflicts ? 'partial' : 'pending',
+      checkpointCursor: {
+        acceptedThroughTurn: -1,
+        replayedThroughTurn: maxTurn,
+        lastConflictTurn: hasConflicts ? maxTurn : undefined,
+      },
+      replaySummary: {
+        appliedFiles: result.applied,
+        skippedFiles: result.skipped,
+        appliedHunks: result.appliedHunks,
+        skippedHunks: result.skippedHunks,
+        conflicts: result.conflicts,
+      },
+    };
 
     try {
-      return new Ctor(Array.from(entries.values()), 'File Changes', true);
-    } catch {
-      return undefined;
-    }
-  }
-
-  async function summarizePersistedSessionChanges(sessionId: string): Promise<string | undefined> {
-    const files = new Set<string>();
-    let additions = 0;
-    let deletions = 0;
-
-    try {
-      const events = await readSessionEvents<AcpEvent>(state.sessionStore.getTurnsPath(sessionId));
-      for (const event of events) {
-        if (event.type !== 'session.diff') {
-          continue;
-        }
-        for (const diff of event.diffs ?? []) {
-          if (diff.file) {
-            files.add(normalizeChangePath(diff.file));
-          }
-          additions += diff.additions ?? 0;
-          deletions += diff.deletions ?? 0;
-        }
+      const current = await state.sessionStore.readMeta(sessionId);
+      const acceptedThroughTurn = current?.checkpointCursor?.acceptedThroughTurn ?? -1;
+      const previousReplayedThroughTurn = current?.checkpointCursor?.replayedThroughTurn;
+      update.checkpointCursor = {
+        acceptedThroughTurn,
+        replayedThroughTurn: hasConflicts ? previousReplayedThroughTurn : maxTurn,
+        lastConflictTurn: hasConflicts ? maxTurn : current?.checkpointCursor?.lastConflictTurn,
+      };
+      if (!hasConflicts && maxTurn !== undefined && acceptedThroughTurn >= maxTurn) {
+        update.changeApprovalState = 'accepted';
       }
+      await state.sessionStore.updateMeta(sessionId, update);
+      logger.appendLine(
+        `[session-provider] Replayed ${result.applied} checkpoint file(s) for ${sessionId} via active response ` +
+        `(external=${result.externalEdits}, fallback=${result.fallbackEdits}, conflicts=${result.conflicts.length})`,
+      );
     } catch (err) {
       logger.appendLine(
-        `[session-provider] Failed to summarize diff events for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+        `[session-provider] Failed to persist checkpoint replay state for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
       );
-    }
-
-    const diffSummary = summarizeChangeFiles(files, additions, deletions);
-    if (diffSummary) {
-      return diffSummary;
-    }
-
-    try {
-      return summarizeSnapshots(await readCheckpoints(state.sessionStore.getSessionDir(sessionId)));
-    } catch (err) {
-      logger.appendLine(
-        `[session-provider] Failed to summarize checkpoints for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return undefined;
     }
   }
 
   async function toSessionListEntry(meta: SerializableSessionMeta): Promise<SessionListEntry> {
-    const description = meta.description
-      ?? summarizeChangeFiles(
-        new Set((meta.changeSummary?.paths ?? []).map(normalizeChangePath)),
-        meta.changeSummary?.additions,
-        meta.changeSummary?.deletions,
-      )
-      ?? await summarizePersistedSessionChanges(meta.id);
-
     return {
       id: meta.id,
       title: meta.title ?? meta.id,
       createdAt: new Date(meta.createdAt ?? Date.now()),
-      description,
+      description: meta.description,
       status: toChatSessionStatus(meta.status) ?? vscode.ChatSessionStatus.Completed,
+      changeApprovalState: meta.changeApprovalState,
+      source: 'persisted',
     };
   }
 
@@ -803,6 +725,10 @@ export function createSessionContentProvider(
         createdAt: existing.createdAt ?? session.createdAt,
         description: existing.description ?? session.description,
         status: existing.status ?? session.status,
+        changeApprovalState: existing.changeApprovalState ?? session.changeApprovalState,
+        resource: session.resource ?? existing.resource,
+        source: 'runtime',
+        hasLiveTurns: session.hasLiveTurns,
       });
     }
 
@@ -812,10 +738,13 @@ export function createSessionContentProvider(
   function publishSessionItems(controller: vscode.ChatSessionItemController, sessions: readonly SessionListEntry[]): void {
     const sessionThemeIcon = new vscode.ThemeIcon('opencode-logo');
     const items = sessions.map((session) => {
-      const resource = createSessionResource(session.id);
+      const resource = session.resource ?? createSessionResource(session.id);
       const item = controller.createChatSessionItem(resource, getSessionLabel(session));
       item.iconPath = sessionThemeIcon;
       item.description = getSessionDescription(session);
+      if (session.changeApprovalState === 'pending' || session.changeApprovalState === 'partial') {
+        item.badge = session.changeApprovalState === 'partial' ? 'Partial' : 'Changes';
+      }
       item.status = session.status ?? vscode.ChatSessionStatus.Completed;
       item.timing = { created: session.createdAt.getTime() };
       item.tooltip = session.id;
@@ -1070,6 +999,43 @@ export function createSessionContentProvider(
     return undefined;
   }
 
+  function findLiveSessionEntryByBackendId(
+    sessionId: string,
+  ): { key: string; state: import('../../types').SessionState } | undefined {
+    for (const [key, chatState] of state.sessions.entries()) {
+      if (chatState.sessionId === sessionId && chatState.turnMap.length > 0) {
+        return { key, state: chatState };
+      }
+    }
+    return undefined;
+  }
+
+  function getPromptFromTurnEvents(events: readonly AcpEvent[]): string | undefined {
+    for (const event of events) {
+      if (event.type === 'part.updated' && event.part.type === 'text') {
+        const text = (event.part as { text?: string }).text?.trim();
+        if (text) {
+          return text;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  function dropFirstPromptEvent(events: readonly AcpEvent[], prompt: string): AcpEvent[] {
+    let dropped = false;
+    return events.filter((event) => {
+      if (!dropped && event.type === 'part.updated' && event.part.type === 'text') {
+        const text = (event.part as { text?: string }).text;
+        if (text === prompt) {
+          dropped = true;
+          return false;
+        }
+      }
+      return true;
+    });
+  }
+
   /**
    * Create a forkHandler function for use by both the ChatSessionItemController
    * and the ChatSession objects returned by provideChatSessionContent().
@@ -1149,74 +1115,120 @@ export function createSessionContentProvider(
   async function fetchSessionHistory(
     sessionId: string,
     token: vscode.CancellationToken,
+    options?: { replayPendingChanges?: boolean },
   ): Promise<RestoredSessionHistory> {
     const turnsPath = state.sessionStore.getTurnsPath(sessionId);
     const sessionDir = state.sessionStore.getSessionDir(sessionId);
 
     // 1. Read events and snapshots
-    const events = await readSessionEvents<AcpEvent>(turnsPath);
+    const turnEvents = await readSessionTurnEvents<AcpEvent>(turnsPath);
+    const hasPersistedTurns = turnEvents.some(turn => turn.start);
+    const events = hasPersistedTurns
+      ? turnEvents.flatMap(turn => turn.events)
+      : await readSessionEvents<AcpEvent>(turnsPath);
     const snapshots = await readCheckpoints(sessionDir);
+    const meta = await state.sessionStore.readMeta(sessionId);
+    const checkpointApproval = getCheckpointApproval(snapshots, meta);
+    const pendingReplaySnapshots = options?.replayPendingChanges === false
+      ? []
+      : getRestoreReplaySnapshots(snapshots, meta);
 
     logger.appendLine(
-      `[session-provider] fetchSessionHistory: read ${events.length} events + ${snapshots.length} snapshots from ${turnsPath}`,
+      `[session-provider] fetchSessionHistory: read ${events.length} events + ${snapshots.length} snapshots from ${turnsPath} ` +
+      `(acceptedThroughTurn=${checkpointApproval.acceptedThroughTurn}, pending=${checkpointApproval.pendingSnapshots.length}, ` +
+      `restoreReplay=${pendingReplaySnapshots.length}, replayPending=${options?.replayPendingChanges !== false})`,
     );
 
-    if (events.length === 0) {
-      return { history: [], snapshots };
-    }
-
-    // 2. Create CollectorStream for replay
-    const collector = new CollectorStream();
-
-    // 3. Create bridge via backend factory (same factory used for live rendering)
-    const bridge = state.backend.createBridge(sessionId);
-    bridge.setStream(collector);
-
-    // 4. Replay events
-    let userTurn: vscode.ChatRequestTurn | null = null;
-
-    for (const event of events) {
-      if (token.isCancellationRequested) break;
-
-      // Detect user message from the first text event
-      if (event.type === 'part.updated' && event.part.type === 'text' && !userTurn) {
-        const textPart = event.part as { text?: string };
-        if (textPart.text && textPart.text.length > 0) {
-          userTurn = new (vscode.ChatRequestTurn as unknown as new (
-            prompt: string, command: string | undefined, references: unknown[], participant: string
-          ) => vscode.ChatRequestTurn)(
-            textPart.text,
-            undefined,
-            [],
-            'opencode-copilot.opencode',
-          );
-        }
-        // Don't replay the user message as assistant output
-        continue;
-      }
-
-      // Replay event through bridge → CollectorStream captures rendered output
-      bridge.processEvent(event);
-    }
-
-    // 5. Build turn from captured parts
-    const restoredDiffPart = createRestoredDiffPart(snapshots);
-    if (restoredDiffPart) {
-      collector.push(restoredDiffPart);
-    }
-    const assistantTurn = collector.buildTurn();
+    const makeRequestTurn = (prompt: string): vscode.ChatRequestTurn => new (vscode.ChatRequestTurn as unknown as new (
+      prompt: string, command: string | undefined, references: unknown[], participant: string
+    ) => vscode.ChatRequestTurn)(
+      prompt,
+      undefined,
+      [],
+      'opencode-copilot.opencode',
+    );
 
     const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
-    if (userTurn) {
-      history.push(userTurn);
+
+    const buildResponseTurn = (turnEventsForResponse: readonly AcpEvent[]): vscode.ChatResponseTurn | undefined => {
+      const collector = new CollectorStream();
+      const bridge = state.backend.createBridge(sessionId);
+      bridge.setStream(collector);
+
+      for (const event of turnEventsForResponse) {
+        if (token.isCancellationRequested) break;
+        bridge.processEvent(event);
+      }
+
+      if (collector.parts.length === 0) {
+        return undefined;
+      }
+      return collector.buildTurn();
+    };
+
+    if (hasPersistedTurns) {
+      for (const turn of turnEvents) {
+        if (token.isCancellationRequested) break;
+
+        const start = turn.start as { prompt?: unknown } | undefined;
+        const prompt = typeof start?.prompt === 'string' ? start.prompt : getPromptFromTurnEvents(turn.events);
+        if (prompt) {
+          history.push(makeRequestTurn(prompt));
+        }
+
+        const responseEvents = prompt ? dropFirstPromptEvent(turn.events, prompt) : turn.events;
+        const responseTurn = buildResponseTurn(responseEvents);
+        if (responseTurn) {
+          history.push(responseTurn);
+        }
+      }
+    } else {
+      let collector = new CollectorStream();
+      let bridge = state.backend.createBridge(sessionId);
+      bridge.setStream(collector);
+
+      const flushAssistantTurn = (): void => {
+        if (collector.parts.length === 0) {
+          return;
+        }
+        history.push(collector.buildTurn());
+        collector = new CollectorStream();
+        bridge = state.backend.createBridge(sessionId);
+        bridge.setStream(collector);
+      };
+
+      let expectingUserMessage = true;
+      for (const event of events) {
+        if (token.isCancellationRequested) break;
+
+        if (event.type === 'part.updated' && event.part.type === 'text' && expectingUserMessage) {
+          const textPart = event.part as { text?: string };
+          if (textPart.text && textPart.text.length > 0) {
+            history.push(makeRequestTurn(textPart.text));
+            expectingUserMessage = false;
+            bridge.processEvent(event);
+            continue;
+          }
+        }
+
+        if (event.type === 'session.idle') {
+          bridge.processEvent(event);
+          flushAssistantTurn();
+          expectingUserMessage = true;
+          continue;
+        }
+
+        bridge.processEvent(event);
+      }
+
+      flushAssistantTurn();
     }
-    history.push(assistantTurn);
 
     logger.appendLine(
       `[session-provider] Restored ${history.length} turns for session ${sessionId}`,
     );
 
-    return { history, snapshots };
+    return { history, snapshots, pendingReplaySnapshots };
   }
 
   // -- The Provider --------------------------------------------------------
@@ -1314,7 +1326,9 @@ export function createSessionContentProvider(
             try {
               await ensureBackendRunning();
 
-              const { history } = await fetchSessionHistory(chatState.sessionId, token);
+              const { history } = await fetchSessionHistory(chatState.sessionId, token, {
+                replayPendingChanges: false,
+              });
 
               // Determine title with priority:
               // 1. Non-placeholder chatState title (already fetched from backend earlier)
@@ -1391,9 +1405,20 @@ export function createSessionContentProvider(
 
           // Get session info for title
           const sessionInfo = await state.backend.sessions.get(sessionId);
+          const vscodeSessionKey = resource.toString();
+          const liveEntry = findLiveSessionEntryByBackendId(sessionId);
+          const isLiveInMemory = !!liveEntry;
+          if (liveEntry && !state.sessions.has(vscodeSessionKey)) {
+            state.sessions.set(vscodeSessionKey, liveEntry.state);
+            logger.appendLine(
+              `[session-provider] Aliased provider resource ${vscodeSessionKey} to live session ${sessionId} from ${liveEntry.key}`,
+            );
+          }
 
           // Fetch message history
-          const { history } = await fetchSessionHistory(sessionId, token);
+          const { history, pendingReplaySnapshots } = await fetchSessionHistory(sessionId, token, {
+            replayPendingChanges: !isLiveInMemory,
+          });
           const backendTitle = sessionInfo.data?.title?.trim() ?? '';
           // Use backend title only if it's a meaningful (non-placeholder) title;
           // otherwise derive from the first user message in history.
@@ -1402,7 +1427,6 @@ export function createSessionContentProvider(
             : getHistoryDerivedSessionTitle(history, sessionId);
 
           // Store in session map for request handler continuity
-          const vscodeSessionKey = resource.toString();
           const existingState = state.sessions.get(vscodeSessionKey);
           let bestTitle = title;
           if (existingState) {
@@ -1447,6 +1471,16 @@ export function createSessionContentProvider(
             title: bestTitle,
             history,
             requestHandler: createParticipantHandler(state),
+            ...(pendingReplaySnapshots.length > 0
+              ? {
+                  activeResponseCallback: async (
+                    stream: vscode.ChatResponseStream,
+                    activeToken: vscode.CancellationToken,
+                  ) => {
+                    await replayPendingSnapshotsForSession(sessionId, pendingReplaySnapshots, stream, activeToken);
+                  },
+                }
+              : {}),
             ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
           };
         } catch (err) {
@@ -1498,13 +1532,12 @@ export async function renderWithExperimentalSurface(
   // Check stream capabilities at runtime (may or may not be available)
   const hasFullProposed = hasFullProposedSurface(stream);
   const hasToolPart = hasChatToolInvocationPart();
-  const hasMultiDiff = hasChatResponseMultiDiffPart();
 
   const logger = { appendLine: (m: string) => { console.log(m); } };
 
   logger.appendLine(
     `[experimental-session] caps: fullProposed=${hasFullProposed}, ` +
-    `toolPart=${hasToolPart}, multiDiff=${hasMultiDiff}`,
+    `toolPart=${hasToolPart}`,
   );
 
   renderer.probeStream(stream);

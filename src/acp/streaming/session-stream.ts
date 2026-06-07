@@ -13,10 +13,13 @@
  */
 
 import path from 'node:path';
+import { promises as fs } from 'node:fs';
 import { ensureSessionDir } from './workspace-setup';
 import {
   writeVersionHeader,
   writeMeta,
+  writeTurnStart,
+  writeTurnEnd,
   writeEvent,
   writeSnapshotLine,
 } from '../serializable/serializer';
@@ -39,6 +42,8 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
     private readonly backendName: string,
     private readonly sessionId: string,
     private readonly meta: SerializableSessionMeta,
+    private readonly turnIndex = 0,
+    private readonly prompt?: string,
   ) {}
 
   // ── Lifecycle ──────────────────────────────────────────────────────────
@@ -55,8 +60,16 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
     );
     this.sessionDir = sessionDir;
     this.filePath = path.join(sessionDir, 'turns.jsonl');
-    await writeVersionHeader(this.filePath);
-    await writeMeta(this.filePath, this.meta as unknown as Record<string, unknown>);
+    const hasExistingContent = await fileHasContent(this.filePath);
+    if (!hasExistingContent) {
+      await writeVersionHeader(this.filePath);
+      await writeMeta(this.filePath, this.meta as unknown as Record<string, unknown>);
+    }
+    await writeTurnStart(this.filePath, {
+      turnIndex: this.turnIndex,
+      prompt: this.prompt,
+      timestamp: new Date().toISOString(),
+    });
     this.headerWritten = true;
   }
 
@@ -65,6 +78,16 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
    * become no-ops.
    */
   close(): void {
+    if (this.isActive) {
+      this.enqueueWrite(async () => {
+        if (!this.filePath) return;
+        await this.ensureHeader();
+        await writeTurnEnd(this.filePath, {
+          turnIndex: this.turnIndex,
+          timestamp: new Date().toISOString(),
+        });
+      });
+    }
     this.isActive = false;
   }
 
@@ -94,13 +117,17 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
    */
   onSnapshot(snapshot: FileSnapshotRecord): void {
     if (!this.isActive) return;
+    const snapshotWithTurn: FileSnapshotRecord = {
+      ...snapshot,
+      turnIndex: snapshot.turnIndex ?? this.turnIndex,
+    };
     this.enqueueWrite(async () => {
       if (!this.filePath || !this.sessionDir) return;
       await this.ensureHeader();
       // Write inline to turns.jsonl for chronological replay
-      await writeSnapshotLine(this.filePath, snapshot);
+      await writeSnapshotLine(this.filePath, snapshotWithTurn);
       // Write to checkpoint store (_checkpoints.jsonl) for structural access
-      await writeSnapshot(this.sessionDir, snapshot);
+      await writeSnapshot(this.sessionDir, snapshotWithTurn);
     });
   }
 
@@ -120,8 +147,16 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
   private async ensureHeader(): Promise<void> {
     if (this.headerWritten || !this.filePath) return;
     this.headerWritten = true;
-    await writeVersionHeader(this.filePath);
-    await writeMeta(this.filePath, this.meta as unknown as Record<string, unknown>);
+    const hasExistingContent = await fileHasContent(this.filePath);
+    if (!hasExistingContent) {
+      await writeVersionHeader(this.filePath);
+      await writeMeta(this.filePath, this.meta as unknown as Record<string, unknown>);
+    }
+    await writeTurnStart(this.filePath, {
+      turnIndex: this.turnIndex,
+      prompt: this.prompt,
+      timestamp: new Date().toISOString(),
+    });
   }
 
   /**
@@ -138,5 +173,14 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
   /** Wait for all pending writes to complete */
   async flush(): Promise<void> {
     await this.writeQueue;
+  }
+}
+
+async function fileHasContent(filePath: string): Promise<boolean> {
+  try {
+    const stat = await fs.stat(filePath);
+    return stat.size > 0;
+  } catch {
+    return false;
   }
 }

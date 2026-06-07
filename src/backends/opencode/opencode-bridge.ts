@@ -30,6 +30,7 @@
  */
 
 import * as vscode from 'vscode';
+import * as path from 'node:path';
 import type {
   AcpEvent,
   AcpResult,
@@ -60,9 +61,6 @@ import type {
   ChatToolInvocationPart,
   ChatToolInvocationStreamData,
   ChatWorkspaceFileEdit,
-  ChatResponseDiffEntry,
-  ChatResponseExternalEditPart,
-  ChatResponseMultiDiffPart,
   ChatResponseWorkspaceEditPart,
 } from '../../types/vscode-proposed-additions';
 import { ChatTodoStatus, ChatQuestion, ChatQuestionType } from '../../types/vscode-proposed-additions';
@@ -99,18 +97,9 @@ type ProposedVscode = typeof vscode & {
     prompt?: string,
     result?: string,
   ) => ChatSubagentToolInvocationData;
-  ChatResponseExternalEditPart?: new (
-    uris: readonly vscode.Uri[],
-    callback: () => Thenable<unknown>,
-  ) => ChatResponseExternalEditPart;
   ChatResponseWorkspaceEditPart?: new (
     edits: readonly ChatWorkspaceFileEdit[],
   ) => ChatResponseWorkspaceEditPart;
-  ChatResponseMultiDiffPart?: new (
-    value: ChatResponseDiffEntry[],
-    title: string,
-    readOnly?: boolean,
-  ) => ChatResponseMultiDiffPart;
 };
 
 // Runtime access to proposed classes (may not exist)
@@ -684,12 +673,8 @@ export class OpenCodeBridge implements AcpBridge {
 
     // If we have a tracker and this is an edit-related permission with a file path, track it
     if (this.tracker && callID && filepath) {
-      // Normalize URI to match VSCode's internal casing (lowercase drive letter on Windows).
-      const rawUri = vscode.Uri.file(filepath);
-      const normalizedPath = rawUri.path.replace(/^\/([A-Z]):\//, (_match: string, drive: string) => `/${drive.toLowerCase()}:`);
-      const fileUri = rawUri.path !== normalizedPath
-        ? rawUri.with({ path: normalizedPath })
-        : rawUri;
+      // Normalize Windows file URIs to match VS Code's internal path comparisons.
+      const fileUri = createExternalEditUri(filepath, this.directory);
 
       // Skip if this callID is already tracked, or if the file already has an active
       // ExternalEditPart (VSCode only supports one per file at a time).
@@ -702,6 +687,7 @@ export class OpenCodeBridge implements AcpBridge {
         try {
           await this.tracker.trackEdit(callID, [fileUri], stream);
           this.externalEditCallIds.add(callID);
+          this.hideProgressiveExternalEditTool(stream, callID);
           this.logTag('edit', `tracked edit callID=${callID}, file=${filepath}`);
         } catch (err) {
           this.logTag('edit', `trackEdit error for callID=${callID}: ${err}`);
@@ -994,42 +980,11 @@ export class OpenCodeBridge implements AcpBridge {
   }
 
   // -------------------------------------------------------------------
-  // session.diff → ChatResponseMultiDiffPart (shows +/- lines in UI)
+  // session.diff is used for persisted/session-list changes, not chat UI.
   // -------------------------------------------------------------------
 
-  private handleSessionDiff(event: AcpSessionDiffEvent, stream: Stream): boolean {
-    const diffs = event.diffs;
-    if (!diffs?.length) {return false;}
-
-    if (!VS.ChatResponseMultiDiffPart || !stream.push) {
-      return false;
-    }
-
-    const entries: ChatResponseDiffEntry[] = diffs
-      .filter((d) => d.status !== 'deleted')
-      .map((d) => {
-        const uri = vscode.Uri.file(d.file);
-        const entry: ChatResponseDiffEntry = {
-          modifiedUri: uri,
-          added: d.additions || undefined,
-          removed: d.deletions || undefined,
-        };
-        if (d.status !== 'added') {
-          entry.originalUri = uri;
-        }
-        return entry;
-      });
-
-    if (!entries.length) {return false;}
-
-    try {
-      const diffPart = new VS.ChatResponseMultiDiffPart(entries, 'File Changes', true);
-      stream.push(diffPart as unknown as vscode.ChatResponsePart);
-      this.log(`pushed MultiDiffPart: ${entries.length} file(s) changed`);
-      return true;
-    } catch {
-      return false;
-    }
+  private handleSessionDiff(_event: AcpSessionDiffEvent, _stream: Stream): boolean {
+    return false;
   }
 
   // -------------------------------------------------------------------
@@ -1204,6 +1159,22 @@ export class OpenCodeBridge implements AcpBridge {
     }
 
     return false;
+  }
+
+  private hideProgressiveExternalEditTool(stream: Stream, callID: string): void {
+    if (!this.progressivePushed.has(callID) || !VS.ChatToolInvocationPart || !stream.push) {
+      return;
+    }
+
+    try {
+      const toolName = this.toolMetas.get(callID)?.name ?? 'edit';
+      const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callID);
+      part.enablePartialUpdate = true;
+      part.isComplete = true;
+      part.presentation = 'hidden';
+      stream.push(part as unknown as vscode.ChatResponsePart);
+      this.logTag('edit', `hid progressive edit tool card for externalEdit callID=${callID}`);
+    } catch { /* best-effort */ }
   }
 
   // -------------------------------------------------------------------
@@ -2133,6 +2104,23 @@ function isTransientFileTool(toolName: string): boolean {
 
 function isEditTool(toolName: string): boolean {
   return toolName === 'edit' || toolName === 'write';
+}
+
+function normalizeWindowsFileUriPath(uriPath: string): string {
+  return /^\/[a-zA-Z]:(?=\/)/.test(uriPath)
+    ? uriPath.toLowerCase()
+    : uriPath;
+}
+
+function createExternalEditUri(filepath: string, directory?: string): vscode.Uri {
+  const absolutePath = directory && !path.isAbsolute(filepath)
+    ? path.join(directory, filepath)
+    : filepath;
+  const rawUri = vscode.Uri.file(absolutePath);
+  const normalizedPath = normalizeWindowsFileUriPath(rawUri.path);
+  return rawUri.path !== normalizedPath
+    ? rawUri.with({ path: normalizedPath })
+    : rawUri;
 }
 
 function getToolTitle(state: AcpToolState): string | undefined {

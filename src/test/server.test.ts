@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { delimiter, resolve } from 'path';
 
 // ---------------------------------------------------------------------------
 // Mock the SDK before importing
@@ -40,10 +41,20 @@ import { OpenCodeServerManager } from '../opencode/server';
 
 describe('OpenCodeServerManager', () => {
   let manager: OpenCodeServerManager;
+  let originalPath: string | undefined;
 
   beforeEach(() => {
     vi.resetAllMocks();
+    originalPath = process.env.PATH;
     manager = new OpenCodeServerManager();
+  });
+
+  afterEach(() => {
+    if (originalPath === undefined) {
+      delete process.env.PATH;
+    } else {
+      process.env.PATH = originalPath;
+    }
   });
 
   // -----------------------------------------------------------------------
@@ -68,11 +79,23 @@ describe('OpenCodeServerManager', () => {
 
     const url = await manager.start();
 
-    expect(createOpencode).toHaveBeenCalledWith({ port: 0 });
+    expect(createOpencode).toHaveBeenCalledWith({ port: 0, timeout: 15_000 });
     expect(url).toBe('http://127.0.0.1:51777');
     expect(manager.getStatus()).toBe('running');
     expect(manager.isRunning()).toBe(true);
     expect(manager.getUrl()).toBe(url);
+  });
+
+  it('should start using the packaged OpenCode CLI path and restore PATH afterward', async () => {
+    (createOpencode as unknown as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      const firstPathEntry = (process.env.PATH ?? '').split(delimiter)[0];
+      expect(resolve(firstPathEntry)).toBe(resolve(process.cwd(), 'node_modules', '.bin'));
+      return mockInstance;
+    });
+
+    await manager.start();
+
+    expect(process.env.PATH).toBe(originalPath);
   });
 
   it('should delete OPENCODE_SERVER_PASSWORD env var before starting', async () => {
@@ -96,6 +119,25 @@ describe('OpenCodeServerManager', () => {
 
     expect(url2).toBe('http://127.0.0.1:51777');
     expect(createOpencode).toHaveBeenCalledTimes(1);
+  });
+
+  it('should reuse an in-flight start call', async () => {
+    let resolveStart: ((value: typeof mockInstance) => void) | undefined;
+    (createOpencode as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise((resolve) => {
+        resolveStart = resolve;
+      }),
+    );
+
+    const first = manager.start('D:\\Temp');
+    const second = manager.start('D:\\Temp');
+    expect(manager.getStatus()).toBe('starting');
+    expect(createOpencode).toHaveBeenCalledTimes(1);
+
+    resolveStart!(mockInstance);
+    await expect(first).resolves.toBe('http://127.0.0.1:51777');
+    await expect(second).resolves.toBe('http://127.0.0.1:51777');
+    expect(manager.getStatus()).toBe('running');
   });
 
   // -----------------------------------------------------------------------

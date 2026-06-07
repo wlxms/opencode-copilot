@@ -1,6 +1,6 @@
 import { createOpencode } from '@opencode-ai/sdk/v2';
 import { existsSync, writeFileSync } from 'fs';
-import { resolve } from 'path';
+import { delimiter, resolve } from 'path';
 import type { OpenCodeClient, OpenCodeServerController } from '../backends/opencode/sdk-types';
 
 export type ServerStatus = 'stopped' | 'starting' | 'running' | 'error';
@@ -31,6 +31,30 @@ function ensureOpencodeConfig(dir: string): boolean {
   return false;
 }
 
+function findPackagedOpenCodeBin(): string | undefined {
+  const candidates = [
+    resolve(__dirname, '..', 'node_modules', '.bin'),
+    resolve(__dirname, '..', '..', 'node_modules', '.bin'),
+    resolve(process.cwd(), 'node_modules', '.bin'),
+  ];
+  return candidates.find((candidate) => existsSync(candidate));
+}
+
+function prependPackagedOpenCodeToPath(): string | undefined {
+  const previousPath = process.env.PATH;
+  const extensionBin = findPackagedOpenCodeBin();
+  if (!extensionBin) {
+    return previousPath;
+  }
+
+  const entries = (previousPath ?? '').split(delimiter).filter(Boolean);
+  const hasExtensionBin = entries.some((entry) => resolve(entry).toLowerCase() === extensionBin.toLowerCase());
+  process.env.PATH = hasExtensionBin
+    ? previousPath
+    : [extensionBin, ...entries].join(delimiter);
+  return previousPath;
+}
+
 /**
  * Manages the lifecycle of the OpenCode server via the official SDK.
  *
@@ -48,6 +72,7 @@ export class OpenCodeServerManager implements OpenCodeServerController {
   } | null = null;
   private status: ServerStatus = 'stopped';
   private serverUrl: string | null = null;
+  private startPromise: Promise<string> | null = null;
 
   /**
    * Start the OpenCode server.
@@ -61,6 +86,19 @@ export class OpenCodeServerManager implements OpenCodeServerController {
       return this.serverUrl;
     }
 
+    if (this.startPromise) {
+      return this.startPromise;
+    }
+
+    this.startPromise = this.doStart(cwd);
+    try {
+      return await this.startPromise;
+    } finally {
+      this.startPromise = null;
+    }
+  }
+
+  private async doStart(cwd?: string): Promise<string> {
     this.status = 'starting';
     this.serverUrl = null;
 
@@ -77,9 +115,20 @@ export class OpenCodeServerManager implements OpenCodeServerController {
       // DO NOT set OPENCODE_SERVER_PASSWORD — it causes 401 Unauthorized
       delete process.env.OPENCODE_SERVER_PASSWORD;
 
-      const instance = await createOpencode({
-        port: 0,
-      });
+      const previousPath = prependPackagedOpenCodeToPath();
+      let instance: Awaited<ReturnType<typeof createOpencode>>;
+      try {
+        instance = await createOpencode({
+          port: 0,
+          timeout: 15_000,
+        });
+      } finally {
+        if (previousPath === undefined) {
+          delete process.env.PATH;
+        } else {
+          process.env.PATH = previousPath;
+        }
+      }
       // Cast at the architectural boundary: SDK v2 OpencodeClient → our typed contract.
       // The shapes are compatible at runtime; the type mismatch is due to SDK's complex
       // ServerSentEventsResult / RequestResult generics vs our simpler SdkResponse wrapper.

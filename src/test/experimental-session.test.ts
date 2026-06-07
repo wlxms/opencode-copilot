@@ -9,11 +9,12 @@ import type { AcpAgent } from '../acp/types';
 import type { AcpBackend } from '../acp/backend';
 import type { ExtensionState } from '../types';
 import { AppEventBus } from '../acp/app-event-bus';
-import { readSessionEvents } from '../acp/serializable/serializer';
+import { readSessionEvents, readSessionTurnEvents } from '../acp/serializable/serializer';
 import { readCheckpoints } from '../acp/checkpoint/checkpoint-store';
 
 vi.mock('../acp/serializable/serializer', () => ({
   readSessionEvents: vi.fn(),
+  readSessionTurnEvents: vi.fn(),
 }));
 vi.mock('../acp/checkpoint/checkpoint-store', () => ({
   readCheckpoints: vi.fn(),
@@ -54,6 +55,7 @@ describe('createSessionContentProvider', () => {
     }));
 
     vi.mocked(readSessionEvents).mockResolvedValue([]);
+    vi.mocked(readSessionTurnEvents).mockResolvedValue([]);
     vi.mocked(readCheckpoints).mockResolvedValue([]);
 
     state = {
@@ -120,6 +122,7 @@ describe('createSessionContentProvider', () => {
         has: vi.fn((key: string) => sessionStore.has(key)),
         set: vi.fn((key: string, value: unknown) => { sessionStore.set(key, value); }),
         values: vi.fn(() => sessionStore.values()),
+        entries: vi.fn(() => sessionStore.entries()),
       } as unknown as ExtensionState['sessions'],
       statusBar: { update: vi.fn() } as unknown as ExtensionState['statusBar'],
       selection: {
@@ -140,6 +143,8 @@ describe('createSessionContentProvider', () => {
         getTurnsPath: vi.fn().mockReturnValue(''),
         getSessionDir: vi.fn().mockReturnValue(''),
         initialize: vi.fn().mockResolvedValue(undefined),
+        readMeta: vi.fn().mockResolvedValue(undefined),
+        updateMeta: vi.fn().mockResolvedValue(undefined),
         writeMeta: vi.fn().mockResolvedValue(undefined),
       } as any,
     };
@@ -221,7 +226,7 @@ describe('createSessionContentProvider', () => {
     expect(items[0]?.description).toBeUndefined();
   });
 
-  it('shows persisted session changes in Session list item descriptions', async () => {
+  it('does not inject persisted diffs into Session list item changes', async () => {
     (state.sessionStore.listSessions as any).mockResolvedValue([
       { id: 'ses_changes', title: 'Changed Session', createdAt: '2026-05-28T04:00:00.000Z', backendName: 'opencode' },
     ]);
@@ -249,7 +254,59 @@ describe('createSessionContentProvider', () => {
     const items = Array.from(controller!.items).map(([, item]) => item);
     expect(items[0]?.label).toBe('Changed Session');
     expect(items[0]?.status).toBe(vscode.ChatSessionStatus.Completed);
-    expect(items[0]?.description).toBe('2 files changed +13 -1');
+    expect(items[0]?.description).toBeUndefined();
+    expect(items[0]?.changes).toBeUndefined();
+  });
+
+  it('does not inject checkpoint summaries into Session list item changes', async () => {
+    (state.sessionStore.listSessions as any).mockResolvedValue([
+      { id: 'ses_checkpoint_summary', title: 'Checkpoint Summary', createdAt: '2026-05-28T04:00:00.000Z', backendName: 'opencode' },
+    ]);
+    vi.mocked(readCheckpoints).mockResolvedValue([
+      {
+        uri: '/workspace/actual.ts',
+        content: 'before',
+        phase: 'before',
+        turnIndex: 0,
+        editIndex: 1,
+        toolCallId: 'tool-1',
+        timestamp: '2026-06-05T00:00:00.000Z',
+      },
+      {
+        uri: '/workspace/actual.ts',
+        content: 'after',
+        phase: 'after',
+        turnIndex: 0,
+        editIndex: 1,
+        toolCallId: 'tool-1',
+        timestamp: '2026-06-05T00:00:01.000Z',
+      },
+    ]);
+    vi.mocked(readSessionEvents).mockResolvedValue([
+      {
+        type: 'session.diff',
+        sessionId: 'ses_checkpoint_summary',
+        diffs: [
+          { file: '/workspace/actual.ts', patch: '', additions: 1, deletions: 0, status: 'modified' },
+          { file: '/workspace/stale-a.ts', patch: '', additions: 2, deletions: 0, status: 'modified' },
+          { file: '/workspace/stale-b.ts', patch: '', additions: 3, deletions: 0, status: 'modified' },
+        ],
+      } as any,
+    ]);
+
+    const { controller } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    await controller!.refreshHandler({
+      isCancellationRequested: false,
+      onCancellationRequested: () => ({ dispose() {} }),
+    });
+
+    const items = Array.from(controller!.items).map(([, item]) => item);
+    expect(items[0]?.description).toBeUndefined();
+    expect(items[0]?.changes).toBeUndefined();
   });
 
   it('derives a restored session title from first user message when backend title is empty', async () => {
@@ -283,6 +340,70 @@ describe('createSessionContentProvider', () => {
     );
   });
 
+  it('restores multiple persisted turns instead of collapsing them into one response', async () => {
+    state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
+    (state.backend.createBridge as any).mockImplementation(() => {
+      let stream: { markdown(value: string): void } | undefined;
+      const partKinds = new Map<string, string>();
+      return {
+        setStream: vi.fn((next: unknown) => { stream = next as { markdown(value: string): void }; }),
+        setCallbacks: vi.fn(),
+        setTracker: vi.fn(),
+        processEvent: vi.fn((event: any) => {
+          if (event.type === 'part.updated' && event.part?.type === 'text' && !event.part.text) {
+            partKinds.set(event.part.id, 'text');
+          }
+          if (event.type === 'part.delta' && partKinds.get(event.partId) === 'text') {
+            stream?.markdown(event.delta);
+          }
+        }),
+        run: vi.fn().mockResolvedValue(true),
+        getUserMessageId: vi.fn().mockReturnValue(null),
+        getSessionTitle: vi.fn().mockReturnValue(null),
+        getHadSubagentTasks: vi.fn().mockReturnValue(false),
+      };
+    });
+    vi.mocked(readSessionTurnEvents).mockResolvedValue([
+      {
+        turnIndex: 0,
+        start: { turnIndex: 0, prompt: 'First question', timestamp: '2026-06-07T00:00:00.000Z' },
+        events: [
+          { type: 'part.updated', part: { type: 'text', id: 'u1', text: 'First question', messageId: 'user-1' } } as any,
+          { type: 'part.updated', part: { type: 'text', id: 'a1', text: '', messageId: 'assistant-1' } } as any,
+          { type: 'part.delta', partId: 'a1', delta: 'First answer', field: 'text' } as any,
+        ],
+        end: { turnIndex: 0, timestamp: '2026-06-07T00:00:01.000Z' },
+      },
+      {
+        turnIndex: 1,
+        start: { turnIndex: 1, prompt: 'Second question', timestamp: '2026-06-07T00:00:02.000Z' },
+        events: [
+          { type: 'part.updated', part: { type: 'text', id: 'u2', text: 'Second question', messageId: 'user-2' } } as any,
+          { type: 'part.updated', part: { type: 'text', id: 'a2', text: '', messageId: 'assistant-2' } } as any,
+          { type: 'part.delta', partId: 'a2', delta: 'Second answer', field: 'text' } as any,
+        ],
+        end: { turnIndex: 1, timestamp: '2026-06-07T00:00:03.000Z' },
+      },
+    ]);
+
+    const { provider } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    const session = await provider.provideChatSessionContent(
+      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+      { inputState: {} as vscode.ChatSessionInputState },
+    );
+
+    const requestTurns = session.history.filter((turn): turn is vscode.ChatRequestTurn => 'prompt' in (turn as any));
+    const responseTurns = session.history.filter(turn => !('prompt' in (turn as any)));
+    expect(requestTurns.map(turn => turn.prompt)).toEqual(['First question', 'Second question']);
+    expect(responseTurns).toHaveLength(2);
+    expect(session.history).toHaveLength(4);
+  });
+
   it('does not publish a session-list change just from restoring content', async () => {
     const sessionListChanged = vi.fn();
     state.bus.on('session-list-changed', sessionListChanged);
@@ -304,7 +425,7 @@ describe('createSessionContentProvider', () => {
     expect(sessionListChanged).not.toHaveBeenCalled();
   });
 
-  it('does not resume a completed restored session just to replay checkpoints', async () => {
+  it('does not replay checkpoints accepted through the restored turn', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-restore-replay-'));
     const file = path.join(dir, 'file.txt');
     fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
@@ -318,6 +439,7 @@ describe('createSessionContentProvider', () => {
         uri: uri.fsPath,
         content: 'a\nb\nc\n',
         phase: 'before',
+        turnIndex: 0,
         editIndex: 1,
         toolCallId: 'tool-1',
         timestamp: '2026-06-05T00:00:00.000Z',
@@ -326,11 +448,17 @@ describe('createSessionContentProvider', () => {
         uri: uri.fsPath,
         content: 'a\nB\nc\n',
         phase: 'after',
+        turnIndex: 0,
         editIndex: 1,
         toolCallId: 'tool-1',
         timestamp: '2026-06-05T00:00:01.000Z',
       },
     ]);
+    (state.sessionStore.readMeta as any).mockResolvedValue({
+      id: 'ses_restore',
+      checkpointCursor: { acceptedThroughTurn: 0 },
+      changeApprovalState: 'accepted',
+    });
 
     const { provider } = createSessionContentProvider(
       state,
@@ -345,6 +473,143 @@ describe('createSessionContentProvider', () => {
 
     expect(session.activeResponseCallback).toBeUndefined();
     expect(fs.readFileSync(file, 'utf-8')).toBe('a\nb\nc\n');
+  });
+
+  it('replays unaccepted restored checkpoints from the active response callback', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-restore-pending-'));
+    const file = path.join(dir, 'file.txt');
+    fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
+    const uri = vscode.Uri.file(file);
+
+    vi.mocked(readSessionEvents).mockResolvedValue([
+      makeTextEvent('Restore pending edit') as any,
+    ]);
+    vi.mocked(readCheckpoints).mockResolvedValue([
+      {
+        uri: uri.fsPath,
+        content: 'a\nb\nc\n',
+        phase: 'before',
+        turnIndex: 1,
+        editIndex: 1,
+        toolCallId: 'tool-1',
+        timestamp: '2026-06-05T00:00:00.000Z',
+      },
+      {
+        uri: uri.fsPath,
+        content: 'a\nB\nc\n',
+        phase: 'after',
+        turnIndex: 1,
+        editIndex: 1,
+        toolCallId: 'tool-1',
+        timestamp: '2026-06-05T00:00:01.000Z',
+      },
+    ]);
+    (state.sessionStore.readMeta as any).mockResolvedValue({
+      id: 'ses_restore',
+      checkpointCursor: { acceptedThroughTurn: 0 },
+      changeApprovalState: 'pending',
+    });
+
+    const { provider } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    const session = await provider.provideChatSessionContent(
+      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+      { inputState: {} as vscode.ChatSessionInputState },
+    );
+
+    expect(session.activeResponseCallback).toBeTypeOf('function');
+    expect(fs.readFileSync(file, 'utf-8')).toBe('a\nb\nc\n');
+
+    const externalEdit = vi.fn(async (_target: vscode.Uri | vscode.Uri[], callback: () => Thenable<unknown>) => {
+      await callback();
+      return 'undo-stop';
+    });
+    const stream = {
+      push: vi.fn(),
+      externalEdit,
+    } as unknown as vscode.ChatResponseStream;
+
+    await session.activeResponseCallback?.(
+      stream,
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+    );
+
+    expect(stream.push).toHaveBeenCalledTimes(1);
+    expect(externalEdit).not.toHaveBeenCalled();
+    expect(fs.readFileSync(file, 'utf-8')).toBe('a\nB\nc\n');
+    expect(state.sessionStore.updateMeta).toHaveBeenCalledWith(
+      'ses_restore',
+      expect.objectContaining({
+        changeApprovalState: 'pending',
+        checkpointCursor: expect.objectContaining({ acceptedThroughTurn: 0, replayedThroughTurn: 1 }),
+      }),
+    );
+  });
+
+  it('uses live in-memory session state when a session-list item targets the same backend session', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-live-alias-'));
+    const file = path.join(dir, 'file.txt');
+    fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
+    const uri = vscode.Uri.file(file);
+    const liveState = {
+      sessionId: 'ses_live',
+      turnMap: [{ vscodeTurn: 0, messageId: 'msg_1' }],
+      title: 'Live Session',
+      createdAt: new Date('2026-06-05T00:00:00.000Z'),
+    };
+    const liveKey = 'opencode-copilot.opencode:/untitled-live';
+    state.sessions.set(liveKey, liveState);
+    state.backend.sessions.get = vi.fn(async () => ({
+      data: { id: 'ses_live', title: 'Live Session', createdAt: liveState.createdAt },
+    }));
+    vi.mocked(readSessionEvents).mockResolvedValue([
+      makeTextEvent('Restore pending edit') as any,
+    ]);
+    vi.mocked(readCheckpoints).mockResolvedValue([
+      {
+        uri: uri.fsPath,
+        content: 'a\nb\nc\n',
+        phase: 'before',
+        turnIndex: 0,
+        editIndex: 1,
+        toolCallId: 'tool-1',
+        timestamp: '2026-06-05T00:00:00.000Z',
+      },
+      {
+        uri: uri.fsPath,
+        content: 'a\nB\nc\n',
+        phase: 'after',
+        turnIndex: 0,
+        editIndex: 1,
+        toolCallId: 'tool-1',
+        timestamp: '2026-06-05T00:00:01.000Z',
+      },
+    ]);
+    (state.sessionStore.readMeta as any).mockResolvedValue({
+      id: 'ses_live',
+      checkpointCursor: { acceptedThroughTurn: -1 },
+      changeApprovalState: 'pending',
+    });
+
+    const { provider } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+    const resource = vscode.Uri.parse('opencode-copilot.opencode:/ses_live');
+    const session = await provider.provideChatSessionContent(
+      resource,
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+      { inputState: {} as vscode.ChatSessionInputState },
+    );
+
+    expect(session.title).toBe('Live Session');
+    expect(state.sessions.get(resource.toString())).toBe(liveState);
+    expect(fs.readFileSync(file, 'utf-8')).toBe('a\nb\nc\n');
+    expect(state.sessionStore.updateMeta).not.toHaveBeenCalled();
   });
 
   // =========================================================================

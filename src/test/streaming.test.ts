@@ -24,6 +24,10 @@ function mockStream(opts?: { withProposed?: boolean }): MockStream {
     markdown: vi.fn(),
     progress: vi.fn(),
     push: vi.fn(),
+    externalEdit: vi.fn(async (_target: vscode.Uri | vscode.Uri[], callback: () => Thenable<unknown>) => {
+      await callback();
+      return 'undo-stop';
+    }),
   };
   if (opts?.withProposed !== false) {
     stream.thinkingProgress = vi.fn();
@@ -584,6 +588,43 @@ describe('OpenCodeBridge', () => {
       );
     });
 
+    it('normalizes Windows file URI paths to lowercase without dropping the slash after the drive', async () => {
+      const stream = mockStream();
+      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
+        sessionId: 'ses_target',
+      });
+      permBridge.setTracker(mockTracker as any);
+      const events = eventStream([
+        permissionAskedEvent({ metadata: { filepath: 'D:\\Temp\\sisyphus-greeting.txt' } }),
+        idleEvent(),
+      ]);
+
+      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+
+      const uris = mockTracker.trackEdit.mock.calls[0]?.[1] as vscode.Uri[];
+      expect(uris[0].path).toBe('/d:/temp/sisyphus-greeting.txt');
+      expect(uris[0].toString()).toBe('file:///d:/temp/sisyphus-greeting.txt');
+    });
+
+    it('resolves relative edit paths against the workspace before tracking externalEdit', async () => {
+      const stream = mockStream();
+      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
+        sessionId: 'ses_target',
+        directory: 'D:\\Temp',
+      });
+      permBridge.setTracker(mockTracker as any);
+      const events = eventStream([
+        permissionAskedEvent({ metadata: { filepath: 'Hello-Sisyphus.txt' } }),
+        idleEvent(),
+      ]);
+
+      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+
+      const uris = mockTracker.trackEdit.mock.calls[0]?.[1] as vscode.Uri[];
+      expect(uris[0].path).toBe('/d:/temp/hello-sisyphus.txt');
+      expect(uris[0].toString()).toBe('file:///d:/temp/hello-sisyphus.txt');
+    });
+
     it('does not call tracker.trackEdit when callId is missing', async () => {
       const stream = mockStream();
       const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
@@ -730,6 +771,96 @@ describe('OpenCodeBridge', () => {
         })
         .filter((p) => p?.toolName === 'edit');
       expect(editParts).toHaveLength(0);
+    });
+
+    it('hides an edit tool card that was pushed before permission.asked marks it as externalEdit', async () => {
+      const stream = mockStream();
+      mockTracker.trackEdit.mockResolvedValue(undefined);
+      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
+        sessionId: 'ses_target',
+      });
+      permBridge.setTracker(mockTracker as any);
+      const callId = 'call_edit_late_permission';
+      const partId = 'prt_edit_tool';
+      const events = eventStream([
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'write',
+            id: partId,
+            callId,
+            state: { status: 'pending', input: {} },
+          },
+        },
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'write',
+            id: partId,
+            callId,
+            state: { status: 'running', input: { filePath: '/workspace/src/app.ts' }, title: 'app.ts' },
+          },
+        },
+        permissionAskedEvent({ tool: { messageId: 'msg_t1', callId } }),
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'write',
+            id: partId,
+            callId,
+            state: { status: 'completed', input: { filePath: '/workspace/src/app.ts' }, output: 'ok' },
+          },
+        },
+        idleEvent(),
+      ]);
+
+      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+
+      const writeParts = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+        .map((call: unknown[]) => call[0] as {
+          toolName?: string;
+          toolCallId?: string;
+          isComplete?: boolean;
+          presentation?: string;
+        })
+        .filter((p) => p?.toolName === 'write' && p?.toolCallId === callId);
+      expect(writeParts.some((p) => p.isComplete === false)).toBe(true);
+      expect(writeParts.some((p) => p.presentation === 'hidden' && p.isComplete === true)).toBe(true);
+      expect(writeParts.filter((p) => p.isComplete === true && p.presentation !== 'hidden')).toHaveLength(0);
+    });
+
+    it('does not push session.diff as MultiDiffPart', async () => {
+      const stream = mockStream();
+      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
+        sessionId: 'ses_target',
+      });
+      permBridge.setTracker(mockTracker as any);
+      const events = eventStream([
+        {
+          type: 'session.diff',
+          sessionId: 'ses_target',
+          diffs: [
+            {
+              file: '/workspace/src/app.ts',
+              patch: '...',
+              additions: 10,
+              deletions: 0,
+              status: 'modified' as const,
+            },
+          ],
+        },
+        idleEvent(),
+      ]);
+
+      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+
+      const diffParts = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+        .map((call: unknown[]) => call[0] as { title?: string; value?: unknown[] })
+        .filter((p) => p?.title === 'File Changes');
+      expect(diffParts).toHaveLength(0);
     });
   });
 

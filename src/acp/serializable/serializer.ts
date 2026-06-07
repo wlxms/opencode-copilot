@@ -22,6 +22,8 @@ import { promises as fs } from 'node:fs';
 const LINE_TYPES = {
   VERSION: 'version',
   META: 'meta',
+  TURN_START: 'turn-start',
+  TURN_END: 'turn-end',
   EVENT: 'event',
   SNAPSHOT: 'snapshot',
 } as const;
@@ -132,6 +134,20 @@ export async function writeSessionMeta(
   await writeMeta(filePath, meta);
 }
 
+export async function writeTurnStart(
+  filePath: string,
+  turn: unknown,
+): Promise<void> {
+  await fs.appendFile(filePath, buildLine(LINE_TYPES.TURN_START, turn), 'utf-8');
+}
+
+export async function writeTurnEnd(
+  filePath: string,
+  turn: unknown,
+): Promise<void> {
+  await fs.appendFile(filePath, buildLine(LINE_TYPES.TURN_END, turn), 'utf-8');
+}
+
 // ===========================================================================
 // v2 serialization (events, snapshots)
 // ===========================================================================
@@ -196,6 +212,67 @@ export async function readSessionEvents<T = unknown>(
     }
   }
   return events;
+}
+
+export interface SessionTurnEvents<T = unknown> {
+  turnIndex: number;
+  start?: unknown;
+  events: T[];
+  end?: unknown;
+}
+
+export async function readSessionTurnEvents<T = unknown>(
+  filePath: string,
+): Promise<SessionTurnEvents<T>[]> {
+  let content: string;
+  try {
+    content = await fs.readFile(filePath, 'utf-8');
+  } catch {
+    return [];
+  }
+  if (!content.trim()) return [];
+
+  const turns: SessionTurnEvents<T>[] = [];
+  let current: SessionTurnEvents<T> | undefined;
+
+  const ensureTurn = (turnIndex: number): SessionTurnEvents<T> => {
+    if (!current || current.turnIndex !== turnIndex) {
+      current = { turnIndex, events: [] };
+      turns.push(current);
+    }
+    return current;
+  };
+
+  for (const raw of content.split('\n')) {
+    const parsed = parseLine(raw);
+    if (!parsed) continue;
+
+    if (parsed.t === LINE_TYPES.TURN_START) {
+      const data = parsed.d as { turnIndex?: unknown };
+      const turnIndex = typeof data.turnIndex === 'number' && Number.isFinite(data.turnIndex)
+        ? data.turnIndex
+        : turns.length;
+      current = { turnIndex, start: parsed.d, events: [] };
+      turns.push(current);
+      continue;
+    }
+
+    if (parsed.t === LINE_TYPES.EVENT) {
+      ensureTurn(current?.turnIndex ?? 0).events.push(parsed.d as T);
+      continue;
+    }
+
+    if (parsed.t === LINE_TYPES.TURN_END) {
+      const data = parsed.d as { turnIndex?: unknown };
+      const turnIndex = typeof data.turnIndex === 'number' && Number.isFinite(data.turnIndex)
+        ? data.turnIndex
+        : current?.turnIndex ?? 0;
+      ensureTurn(turnIndex).end = parsed.d;
+      current = undefined;
+    }
+  }
+
+  return turns.filter(turn => turn.events.length > 0 || turn.start || turn.end);
 }
 
 /**

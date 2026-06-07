@@ -120,6 +120,14 @@ export class LanguageModelTextPart {
     constructor(public readonly value: string) {}
 }
 
+export class LanguageModelChatMessage {
+    static User(content: string): LanguageModelChatMessage {
+        return new LanguageModelChatMessage(content);
+    }
+
+    constructor(public readonly content: string) {}
+}
+
 export class LanguageModelThinkingPart {
     constructor(
         public readonly value: string,
@@ -160,6 +168,11 @@ export interface LanguageModelChat {
     readonly vendor?: string;
     readonly name?: string;
     readonly version?: string;
+    sendRequest?(
+        messages: LanguageModelChatMessage[],
+        options?: unknown,
+        token?: CancellationToken,
+    ): Thenable<{ text: AsyncIterable<string> }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +207,11 @@ export class Uri {
     readonly fsPath: string;
 
     static file(path: string): Uri {
-        return new Uri('file', '', path, '', '');
+        const normalized = path.replace(/\\/g, '/');
+        const uriPath = /^[a-zA-Z]:\//.test(normalized)
+            ? `/${normalized}`
+            : normalized;
+        return new Uri('file', '', uriPath, '', '');
     }
 
     static parse(value: string): Uri {
@@ -219,11 +236,17 @@ export class Uri {
         this.path = path;
         this.query = query;
         this.fragment = fragment;
-        this.fsPath = path.replace(/\//g, '\\');
+        this.fsPath = path.replace(/^\/([a-zA-Z]:)(?=\/)/, '$1').replace(/\//g, '\\');
     }
 
-    with(_change: unknown): this {
-        return this;
+    with(change: { scheme?: string; authority?: string; path?: string; query?: string; fragment?: string }): this {
+        return new Uri(
+            change.scheme ?? this.scheme,
+            change.authority ?? this.authority,
+            change.path ?? this.path,
+            change.query ?? this.query,
+            change.fragment ?? this.fragment,
+        ) as this;
     }
 
     toString(): string {
@@ -281,6 +304,72 @@ export class ChatResponseThinkingProgressPart {
     ) {}
 }
 
+export class Position {
+    constructor(public readonly line: number, public readonly character: number) {}
+}
+
+export class Range {
+    constructor(
+        public readonly startLine: number,
+        public readonly startCharacter: number,
+        public readonly endLine: number,
+        public readonly endCharacter: number,
+    ) {}
+}
+
+export class WorkspaceEdit {
+    readonly operations: unknown[] = [];
+
+    createFile(uri: Uri, options?: unknown): void {
+        this.operations.push({ type: 'createFile', uri, options });
+    }
+
+    deleteFile(uri: Uri, options?: unknown): void {
+        this.operations.push({ type: 'deleteFile', uri, options });
+    }
+
+    replace(uri: Uri, range: Range, text: string): void {
+        this.operations.push({ type: 'replace', uri, range, text });
+    }
+}
+
+export class ChatResponseExternalEditPart {
+    readonly applied: Thenable<string>;
+
+    constructor(
+        public readonly uris: readonly Uri[],
+        public readonly callback: () => Thenable<unknown>,
+    ) {
+        this.applied = Promise.resolve(callback()).then(() => '');
+    }
+}
+
+export class ChatSessionChangedFile {
+    constructor(
+        public readonly uri: Uri,
+        public readonly originalUri?: Uri,
+        public readonly modifiedUri?: Uri,
+        public insertions: number = 0,
+        public deletions: number = 0,
+    ) {}
+}
+
+export interface ChatResponseDiffEntry {
+    originalUri?: Uri;
+    modifiedUri?: Uri;
+    goToFileUri?: Uri;
+    added?: number;
+    removed?: number;
+}
+
+export class ChatResponseMultiDiffPart {
+    constructor(
+        public readonly value: ChatResponseDiffEntry[],
+        public readonly title: string,
+        public readonly readOnly?: boolean,
+    ) {}
+}
+
 /**
  * Mock for proposed API: ChatToolInvocationPart
  * This is NOT in @types/vscode — available at runtime with chatParticipantAdditions.
@@ -310,6 +399,7 @@ export interface ChatResponseStream {
     markdown(value: string): void;
     progress(value: string): void;
     push(part: unknown): void;
+    externalEdit?(target: Uri | Uri[], callback: () => Thenable<unknown>): Thenable<string>;
     anchor?(value: unknown, title?: string): void;
     button?(command: unknown): void;
     filetree?(value: unknown, baseUri?: unknown): void;
@@ -337,6 +427,7 @@ export interface ChatSessionItem {
     iconPath?: unknown;
     description?: string;
     badge?: string;
+    changes?: ChatSessionChangedFile[];
     status?: ChatSessionStatus;
     tooltip?: string;
     timing?: { readonly created: number };
@@ -414,14 +505,73 @@ export const chat = {
 };
 
 export const lm = {
+    selectChatModels: async (_selector?: unknown): Promise<LanguageModelChat[]> => [],
     registerLanguageModelChatProvider(_vendor: string, _provider: unknown) {
         return { dispose() {} };
+    },
+    languageModelAccessInformation: {
+        canSendRequest(_chat: LanguageModelChat) {
+            return true;
+        },
     },
 };
 
 export const workspace = {
     workspaceFolders: undefined as Array<{ uri: Uri; name: string; index: number }> | undefined,
+    applyEdit: async (edit: WorkspaceEdit): Promise<boolean> => {
+        const fs = await import('node:fs');
+        for (const operation of edit.operations as Array<{ type: string; uri?: Uri; text?: string; range?: Range }>) {
+            if (operation.type === 'createFile' && operation.uri) {
+                if (!fs.existsSync(operation.uri.fsPath)) {
+                    fs.writeFileSync(operation.uri.fsPath, '', 'utf-8');
+                }
+            }
+            if (operation.type === 'replace' && operation.uri) {
+                const current = fs.existsSync(operation.uri.fsPath)
+                    ? fs.readFileSync(operation.uri.fsPath, 'utf-8')
+                    : '';
+                if (operation.range) {
+                    const start = offsetAtPosition(current, operation.range.startLine, operation.range.startCharacter);
+                    const end = offsetAtPosition(current, operation.range.endLine, operation.range.endCharacter);
+                    fs.writeFileSync(
+                        operation.uri.fsPath,
+                        current.slice(0, start) + (operation.text ?? '') + current.slice(end),
+                        'utf-8',
+                    );
+                } else {
+                    fs.writeFileSync(operation.uri.fsPath, operation.text ?? '', 'utf-8');
+                }
+            }
+            if (operation.type === 'deleteFile' && operation.uri && fs.existsSync(operation.uri.fsPath)) {
+                fs.unlinkSync(operation.uri.fsPath);
+            }
+        }
+        return true;
+    },
+    getConfiguration: (_section?: string) => ({
+        get<T>(_key: string, defaultValue: T): T {
+            return defaultValue;
+        },
+    }),
 };
+
+function offsetAtPosition(text: string, line: number, character: number): number {
+    if (line <= 0) {
+        return Math.max(0, character);
+    }
+
+    let currentLine = 0;
+    for (let i = 0; i < text.length; i++) {
+        if (currentLine === line) {
+            return Math.min(text.length, i + character);
+        }
+        if (text.charCodeAt(i) === 10) {
+            currentLine++;
+        }
+    }
+
+    return text.length;
+}
 
 // ---------------------------------------------------------------------------
 // Turn types for chat history

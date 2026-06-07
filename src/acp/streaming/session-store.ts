@@ -53,6 +53,54 @@ export class SessionStore {
     );
   }
 
+  /** Read session metadata from _meta.json, falling back to turns.jsonl meta. */
+  async readMeta(sessionId: string): Promise<SerializableSessionMeta | undefined> {
+    const sessionDir = this.getSessionDir(sessionId);
+    try {
+      const metaContent = await fs.readFile(path.join(sessionDir, META_FILENAME), 'utf-8');
+      return JSON.parse(metaContent) as SerializableSessionMeta;
+    } catch {
+      // Fall through to turns.jsonl meta for older persisted sessions.
+    }
+
+    try {
+      const turnsContent = await fs.readFile(path.join(sessionDir, 'turns.jsonl'), 'utf-8');
+      for (const line of turnsContent.split('\n')) {
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed.t === 'meta') {
+            return parsed.d as SerializableSessionMeta;
+          }
+        } catch {
+          // skip malformed lines
+        }
+      }
+    } catch {
+      return undefined;
+    }
+
+    return undefined;
+  }
+
+  /** Merge a partial metadata update into the current session metadata. */
+  async updateMeta(
+    sessionId: string,
+    update: Partial<SerializableSessionMeta>,
+  ): Promise<SerializableSessionMeta> {
+    const existing = await this.readMeta(sessionId);
+    const next: SerializableSessionMeta = {
+      id: sessionId,
+      ...existing,
+      ...update,
+      checkpointCursor: {
+        ...existing?.checkpointCursor,
+        ...update.checkpointCursor,
+      },
+    };
+    await this.writeMeta(sessionId, next);
+    return next;
+  }
+
   /** List all sessions from filesystem (reads _meta.json from each directory) */
   async listSessions(): Promise<SerializableSessionMeta[]> {
     let entries: string[];

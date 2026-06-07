@@ -41,8 +41,6 @@ import type {
   ChatToolSpecificData,
   ChatToolInvocationPart,
   ChatToolInvocationStreamData,
-  ChatResponseDiffEntry,
-  ChatResponseMultiDiffPart,
 } from '../../types/vscode-proposed-additions';
 import { ChatTodoStatus } from '../../types/vscode-proposed-additions';
 
@@ -50,7 +48,6 @@ import {
   hasThinkingProgress,
   hasToolUI,
   hasChatToolInvocationPart,
-  hasChatResponseMultiDiffPart,
   hasChatSubagentToolInvocationData,
 } from './capabilities';
 import { type SubagentScope, formatSubagentProgress } from '../../participant/subagent';
@@ -85,11 +82,6 @@ const Proposed = vscode as typeof vscode & {
     prompt?: string,
     result?: string,
   ) => ChatSubagentToolInvocationData;
-  ChatResponseMultiDiffPart?: new (
-    value: ChatResponseDiffEntry[],
-    title: string,
-    readOnly?: boolean,
-  ) => ChatResponseMultiDiffPart;
 };
 
 // ---------------------------------------------------------------------------
@@ -346,45 +338,11 @@ export class AcpRenderer {
   }
 
   /**
-   * Handle a `session.diff` event — render file diffs using
-   * `ChatResponseMultiDiffPart` if available.
+   * `session.diff` is kept for persistence/session-list summaries.
+   * Do not render it as a MultiDiff part; externalEdit is the single edit UI.
    */
   private handleSessionDiff(evt: AcpSessionDiffEvent, stream: Stream): boolean {
-    const diffs = evt.diffs;
-    if (!diffs?.length) {return false;}
-
-    if (!hasChatResponseMultiDiffPart() || !stream.push) {
-      return false;
-    }
-
-    const entries: ChatResponseDiffEntry[] = diffs
-      .filter((d) => d.status !== 'deleted')
-      .map((d) => {
-        const uri = vscode.Uri.file(d.file);
-        const entry: ChatResponseDiffEntry = {
-          modifiedUri: uri,
-          added: d.additions || undefined,
-          removed: d.deletions || undefined,
-        };
-        if (d.status !== 'added') {
-          entry.originalUri = uri;
-        }
-        return entry;
-      });
-
-    if (!entries.length) {return false;}
-
-    const Ctor = Proposed.ChatResponseMultiDiffPart;
-    if (!Ctor) {return false;}
-
-    try {
-      const diffPart = new Ctor(entries, 'File Changes', true);
-      stream.push(diffPart as unknown as vscode.ChatResponsePart);
-      this.log(`pushed MultiDiffPart: ${entries.length} file(s) changed`);
-      return true;
-    } catch {
-      return false;
-    }
+    return false;
   }
 
   // -------------------------------------------------------------------
@@ -1084,7 +1042,7 @@ export function buildToolSpecificData(
       case 'edit': {
         // For edit/write we intentionally avoid resources cards here.
         // Running/completed messages already use file bubbles, and the final edit UI should
-        // be represented by ChatResponseExternalEditPart instead of a duplicate resources list.
+        // be represented by externalEdit instead of a duplicate resources list.
         return undefined;
       }
 

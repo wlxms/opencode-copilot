@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Tests for SerializableSessionStream.
  *
  * Uses temporary directories to isolate each test case, cleaning up in afterEach.
@@ -76,7 +76,7 @@ describe('SerializableSessionStream', () => {
     }
   });
 
-  // ── initialize ──────────────────────────────────────────────────────────
+  // 鈹€鈹€ initialize 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
   it('creates session directory on initialize', async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-init-'));
@@ -84,7 +84,7 @@ describe('SerializableSessionStream', () => {
 
     await stream.initialize();
 
-    const sessionDir = path.join(tmpDir, '.opencode', 'sessions', 'test-backend', 'test-session');
+    const sessionDir = path.join(tmpDir, '.acpilot', 'test-backend', 'test-session');
     const dirStat = await fs.stat(sessionDir);
     expect(dirStat.isDirectory()).toBe(true);
   });
@@ -97,8 +97,7 @@ describe('SerializableSessionStream', () => {
 
     const expectedPath = path.join(
       tmpDir,
-      '.opencode',
-      'sessions',
+      '.acpilot',
       'test-backend',
       'test-session',
       'turns.jsonl',
@@ -112,7 +111,58 @@ describe('SerializableSessionStream', () => {
     expect(exists).toBe(true);
   });
 
-  // ── onEvent ──────────────────────────────────────────────────────────────
+
+  it('persists turn-start and turn-end records around turn events', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-turn-'));
+    const meta: SerializableSessionMeta = {
+      id: 'test-session',
+      title: 'Test Session',
+      createdAt: new Date().toISOString(),
+    };
+    const stream = new SerializableSessionStream(tmpDir, 'test-backend', 'test-session', meta, 3, 'Fix bug');
+
+    await stream.initialize();
+    stream.onEvent(makeEvent());
+    stream.close();
+    await stream.flush();
+
+    const filePath = stream.getFilePath();
+    expect(filePath).toBeTruthy();
+    const parsed = await readParsedLines(filePath!);
+    expect(parsed).toEqual(expect.arrayContaining([
+      expect.objectContaining({ t: 'turn-start', d: expect.objectContaining({ turnIndex: 3, prompt: 'Fix bug' }) }),
+      expect.objectContaining({ t: 'event' }),
+      expect.objectContaining({ t: 'turn-end', d: expect.objectContaining({ turnIndex: 3 }) }),
+    ]));
+  });
+
+  it('appends later turns without rewriting existing session history', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-append-turn-'));
+    const meta: SerializableSessionMeta = {
+      id: 'test-session',
+      title: 'Test Session',
+      createdAt: new Date().toISOString(),
+    };
+
+    const first = new SerializableSessionStream(tmpDir, 'test-backend', 'test-session', meta, 0, 'First');
+    await first.initialize();
+    first.onEvent(makeEvent({ part: { id: 'p1', type: 'text', text: 'first' } } as any));
+    first.close();
+    await first.flush();
+
+    const second = new SerializableSessionStream(tmpDir, 'test-backend', 'test-session', meta, 1, 'Second');
+    await second.initialize();
+    second.onEvent(makeEvent({ part: { id: 'p2', type: 'text', text: 'second' } } as any));
+    second.close();
+    await second.flush();
+
+    const parsed = await readParsedLines(second.getFilePath()!);
+    const turnStarts = parsed.filter((line: any) => line.t === 'turn-start');
+    const events = parsed.filter((line: any) => line.t === 'event');
+    expect(turnStarts.map((line: any) => line.d.prompt)).toEqual(['First', 'Second']);
+    expect(events.map((line: any) => line.d.part.id)).toEqual(['p1', 'p2']);
+  });
+  // 鈹€鈹€ onEvent 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
   it('writes event line to turns.jsonl', async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-ev-'));
@@ -127,16 +177,15 @@ describe('SerializableSessionStream', () => {
 
     const filePath = path.join(
       tmpDir,
-      '.opencode',
-      'sessions',
+      '.acpilot',
       'test-backend',
       'test-session',
       'turns.jsonl',
     );
     const lines = await readParsedLines(filePath);
 
-    // Should have version, meta, event
-    expect(lines).toHaveLength(3);
+    // Should have version, meta, turn-start, event
+    expect(lines).toHaveLength(4);
 
     // First line is version
     expect(lines[0]).toHaveProperty('v', 2);
@@ -148,8 +197,9 @@ describe('SerializableSessionStream', () => {
 
     // Third line is the event
     expect(lines[2]).toHaveProperty('v', 2);
-    expect((lines[2] as any).t).toBe('event');
-    expect((lines[2] as any).d).toEqual(event);
+    expect((lines[2] as any).t).toBe('turn-start');
+    expect((lines[3] as any).t).toBe('event');
+    expect((lines[3] as any).d).toEqual(event);
   });
 
   it('writes multiple events in order', async () => {
@@ -166,21 +216,20 @@ describe('SerializableSessionStream', () => {
 
     const filePath = path.join(
       tmpDir,
-      '.opencode',
-      'sessions',
+      '.acpilot',
       'test-backend',
       'test-session',
       'turns.jsonl',
     );
     const lines = await readParsedLines(filePath);
 
-    // version + meta + 2 events = 4
-    expect(lines).toHaveLength(4);
-    expect((lines[2] as any).d).toEqual(event1);
-    expect((lines[3] as any).d).toEqual(event2);
+    // version + meta + turn-start + 2 events = 5
+    expect(lines).toHaveLength(5);
+    expect((lines[3] as any).d).toEqual(event1);
+    expect((lines[4] as any).d).toEqual(event2);
   });
 
-  // ── onSnapshot ──────────────────────────────────────────────────────────
+  // 鈹€鈹€ onSnapshot 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
   it('writes snapshot to both turns.jsonl and checkpoint store', async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-ss-'));
@@ -194,24 +243,25 @@ describe('SerializableSessionStream', () => {
     // Check turns.jsonl
     const turnsPath = path.join(
       tmpDir,
-      '.opencode',
-      'sessions',
+      '.acpilot',
       'test-backend',
       'test-session',
       'turns.jsonl',
     );
     const turnsLines = await readParsedLines(turnsPath);
 
-    // version + meta + snapshot = 3
-    expect(turnsLines).toHaveLength(3);
-    expect((turnsLines[2] as any).t).toBe('snapshot');
-    expect((turnsLines[2] as any).d).toEqual(snapshot);
+    // version + meta + turn-start + snapshot = 4
+    expect(turnsLines).toHaveLength(4);
+    expect((turnsLines[3] as any).t).toBe('snapshot');
+    expect((turnsLines[3] as any).d).toEqual(expect.objectContaining(snapshot));
+    expect((turnsLines[3] as any).d.turnIndex).toBe(0);
 
     // Check _checkpoints.jsonl
-    const sessionDir = path.join(tmpDir, '.opencode', 'sessions', 'test-backend', 'test-session');
+    const sessionDir = path.join(tmpDir, '.acpilot', 'test-backend', 'test-session');
     const checkpoints = await readCheckpoints(sessionDir);
     expect(checkpoints).toHaveLength(1);
-    expect(checkpoints[0]).toEqual(snapshot);
+    expect(checkpoints[0]).toEqual(expect.objectContaining(snapshot));
+    expect(checkpoints[0].turnIndex).toBe(0);
   });
 
   it('writes multiple snapshots to both stores in order', async () => {
@@ -228,31 +278,30 @@ describe('SerializableSessionStream', () => {
     stream.onSnapshot(snap3);
     await new Promise((r) => setTimeout(r, 50));
 
-    // Check turns.jsonl — version + meta + 3 snapshots = 5
+    // Check turns.jsonl 鈥?version + meta + 3 snapshots = 5
     const turnsPath = path.join(
       tmpDir,
-      '.opencode',
-      'sessions',
+      '.acpilot',
       'test-backend',
       'test-session',
       'turns.jsonl',
     );
     const turnsLines = await readParsedLines(turnsPath);
-    expect(turnsLines).toHaveLength(5);
-    expect((turnsLines[2] as any).d).toEqual(snap1);
-    expect((turnsLines[3] as any).d).toEqual(snap2);
-    expect((turnsLines[4] as any).d).toEqual(snap3);
+    expect(turnsLines).toHaveLength(6);
+    expect((turnsLines[3] as any).d).toEqual(expect.objectContaining(snap1));
+    expect((turnsLines[4] as any).d).toEqual(expect.objectContaining(snap2));
+    expect((turnsLines[5] as any).d).toEqual(expect.objectContaining(snap3));
 
     // Check checkpoint store
-    const sessionDir = path.join(tmpDir, '.opencode', 'sessions', 'test-backend', 'test-session');
+    const sessionDir = path.join(tmpDir, '.acpilot', 'test-backend', 'test-session');
     const checkpoints = await readCheckpoints(sessionDir);
     expect(checkpoints).toHaveLength(3);
-    expect(checkpoints[0]).toEqual(snap1);
-    expect(checkpoints[1]).toEqual(snap2);
-    expect(checkpoints[2]).toEqual(snap3);
+    expect(checkpoints[0]).toEqual(expect.objectContaining(snap1));
+    expect(checkpoints[1]).toEqual(expect.objectContaining(snap2));
+    expect(checkpoints[2]).toEqual(expect.objectContaining(snap3));
   });
 
-  // ── onError ─────────────────────────────────────────────────────────────
+  // 鈹€鈹€ onError 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
   it('logs error without writing to file', async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-er-'));
@@ -268,22 +317,23 @@ describe('SerializableSessionStream', () => {
       error,
     );
 
-    // No turns.jsonl should have been created
+    // initialize writes turns.jsonl with metadata and turn-start, but errors are not appended
     const turnsPath = path.join(
       tmpDir,
-      '.opencode',
-      'sessions',
+      '.acpilot',
       'test-backend',
       'test-session',
       'turns.jsonl',
     );
     const exists = await fs.stat(turnsPath).then(() => true).catch(() => false);
-    expect(exists).toBe(false);
+    expect(exists).toBe(true);
+    const lines = await readParsedLines(turnsPath);
+    expect(lines.some((line: any) => line.t === 'event')).toBe(false);
 
     consoleSpy.mockRestore();
   });
 
-  // ── close ────────────────────────────────────────────────────────────────
+  // 鈹€鈹€ close 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
   it('stops writing events after close', async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-cl-'));
@@ -298,18 +348,17 @@ describe('SerializableSessionStream', () => {
 
     const turnsPath = path.join(
       tmpDir,
-      '.opencode',
-      'sessions',
+      '.acpilot',
       'test-backend',
       'test-session',
       'turns.jsonl',
     );
     const lines = await readParsedLines(turnsPath);
 
-    // version + meta + 1 event = 3 (the after-close event should not appear)
-    expect(lines).toHaveLength(3);
-    expect((lines[2] as any).d).toHaveProperty('part');
-    expect((lines[2] as any).d.part).toHaveProperty('id', 'p1');
+    // version + meta + turn-start + 1 event + turn-end = 5 (the after-close event should not appear)
+    expect(lines).toHaveLength(5);
+    expect((lines[3] as any).d).toHaveProperty('part');
+    expect((lines[3] as any).d.part).toHaveProperty('id', 'p1');
   });
 
   it('stops writing snapshots after close', async () => {
@@ -322,7 +371,7 @@ describe('SerializableSessionStream', () => {
     stream.onSnapshot(makeSnapshot(1));
     await new Promise((r) => setTimeout(r, 50));
 
-    const sessionDir = path.join(tmpDir, '.opencode', 'sessions', 'test-backend', 'test-session');
+    const sessionDir = path.join(tmpDir, '.acpilot', 'test-backend', 'test-session');
     const checkpoints = await readCheckpoints(sessionDir);
 
     // Only the snapshot written before close should exist

@@ -64,6 +64,15 @@ export class SessionManager {
     return this.sessionMap.values();
   }
 
+  /**
+   * Iterate over all session mappings.
+   * Used when a provider resource needs to be reconciled with an already-live
+   * VS Code chat resource for the same backend session.
+   */
+  entries(): IterableIterator<[string, SessionState]> {
+    return this.sessionMap.entries();
+  }
+
   // -- write --------------------------------------------------------------
 
   /**

@@ -282,12 +282,28 @@ declare module 'vscode' {
     iconPath?: IconPath;
     description?: string | MarkdownString;
     badge?: string | MarkdownString;
+    changes?: ChatSessionChangedFile[];
     status?: ChatSessionStatus;
     tooltip?: string | MarkdownString;
     readonly legacyResource?: Uri;
     timing?: {
       readonly created: number;
     };
+  }
+
+  export class ChatSessionChangedFile {
+    constructor(
+      uri: Uri,
+      originalUri?: Uri,
+      modifiedUri?: Uri,
+      insertions: number,
+      deletions: number,
+    );
+    readonly uri: Uri;
+    readonly originalUri: Uri | undefined;
+    readonly modifiedUri: Uri | undefined;
+    insertions: number;
+    deletions: number;
   }
 
   export interface ChatSessionItemCollection extends Iterable<readonly [id: Uri, chatSessionItem: ChatSessionItem]> {

@@ -16,9 +16,12 @@ import {
   writeMeta,
   readSessionMeta,
   writeSessionMeta,
+  writeTurnStart,
+  writeTurnEnd,
   writeEvent,
   writeSnapshotLine,
   readSessionEvents,
+  readSessionTurnEvents,
   readSessionSnapshots,
 } from '../../acp/serializable/serializer';
 import type { FileSnapshotRecord } from '../../acp/serializable/types';
@@ -301,6 +304,31 @@ describe('writeEvent / readSessionEvents', () => {
     expect(events).toHaveLength(2);
     expect(events[0]).toEqual({ type: 'part.updated' });
     expect(events[1]).toEqual({ type: 'session.idle' });
+  });
+});
+
+describe('turn envelope serialization', () => {
+  it('groups events by persisted turn-start and turn-end records', async () => {
+    const dir = await getTmpDir();
+    const fp = testFile('turn-events.jsonl');
+
+    await writeVersionHeader(fp);
+    await writeTurnStart(fp, { turnIndex: 0, prompt: 'first', timestamp: '2026-06-07T00:00:00.000Z' });
+    await writeEvent(fp, { type: 'part.updated', part: { type: 'text', id: 'u1', text: 'first' } });
+    await writeEvent(fp, { type: 'part.updated', part: { type: 'text', id: 'a1', text: '' } });
+    await writeTurnEnd(fp, { turnIndex: 0, timestamp: '2026-06-07T00:00:01.000Z' });
+    await writeTurnStart(fp, { turnIndex: 1, prompt: 'second', timestamp: '2026-06-07T00:00:02.000Z' });
+    await writeEvent(fp, { type: 'part.updated', part: { type: 'text', id: 'u2', text: 'second' } });
+    await writeTurnEnd(fp, { turnIndex: 1, timestamp: '2026-06-07T00:00:03.000Z' });
+
+    const turns = await readSessionTurnEvents(fp);
+    expect(turns).toHaveLength(2);
+    expect(turns[0].turnIndex).toBe(0);
+    expect((turns[0].start as any).prompt).toBe('first');
+    expect(turns[0].events).toHaveLength(2);
+    expect(turns[1].turnIndex).toBe(1);
+    expect((turns[1].start as any).prompt).toBe('second');
+    expect(turns[1].events).toHaveLength(1);
   });
 });
 

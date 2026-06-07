@@ -20,6 +20,8 @@ export interface FileSnapshotRecord {
   content: string;
   /** Whether this is the file state before or after a tool edit */
   phase?: 'before' | 'after';
+  /** 0-based user turn that produced this snapshot */
+  turnIndex?: number;
   /** Monotonically increasing edit index within the session */
   editIndex: number;
   /** The tool call ID that produced this edit */
@@ -88,6 +90,19 @@ export type SerializableLineType =
   | 'version' | 'meta' | 'turn-start' | 'part' | 'turn-end'   // v1
   | 'event' | 'snapshot';                                       // v2
 
+export interface SerializableTurnStart {
+  turnIndex: number;
+  prompt?: string;
+  messageId?: string;
+  timestamp: string;
+}
+
+export interface SerializableTurnEnd {
+  turnIndex: number;
+  messageId?: string;
+  timestamp: string;
+}
+
 // ===========================================================================
 // Envelope
 // ===========================================================================
@@ -131,4 +146,20 @@ export interface SerializableSessionMeta {
     paths?: string[];
   };
   status?: 'completed' | 'inProgress' | 'needsInput' | 'failed';
+  changeApprovalState?: 'none' | 'pending' | 'accepted' | 'rejected' | 'partial';
+  checkpointCursor?: {
+    /** Inclusive user turn index accepted by the user. -1 means no turn accepted. */
+    acceptedThroughTurn: number;
+    /** Last turn whose pending checkpoints were replayed during local restore. */
+    replayedThroughTurn?: number;
+    /** Last turn where at least one checkpoint hunk conflicted. */
+    lastConflictTurn?: number;
+  };
+  replaySummary?: {
+    appliedFiles: number;
+    skippedFiles: number;
+    appliedHunks: number;
+    skippedHunks: number;
+    conflicts: Array<{ uri: string; reason: string; turnIndex?: number }>;
+  };
 }

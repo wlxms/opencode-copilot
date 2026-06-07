@@ -64,6 +64,11 @@
           "type": "boolean",
           "default": false,
           "description": "[Experimental] Enable ACP Model Bridge — bridges ACP backend models into Copilot's native model picker with full vendor isolation. (Not yet implemented)"
+        },
+        "opencode.experimental.checkpointReplay": {
+          "type": "boolean",
+          "default": true,
+          "description": "Replay restored session file checkpoints through VS Code chat external edits when available, preserving ordinary workspace edits on conflicts."
         }
       }
     },
@@ -178,7 +183,8 @@
     "@ai-sdk/google": "^3.0.80",
     "@ai-sdk/openai": "^3.0.67",
     "@ai-sdk/openai-compatible": "^2.0.48",
-    "@opencode-ai/sdk": "^1.15.10",
-    "ai": "^6.0.193"
+    "@opencode-ai/sdk": "^1.16.0",
+    "ai": "^6.0.193",
+    "opencode-ai": "^1.16.0"
   }
 }
