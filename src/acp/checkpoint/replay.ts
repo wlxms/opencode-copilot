@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { createHash } from 'node:crypto';
 import * as vscode from 'vscode';
 import type { FileSnapshotRecord } from '../serializable/types';
 
@@ -114,7 +115,16 @@ export async function replaySnapshotsToWorkspace(
       }
     }
 
+    logger?.appendLine(
+      `[checkpoint-replay] baseline restore before: uri=${uri.toString()} current=${formatContentForLog(current)} ` +
+      `checkpointBefore=${formatContentForLog({ text: before, missing: beforeMissing })} ` +
+      `checkpointAfter=${formatContentForLog({ text: after, missing: afterMissing })}`,
+    );
     const prepared = prepareCheckpointBaseline(uri, current, before, after, beforeMissing, afterMissing);
+    logger?.appendLine(
+      `[checkpoint-replay] baseline restore after: uri=${uri.toString()} restored=${formatContentForLog(readCurrent(uri))} ` +
+      `ok=${prepared.ok} reversedHunks=${prepared.reversedHunks}`,
+    );
     for (const conflict of prepared.conflicts) {
       result.skippedHunks++;
       result.conflicts.push({ uri: uri.toString(), reason: conflict.reason });
@@ -167,8 +177,9 @@ export async function replaySnapshotsToWorkspace(
       plan.before,
       plan.after,
       options,
+      logger,
     );
-    if (mode === 'external') {
+    if (mode === 'externalEdit') {
       result.externalEdits++;
     } else {
       result.fallbackEdits++;
@@ -187,48 +198,66 @@ async function writeWithBestCheckpointIntegration(
   before: string,
   after: string,
   options?: ReplayOptions,
-): Promise<'external' | 'workspace'> {
+  logger?: { appendLine(message: string): void },
+): Promise<'externalEdit' | 'workspace'> {
   const stream = options?.stream as {
-    push?: (part: unknown) => void;
     externalEdit?: (target: vscode.Uri | vscode.Uri[], callback: () => Thenable<unknown>) => Thenable<string>;
   } | undefined;
-  const ExternalEditCtor = (vscode as unknown as {
-    ChatResponseExternalEditPart?: new (
-      uris: readonly vscode.Uri[],
-      callback: () => Thenable<unknown>,
-    ) => { applied?: Thenable<unknown> };
-  }).ChatResponseExternalEditPart;
-
-  if (options?.preferExternalEdit && stream?.push && ExternalEditCtor && !options.token?.isCancellationRequested) {
-    let callbackRan = false;
-    const part = new ExternalEditCtor([uri], async () => {
-      callbackRan = true;
-      if (!options.token?.isCancellationRequested) {
-        writeDirectFromCheckpointPatch(uri, next, before, after);
-      }
-    });
-
-    stream.push(part);
-    if (part.applied) {
-      await settleWithTimeout(part.applied, 10_000).catch(() => undefined);
-    }
-
-    const observed = readCurrent(uri);
-    if (callbackRan || (observed.text === next.text && observed.missing === next.missing)) {
-      return 'external';
-    }
-  }
 
   if (options?.preferExternalEdit && stream?.externalEdit && !options.token?.isCancellationRequested) {
-    await settleWithTimeout(stream.externalEdit(uri, async () => {
+    logger?.appendLine(
+      `[checkpoint-replay] externalEdit begin: uri=${uri.toString()} fsPath=${uri.fsPath} ` +
+      `disk=${describeFileState(readCurrent(uri))} expectedBefore=${describeTextState(before, false)} ` +
+      `expectedAfter=${describeTextState(after, next.missing)} target=${describeFileState(next)}`,
+    );
+    logger?.appendLine(
+      `[checkpoint-replay] replay before: uri=${uri.toString()} current=${formatContentForLog(readCurrent(uri))} ` +
+      `replayBefore=${formatContentForLog({ text: before, missing: false })} ` +
+      `replayAfter=${formatContentForLog({ text: after, missing: next.missing })} ` +
+      `target=${formatContentForLog(next)}`,
+    );
+
+    const settled = await settleWithTimeoutStatus(stream.externalEdit(uri, async () => {
+      const beforeWrite = readCurrent(uri);
+      logger?.appendLine(
+        `[checkpoint-replay] externalEdit callback before-write: uri=${uri.toString()} ` +
+        `disk=${describeFileState(beforeWrite)} content=${formatContentForLog(beforeWrite)}`,
+      );
       if (!options.token?.isCancellationRequested) {
         writeDirectFromCheckpointPatch(uri, next, before, after);
       }
-    }), 10_000).catch(() => undefined);
+      const afterWrite = readCurrent(uri);
+      logger?.appendLine(
+        `[checkpoint-replay] externalEdit callback after-write: uri=${uri.toString()} ` +
+        `disk=${describeFileState(afterWrite)} content=${formatContentForLog(afterWrite)}`,
+      );
+    }), 10_000);
+
+    if (settled.error) {
+      logger?.appendLine(
+        `[checkpoint-replay] externalEdit end: uri=${uri.toString()} error=${
+          settled.error instanceof Error ? settled.error.message : String(settled.error)
+        }`,
+      );
+    } else if (settled.timedOut) {
+      logger?.appendLine(`[checkpoint-replay] externalEdit end: uri=${uri.toString()} timeout=10000ms`);
+    } else {
+      logger?.appendLine(
+        `[checkpoint-replay] externalEdit end: uri=${uri.toString()} undoStopId=${settled.value ?? '(empty)'}`,
+      );
+    }
 
     const observed = readCurrent(uri);
+    logger?.appendLine(
+      `[checkpoint-replay] externalEdit observed: uri=${uri.toString()} ` +
+      `disk=${describeFileState(observed)} matchesTarget=${observed.text === next.text && observed.missing === next.missing}`,
+    );
+    logger?.appendLine(
+      `[checkpoint-replay] replay after: uri=${uri.toString()} observed=${formatContentForLog(observed)} ` +
+      `target=${formatContentForLog(next)}`,
+    );
     if (observed.text === next.text && observed.missing === next.missing) {
-      return 'external';
+      return 'externalEdit';
     }
   }
 
@@ -236,11 +265,23 @@ async function writeWithBestCheckpointIntegration(
   return 'workspace';
 }
 
-async function settleWithTimeout<T>(promise: Thenable<T>, timeoutMs: number): Promise<T | undefined> {
-  return Promise.race([
-    Promise.resolve(promise),
-    new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), timeoutMs)),
-  ]);
+async function settleWithTimeoutStatus<T>(
+  promise: Thenable<T>,
+  timeoutMs: number,
+): Promise<{ timedOut: boolean; value?: T; error?: unknown }> {
+  const timeoutSentinel = Symbol('timeout');
+  try {
+    const value = await Promise.race<T | typeof timeoutSentinel>([
+      Promise.resolve(promise),
+      new Promise<typeof timeoutSentinel>((resolve) => setTimeout(() => resolve(timeoutSentinel), timeoutMs)),
+    ]);
+    if (value === timeoutSentinel) {
+      return { timedOut: true };
+    }
+    return { timedOut: false, value };
+  } catch (error) {
+    return { timedOut: false, error };
+  }
 }
 
 export function applyPatchSafely(
@@ -614,6 +655,28 @@ function normalizeSnapshotUriKey(value: string): string {
 interface FileState {
   text: string;
   missing: boolean;
+}
+
+function describeFileState(state: FileState): string {
+  return describeTextState(state.text, state.missing);
+}
+
+function formatContentForLog(state: FileState): string {
+  if (state.missing) {
+    return '{missing=true, content="<missing>"}';
+  }
+  return `{missing=false, length=${state.text.length}, hash=${hashText(state.text)}, content=${JSON.stringify(state.text)}}`;
+}
+
+function describeTextState(text: string, missing: boolean): string {
+  if (missing) {
+    return 'missing=true length=0 hash=missing';
+  }
+  return `missing=false length=${text.length} hash=${hashText(text)}`;
+}
+
+function hashText(text: string): string {
+  return createHash('sha256').update(text).digest('hex').slice(0, 12);
 }
 
 function readCurrent(uri: vscode.Uri): FileState {

@@ -27,6 +27,12 @@ function makeTextEvent(text: string) {
   };
 }
 
+function getNonDiagnosticSessionItems(controller: vscode.ChatSessionItemController) {
+  return Array.from(controller.items)
+    .map(([, item]) => item)
+    .filter(item => item.resource.path !== '/__active-response-external-edit-test__');
+}
+
 describe('createSessionContentProvider', () => {
   let state: ExtensionState;
 
@@ -173,7 +179,7 @@ describe('createSessionContentProvider', () => {
       onCancellationRequested: () => ({ dispose() {} }),
     });
 
-    const items = Array.from(controller!.items).map(([, item]) => item);
+    const items = getNonDiagnosticSessionItems(controller!);
     expect(items).toHaveLength(2);
     const labels = items.map(item => item.label);
     const paths = items.map(item => item.resource.path);
@@ -199,7 +205,7 @@ describe('createSessionContentProvider', () => {
       onCancellationRequested: () => ({ dispose() {} }),
     });
 
-    const items = Array.from(controller!.items).map(([, item]) => item);
+    const items = getNonDiagnosticSessionItems(controller!);
     expect(items).toHaveLength(1);
     expect(items[0]?.label).toBe('Runtime Session');
     expect(items[0]?.description).toBeUndefined();
@@ -221,7 +227,7 @@ describe('createSessionContentProvider', () => {
       onCancellationRequested: () => ({ dispose() {} }),
     });
 
-    const items = Array.from(controller!.items).map(([, item]) => item);
+    const items = getNonDiagnosticSessionItems(controller!);
     expect(items[0]?.label).toBe('Restored Session');
     expect(items[0]?.description).toBeUndefined();
   });
@@ -251,7 +257,7 @@ describe('createSessionContentProvider', () => {
       onCancellationRequested: () => ({ dispose() {} }),
     });
 
-    const items = Array.from(controller!.items).map(([, item]) => item);
+    const items = getNonDiagnosticSessionItems(controller!);
     expect(items[0]?.label).toBe('Changed Session');
     expect(items[0]?.status).toBe(vscode.ChatSessionStatus.Completed);
     expect(items[0]?.description).toBeUndefined();
@@ -304,7 +310,7 @@ describe('createSessionContentProvider', () => {
       onCancellationRequested: () => ({ dispose() {} }),
     });
 
-    const items = Array.from(controller!.items).map(([, item]) => item);
+    const items = getNonDiagnosticSessionItems(controller!);
     expect(items[0]?.description).toBeUndefined();
     expect(items[0]?.changes).toBeUndefined();
   });
@@ -538,8 +544,8 @@ describe('createSessionContentProvider', () => {
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
     );
 
-    expect(stream.push).toHaveBeenCalledTimes(1);
-    expect(externalEdit).not.toHaveBeenCalled();
+    expect(stream.push).not.toHaveBeenCalled();
+    expect(externalEdit).toHaveBeenCalledTimes(1);
     expect(fs.readFileSync(file, 'utf-8')).toBe('a\nB\nc\n');
     expect(state.sessionStore.updateMeta).toHaveBeenCalledWith(
       'ses_restore',
@@ -548,6 +554,55 @@ describe('createSessionContentProvider', () => {
         checkpointCursor: expect.objectContaining({ acceptedThroughTurn: 0, replayedThroughTurn: 1 }),
       }),
     );
+  });
+
+  it('replays pending checkpoints again after a prior restore replay', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-restore-replayed-pending-'));
+    const file = path.join(dir, 'file.txt');
+    fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
+    const uri = vscode.Uri.file(file);
+
+    vi.mocked(readSessionEvents).mockResolvedValue([
+      makeTextEvent('Restore previously replayed pending edit') as any,
+    ]);
+    vi.mocked(readCheckpoints).mockResolvedValue([
+      {
+        uri: uri.fsPath,
+        content: 'a\nb\nc\n',
+        phase: 'before',
+        turnIndex: 1,
+        editIndex: 1,
+        toolCallId: 'tool-1',
+        timestamp: '2026-06-05T00:00:00.000Z',
+      },
+      {
+        uri: uri.fsPath,
+        content: 'a\nB\nc\n',
+        phase: 'after',
+        turnIndex: 1,
+        editIndex: 1,
+        toolCallId: 'tool-1',
+        timestamp: '2026-06-05T00:00:01.000Z',
+      },
+    ]);
+    (state.sessionStore.readMeta as any).mockResolvedValue({
+      id: 'ses_restore',
+      checkpointCursor: { acceptedThroughTurn: 0, replayedThroughTurn: 1 },
+      changeApprovalState: 'pending',
+    });
+
+    const { provider } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    const session = await provider.provideChatSessionContent(
+      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+      { inputState: {} as vscode.ChatSessionInputState },
+    );
+
+    expect(session.activeResponseCallback).toBeTypeOf('function');
   });
 
   it('uses live in-memory session state when a session-list item targets the same backend session', async () => {
@@ -692,7 +747,7 @@ describe('createSessionContentProvider', () => {
       onCancellationRequested: () => ({ dispose() {} }),
     });
 
-    const items = Array.from(controller!.items).map(([, item]) => item);
+    const items = getNonDiagnosticSessionItems(controller!);
     expect(items).toHaveLength(1);
     expect(items[0]?.label).toBe('Derived From Prompt');
   });
@@ -719,7 +774,7 @@ describe('createSessionContentProvider', () => {
       onCancellationRequested: () => ({ dispose() {} }),
     });
 
-    const items = Array.from(controller!.items).map(([, item]) => item);
+    const items = getNonDiagnosticSessionItems(controller!);
     expect(items).toHaveLength(1);
     expect(items[0]?.label).toBe('Runtime Rename Title');
   });

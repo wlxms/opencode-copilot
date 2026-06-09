@@ -87,7 +87,7 @@ describe('checkpoint replay', () => {
     expect(result).toEqual({ ok: true, text: 'a\nB\nc\nUSER\n' });
   });
 
-  it('prefers ChatResponseExternalEditPart for restore replay', async () => {
+  it('prefers direct stream.externalEdit for restore replay', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'replay-external-'));
     const file = path.join(dir, 'file.txt');
     fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
@@ -106,12 +106,12 @@ describe('checkpoint replay', () => {
     expect(result.applied).toBe(1);
     expect(result.externalEdits).toBe(1);
     expect(result.fallbackEdits).toBe(0);
-    expect(externalEdit).not.toHaveBeenCalled();
-    expect(pushed).toHaveLength(1);
+    expect(externalEdit).toHaveBeenCalledTimes(1);
+    expect(pushed).toHaveLength(0);
     expect(fs.readFileSync(file, 'utf-8')).toBe('a\nB\nc\n');
   });
 
-  it('uses direct file writes inside visible external edit callbacks', async () => {
+  it('falls back to workspace edits when only push is available', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'replay-external-direct-'));
     const file = path.join(dir, 'file.txt');
     fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
@@ -128,16 +128,17 @@ describe('checkpoint replay', () => {
       });
 
       expect(result.applied).toBe(1);
-      expect(result.externalEdits).toBe(1);
-      expect(pushed).toHaveLength(1);
-      expect(applyEdit).not.toHaveBeenCalled();
+      expect(result.externalEdits).toBe(0);
+      expect(result.fallbackEdits).toBe(1);
+      expect(pushed).toHaveLength(0);
+      expect(applyEdit).toHaveBeenCalledTimes(1);
       expect(fs.readFileSync(file, 'utf-8')).toBe('a\nB\nc\n');
     } finally {
       (vscode.workspace as any).applyEdit = originalApplyEdit;
     }
   });
 
-  it('uses stream.externalEdit when visible external edit parts are unavailable', async () => {
+  it('uses direct file writes inside stream.externalEdit callbacks', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'replay-external-method-'));
     const file = path.join(dir, 'file.txt');
     fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
@@ -166,7 +167,7 @@ describe('checkpoint replay', () => {
     }
   });
 
-  it('uses ChatResponseExternalEditPart when only push is available', async () => {
+  it('does not synthesize ChatResponseExternalEditPart when only push is available', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'replay-external-part-'));
     const file = path.join(dir, 'file.txt');
     fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
@@ -179,9 +180,9 @@ describe('checkpoint replay', () => {
     });
 
     expect(result.applied).toBe(1);
-    expect(result.externalEdits).toBe(1);
-    expect(result.fallbackEdits).toBe(0);
-    expect(pushed).toHaveLength(1);
+    expect(result.externalEdits).toBe(0);
+    expect(result.fallbackEdits).toBe(1);
+    expect(pushed).toHaveLength(0);
     expect(fs.readFileSync(file, 'utf-8')).toBe('a\nB\nc\n');
   });
 
@@ -248,19 +249,22 @@ describe('checkpoint replay', () => {
     const file = path.join(dir, 'file.txt');
     fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
     const uri = vscode.Uri.file(file);
-    const pushed: unknown[] = [];
+    const externalEdit = vi.fn(async (_target: vscode.Uri | vscode.Uri[], callback: () => Thenable<unknown>) => {
+      await callback();
+      return 'undo-stop';
+    });
 
     const result = await replaySnapshotsToWorkspace([
       ...makePair(uri, 'a\nb\nc\n', 'a\nB\nc\n', false, false, 'tool-1', 1, 0),
       ...makePair(uri, 'a\nB\nc\n', 'a\nBB\nc\n', false, false, 'tool-2', 2, 0),
     ], undefined, {
-      stream: { push: (part: unknown) => pushed.push(part) },
+      stream: { externalEdit },
       preferExternalEdit: true,
     });
 
     expect(result.applied).toBe(1);
     expect(result.externalEdits).toBe(1);
-    expect(pushed).toHaveLength(1);
+    expect(externalEdit).toHaveBeenCalledTimes(1);
     expect(fs.readFileSync(file, 'utf-8')).toBe('a\nBB\nc\n');
   });
 

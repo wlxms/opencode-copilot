@@ -45,6 +45,8 @@
  * @module
  */
 import * as vscode from 'vscode';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 import type { ExtensionState } from '../../types';
 import type { AcpEvent } from '../../acp/types';
 import type { AcpEventStream } from '../../acp/backend';
@@ -75,6 +77,7 @@ import { readCheckpoints } from '../../acp/checkpoint/checkpoint-store';
 import { getCheckpointApproval, snapshotTurnIndex } from '../../acp/checkpoint/approval-state';
 import { replaySnapshotsToWorkspace } from '../../acp/checkpoint/replay';
 import { applySessionTitle } from '../../participant/session-title';
+import { ExternalEditTracker } from '../../participant/external-edit-tracker';
 
 // ---------------------------------------------------------------------------
 // Internal types for session content rendering (not part of the VS Code API)
@@ -292,6 +295,7 @@ export class ExperimentalChatSession {
  * in package.json.
  */
 export const OPENCODE_SESSION_SCHEME = 'opencode-copilot.opencode';
+const ACTIVE_RESPONSE_EXTERNAL_EDIT_TEST_ID = '__active-response-external-edit-test__';
 
 function getWorkspaceDirectory(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
@@ -299,6 +303,17 @@ function getWorkspaceDirectory(): string | undefined {
 
 function createSessionResource(sessionId: string): vscode.Uri {
   return vscode.Uri.parse(`${OPENCODE_SESSION_SCHEME}:/${sessionId}`);
+}
+
+function createDiagnosticSessionEntry(): SessionListEntry {
+  return {
+    id: ACTIVE_RESPONSE_EXTERNAL_EDIT_TEST_ID,
+    title: 'Diagnostic: ActiveResponse externalEdit',
+    createdAt: new Date(0),
+    description: 'stream.externalEdit probe',
+    status: vscode.ChatSessionStatus.Completed,
+    source: 'runtime',
+  };
 }
 
 /**
@@ -620,16 +635,11 @@ export function createSessionContentProvider(
     snapshots: readonly FileSnapshotRecord[],
     meta?: SerializableSessionMeta,
   ): FileSnapshotRecord[] {
-    const replayedThroughTurn = meta?.checkpointCursor?.replayedThroughTurn;
     const acceptedThroughTurn = meta?.checkpointCursor?.acceptedThroughTurn;
-    const lastReplayed = typeof replayedThroughTurn === 'number' && Number.isFinite(replayedThroughTurn)
-      ? replayedThroughTurn
-      : -1;
     const lastAccepted = typeof acceptedThroughTurn === 'number' && Number.isFinite(acceptedThroughTurn)
       ? acceptedThroughTurn
       : -1;
-    const restoreFloor = Math.max(lastReplayed, lastAccepted);
-    return snapshots.filter(snapshot => snapshotTurnIndex(snapshot) > restoreFloor);
+    return snapshots.filter(snapshot => snapshotTurnIndex(snapshot) > lastAccepted);
   }
 
   async function replayPendingSnapshotsForSession(
@@ -796,7 +806,10 @@ export function createSessionContentProvider(
       );
 
       const listedItems = await Promise.all(sessions.map(toSessionListEntry));
-      const items = mergeSessions(listedItems, collectRuntimeSessions());
+      const items = mergeSessions(listedItems, [
+        ...collectRuntimeSessions(),
+        createDiagnosticSessionEntry(),
+      ]);
 
       publishSessionItems(controller, items);
     } finally {
@@ -1302,6 +1315,37 @@ export function createSessionContentProvider(
       // New session — no history to restore
       // VSCode generates untitled-* URIs for fresh sessions; only real OpenCode
       // session IDs (e.g. from session.list()) should trigger history fetch.
+      if (sessionId === ACTIVE_RESPONSE_EXTERNAL_EDIT_TEST_ID) {
+        return Promise.resolve({
+          title: 'Diagnostic: ActiveResponse externalEdit',
+          history: [
+            createRequestTurn(
+              'Run activeResponseCallback externalEdit diagnostic',
+              undefined,
+              [],
+            ),
+            createResponseTurn(
+              [
+                new vscode.ChatResponseMarkdownPart(
+                  new vscode.MarkdownString(
+                    'This diagnostic session writes a temp file inside `activeResponseCallback` using `stream.externalEdit`.',
+                  ),
+                ),
+              ],
+              {},
+            ),
+          ],
+          requestHandler: createParticipantHandler(state),
+          activeResponseCallback: async (
+            stream: vscode.ChatResponseStream,
+            activeToken: vscode.CancellationToken,
+          ) => {
+            await runActiveResponseExternalEditDiagnostic(stream, activeToken, logger);
+          },
+          ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
+        });
+      }
+
       if (!sessionId || sessionId === 'new') {
         return Promise.resolve({
           title: 'New OpenCode Session',
@@ -1627,6 +1671,276 @@ function createResponseTurn(
     command?: string,
   ) => vscode.ChatResponseTurn;
   return new Ctor(response, result, PARTICIPANT_ID);
+}
+
+async function runActiveResponseExternalEditDiagnostic(
+  stream: vscode.ChatResponseStream,
+  token: vscode.CancellationToken,
+  logger: { appendLine(m: string): void },
+): Promise<void> {
+  const workspaceDir = getWorkspaceDirectory();
+  const tempRoot = workspaceDir ?? process.env.TEMP ?? process.env.TMP ?? process.cwd();
+  const filePath = path.join(tempRoot, `.opencode-active-response-externaledit-${Date.now()}.txt`);
+  const uri = vscode.Uri.file(filePath);
+  const before = [
+    'activeResponse externalEdit diagnostic',
+    `created=${new Date().toISOString()}`,
+    'state=before',
+    '',
+  ].join('\n');
+  const after = [
+    'activeResponse externalEdit diagnostic',
+    `created=${new Date().toISOString()}`,
+    'state=after',
+    'written inside stream.externalEdit callback',
+    '',
+  ].join('\n');
+
+  logger.appendLine(
+    `[active-response-externalEdit-test] start uri=${uri.toString().toLowerCase()} ` +
+    `hasExternalEdit=${typeof (stream as { externalEdit?: unknown }).externalEdit === 'function'} ` +
+    `hasPush=${typeof (stream as { push?: unknown }).push === 'function'}`,
+  );
+
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, before, 'utf8');
+
+  stream.markdown(`\nStarting activeResponse tracker externalEdit diagnostic for \`${uri.fsPath}\`.\n\n`);
+  await pushActiveResponseReadFileDiagnostics(stream, uri, logger);
+  await pushActiveResponseTextEditDiagnostic(stream, uri, logger);
+
+  if (token.isCancellationRequested) {
+    logger.appendLine('[active-response-externalEdit-test] cancelled before trackEdit');
+    return;
+  }
+
+  const beforeDisk = await fs.readFile(filePath, 'utf8');
+  logger.appendLine(
+    `[active-response-externalEdit-test] before trackEdit length=${beforeDisk.length} ` +
+    `matchesBefore=${beforeDisk === before}`,
+  );
+
+  const tracker = new ExternalEditTracker();
+  const editKey = `active-response-${Date.now()}`;
+
+  try {
+    await tracker.trackEdit(editKey, [uri], stream, token);
+    const trackedBefore = await fs.readFile(filePath, 'utf8');
+    logger.appendLine(
+      `[active-response-externalEdit-test] trackEdit resolved length=${trackedBefore.length} ` +
+      `matchesBefore=${trackedBefore === before}`,
+    );
+
+    await fs.writeFile(filePath, after, 'utf8');
+    const afterExternalWrite = await fs.readFile(filePath, 'utf8');
+    logger.appendLine(
+      `[active-response-externalEdit-test] after external write length=${afterExternalWrite.length} ` +
+      `matchesAfter=${afterExternalWrite === after}`,
+    );
+
+    const completion = tracker.completeEdit(editKey);
+    if (!completion) {
+      logger.appendLine('[active-response-externalEdit-test] completeEdit returned undefined');
+      stream.markdown('`completeEdit` returned undefined; external edit was not tracked.\n');
+      return;
+    }
+
+    const undoStopId = await completion;
+
+    const observed = await fs.readFile(filePath, 'utf8');
+    logger.appendLine(
+      `[active-response-externalEdit-test] completeEdit undoStopId=${undoStopId || '(empty)'} ` +
+      `observedLength=${observed.length} matchesAfter=${observed === after}`,
+    );
+    stream.markdown(
+      `tracker externalEdit resolved. undoStopId: \`${undoStopId || '(empty)'}\`. ` +
+      `Final content matches target: \`${observed === after}\`.\n`,
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.appendLine(`[active-response-externalEdit-test] error ${message}`);
+    stream.markdown(`externalEdit diagnostic failed: ${message}\n`);
+  } finally {
+    tracker.dispose();
+    await delayActiveResponseEnd(5000, token, logger);
+  }
+}
+
+async function delayActiveResponseEnd(
+  delayMs: number,
+  token: vscode.CancellationToken,
+  logger: { appendLine(m: string): void },
+): Promise<void> {
+  if (token.isCancellationRequested) {
+    logger.appendLine('[active-response-delay-test] skipped; token already cancelled');
+    return;
+  }
+
+  logger.appendLine(`[active-response-delay-test] holding active response open for ${delayMs}ms`);
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, delayMs);
+    token.onCancellationRequested(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+  logger.appendLine('[active-response-delay-test] active response delay finished');
+}
+
+async function pushActiveResponseTextEditDiagnostic(
+  stream: vscode.ChatResponseStream,
+  uri: vscode.Uri,
+  logger: { appendLine(m: string): void },
+): Promise<void> {
+  const push = (stream as { push?: (part: unknown) => void }).push;
+  const vsc = vscode as unknown as Record<string, unknown>;
+  const TextEditCtor = vsc.ChatResponseTextEditPart as
+    | (new (...args: unknown[]) => unknown)
+    | undefined;
+  const WorkspaceEditCtor = vsc.ChatResponseWorkspaceEditPart as
+    | (new (...args: unknown[]) => unknown)
+    | undefined;
+  const text = await fs.readFile(uri.fsPath, 'utf8');
+  const replacement = text.replace('state=before', 'state=textEdit-probe');
+  const lineCount = text.split('\n').length;
+  const fullRange = new vscode.Range(
+    new vscode.Position(0, 0),
+    new vscode.Position(lineCount, 0),
+  );
+  const edit = new vscode.TextEdit(fullRange, replacement);
+  const workspaceEdit = new vscode.WorkspaceEdit();
+  workspaceEdit.replace(uri, fullRange, replacement);
+
+  logger.appendLine(
+    `[active-response-textEdit-test] start hasPush=${typeof push === 'function'} ` +
+    `hasTextEditPart=${typeof TextEditCtor === 'function'} ` +
+    `hasWorkspaceEditPart=${typeof WorkspaceEditCtor === 'function'}`,
+  );
+  stream.markdown('\nPushing activeResponse textEdit diagnostics.\n\n');
+
+  if (!push) {
+    logger.appendLine('[active-response-textEdit-test] skipped; stream.push unavailable');
+    return;
+  }
+
+  if (TextEditCtor) {
+    const attempts: Array<{ label: string; args: unknown[] }> = [
+      { label: 'uri-edits', args: [uri, [edit]] },
+      { label: 'workspace-edit', args: [workspaceEdit] },
+      { label: 'entries', args: [[{ uri, edits: [edit] }]] },
+      { label: 'uri-range-text', args: [uri, fullRange, replacement] },
+    ];
+    let pushed = false;
+    for (const attempt of attempts) {
+      try {
+        const part = new TextEditCtor(...attempt.args);
+        push(part);
+        logger.appendLine(`[active-response-textEdit-test] pushed ChatResponseTextEditPart shape=${attempt.label}`);
+        pushed = true;
+        break;
+      } catch (err) {
+        logger.appendLine(
+          `[active-response-textEdit-test] TextEditPart shape=${attempt.label} failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+    if (!pushed) {
+      logger.appendLine('[active-response-textEdit-test] ChatResponseTextEditPart available but no constructor shape worked');
+    }
+  }
+
+  if (WorkspaceEditCtor) {
+    try {
+      const part = new WorkspaceEditCtor([{ oldResource: uri, newResource: uri }]);
+      push(part);
+      logger.appendLine('[active-response-textEdit-test] pushed ChatResponseWorkspaceEditPart same-resource probe');
+    } catch (err) {
+      logger.appendLine(
+        `[active-response-textEdit-test] WorkspaceEditPart failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  await yieldToEventLoop();
+}
+
+async function pushActiveResponseReadFileDiagnostics(
+  stream: vscode.ChatResponseStream,
+  uri: vscode.Uri,
+  logger: { appendLine(m: string): void },
+): Promise<void> {
+  logger.appendLine(
+    `[active-response-read-test] start normal-renderer uri=${uri.toString().toLowerCase()}`,
+  );
+
+  stream.markdown('\nReplaying normal read tool stream through AcpRenderer.\n\n');
+
+  const renderer = new AcpRenderer({ logger });
+  renderer.probeStream(stream);
+  const callId = `active-response-read-${Date.now()}`;
+  const partId = `${callId}-part`;
+  const started = Date.now();
+  const events: AcpEvent[] = [
+    {
+      type: 'part.updated',
+      part: {
+        type: 'tool',
+        id: partId,
+        callId,
+        toolName: 'read',
+        state: {
+          status: 'pending',
+          input: {},
+        },
+      },
+    },
+    {
+      type: 'part.updated',
+      part: {
+        type: 'tool',
+        id: partId,
+        callId,
+        toolName: 'read',
+        state: {
+          status: 'running',
+          input: { filePath: uri.fsPath, offset: 1, limit: 4 },
+          title: path.basename(uri.fsPath),
+          startTime: started,
+        },
+      },
+    },
+    {
+      type: 'part.updated',
+      part: {
+        type: 'tool',
+        id: partId,
+        callId,
+        toolName: 'read',
+        state: {
+          status: 'completed',
+          input: { filePath: uri.fsPath, offset: 1, limit: 4 },
+          output: await fs.readFile(uri.fsPath, 'utf8'),
+          title: path.basename(uri.fsPath),
+          startTime: started,
+          endTime: Date.now(),
+        },
+      },
+    },
+  ];
+
+  for (const event of events) {
+    const result = renderer.renderEvent(event, stream);
+    logger.appendLine(
+      `[active-response-read-test] rendered ${event.type} ` +
+      `status=${event.type === 'part.updated' && event.part.type === 'tool' ? event.part.state.status : 'n/a'} ` +
+      `rendered=${result.rendered}`,
+    );
+    await yieldToEventLoop();
+  }
 }
 
 function getTitle(state: { title?: string }): string | undefined {
