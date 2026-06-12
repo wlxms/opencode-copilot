@@ -111,6 +111,39 @@ describe('SerializableSessionStream', () => {
     expect(exists).toBe(true);
   });
 
+  it('persists external edit ids in request details metadata', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-edit-map-'));
+    const stream = new SerializableSessionStream(
+      tmpDir,
+      'test-backend',
+      'test-session',
+      {
+        id: 'test-session',
+        title: 'Test Session',
+        createdAt: new Date().toISOString(),
+      },
+      2,
+      'Edit a file',
+    );
+
+    await stream.initialize();
+    stream.onExternalEdit('tool-1', 'undo-stop-1');
+    stream.onExternalEdit('tool-2', 'undo-stop-2');
+    await stream.flush();
+
+    const metaPath = path.join(tmpDir, '.acpilot', 'test-backend', 'test-session', '_meta.json');
+    const meta = JSON.parse(await fs.readFile(metaPath, 'utf-8')) as SerializableSessionMeta;
+    expect(meta.requestDetails).toEqual([
+      {
+        vscodeRequestId: 'turn-2',
+        toolIdEditMap: {
+          'tool-1': 'undo-stop-1',
+          'tool-2': 'undo-stop-2',
+        },
+      },
+    ]);
+  });
+
 
   it('persists turn-start and turn-end records around turn events', async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-turn-'));

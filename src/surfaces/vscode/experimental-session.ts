@@ -45,7 +45,6 @@
  * @module
  */
 import * as vscode from 'vscode';
-import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { ExtensionState } from '../../types';
 import type { AcpEvent } from '../../acp/types';
@@ -72,12 +71,11 @@ import {
 } from './capabilities';
 
 import { CollectorStream } from '../../acp/streaming/collector-stream';
-import { readSessionEvents, readSessionTurnEvents } from '../../acp/serializable/serializer';
+import { readSessionEvents, readSessionTurnEvents, type SessionTurnEvents } from '../../acp/serializable/serializer';
 import { readCheckpoints } from '../../acp/checkpoint/checkpoint-store';
 import { getCheckpointApproval, snapshotTurnIndex } from '../../acp/checkpoint/approval-state';
-import { replaySnapshotsToWorkspace } from '../../acp/checkpoint/replay';
+import { pushSnapshotTextEditParts, replaySnapshotsToWorkspace } from '../../acp/checkpoint/replay';
 import { applySessionTitle } from '../../participant/session-title';
-import { ExternalEditTracker } from '../../participant/external-edit-tracker';
 
 // ---------------------------------------------------------------------------
 // Internal types for session content rendering (not part of the VS Code API)
@@ -113,7 +111,10 @@ interface RestoredSessionHistory {
   history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[];
   snapshots: FileSnapshotRecord[];
   pendingReplaySnapshots: FileSnapshotRecord[];
+  restoreReplaySnapshots: FileSnapshotRecord[];
 }
+
+type ToolIdEditMap = Map<string, string>;
 
 interface SessionListEntry {
   id: string;
@@ -121,6 +122,8 @@ interface SessionListEntry {
   createdAt: Date;
   description?: string;
   status?: vscode.ChatSessionStatus;
+  archived?: boolean;
+  legacyResource?: vscode.Uri;
   changeApprovalState?: SerializableSessionMeta['changeApprovalState'];
   resource?: vscode.Uri;
   source: 'persisted' | 'runtime';
@@ -295,25 +298,12 @@ export class ExperimentalChatSession {
  * in package.json.
  */
 export const OPENCODE_SESSION_SCHEME = 'opencode-copilot.opencode';
-const ACTIVE_RESPONSE_EXTERNAL_EDIT_TEST_ID = '__active-response-external-edit-test__';
-
 function getWorkspaceDirectory(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
 }
 
 function createSessionResource(sessionId: string): vscode.Uri {
   return vscode.Uri.parse(`${OPENCODE_SESSION_SCHEME}:/${sessionId}`);
-}
-
-function createDiagnosticSessionEntry(): SessionListEntry {
-  return {
-    id: ACTIVE_RESPONSE_EXTERNAL_EDIT_TEST_ID,
-    title: 'Diagnostic: ActiveResponse externalEdit',
-    createdAt: new Date(0),
-    description: 'stream.externalEdit probe',
-    status: vscode.ChatSessionStatus.Completed,
-    source: 'runtime',
-  };
 }
 
 /**
@@ -642,6 +632,155 @@ export function createSessionContentProvider(
     return snapshots.filter(snapshot => snapshotTurnIndex(snapshot) > lastAccepted);
   }
 
+  function getToolCompleteReplaySnapshots(
+    snapshots: readonly FileSnapshotRecord[],
+    turnEvents: readonly SessionTurnEvents<AcpEvent>[],
+  ): FileSnapshotRecord[] {
+    if (snapshots.length === 0 || turnEvents.length === 0) {
+      return [];
+    }
+
+    const snapshotsByCallId = new Map<string, FileSnapshotRecord[]>();
+    for (const snapshot of snapshots) {
+      if (!snapshot.toolCallId) {
+        continue;
+      }
+      const entries = snapshotsByCallId.get(snapshot.toolCallId) ?? [];
+      entries.push(snapshot);
+      snapshotsByCallId.set(snapshot.toolCallId, entries);
+    }
+
+    const replaySnapshots: FileSnapshotRecord[] = [];
+    const appendedCallIds = new Set<string>();
+    for (const turn of turnEvents) {
+      for (const event of turn.events) {
+        if (event.type !== 'part.updated' || event.part.type !== 'tool') {
+          continue;
+        }
+        const state = event.part.state as { status?: string };
+        if (state.status !== 'completed' && state.status !== 'error') {
+          continue;
+        }
+        if (!isRestoredEditToolName(event.part.toolName)) {
+          continue;
+        }
+        const callId = event.part.callId;
+        if (!callId || appendedCallIds.has(callId)) {
+          continue;
+        }
+        const entries = snapshotsByCallId.get(callId);
+        if (!entries?.length) {
+          continue;
+        }
+        appendedCallIds.add(callId);
+        replaySnapshots.push(...entries);
+      }
+    }
+
+    return replaySnapshots;
+  }
+
+  function getToolCompleteReplaySnapshotsForEvents(
+    snapshots: readonly FileSnapshotRecord[],
+    events: readonly AcpEvent[],
+  ): FileSnapshotRecord[] {
+    if (snapshots.length === 0 || events.length === 0) {
+      return [];
+    }
+
+    const snapshotsByCallId = new Map<string, FileSnapshotRecord[]>();
+    for (const snapshot of snapshots) {
+      if (!snapshot.toolCallId) {
+        continue;
+      }
+      const entries = snapshotsByCallId.get(snapshot.toolCallId) ?? [];
+      entries.push(snapshot);
+      snapshotsByCallId.set(snapshot.toolCallId, entries);
+    }
+
+    const replaySnapshots: FileSnapshotRecord[] = [];
+    const appendedCallIds = new Set<string>();
+    for (const event of events) {
+      if (event.type !== 'part.updated' || event.part.type !== 'tool') {
+        continue;
+      }
+      const state = event.part.state as { status?: string };
+      if (state.status !== 'completed' && state.status !== 'error') {
+        continue;
+      }
+      if (!isRestoredEditToolName(event.part.toolName)) {
+        continue;
+      }
+      const callId = event.part.callId;
+      if (!callId || appendedCallIds.has(callId)) {
+        continue;
+      }
+      const entries = snapshotsByCallId.get(callId);
+      if (!entries?.length) {
+        continue;
+      }
+      appendedCallIds.add(callId);
+      replaySnapshots.push(...entries);
+    }
+
+    return replaySnapshots;
+  }
+
+  function getToolIdEditMap(meta?: SerializableSessionMeta): ToolIdEditMap {
+    const result: ToolIdEditMap = new Map();
+    for (const details of meta?.requestDetails ?? []) {
+      for (const [toolCallId, editId] of Object.entries(details.toolIdEditMap ?? {})) {
+        if (editId) {
+          result.set(toolCallId, editId);
+        }
+      }
+    }
+    return result;
+  }
+
+  function filterSnapshotsWithRestoredEditRecords(
+    snapshots: readonly FileSnapshotRecord[],
+    toolIdEditMap: ToolIdEditMap,
+  ): FileSnapshotRecord[] {
+    if (toolIdEditMap.size === 0) {
+      return [];
+    }
+    return snapshots.filter(snapshot => !!snapshot.toolCallId && toolIdEditMap.has(snapshot.toolCallId));
+  }
+
+  function excludeSnapshots(
+    snapshots: readonly FileSnapshotRecord[],
+    excluded: readonly FileSnapshotRecord[],
+  ): FileSnapshotRecord[] {
+    if (snapshots.length === 0 || excluded.length === 0) {
+      return [...snapshots];
+    }
+    const excludedSet = new Set(excluded);
+    return snapshots.filter(snapshot => !excludedSet.has(snapshot));
+  }
+
+  function getRestoreSnapshotsForToolCompleteEvent(
+    snapshots: readonly FileSnapshotRecord[],
+    event: AcpEvent,
+  ): FileSnapshotRecord[] {
+    if (event.type !== 'part.updated' || event.part.type !== 'tool') {
+      return [];
+    }
+    const state = event.part.state as { status?: string };
+    if (state.status !== 'completed' && state.status !== 'error') {
+      return [];
+    }
+    const part = event.part as { toolName?: string; callId?: string };
+    if (!isRestoredEditToolName(part.toolName) || !part.callId) {
+      return [];
+    }
+    return snapshots.filter(snapshot => snapshot.toolCallId === part.callId);
+  }
+
+  function isRestoredEditToolName(toolName: string | undefined): boolean {
+    return toolName === 'edit' || toolName === 'write';
+  }
+
   async function replayPendingSnapshotsForSession(
     sessionId: string,
     pendingSnapshots: readonly FileSnapshotRecord[],
@@ -658,6 +797,14 @@ export function createSessionContentProvider(
       preferExternalEdit: true,
       redoAlreadyApplied: true,
     });
+    await persistPendingReplayResult(sessionId, pendingSnapshots, result);
+  }
+
+  async function persistPendingReplayResult(
+    sessionId: string,
+    pendingSnapshots: readonly FileSnapshotRecord[],
+    result: Awaited<ReturnType<typeof replaySnapshotsToWorkspace>>,
+  ): Promise<void> {
     const maxTurn = maxSnapshotTurn(pendingSnapshots);
     const hasConflicts = result.conflicts.length > 0;
     const update: Partial<SerializableSessionMeta> = {
@@ -700,6 +847,46 @@ export function createSessionContentProvider(
     }
   }
 
+  function pushSnapshotsForRestoredEditTools(
+    sessionId: string,
+    restoreSnapshots: readonly FileSnapshotRecord[],
+    stream: { parts?: readonly unknown[]; markdown?: (value: string) => void; push?: (part: unknown) => void },
+    toolIdEditMap: ToolIdEditMap,
+  ): void {
+    if (restoreSnapshots.length === 0) {
+      return;
+    }
+
+    hideRestoredEditToolParts(restoreSnapshots, stream.parts);
+    const snapshotsWithEditIds = restoreSnapshots.map(snapshot => {
+      const editId = snapshot.toolCallId ? toolIdEditMap.get(snapshot.toolCallId) : undefined;
+      return editId && snapshot.phase === 'after'
+        ? { ...snapshot, undoStopId: editId }
+        : snapshot;
+    });
+    const result = pushSnapshotTextEditParts(snapshotsWithEditIds, stream, logger);
+    logger.appendLine(
+      `[session-provider] Pushed ${result.pushed} restored text edit part(s) for ${sessionId} in restored history ` +
+      `(skipped=${result.skipped}, conflicts=${result.conflicts.length})`,
+    );
+  }
+
+  function hideRestoredEditToolParts(
+    restoreSnapshots: readonly FileSnapshotRecord[],
+    parts: readonly unknown[] | undefined,
+  ): void {
+    if (!parts?.length) {
+      return;
+    }
+    const callIds = new Set(restoreSnapshots.map(snapshot => snapshot.toolCallId).filter(Boolean));
+    for (const part of parts) {
+      const toolPart = part as { toolCallId?: string; presentation?: 'hidden' | 'hiddenAfterComplete' };
+      if (toolPart.toolCallId && callIds.has(toolPart.toolCallId)) {
+        toolPart.presentation = 'hidden';
+      }
+    }
+  }
+
   async function toSessionListEntry(meta: SerializableSessionMeta): Promise<SessionListEntry> {
     return {
       id: meta.id,
@@ -707,6 +894,7 @@ export function createSessionContentProvider(
       createdAt: new Date(meta.createdAt ?? Date.now()),
       description: meta.description,
       status: toChatSessionStatus(meta.status) ?? vscode.ChatSessionStatus.Completed,
+      archived: meta.archived,
       changeApprovalState: meta.changeApprovalState,
       source: 'persisted',
     };
@@ -735,6 +923,7 @@ export function createSessionContentProvider(
         createdAt: existing.createdAt ?? session.createdAt,
         description: existing.description ?? session.description,
         status: existing.status ?? session.status,
+        archived: existing.archived ?? session.archived,
         changeApprovalState: existing.changeApprovalState ?? session.changeApprovalState,
         resource: session.resource ?? existing.resource,
         source: 'runtime',
@@ -752,6 +941,10 @@ export function createSessionContentProvider(
       const item = controller.createChatSessionItem(resource, getSessionLabel(session));
       item.iconPath = sessionThemeIcon;
       item.description = getSessionDescription(session);
+      item.archived = session.archived ?? false;
+      if (session.legacyResource) {
+        (item as { legacyResource?: vscode.Uri }).legacyResource = session.legacyResource;
+      }
       if (session.changeApprovalState === 'pending' || session.changeApprovalState === 'partial') {
         item.badge = session.changeApprovalState === 'partial' ? 'Partial' : 'Changes';
       }
@@ -808,7 +1001,6 @@ export function createSessionContentProvider(
       const listedItems = await Promise.all(sessions.map(toSessionListEntry));
       const items = mergeSessions(listedItems, [
         ...collectRuntimeSessions(),
-        createDiagnosticSessionEntry(),
       ]);
 
       publishSessionItems(controller, items);
@@ -840,6 +1032,55 @@ export function createSessionContentProvider(
   };
   const backendReadyDispose = state.bus.on('backend-ready', onBackendReadyHandler);
 
+  async function createNewSessionItemFromInitialRequest(
+    ctrl: vscode.ChatSessionItemController,
+    request: { readonly prompt: string; readonly command?: string },
+  ): Promise<vscode.ChatSessionItem> {
+    const directory = getWorkspaceDirectory();
+    const title = createSessionLabelFromPrompt(request.prompt, 'new');
+    const result = await state.backend.sessions.create({
+      title,
+      directory,
+    });
+    if (result.error || !result.data) {
+      const message = String(result.error ?? 'unknown error');
+      logger.appendLine(`[session-provider] Failed to create new session item: ${message}`);
+      throw new Error(`Failed to create new session item: ${message}`);
+    }
+
+    const sessionId = result.data.id;
+    const createdAt = result.data.createdAt ?? new Date();
+    const resource = createSessionResource(sessionId);
+    const resolvedTitle = result.data.title?.trim() || title;
+    const chatState = {
+      sessionId,
+      turnMap: [],
+      title: resolvedTitle,
+      createdAt,
+    };
+
+    state.sessions.set(sessionId, chatState);
+    state.sessions.set(resource.toString(), chatState);
+    await state.sessionStore.writeMeta(sessionId, {
+      id: sessionId,
+      title: resolvedTitle,
+      createdAt: createdAt.toISOString(),
+      backendName: state.backend.name,
+    });
+
+    const item = ctrl.createChatSessionItem(resource, resolvedTitle);
+    item.iconPath = new vscode.ThemeIcon('opencode-logo');
+    item.status = vscode.ChatSessionStatus.InProgress;
+    item.timing = { created: createdAt.getTime() };
+    item.tooltip = sessionId;
+    ctrl.items.add(item);
+
+    logger.appendLine(
+      `[session-provider] Created new session item ${sessionId} from initial request resource=${resource.toString()}`,
+    );
+    return item;
+  }
+
   // -- ChatSessionItemController: Picker Tracking --------------------------
   // The controller creates tracked inputState objects via createChatSessionInputState().
   // VSCode monitors these objects, so onDidChange actually fires when the user
@@ -852,6 +1093,7 @@ export function createSessionContentProvider(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let controller: vscode.ChatSessionItemController | undefined;
   let sessionListChangedDispose: (() => void) | undefined;
+  let sessionItemStateChangedDispose: { dispose(): void } | undefined;
 
   if (hasControllerAPI) {
     controller = (vscode.chat as any).createChatSessionItemController(
@@ -872,10 +1114,30 @@ export function createSessionContentProvider(
       },
     ) as vscode.ChatSessionItemController;
 
+    controller.newChatSessionItemHandler = async (handlerContext, token) => {
+      if (token.isCancellationRequested) {
+        throw new Error('New session creation cancelled');
+      }
+      return createNewSessionItemFromInitialRequest(controller!, handlerContext.request);
+    };
+
     sessionListChangedDispose = state.bus.on('session-list-changed', () => {
       refreshSessionItems().catch((err) => {
         logger.appendLine(
           `[session-provider] Session list refresh on event failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    });
+
+    sessionItemStateChangedDispose = controller.onDidChangeChatSessionItemState?.((item) => {
+      const sessionId = resolveOpenCodeSessionId(item.resource) ?? extractSessionId(item.resource);
+      if (!sessionId || sessionId === 'new' || sessionId.startsWith('untitled-')) {
+        return;
+      }
+
+      state.sessionStore.updateMeta(sessionId, { archived: !!item.archived }).catch((err) => {
+        logger.appendLine(
+          `[session-provider] Failed to persist archived state for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
         );
       });
     });
@@ -963,6 +1225,7 @@ export function createSessionContentProvider(
     dispose: () => {
       backendReadyDispose();
       sessionListChangedDispose?.();
+      sessionItemStateChangedDispose?.dispose();
     },
   });
 
@@ -1104,6 +1367,7 @@ export function createSessionContentProvider(
 
       const item = ctrl.createChatSessionItem(newResource, getSessionLabel({ id: newSessionId, title }));
       item.status = vscode.ChatSessionStatus.Completed;
+      item.archived = false;
       item.timing = { created: Date.now() };
       ctrl.items.add(item);
 
@@ -1141,15 +1405,31 @@ export function createSessionContentProvider(
       : await readSessionEvents<AcpEvent>(turnsPath);
     const snapshots = await readCheckpoints(sessionDir);
     const meta = await state.sessionStore.readMeta(sessionId);
+    const toolIdEditMap = getToolIdEditMap(meta);
     const checkpointApproval = getCheckpointApproval(snapshots, meta);
+    const restoreReplaySnapshots = hasPersistedTurns
+      ? getToolCompleteReplaySnapshots(snapshots, turnEvents)
+      : getToolCompleteReplaySnapshotsForEvents(snapshots, events);
+    const restorableMappedEditSnapshots = filterSnapshotsWithRestoredEditRecords(restoreReplaySnapshots, toolIdEditMap);
+    const restorableSnapshotEditCallIds = new Set(
+      restoreReplaySnapshots
+        .filter(snapshot => snapshot.phase === 'after' && !!snapshot.undoStopId && snapshot.toolCallId)
+        .map(snapshot => snapshot.toolCallId!),
+    );
+    const restorableSnapshotEditSnapshots = restoreReplaySnapshots.filter(snapshot =>
+      !!snapshot.toolCallId && restorableSnapshotEditCallIds.has(snapshot.toolCallId)
+    );
+    const restorableEditSnapshots = restorableMappedEditSnapshots.length > 0
+      ? restorableMappedEditSnapshots
+      : restorableSnapshotEditSnapshots;
     const pendingReplaySnapshots = options?.replayPendingChanges === false
       ? []
-      : getRestoreReplaySnapshots(snapshots, meta);
+      : excludeSnapshots(getRestoreReplaySnapshots(snapshots, meta), restorableEditSnapshots);
 
     logger.appendLine(
       `[session-provider] fetchSessionHistory: read ${events.length} events + ${snapshots.length} snapshots from ${turnsPath} ` +
       `(acceptedThroughTurn=${checkpointApproval.acceptedThroughTurn}, pending=${checkpointApproval.pendingSnapshots.length}, ` +
-      `restoreReplay=${pendingReplaySnapshots.length}, replayPending=${options?.replayPendingChanges !== false})`,
+      `restoreReplay=${restoreReplaySnapshots.length}, editRecords=${toolIdEditMap.size}, replayPending=${options?.replayPendingChanges !== false})`,
     );
 
     const makeRequestTurn = (prompt: string): vscode.ChatRequestTurn => new (vscode.ChatRequestTurn as unknown as new (
@@ -1163,7 +1443,10 @@ export function createSessionContentProvider(
 
     const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
 
-    const buildResponseTurn = (turnEventsForResponse: readonly AcpEvent[]): vscode.ChatResponseTurn | undefined => {
+    const buildResponseTurn = (
+      turnEventsForResponse: readonly AcpEvent[],
+      snapshotsForResponse: readonly FileSnapshotRecord[],
+    ): vscode.ChatResponseTurn | undefined => {
       const collector = new CollectorStream();
       const bridge = state.backend.createBridge(sessionId);
       bridge.setStream(collector);
@@ -1171,6 +1454,12 @@ export function createSessionContentProvider(
       for (const event of turnEventsForResponse) {
         if (token.isCancellationRequested) break;
         bridge.processEvent(event);
+        pushSnapshotsForRestoredEditTools(
+          sessionId,
+          getRestoreSnapshotsForToolCompleteEvent(snapshotsForResponse, event),
+          collector,
+          toolIdEditMap,
+        );
       }
 
       if (collector.parts.length === 0) {
@@ -1190,7 +1479,7 @@ export function createSessionContentProvider(
         }
 
         const responseEvents = prompt ? dropFirstPromptEvent(turn.events, prompt) : turn.events;
-        const responseTurn = buildResponseTurn(responseEvents);
+        const responseTurn = buildResponseTurn(responseEvents, getToolCompleteReplaySnapshotsForEvents(snapshots, responseEvents));
         if (responseTurn) {
           history.push(responseTurn);
         }
@@ -1232,6 +1521,12 @@ export function createSessionContentProvider(
         }
 
         bridge.processEvent(event);
+        pushSnapshotsForRestoredEditTools(
+          sessionId,
+          getRestoreSnapshotsForToolCompleteEvent(snapshots, event),
+          collector,
+          toolIdEditMap,
+        );
       }
 
       flushAssistantTurn();
@@ -1241,7 +1536,7 @@ export function createSessionContentProvider(
       `[session-provider] Restored ${history.length} turns for session ${sessionId}`,
     );
 
-    return { history, snapshots, pendingReplaySnapshots };
+    return { history, snapshots, pendingReplaySnapshots, restoreReplaySnapshots };
   }
 
   // -- The Provider --------------------------------------------------------
@@ -1315,37 +1610,6 @@ export function createSessionContentProvider(
       // New session — no history to restore
       // VSCode generates untitled-* URIs for fresh sessions; only real OpenCode
       // session IDs (e.g. from session.list()) should trigger history fetch.
-      if (sessionId === ACTIVE_RESPONSE_EXTERNAL_EDIT_TEST_ID) {
-        return Promise.resolve({
-          title: 'Diagnostic: ActiveResponse externalEdit',
-          history: [
-            createRequestTurn(
-              'Run activeResponseCallback externalEdit diagnostic',
-              undefined,
-              [],
-            ),
-            createResponseTurn(
-              [
-                new vscode.ChatResponseMarkdownPart(
-                  new vscode.MarkdownString(
-                    'This diagnostic session writes a temp file inside `activeResponseCallback` using `stream.externalEdit`.',
-                  ),
-                ),
-              ],
-              {},
-            ),
-          ],
-          requestHandler: createParticipantHandler(state),
-          activeResponseCallback: async (
-            stream: vscode.ChatResponseStream,
-            activeToken: vscode.CancellationToken,
-          ) => {
-            await runActiveResponseExternalEditDiagnostic(stream, activeToken, logger);
-          },
-          ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
-        });
-      }
-
       if (!sessionId || sessionId === 'new') {
         return Promise.resolve({
           title: 'New OpenCode Session',
@@ -1660,289 +1924,6 @@ function createRequestTurn(
  * Missing the `participant` parameter causes VS Code to reject or silently
  * drop the turn during rendering.
  */
-function createResponseTurn(
-  response: readonly vscode.ChatResponseMarkdownPart[],
-  result: vscode.ChatResult,
-): vscode.ChatResponseTurn {
-  const Ctor = vscode.ChatResponseTurn as unknown as new (
-    r: readonly vscode.ChatResponseMarkdownPart[],
-    res: vscode.ChatResult,
-    participant: string,
-    command?: string,
-  ) => vscode.ChatResponseTurn;
-  return new Ctor(response, result, PARTICIPANT_ID);
-}
-
-async function runActiveResponseExternalEditDiagnostic(
-  stream: vscode.ChatResponseStream,
-  token: vscode.CancellationToken,
-  logger: { appendLine(m: string): void },
-): Promise<void> {
-  const workspaceDir = getWorkspaceDirectory();
-  const tempRoot = workspaceDir ?? process.env.TEMP ?? process.env.TMP ?? process.cwd();
-  const filePath = path.join(tempRoot, `.opencode-active-response-externaledit-${Date.now()}.txt`);
-  const uri = vscode.Uri.file(filePath);
-  const before = [
-    'activeResponse externalEdit diagnostic',
-    `created=${new Date().toISOString()}`,
-    'state=before',
-    '',
-  ].join('\n');
-  const after = [
-    'activeResponse externalEdit diagnostic',
-    `created=${new Date().toISOString()}`,
-    'state=after',
-    'written inside stream.externalEdit callback',
-    '',
-  ].join('\n');
-
-  logger.appendLine(
-    `[active-response-externalEdit-test] start uri=${uri.toString().toLowerCase()} ` +
-    `hasExternalEdit=${typeof (stream as { externalEdit?: unknown }).externalEdit === 'function'} ` +
-    `hasPush=${typeof (stream as { push?: unknown }).push === 'function'}`,
-  );
-
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, before, 'utf8');
-
-  stream.markdown(`\nStarting activeResponse tracker externalEdit diagnostic for \`${uri.fsPath}\`.\n\n`);
-  await pushActiveResponseReadFileDiagnostics(stream, uri, logger);
-  await pushActiveResponseTextEditDiagnostic(stream, uri, logger);
-
-  if (token.isCancellationRequested) {
-    logger.appendLine('[active-response-externalEdit-test] cancelled before trackEdit');
-    return;
-  }
-
-  const beforeDisk = await fs.readFile(filePath, 'utf8');
-  logger.appendLine(
-    `[active-response-externalEdit-test] before trackEdit length=${beforeDisk.length} ` +
-    `matchesBefore=${beforeDisk === before}`,
-  );
-
-  const tracker = new ExternalEditTracker();
-  const editKey = `active-response-${Date.now()}`;
-
-  try {
-    await tracker.trackEdit(editKey, [uri], stream, token);
-    const trackedBefore = await fs.readFile(filePath, 'utf8');
-    logger.appendLine(
-      `[active-response-externalEdit-test] trackEdit resolved length=${trackedBefore.length} ` +
-      `matchesBefore=${trackedBefore === before}`,
-    );
-
-    await fs.writeFile(filePath, after, 'utf8');
-    const afterExternalWrite = await fs.readFile(filePath, 'utf8');
-    logger.appendLine(
-      `[active-response-externalEdit-test] after external write length=${afterExternalWrite.length} ` +
-      `matchesAfter=${afterExternalWrite === after}`,
-    );
-
-    const completion = tracker.completeEdit(editKey);
-    if (!completion) {
-      logger.appendLine('[active-response-externalEdit-test] completeEdit returned undefined');
-      stream.markdown('`completeEdit` returned undefined; external edit was not tracked.\n');
-      return;
-    }
-
-    const undoStopId = await completion;
-
-    const observed = await fs.readFile(filePath, 'utf8');
-    logger.appendLine(
-      `[active-response-externalEdit-test] completeEdit undoStopId=${undoStopId || '(empty)'} ` +
-      `observedLength=${observed.length} matchesAfter=${observed === after}`,
-    );
-    stream.markdown(
-      `tracker externalEdit resolved. undoStopId: \`${undoStopId || '(empty)'}\`. ` +
-      `Final content matches target: \`${observed === after}\`.\n`,
-    );
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logger.appendLine(`[active-response-externalEdit-test] error ${message}`);
-    stream.markdown(`externalEdit diagnostic failed: ${message}\n`);
-  } finally {
-    tracker.dispose();
-    await delayActiveResponseEnd(5000, token, logger);
-  }
-}
-
-async function delayActiveResponseEnd(
-  delayMs: number,
-  token: vscode.CancellationToken,
-  logger: { appendLine(m: string): void },
-): Promise<void> {
-  if (token.isCancellationRequested) {
-    logger.appendLine('[active-response-delay-test] skipped; token already cancelled');
-    return;
-  }
-
-  logger.appendLine(`[active-response-delay-test] holding active response open for ${delayMs}ms`);
-  await new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, delayMs);
-    token.onCancellationRequested(() => {
-      clearTimeout(timer);
-      resolve();
-    });
-  });
-  logger.appendLine('[active-response-delay-test] active response delay finished');
-}
-
-async function pushActiveResponseTextEditDiagnostic(
-  stream: vscode.ChatResponseStream,
-  uri: vscode.Uri,
-  logger: { appendLine(m: string): void },
-): Promise<void> {
-  const push = (stream as { push?: (part: unknown) => void }).push;
-  const vsc = vscode as unknown as Record<string, unknown>;
-  const TextEditCtor = vsc.ChatResponseTextEditPart as
-    | (new (...args: unknown[]) => unknown)
-    | undefined;
-  const WorkspaceEditCtor = vsc.ChatResponseWorkspaceEditPart as
-    | (new (...args: unknown[]) => unknown)
-    | undefined;
-  const text = await fs.readFile(uri.fsPath, 'utf8');
-  const replacement = text.replace('state=before', 'state=textEdit-probe');
-  const lineCount = text.split('\n').length;
-  const fullRange = new vscode.Range(
-    new vscode.Position(0, 0),
-    new vscode.Position(lineCount, 0),
-  );
-  const edit = new vscode.TextEdit(fullRange, replacement);
-  const workspaceEdit = new vscode.WorkspaceEdit();
-  workspaceEdit.replace(uri, fullRange, replacement);
-
-  logger.appendLine(
-    `[active-response-textEdit-test] start hasPush=${typeof push === 'function'} ` +
-    `hasTextEditPart=${typeof TextEditCtor === 'function'} ` +
-    `hasWorkspaceEditPart=${typeof WorkspaceEditCtor === 'function'}`,
-  );
-  stream.markdown('\nPushing activeResponse textEdit diagnostics.\n\n');
-
-  if (!push) {
-    logger.appendLine('[active-response-textEdit-test] skipped; stream.push unavailable');
-    return;
-  }
-
-  if (TextEditCtor) {
-    const attempts: Array<{ label: string; args: unknown[] }> = [
-      { label: 'uri-edits', args: [uri, [edit]] },
-      { label: 'workspace-edit', args: [workspaceEdit] },
-      { label: 'entries', args: [[{ uri, edits: [edit] }]] },
-      { label: 'uri-range-text', args: [uri, fullRange, replacement] },
-    ];
-    let pushed = false;
-    for (const attempt of attempts) {
-      try {
-        const part = new TextEditCtor(...attempt.args);
-        push(part);
-        logger.appendLine(`[active-response-textEdit-test] pushed ChatResponseTextEditPart shape=${attempt.label}`);
-        pushed = true;
-        break;
-      } catch (err) {
-        logger.appendLine(
-          `[active-response-textEdit-test] TextEditPart shape=${attempt.label} failed: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      }
-    }
-    if (!pushed) {
-      logger.appendLine('[active-response-textEdit-test] ChatResponseTextEditPart available but no constructor shape worked');
-    }
-  }
-
-  if (WorkspaceEditCtor) {
-    try {
-      const part = new WorkspaceEditCtor([{ oldResource: uri, newResource: uri }]);
-      push(part);
-      logger.appendLine('[active-response-textEdit-test] pushed ChatResponseWorkspaceEditPart same-resource probe');
-    } catch (err) {
-      logger.appendLine(
-        `[active-response-textEdit-test] WorkspaceEditPart failed: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
-  }
-
-  await yieldToEventLoop();
-}
-
-async function pushActiveResponseReadFileDiagnostics(
-  stream: vscode.ChatResponseStream,
-  uri: vscode.Uri,
-  logger: { appendLine(m: string): void },
-): Promise<void> {
-  logger.appendLine(
-    `[active-response-read-test] start normal-renderer uri=${uri.toString().toLowerCase()}`,
-  );
-
-  stream.markdown('\nReplaying normal read tool stream through AcpRenderer.\n\n');
-
-  const renderer = new AcpRenderer({ logger });
-  renderer.probeStream(stream);
-  const callId = `active-response-read-${Date.now()}`;
-  const partId = `${callId}-part`;
-  const started = Date.now();
-  const events: AcpEvent[] = [
-    {
-      type: 'part.updated',
-      part: {
-        type: 'tool',
-        id: partId,
-        callId,
-        toolName: 'read',
-        state: {
-          status: 'pending',
-          input: {},
-        },
-      },
-    },
-    {
-      type: 'part.updated',
-      part: {
-        type: 'tool',
-        id: partId,
-        callId,
-        toolName: 'read',
-        state: {
-          status: 'running',
-          input: { filePath: uri.fsPath, offset: 1, limit: 4 },
-          title: path.basename(uri.fsPath),
-          startTime: started,
-        },
-      },
-    },
-    {
-      type: 'part.updated',
-      part: {
-        type: 'tool',
-        id: partId,
-        callId,
-        toolName: 'read',
-        state: {
-          status: 'completed',
-          input: { filePath: uri.fsPath, offset: 1, limit: 4 },
-          output: await fs.readFile(uri.fsPath, 'utf8'),
-          title: path.basename(uri.fsPath),
-          startTime: started,
-          endTime: Date.now(),
-        },
-      },
-    },
-  ];
-
-  for (const event of events) {
-    const result = renderer.renderEvent(event, stream);
-    logger.appendLine(
-      `[active-response-read-test] rendered ${event.type} ` +
-      `status=${event.type === 'part.updated' && event.part.type === 'tool' ? event.part.state.status : 'n/a'} ` +
-      `rendered=${result.rendered}`,
-    );
-    await yieldToEventLoop();
-  }
-}
-
 function getTitle(state: { title?: string }): string | undefined {
   return state.title;
 }

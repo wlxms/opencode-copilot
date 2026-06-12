@@ -209,6 +209,8 @@ export interface StreamingBridgeCallbacks {
   onEvent(event: AcpEvent): void;
   /** A file snapshot was captured (before write/edit) */
   onSnapshot(snapshot: FileSnapshotRecord): void;
+  /** VS Code returned a real external edit id for a backend tool call. */
+  onExternalEdit?(toolCallId: string, undoStopId: string): void;
   /** A non-recoverable error occurred */
   onError(error: Error): void;
 }

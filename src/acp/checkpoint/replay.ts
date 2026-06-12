@@ -21,6 +21,12 @@ export interface ReplayOptions {
   token?: vscode.CancellationToken;
 }
 
+export interface TextEditPartsReplayResult {
+  pushed: number;
+  skipped: number;
+  conflicts: Array<{ uri: string; reason: string }>;
+}
+
 type ApplyPatchResult =
   | { ok: true; text: string }
   | { ok: false; reason: string };
@@ -186,6 +192,72 @@ export async function replaySnapshotsToWorkspace(
     }
     result.applied++;
     logger?.appendLine(`[checkpoint-replay] applied (${mode}, rewind=${plan.reversedHunks}): ${plan.uri.toString()}`);
+  }
+
+  return result;
+}
+
+export function pushSnapshotTextEditParts(
+  snapshots: readonly FileSnapshotRecord[],
+  stream: unknown,
+  logger?: { appendLine(message: string): void },
+): TextEditPartsReplayResult {
+  const result: TextEditPartsReplayResult = {
+    pushed: 0,
+    skipped: 0,
+    conflicts: [],
+  };
+  const target = stream as { markdown?: (value: string) => void; push?: (part: unknown) => void } | undefined;
+  const CodeblockUriCtor = (vscode as unknown as {
+    ChatResponseCodeblockUriPart?: new (uri: vscode.Uri, isEdit?: boolean, undoStopId?: string) => unknown;
+  }).ChatResponseCodeblockUriPart;
+  const TextEditPartCtor = (vscode as unknown as {
+    ChatResponseTextEditPart?: new (uri: vscode.Uri, editsOrDone: unknown) => unknown;
+  }).ChatResponseTextEditPart;
+
+  if (!target?.push || !CodeblockUriCtor || !TextEditPartCtor) {
+    result.conflicts.push({ uri: '', reason: 'Restored text edit part APIs are unavailable' });
+    logger?.appendLine(
+      `[checkpoint-replay] restored text edit parts skipped: ` +
+      `hasPush=${typeof target?.push === 'function'} ` +
+      `hasCodeblockUri=${typeof CodeblockUriCtor === 'function'} ` +
+      `hasTextEdit=${typeof TextEditPartCtor === 'function'}`,
+    );
+    return result;
+  }
+
+  for (const pair of pairSnapshotsByToolCall(snapshots)) {
+    const uri = toFileUri(pair.after.uri || pair.before.uri);
+    if (!uri) {
+      const unsupported = pair.after.uri || pair.before.uri;
+      result.conflicts.push({ uri: unsupported, reason: 'Unsupported URI' });
+      continue;
+    }
+
+    const editId = pair.after.undoStopId;
+    if (!editId) {
+      result.conflicts.push({ uri: uri.toString(), reason: 'Missing undo stop id for restored edit' });
+      result.skipped++;
+      continue;
+    }
+
+    const before = pair.before.missing ? '' : pair.before.content;
+    const after = pair.after.missing ? '' : pair.after.content;
+    if (before === after && !!pair.before.missing === !!pair.after.missing) {
+      result.skipped++;
+      continue;
+    }
+
+    target.markdown?.call(target, '\n````\n');
+    target.push.call(target, new CodeblockUriCtor(uri, true, editId));
+    target.push.call(target, new TextEditPartCtor(uri, []));
+    target.push.call(target, new TextEditPartCtor(uri, true));
+    target.markdown?.call(target, '\n````\n');
+    result.pushed++;
+    logger?.appendLine(
+      `[checkpoint-replay] restored text edit parts pushed: uri=${uri.toString()} ` +
+      `editId=${editId}`,
+    );
   }
 
   return result;
@@ -598,6 +670,25 @@ function pairSnapshots(snapshots: readonly FileSnapshotRecord[]): SnapshotPair[]
     .sort((a, b) => a.before.editIndex - b.before.editIndex);
 
   return coalescePairsByTurnAndUri(perEditPairs);
+}
+
+function pairSnapshotsByToolCall(snapshots: readonly FileSnapshotRecord[]): SnapshotPair[] {
+  const byKey = new Map<string, Partial<SnapshotPair>>();
+  for (const snapshot of snapshots) {
+    if (!snapshot.toolCallId || !snapshot.uri) continue;
+    const key = `${snapshot.toolCallId}\n${normalizeSnapshotUriKey(snapshot.uri)}`;
+    const entry = byKey.get(key) ?? {};
+    if (snapshot.phase === 'after') {
+      entry.after = snapshot;
+    } else {
+      entry.before = snapshot;
+    }
+    byKey.set(key, entry);
+  }
+
+  return Array.from(byKey.values())
+    .filter((entry): entry is SnapshotPair => !!entry.before && !!entry.after)
+    .sort((a, b) => a.before.editIndex - b.before.editIndex);
 }
 
 function coalescePairsByTurnAndUri(pairs: readonly SnapshotPair[]): SnapshotPair[] {

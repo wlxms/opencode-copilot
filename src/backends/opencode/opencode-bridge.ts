@@ -137,6 +137,8 @@ export class OpenCodeBridge implements AcpBridge {
   private progressivePushed: Set<string> = new Set();
   /** Tool callIDs represented by VS Code ExternalEditPart instead of tool cards. */
   private externalEditCallIds: Set<string> = new Set();
+  /** externalEdit completion promises that persist after snapshots with undoStopId. */
+  private externalEditCompletions: Promise<unknown>[] = [];
   /** Timestamp of last processed delta (for inter-delta gap measurement) */
   private lastDeltaTime: number = 0;
   /** Active subagent scopes — filters child events from rendering as independent cards */
@@ -374,6 +376,7 @@ export class OpenCodeBridge implements AcpBridge {
       this.log(`bridge error: ${msg}`);
       stream.markdown(`\n⚠️ ${msg}\n`);
     } finally {
+      await this.drainExternalEditCompletions();
       this.log(
         `bridge reset: userMessageId=${this.userMessageId ?? 'null'}, ` +
         `partKinds=${this.partKinds.size}, toolMetas=${this.toolMetas.size}, ` +
@@ -1141,7 +1144,25 @@ export class OpenCodeBridge implements AcpBridge {
       // Complete tracker edit if this is a tracked tool
       if (this.tracker && typeof this.tracker.completeEdit === 'function') {
         try {
-          this.tracker.completeEdit(callID);
+          const completion = this.tracker.completeEdit(callID);
+          if (completion) {
+            this.externalEditCompletions.push(
+              Promise.resolve(completion)
+                .then((undoStopId) => {
+                  if (undoStopId) {
+                    this.callbacks?.onExternalEdit?.(callID, undoStopId);
+                    this.logTag('edit', `externalEdit completed callID=${callID}, undoStopId=${undoStopId}`);
+                  } else {
+                    this.logTag('edit', `externalEdit completed callID=${callID} without undoStopId`);
+                  }
+                })
+                .catch((err: unknown) => {
+                  this.logTag('edit', `externalEdit completion failed for callID=${callID}: ${
+                    err instanceof Error ? err.message : String(err)
+                  }`);
+                }),
+            );
+          }
         } catch { /* best-effort */ }
       }
 
@@ -2010,11 +2031,20 @@ export class OpenCodeBridge implements AcpBridge {
     this.toolMetas.clear();
     this.progressivePushed.clear();
     this.externalEditCallIds.clear();
+    this.externalEditCompletions = [];
     this.activeSubagentScopes.clear();
     this.deferredIdle = false;
     this.clearDeferredIdleTimer();
     this.forceStopResolve = null;
     this.assistantPhaseStarted = false;
+  }
+
+  private async drainExternalEditCompletions(): Promise<void> {
+    if (this.externalEditCompletions.length === 0) {
+      return;
+    }
+    const completions = this.externalEditCompletions.splice(0);
+    await Promise.allSettled(completions);
   }
 
   // -------------------------------------------------------------------

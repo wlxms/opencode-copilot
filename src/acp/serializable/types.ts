@@ -30,6 +30,17 @@ export interface FileSnapshotRecord {
   timestamp: string;
   /** True when the file did not exist at this phase */
   missing?: boolean;
+  /** VS Code edit/undo stop id returned by externalEdit for this tool edit. */
+  undoStopId?: string;
+}
+
+export interface SerializableRequestDetails {
+  /** Stable provider request id when available; turn index fallback otherwise. */
+  vscodeRequestId: string;
+  /** Backend request id if exposed by the backend. */
+  backendRequestId?: string;
+  /** Map of backend tool call id to VS Code edit/undo stop id. */
+  toolIdEditMap: Record<string, string>;
 }
 
 // ===========================================================================
@@ -146,6 +157,7 @@ export interface SerializableSessionMeta {
     paths?: string[];
   };
   status?: 'completed' | 'inProgress' | 'needsInput' | 'failed';
+  archived?: boolean;
   changeApprovalState?: 'none' | 'pending' | 'accepted' | 'rejected' | 'partial';
   checkpointCursor?: {
     /** Inclusive user turn index accepted by the user. -1 means no turn accepted. */
@@ -162,4 +174,5 @@ export interface SerializableSessionMeta {
     skippedHunks: number;
     conflicts: Array<{ uri: string; reason: string; turnIndex?: number }>;
   };
+  requestDetails?: SerializableRequestDetails[];
 }

@@ -77,14 +77,18 @@ export class ExternalEditTracker {
     }
     const beforeSnapshots = uris.map((uri, index) => captureSnapshot(uri, editKey, 'before', index, this.getTurnIndex?.()));
 
+    const externalEdit = (stream as {
+      externalEdit?: (target: vscode.Uri | vscode.Uri[], callback: () => Thenable<unknown>) => Thenable<string>;
+    }).externalEdit;
     const ExternalEditCtor = (vscode as any).ChatResponseExternalEditPart as
       | (new (
           uris: readonly vscode.Uri[],
           callback: () => Thenable<unknown>,
         ) => { applied: Thenable<string> })
       | undefined;
+    const push = (stream as { push?: (part: unknown) => void }).push;
 
-    if (!ExternalEditCtor || typeof (stream as { push?: unknown }).push !== 'function') {
+    if (typeof externalEdit !== 'function' && (!ExternalEditCtor || typeof push !== 'function')) {
       return;
     }
 
@@ -102,23 +106,29 @@ export class ExternalEditTracker {
         });
       }
 
-      const part = new ExternalEditCtor(uris, async () => {
+      const callback = async () => {
         for (const snapshot of beforeSnapshots) {
           this.onSnapshot?.(snapshot);
         }
         resolveTrackEdit();
         await deferredPromise;
         cancelDisposable?.dispose();
-      });
+      };
+
+      const onDidComplete = typeof externalEdit === 'function'
+        ? externalEdit.call(stream, uris, callback)
+        : (() => {
+            const part = new ExternalEditCtor!(uris, callback);
+            push!.call(stream, part);
+            return part.applied;
+          })();
 
       this._ongoingEdits.set(editKey, {
-        onDidComplete: part.applied,
+        onDidComplete,
         complete: () => deferredResolve?.(),
         uris,
         beforeSnapshots,
       });
-
-      (stream as { push(part: unknown): void }).push(part);
     });
   }
 
@@ -128,11 +138,24 @@ export class ExternalEditTracker {
       return undefined;
     }
     this._ongoingEdits.delete(editKey);
-    edit.uris.forEach((uri, index) => {
-      this.onSnapshot?.(captureSnapshot(uri, editKey, 'after', edit.beforeSnapshots.length + index, this.getTurnIndex?.()));
-    });
     edit.complete();
-    return edit.onDidComplete;
+    const completed = Promise.resolve(edit.onDidComplete);
+    completed.then(
+      (undoStopId) => {
+        edit.uris.forEach((uri, index) => {
+          this.onSnapshot?.({
+            ...captureSnapshot(uri, editKey, 'after', edit.beforeSnapshots.length + index, this.getTurnIndex?.()),
+            undoStopId: undoStopId || undefined,
+          });
+        });
+      },
+      () => {
+        edit.uris.forEach((uri, index) => {
+          this.onSnapshot?.(captureSnapshot(uri, editKey, 'after', edit.beforeSnapshots.length + index, this.getTurnIndex?.()));
+        });
+      },
+    );
+    return completed;
   }
 
   dispose(): void {

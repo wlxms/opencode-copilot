@@ -304,6 +304,30 @@ export class ChatResponseThinkingProgressPart {
     ) {}
 }
 
+export class ChatResponseCodeblockUriPart {
+    constructor(
+        public readonly value: Uri,
+        public readonly isEdit?: boolean,
+        public readonly undoStopId?: string,
+    ) {}
+}
+
+export class ChatResponseTextEditPart {
+    constructor(
+        public readonly uri: Uri,
+        public readonly editsOrDone: unknown,
+    ) {
+        if (editsOrDone === true) {
+            this.isDone = true;
+            this.edits = [];
+        } else {
+            this.edits = Array.isArray(editsOrDone) ? editsOrDone : [editsOrDone];
+        }
+    }
+    readonly edits: unknown[];
+    readonly isDone?: boolean;
+}
+
 export class Position {
     constructor(public readonly line: number, public readonly character: number) {}
 }
@@ -314,6 +338,13 @@ export class Range {
         public readonly startCharacter: number,
         public readonly endLine: number,
         public readonly endCharacter: number,
+    ) {}
+}
+
+export class TextEdit {
+    constructor(
+        public readonly range: Range,
+        public readonly newText: string,
     ) {}
 }
 
@@ -334,13 +365,14 @@ export class WorkspaceEdit {
 }
 
 export class ChatResponseExternalEditPart {
+    static nextUndoStopId = '';
     readonly applied: Thenable<string>;
 
     constructor(
         public readonly uris: readonly Uri[],
         public readonly callback: () => Thenable<unknown>,
     ) {
-        this.applied = Promise.resolve(callback()).then(() => '');
+        this.applied = Promise.resolve(callback()).then(() => ChatResponseExternalEditPart.nextUndoStopId);
     }
 }
 
@@ -430,6 +462,7 @@ export interface ChatSessionItem {
     changes?: ChatSessionChangedFile[];
     status?: ChatSessionStatus;
     tooltip?: string;
+    archived?: boolean;
     timing?: { readonly created: number };
 }
 
@@ -460,9 +493,21 @@ export const chat = {
         refreshHandler: (token: CancellationToken) => Promise<void> | Thenable<void>,
     ) {
         const items = new Map<string, ChatSessionItem>();
+        const onDidChangeChatSessionItemStateEmitter = new EventEmitter<ChatSessionItem>();
+        let newChatSessionItemHandler: unknown;
         return {
             id,
             refreshHandler,
+            onDidChangeChatSessionItemState: onDidChangeChatSessionItemStateEmitter.event,
+            get newChatSessionItemHandler() {
+                return newChatSessionItemHandler;
+            },
+            set newChatSessionItemHandler(handler: unknown) {
+                newChatSessionItemHandler = handler;
+            },
+            fireDidChangeChatSessionItemState(item: ChatSessionItem) {
+                onDidChangeChatSessionItemStateEmitter.fire(item);
+            },
             items: {
                 get size() {
                     return items.size;
@@ -593,3 +638,16 @@ export class ChatResponseTurn {
         public readonly result?: ChatResult,
     ) {}
 };
+
+export class ChatResponseTurn2 {
+    public readonly responses: unknown[];
+
+    constructor(
+        public readonly response: unknown[],
+        public readonly result: ChatResult = { metadata: {} },
+        public readonly participant: string = 'opencode',
+        public readonly command?: string,
+    ) {
+        this.responses = response;
+    }
+}

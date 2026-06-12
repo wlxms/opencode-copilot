@@ -139,7 +139,7 @@ declare module 'vscode' {
     /**
      * The history of turns in this chat session.
      */
-    readonly history: (ChatRequestTurn | ChatResponseTurn)[];
+    readonly history: (ChatRequestTurn | ChatResponseTurn | ChatResponseTurn2)[];
 
     /**
      * Optional session options (e.g. model selection, agent selection).
@@ -285,6 +285,7 @@ declare module 'vscode' {
     changes?: ChatSessionChangedFile[];
     status?: ChatSessionStatus;
     tooltip?: string | MarkdownString;
+    archived?: boolean;
     readonly legacyResource?: Uri;
     timing?: {
       readonly created: number;
@@ -304,6 +305,19 @@ declare module 'vscode' {
     readonly modifiedUri: Uri | undefined;
     insertions: number;
     deletions: number;
+  }
+
+  export class ChatResponseTurn2 {
+    constructor(
+      response: ReadonlyArray<ExtendedChatResponsePart | ChatResponseMarkdownPart | ChatResponseFileTreePart | ChatResponseAnchorPart | ChatResponseCommandButtonPart | ChatToolInvocationPart>,
+      result: ChatResult,
+      participant: string,
+      command?: string,
+    );
+    readonly response: ReadonlyArray<ExtendedChatResponsePart | ChatResponseMarkdownPart | ChatResponseFileTreePart | ChatResponseAnchorPart | ChatResponseCommandButtonPart | ChatToolInvocationPart>;
+    readonly result: ChatResult;
+    readonly participant: string;
+    readonly command?: string;
   }
 
   export interface ChatSessionItemCollection extends Iterable<readonly [id: Uri, chatSessionItem: ChatSessionItem]> {
@@ -329,6 +343,19 @@ declare module 'vscode' {
   export type ChatSessionItemControllerRefreshHandler = (
     token: CancellationToken,
   ) => Thenable<void>;
+
+  export interface ChatSessionItemControllerNewItemHandlerContext {
+    readonly request: {
+      readonly prompt: string;
+      readonly command?: string;
+    };
+    readonly inputState: ChatSessionInputState;
+  }
+
+  export type ChatSessionItemControllerNewItemHandler = (
+    context: ChatSessionItemControllerNewItemHandlerContext,
+    token: CancellationToken,
+  ) => Thenable<ChatSessionItem> | ChatSessionItem;
 
   /**
    * Callback invoked to get the input state for a chat session.
@@ -360,6 +387,10 @@ declare module 'vscode' {
     createChatSessionItem(resource: Uri, label: string): ChatSessionItem;
 
     readonly refreshHandler: ChatSessionItemControllerRefreshHandler;
+
+    readonly onDidChangeChatSessionItemState?: Event<ChatSessionItem>;
+
+    newChatSessionItemHandler?: ChatSessionItemControllerNewItemHandler;
 
     resolveChatSessionItem?: (item: ChatSessionItem, token: CancellationToken) => Thenable<void>;
 

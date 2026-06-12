@@ -27,10 +27,26 @@ function makeTextEvent(text: string) {
   };
 }
 
+function expectRestoredTextEditParts(pushed: readonly unknown[], editId: string | undefined) {
+  const uriPart = pushed.find(part => part instanceof (vscode as any).ChatResponseCodeblockUriPart) as any;
+  expect(uriPart?.isEdit).toBe(true);
+  expect(uriPart?.undoStopId).toBe(editId);
+
+  const textEditParts = pushed.filter(part => part instanceof (vscode as any).ChatResponseTextEditPart) as any[];
+  expect(textEditParts).toHaveLength(2);
+  expect(textEditParts[0]?.editsOrDone).toEqual([]);
+  expect(textEditParts[1]?.editsOrDone).toBe(true);
+}
+
 function getNonDiagnosticSessionItems(controller: vscode.ChatSessionItemController) {
   return Array.from(controller.items)
     .map(([, item]) => item)
-    .filter(item => item.resource.path !== '/__active-response-external-edit-test__');
+    .filter(item => !item.resource.path.startsWith('/__'));
+}
+
+function getFirstResponseParts(session: vscode.ChatSession): unknown[] {
+  const responseTurn = session.history.find(turn => !('prompt' in (turn as any))) as vscode.ChatResponseTurn;
+  return (responseTurn as unknown as { responses: unknown[] }).responses;
 }
 
 describe('createSessionContentProvider', () => {
@@ -188,6 +204,40 @@ describe('createSessionContentProvider', () => {
     expect(paths).toContain('/ses_1');
     expect(paths).toContain('/ses_2');
     expect(items.every(item => item.status === vscode.ChatSessionStatus.Completed)).toBe(true);
+    expect(items.every(item => item.archived === false)).toBe(true);
+  });
+
+  it('creates a real session item before the first request for edit-session storage', async () => {
+    const createdAt = new Date('2026-06-11T00:00:00.000Z');
+    (state.backend.sessions.create as any).mockResolvedValue({
+      data: { id: 'ses_new_real', title: 'Fix restored edits', createdAt },
+    });
+
+    const { controller } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    const handler = controller!.newChatSessionItemHandler!;
+    const item = await handler(
+      {
+        request: { prompt: 'Fix restored edits' },
+        inputState: {} as vscode.ChatSessionInputState,
+      },
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+    );
+
+    expect(item.resource.scheme).toBe('opencode-copilot.opencode');
+    expect(item.resource.path).toBe('/ses_new_real');
+    expect(item.label).toBe('Fix restored edits');
+    expect(controller!.items.get(item.resource)).toBe(item);
+    expect(state.sessions.get(item.resource.toString())?.sessionId).toBe('ses_new_real');
+    expect(state.sessionStore.writeMeta).toHaveBeenCalledWith('ses_new_real', {
+      id: 'ses_new_real',
+      title: 'Fix restored edits',
+      createdAt: createdAt.toISOString(),
+      backendName: 'opencode',
+    });
   });
 
   it('publishes runtime session when backend list is empty', async () => {
@@ -210,6 +260,63 @@ describe('createSessionContentProvider', () => {
     expect(items[0]?.label).toBe('Runtime Session');
     expect(items[0]?.description).toBeUndefined();
     expect(items[0]?.resource.path).toBe('/ses_runtime');
+  });
+
+  it('publishes archived state from persisted session metadata', async () => {
+    (state.sessionStore.listSessions as any).mockResolvedValue([
+      {
+        id: 'ses_archived',
+        title: 'Archived Session',
+        createdAt: '2026-05-28T02:00:00.000Z',
+        backendName: 'opencode',
+        archived: true,
+      },
+    ]);
+
+    const { controller } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    await controller!.refreshHandler({
+      isCancellationRequested: false,
+      onCancellationRequested: () => ({ dispose() {} }),
+    });
+
+    const items = getNonDiagnosticSessionItems(controller!);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.resource.path).toBe('/ses_archived');
+    expect(items[0]?.archived).toBe(true);
+  });
+
+  it('persists chat session item archive state changes', async () => {
+    (state.sessionStore.listSessions as any).mockResolvedValue([
+      {
+        id: 'ses_unarchive',
+        title: 'Unarchive Session',
+        createdAt: '2026-05-28T02:00:00.000Z',
+        backendName: 'opencode',
+        archived: true,
+      },
+    ]);
+
+    const { controller } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    await controller!.refreshHandler({
+      isCancellationRequested: false,
+      onCancellationRequested: () => ({ dispose() {} }),
+    });
+
+    const item = getNonDiagnosticSessionItems(controller!)[0]!;
+    item.archived = false;
+    (controller as any).fireDidChangeChatSessionItemState(item);
+
+    await vi.waitFor(() => {
+      expect(state.sessionStore.updateMeta).toHaveBeenCalledWith('ses_unarchive', { archived: false });
+    });
   });
 
   it('preserves restored provider session title in Session list items', async () => {
@@ -410,6 +517,189 @@ describe('createSessionContentProvider', () => {
     expect(session.history).toHaveLength(4);
   });
 
+  it('adds restored edit bubble parts at the completed edit tool position', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-restore-external-edit-'));
+    const file = path.join(dir, 'File.TXT');
+    fs.writeFileSync(file, 'after\n', 'utf-8');
+    const checkpointUri = vscode.Uri.file(file).toString();
+    const callId = 'tool-edit-1';
+    (state.backend.createBridge as any).mockImplementation(() => {
+      let stream: { push(part: unknown): void } | undefined;
+      return {
+        setStream: vi.fn((next: unknown) => { stream = next as { push(part: unknown): void }; }),
+        setCallbacks: vi.fn(),
+        setTracker: vi.fn(),
+        processEvent: vi.fn((event: any) => {
+          if (event.type === 'part.updated' && event.part?.type === 'tool') {
+            const ToolPart = (vscode as any).ChatToolInvocationPart;
+            stream?.push(new ToolPart(event.part.toolName, event.part.callId));
+          }
+        }),
+        run: vi.fn().mockResolvedValue(true),
+        getUserMessageId: vi.fn().mockReturnValue(null),
+        getSessionTitle: vi.fn().mockReturnValue(null),
+        getHadSubagentTasks: vi.fn().mockReturnValue(false),
+      };
+    });
+
+    vi.mocked(readSessionTurnEvents).mockResolvedValue([
+      {
+        turnIndex: 0,
+        start: { turnIndex: 0, prompt: 'Edit the file', timestamp: '2026-06-07T00:00:00.000Z' },
+        events: [
+          {
+            type: 'part.updated',
+            part: {
+              type: 'tool',
+              id: 'tool-part-1',
+              toolName: 'edit',
+              callId,
+              state: {
+                status: 'completed',
+                input: { filePath: file },
+                output: 'ok',
+                title: 'File.TXT',
+              },
+            },
+          } as any,
+        ],
+        end: { turnIndex: 0, timestamp: '2026-06-07T00:00:01.000Z' },
+      },
+    ]);
+    vi.mocked(state.sessionStore.readMeta).mockResolvedValue({ id: 'ses_restore' });
+    vi.mocked(readCheckpoints).mockResolvedValue([
+      {
+        uri: checkpointUri,
+        content: 'before\n',
+        phase: 'before',
+        turnIndex: 0,
+        editIndex: 1,
+        toolCallId: callId,
+        timestamp: '2026-06-07T00:00:00.500Z',
+      },
+      {
+        uri: checkpointUri,
+        content: 'after\n',
+        phase: 'after',
+        turnIndex: 0,
+        editIndex: 1,
+        toolCallId: callId,
+        timestamp: '2026-06-07T00:00:01.000Z',
+        undoStopId: 'undo-stop-edit-1',
+      },
+    ]);
+
+    const { provider } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    const session = await provider.provideChatSessionContent(
+      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+      { inputState: {} as vscode.ChatSessionInputState },
+    );
+    expect(fs.readFileSync(file, 'utf-8')).toBe('after\n');
+
+    const responses = getFirstResponseParts(session);
+    const toolPart = responses.find(part => part instanceof (vscode as any).ChatToolInvocationPart) as any;
+    expect(toolPart?.toolCallId).toBe(callId);
+    expect(toolPart?.presentation).toBe('hidden');
+    expectRestoredTextEditParts(responses, 'undo-stop-edit-1');
+    expect(session.activeResponseCallback).toBeUndefined();
+    expect(fs.readFileSync(file, 'utf-8')).toBe('after\n');
+  });
+
+  it('uses persisted tool edit records for restored edit bubble ids', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-restore-edit-record-'));
+    const file = path.join(dir, 'recorded.txt');
+    fs.writeFileSync(file, 'after\n', 'utf-8');
+    const checkpointUri = vscode.Uri.file(file).toString();
+    const callId = 'tool-edit-record-1';
+    (state.backend.createBridge as any).mockImplementation(() => {
+      let stream: { push(part: unknown): void } | undefined;
+      return {
+        setStream: vi.fn((next: unknown) => { stream = next as { push(part: unknown): void }; }),
+        setCallbacks: vi.fn(),
+        setTracker: vi.fn(),
+        processEvent: vi.fn((event: any) => {
+          if (event.type === 'part.updated' && event.part?.type === 'tool') {
+            const ToolPart = (vscode as any).ChatToolInvocationPart;
+            stream?.push(new ToolPart(event.part.toolName, event.part.callId));
+          }
+        }),
+        run: vi.fn().mockResolvedValue(true),
+        getUserMessageId: vi.fn().mockReturnValue(null),
+        getSessionTitle: vi.fn().mockReturnValue(null),
+        getHadSubagentTasks: vi.fn().mockReturnValue(false),
+      };
+    });
+
+    vi.mocked(readSessionTurnEvents).mockResolvedValue([
+      {
+        turnIndex: 0,
+        start: { turnIndex: 0, prompt: 'Edit with record', timestamp: '2026-06-07T00:00:00.000Z' },
+        events: [
+          {
+            type: 'part.updated',
+            part: {
+              type: 'tool',
+              id: 'tool-part-1',
+              toolName: 'edit',
+              callId,
+              state: { status: 'completed', input: { filePath: file }, output: 'ok', title: 'recorded.txt' },
+            },
+          } as any,
+        ],
+        end: { turnIndex: 0, timestamp: '2026-06-07T00:00:01.000Z' },
+      },
+    ]);
+    vi.mocked(readCheckpoints).mockResolvedValue([
+      {
+        uri: checkpointUri,
+        content: 'before\n',
+        phase: 'before',
+        turnIndex: 0,
+        editIndex: 1,
+        toolCallId: callId,
+        timestamp: '2026-06-07T00:00:00.500Z',
+      },
+      {
+        uri: checkpointUri,
+        content: 'after\n',
+        phase: 'after',
+        turnIndex: 0,
+        editIndex: 1,
+        toolCallId: callId,
+        timestamp: '2026-06-07T00:00:01.000Z',
+      },
+    ]);
+    vi.mocked(state.sessionStore.readMeta).mockResolvedValue({
+      id: 'ses_restore',
+      requestDetails: [
+        {
+          vscodeRequestId: 'turn-0',
+          toolIdEditMap: { [callId]: 'persisted-undo-stop-1' },
+        },
+      ],
+    });
+
+    const { provider } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    const session = await provider.provideChatSessionContent(
+      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+      { inputState: {} as vscode.ChatSessionInputState },
+    );
+
+    const responses = getFirstResponseParts(session);
+    expectRestoredTextEditParts(responses, 'persisted-undo-stop-1');
+    expect(session.activeResponseCallback).toBeUndefined();
+  });
+
   it('does not publish a session-list change just from restoring content', async () => {
     const sessionListChanged = vi.fn();
     state.bus.on('session-list-changed', sessionListChanged);
@@ -431,14 +721,50 @@ describe('createSessionContentProvider', () => {
     expect(sessionListChanged).not.toHaveBeenCalled();
   });
 
-  it('does not replay checkpoints accepted through the restored turn', async () => {
+  it('does not replay already accepted restored checkpoints', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-restore-replay-'));
     const file = path.join(dir, 'file.txt');
-    fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
+    fs.writeFileSync(file, 'a\nB\nc\n', 'utf-8');
     const uri = vscode.Uri.file(file);
+    const callId = 'tool-1';
 
-    vi.mocked(readSessionEvents).mockResolvedValue([
-      makeTextEvent('Restore edited file') as any,
+    (state.backend.createBridge as any).mockImplementation(() => {
+      let stream: { push(part: unknown): void } | undefined;
+      return {
+        setStream: vi.fn((next: unknown) => { stream = next as { push(part: unknown): void }; }),
+        setCallbacks: vi.fn(),
+        setTracker: vi.fn(),
+        processEvent: vi.fn((event: any) => {
+          if (event.type === 'part.updated' && event.part?.type === 'tool') {
+            const ToolPart = (vscode as any).ChatToolInvocationPart;
+            stream?.push(new ToolPart(event.part.toolName, event.part.callId));
+          }
+        }),
+        run: vi.fn().mockResolvedValue(true),
+        getUserMessageId: vi.fn().mockReturnValue(null),
+        getSessionTitle: vi.fn().mockReturnValue(null),
+        getHadSubagentTasks: vi.fn().mockReturnValue(false),
+      };
+    });
+
+    vi.mocked(readSessionTurnEvents).mockResolvedValue([
+      {
+        turnIndex: 0,
+        start: { turnIndex: 0, prompt: 'Restore edited file', timestamp: '2026-06-05T00:00:00.000Z' },
+        events: [
+          {
+            type: 'part.updated',
+            part: {
+              type: 'tool',
+              id: 'tool-part-1',
+              toolName: 'edit',
+              callId,
+              state: { status: 'completed', input: { filePath: file }, output: 'ok', title: 'file.txt' },
+            },
+          } as any,
+        ],
+        end: { turnIndex: 0, timestamp: '2026-06-05T00:00:01.000Z' },
+      },
     ]);
     vi.mocked(readCheckpoints).mockResolvedValue([
       {
@@ -447,7 +773,7 @@ describe('createSessionContentProvider', () => {
         phase: 'before',
         turnIndex: 0,
         editIndex: 1,
-        toolCallId: 'tool-1',
+        toolCallId: callId,
         timestamp: '2026-06-05T00:00:00.000Z',
       },
       {
@@ -456,8 +782,9 @@ describe('createSessionContentProvider', () => {
         phase: 'after',
         turnIndex: 0,
         editIndex: 1,
-        toolCallId: 'tool-1',
+        toolCallId: callId,
         timestamp: '2026-06-05T00:00:01.000Z',
+        undoStopId: 'undo-stop-tool-1',
       },
     ]);
     (state.sessionStore.readMeta as any).mockResolvedValue({
@@ -478,17 +805,40 @@ describe('createSessionContentProvider', () => {
     );
 
     expect(session.activeResponseCallback).toBeUndefined();
-    expect(fs.readFileSync(file, 'utf-8')).toBe('a\nb\nc\n');
+    expect(fs.readFileSync(file, 'utf-8')).toBe('a\nB\nc\n');
+
+    expectRestoredTextEditParts(getFirstResponseParts(session), 'undo-stop-tool-1');
+    expect(fs.readFileSync(file, 'utf-8')).toBe('a\nB\nc\n');
+    expect(state.sessionStore.updateMeta).not.toHaveBeenCalledWith(
+      'ses_restore',
+      expect.objectContaining({ changeApprovalState: 'pending' }),
+    );
   });
 
-  it('replays unaccepted restored checkpoints from the active response callback', async () => {
+  it('does not replay unaccepted checkpoints when restored edit records have undo stop ids', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-restore-pending-'));
     const file = path.join(dir, 'file.txt');
     fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
     const uri = vscode.Uri.file(file);
 
-    vi.mocked(readSessionEvents).mockResolvedValue([
-      makeTextEvent('Restore pending edit') as any,
+    vi.mocked(readSessionTurnEvents).mockResolvedValue([
+      {
+        turnIndex: 1,
+        start: { turnIndex: 1, prompt: 'Restore pending edit', timestamp: '2026-06-05T00:00:00.000Z' },
+        events: [
+          {
+            type: 'part.updated',
+            part: {
+              type: 'tool',
+              id: 'tool-part-1',
+              toolName: 'edit',
+              callId: 'tool-1',
+              state: { status: 'completed', input: { filePath: file }, output: 'ok', title: 'file.txt' },
+            },
+          } as any,
+        ],
+        end: { turnIndex: 1, timestamp: '2026-06-05T00:00:01.000Z' },
+      },
     ]);
     vi.mocked(readCheckpoints).mockResolvedValue([
       {
@@ -508,6 +858,7 @@ describe('createSessionContentProvider', () => {
         editIndex: 1,
         toolCallId: 'tool-1',
         timestamp: '2026-06-05T00:00:01.000Z',
+        undoStopId: 'undo-stop-tool-1',
       },
     ]);
     (state.sessionStore.readMeta as any).mockResolvedValue({
@@ -527,31 +878,15 @@ describe('createSessionContentProvider', () => {
       { inputState: {} as vscode.ChatSessionInputState },
     );
 
-    expect(session.activeResponseCallback).toBeTypeOf('function');
+    expect(session.activeResponseCallback).toBeUndefined();
     expect(fs.readFileSync(file, 'utf-8')).toBe('a\nb\nc\n');
 
-    const externalEdit = vi.fn(async (_target: vscode.Uri | vscode.Uri[], callback: () => Thenable<unknown>) => {
-      await callback();
-      return 'undo-stop';
-    });
-    const stream = {
-      push: vi.fn(),
-      externalEdit,
-    } as unknown as vscode.ChatResponseStream;
-
-    await session.activeResponseCallback?.(
-      stream,
-      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
-    );
-
-    expect(stream.push).not.toHaveBeenCalled();
-    expect(externalEdit).toHaveBeenCalledTimes(1);
-    expect(fs.readFileSync(file, 'utf-8')).toBe('a\nB\nc\n');
-    expect(state.sessionStore.updateMeta).toHaveBeenCalledWith(
+    expectRestoredTextEditParts(getFirstResponseParts(session), 'undo-stop-tool-1');
+    expect(fs.readFileSync(file, 'utf-8')).toBe('a\nb\nc\n');
+    expect(state.sessionStore.updateMeta).not.toHaveBeenCalledWith(
       'ses_restore',
       expect.objectContaining({
-        changeApprovalState: 'pending',
-        checkpointCursor: expect.objectContaining({ acceptedThroughTurn: 0, replayedThroughTurn: 1 }),
+        checkpointCursor: expect.objectContaining({ replayedThroughTurn: 1 }),
       }),
     );
   });
@@ -562,8 +897,24 @@ describe('createSessionContentProvider', () => {
     fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
     const uri = vscode.Uri.file(file);
 
-    vi.mocked(readSessionEvents).mockResolvedValue([
-      makeTextEvent('Restore previously replayed pending edit') as any,
+    vi.mocked(readSessionTurnEvents).mockResolvedValue([
+      {
+        turnIndex: 1,
+        start: { turnIndex: 1, prompt: 'Restore previously replayed pending edit', timestamp: '2026-06-05T00:00:00.000Z' },
+        events: [
+          {
+            type: 'part.updated',
+            part: {
+              type: 'tool',
+              id: 'tool-part-1',
+              toolName: 'edit',
+              callId: 'tool-1',
+              state: { status: 'completed', input: { filePath: file }, output: 'ok', title: 'file.txt' },
+            },
+          } as any,
+        ],
+        end: { turnIndex: 1, timestamp: '2026-06-05T00:00:01.000Z' },
+      },
     ]);
     vi.mocked(readCheckpoints).mockResolvedValue([
       {

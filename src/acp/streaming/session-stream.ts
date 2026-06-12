@@ -25,7 +25,7 @@ import {
 } from '../serializable/serializer';
 import { writeSnapshot } from '../checkpoint/checkpoint-store';
 import type { StreamingBridgeCallbacks } from '../../acp/backend';
-import type { SerializableSessionMeta, FileSnapshotRecord } from '../serializable/types';
+import type { SerializableSessionMeta, FileSnapshotRecord, SerializableRequestDetails } from '../serializable/types';
 import type { AcpEvent } from '../types';
 
 const LOG_PREFIX = '[SerializableSessionStream]';
@@ -36,6 +36,7 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
   private headerWritten = false;
   private isActive = true;
   private writeQueue: Promise<void> = Promise.resolve();
+  private requestDetails: SerializableRequestDetails[] = [];
 
   constructor(
     private readonly workspaceRoot: string,
@@ -65,6 +66,7 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
       await writeVersionHeader(this.filePath);
       await writeMeta(this.filePath, this.meta as unknown as Record<string, unknown>);
     }
+    this.requestDetails = [...(this.meta.requestDetails ?? [])];
     await writeTurnStart(this.filePath, {
       turnIndex: this.turnIndex,
       prompt: this.prompt,
@@ -128,6 +130,36 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
       await writeSnapshotLine(this.filePath, snapshotWithTurn);
       // Write to checkpoint store (_checkpoints.jsonl) for structural access
       await writeSnapshot(this.sessionDir, snapshotWithTurn);
+    });
+  }
+
+  onExternalEdit(toolCallId: string, undoStopId: string): void {
+    if (!this.isActive || !undoStopId) return;
+    const vscodeRequestId = `turn-${this.turnIndex}`;
+    const existing = this.requestDetails.find(details => details.vscodeRequestId === vscodeRequestId);
+    if (existing) {
+      existing.toolIdEditMap = {
+        ...existing.toolIdEditMap,
+        [toolCallId]: undoStopId,
+      };
+    } else {
+      this.requestDetails.push({
+        vscodeRequestId,
+        toolIdEditMap: { [toolCallId]: undoStopId },
+      });
+    }
+
+    this.enqueueWrite(async () => {
+      if (!this.filePath || !this.sessionDir) return;
+      await this.ensureHeader();
+      await fs.writeFile(
+        path.join(this.sessionDir, '_meta.json'),
+        JSON.stringify({
+          ...this.meta,
+          requestDetails: this.requestDetails,
+        }, null, 2),
+        'utf-8',
+      );
     });
   }
 

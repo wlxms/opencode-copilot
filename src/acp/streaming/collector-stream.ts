@@ -9,7 +9,7 @@ import * as vscode from 'vscode';
  * (`thinkingProgress`) use runtime detection so they work whether or not
  * the VS Code proposal is enabled.
  *
- * Use `buildTurn()` to construct a `vscode.ChatResponseTurn` from the captured
+ * Use `buildTurn()` to construct a chat response turn from the captured
  * parts, and `reset()` to clear the buffer.
  */
 export class CollectorStream {
@@ -138,19 +138,32 @@ export class CollectorStream {
   // ── Control ────────────────────────────────────────────────────────────
 
   /**
-   * Build a {@link vscode.ChatResponseTurn} from the currently captured parts.
+   * Build a response turn from the currently captured parts.
    *
-   * The cast through `unknown` is required because VS Code's
-   * `ChatResponseTurn` constructor is typed as private.
+   * Copilot CLI restores provider history with ChatResponseTurn2. Prefer that
+   * shape when available so proposed/extended response parts take VS Code's
+   * session-provider restore path, then fall back for older test/runtime shims.
    */
-  buildTurn(): vscode.ChatResponseTurn {
-    const Ctor = vscode.ChatResponseTurn as unknown as new (
+  buildTurn(): vscode.ChatResponseTurn | vscode.ChatResponseTurn2 {
+    const Turn2Ctor = (vscode as unknown as {
+      ChatResponseTurn2?: new (
+        r: readonly unknown[],
+        res: vscode.ChatResult,
+        participant: string,
+        command?: string,
+      ) => vscode.ChatResponseTurn2;
+    }).ChatResponseTurn2;
+    if (Turn2Ctor) {
+      return new Turn2Ctor(this._parts, { metadata: {} }, 'opencode-copilot.opencode');
+    }
+
+    const TurnCtor = vscode.ChatResponseTurn as unknown as new (
       r: readonly unknown[],
       res: vscode.ChatResult,
       participant: string,
       command?: string,
     ) => vscode.ChatResponseTurn;
-    return new Ctor(this._parts, { metadata: {} }, 'opencode-copilot.opencode');
+    return new TurnCtor(this._parts, { metadata: {} }, 'opencode-copilot.opencode');
   }
 
   /** Clear all captured parts. */
