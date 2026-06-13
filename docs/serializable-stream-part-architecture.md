@@ -22,7 +22,7 @@ SerializableSession
 | - TitleLifecycle
 |     -> start from first prompt
 |     -> async patch SessionMeta and backend title
-| - SerializableTurn
+| - SerializableTurnRecord
     | > write TurnMeta with prompt and request id
     | - StreamingRecorder
         | - StreamingBridge
@@ -55,8 +55,8 @@ checkpoint approval cursor, and session-level indexes.
 not at turn finalization. Turn finalization may reconcile an already observed
 title, but should not be the primary naming path.
 
-`SerializableTurn` owns prompt, turn index, VS Code request id, backend message
-id, status, and timing.
+`SerializableTurnRecord` owns prompt, turn index, VS Code request id, backend
+message id, status, and timing.
 
 `SerializableStreamPart` owns extensible streamed content plus local recovery
 metadata.
@@ -152,21 +152,12 @@ This model covers the current behavior through these invariants:
   written immediately, and generated titles patch meta/backend asynchronously.
   Turn finalization only reconciles titles already observed from the backend.
 
-## Feature Flag
+## Legacy Compatibility
 
-`opencode.experimental.serializableStreamParts` controls the new path.
+Live persistence now always writes SSP records (`stream-part`). The previous
+raw ACP `event` writer is no longer a live architecture path.
 
-Default: `true`.
-
-When enabled:
-
-- live persistence writes SSP records (`stream-part`) instead of legacy raw
-  `event` records;
-- restore reads SSP records, rebuilds request/edit indexes from SSP meta, and
-  projects specialized SSP records into the current ACP restore renderer;
-- legacy event records remain readable as fallback.
-
-When disabled:
-
-- live persistence writes legacy `event` records;
-- restore reads legacy event records.
+Restore still reads legacy raw `event` records as a compatibility fallback for
+sessions written before SSP existed. That fallback is intentionally isolated at
+the deserialization boundary: once loaded, legacy events are rendered through
+the same restore pipeline as projected SSP events.

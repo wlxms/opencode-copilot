@@ -69,11 +69,6 @@
           "type": "boolean",
           "default": true,
           "description": "Replay restored session file checkpoints through VS Code chat external edits when available, preserving ordinary workspace edits on conflicts."
-        },
-        "opencode.experimental.serializableStreamParts": {
-          "type": "boolean",
-          "default": true,
-          "description": "Persist and restore chat turns through SerializableStreamPart records. When disabled, the extension uses the legacy raw ACP event persistence path."
         }
       }
     },

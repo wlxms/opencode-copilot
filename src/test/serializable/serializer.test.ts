@@ -18,11 +18,11 @@ import {
   writeSessionMeta,
   writeTurnStart,
   writeTurnEnd,
-  writeEvent,
+  writeLegacyEvent,
   writeStreamPart,
   writeSnapshotLine,
-  readSessionEvents,
-  readSessionTurnEvents,
+  readLegacySessionEvents,
+  readLegacySessionTurnEvents,
   readSessionStreamParts,
   readSessionTurnStreamParts,
   readSessionSnapshots,
@@ -243,15 +243,15 @@ describe('writeMeta / readSessionMeta / writeSessionMeta', () => {
 // v2: Events
 // ===========================================================================
 
-describe('writeEvent / readSessionEvents', () => {
+describe('writeLegacyEvent / readLegacySessionEvents', () => {
   it('writes an event and reads it back', async () => {
     const dir = await getTmpDir();
     const fp = testFile('events.jsonl');
 
     const event = { type: 'session.created', sessionId: 'ses_001', title: 'Test' };
-    await writeEvent(fp, event);
+    await writeLegacyEvent(fp, event);
 
-    const events = await readSessionEvents(fp);
+    const events = await readLegacySessionEvents(fp);
     expect(events).toHaveLength(1);
     expect(events[0]).toEqual(event);
   });
@@ -264,11 +264,11 @@ describe('writeEvent / readSessionEvents', () => {
     const e2 = { type: 'session.idle', sessionId: 'ses_001' };
     const e3 = { type: 'session.diff', sessionId: 'ses_001', diffs: [] };
 
-    await writeEvent(fp, e1);
-    await writeEvent(fp, e2);
-    await writeEvent(fp, e3);
+    await writeLegacyEvent(fp, e1);
+    await writeLegacyEvent(fp, e2);
+    await writeLegacyEvent(fp, e3);
 
-    const events = await readSessionEvents(fp);
+    const events = await readLegacySessionEvents(fp);
     expect(events).toHaveLength(3);
     expect(events[0]).toEqual(e1);
     expect(events[1]).toEqual(e2);
@@ -279,7 +279,7 @@ describe('writeEvent / readSessionEvents', () => {
     const dir = await getTmpDir();
     const fp = testFile('nonexistent.jsonl');
 
-    const events = await readSessionEvents(fp);
+    const events = await readLegacySessionEvents(fp);
     expect(events).toEqual([]);
   });
 
@@ -289,7 +289,7 @@ describe('writeEvent / readSessionEvents', () => {
 
     await fs.writeFile(fp, '', 'utf-8');
 
-    const events = await readSessionEvents(fp);
+    const events = await readLegacySessionEvents(fp);
     expect(events).toEqual([]);
   });
 
@@ -299,11 +299,11 @@ describe('writeEvent / readSessionEvents', () => {
 
     // Write a version header, then events, then meta — only events returned
     await writeVersionHeader(fp);
-    await writeEvent(fp, { type: 'part.updated' });
+    await writeLegacyEvent(fp, { type: 'part.updated' });
     await writeMeta(fp, { info: 'test' });
-    await writeEvent(fp, { type: 'session.idle' });
+    await writeLegacyEvent(fp, { type: 'session.idle' });
 
-    const events = await readSessionEvents(fp);
+    const events = await readLegacySessionEvents(fp);
     expect(events).toHaveLength(2);
     expect(events[0]).toEqual({ type: 'part.updated' });
     expect(events[1]).toEqual({ type: 'session.idle' });
@@ -317,14 +317,14 @@ describe('turn envelope serialization', () => {
 
     await writeVersionHeader(fp);
     await writeTurnStart(fp, { turnIndex: 0, prompt: 'first', timestamp: '2026-06-07T00:00:00.000Z' });
-    await writeEvent(fp, { type: 'part.updated', part: { type: 'text', id: 'u1', text: 'first' } });
-    await writeEvent(fp, { type: 'part.updated', part: { type: 'text', id: 'a1', text: '' } });
+    await writeLegacyEvent(fp, { type: 'part.updated', part: { type: 'text', id: 'u1', text: 'first' } });
+    await writeLegacyEvent(fp, { type: 'part.updated', part: { type: 'text', id: 'a1', text: '' } });
     await writeTurnEnd(fp, { turnIndex: 0, timestamp: '2026-06-07T00:00:01.000Z' });
     await writeTurnStart(fp, { turnIndex: 1, prompt: 'second', timestamp: '2026-06-07T00:00:02.000Z' });
-    await writeEvent(fp, { type: 'part.updated', part: { type: 'text', id: 'u2', text: 'second' } });
+    await writeLegacyEvent(fp, { type: 'part.updated', part: { type: 'text', id: 'u2', text: 'second' } });
     await writeTurnEnd(fp, { turnIndex: 1, timestamp: '2026-06-07T00:00:03.000Z' });
 
-    const turns = await readSessionTurnEvents(fp);
+    const turns = await readLegacySessionTurnEvents(fp);
     expect(turns).toHaveLength(2);
     expect(turns[0].turnIndex).toBe(0);
     expect((turns[0].start as any).prompt).toBe('first');
@@ -459,7 +459,7 @@ describe('writeSnapshotLine / readSessionSnapshots', () => {
     // Write version, snapshot, event, snapshot, meta — only snapshots returned
     await writeVersionHeader(fp);
     await writeSnapshotLine(fp, makeSnapshot('file:///a.ts', '// a'));
-    await writeEvent(fp, { type: 'session.created' });
+    await writeLegacyEvent(fp, { type: 'session.created' });
     await writeSnapshotLine(fp, makeSnapshot('file:///b.ts', '// b'));
     await writeMeta(fp, { info: 'test' });
 

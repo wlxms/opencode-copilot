@@ -9,12 +9,12 @@ import type { AcpAgent } from '../acp/types';
 import type { AcpBackend } from '../acp/backend';
 import type { ExtensionState } from '../types';
 import { AppEventBus } from '../acp/app-event-bus';
-import { readSessionEvents, readSessionTurnEvents, readSessionTurnStreamParts } from '../acp/serializable/serializer';
+import { readLegacySessionEvents, readLegacySessionTurnEvents, readSessionTurnStreamParts } from '../acp/serializable/serializer';
 import { readCheckpoints } from '../acp/checkpoint/checkpoint-store';
 
 vi.mock('../acp/serializable/serializer', () => ({
-  readSessionEvents: vi.fn(),
-  readSessionTurnEvents: vi.fn(),
+  readLegacySessionEvents: vi.fn(),
+  readLegacySessionTurnEvents: vi.fn(),
   readSessionTurnStreamParts: vi.fn(),
 }));
 vi.mock('../acp/checkpoint/checkpoint-store', () => ({
@@ -77,8 +77,8 @@ describe('createSessionContentProvider', () => {
       },
     }));
 
-    vi.mocked(readSessionEvents).mockResolvedValue([]);
-    vi.mocked(readSessionTurnEvents).mockResolvedValue([]);
+    vi.mocked(readLegacySessionEvents).mockResolvedValue([]);
+    vi.mocked(readLegacySessionTurnEvents).mockResolvedValue([]);
     vi.mocked(readSessionTurnStreamParts).mockResolvedValue([]);
     vi.mocked(readCheckpoints).mockResolvedValue([]);
 
@@ -347,7 +347,7 @@ describe('createSessionContentProvider', () => {
     (state.sessionStore.listSessions as any).mockResolvedValue([
       { id: 'ses_changes', title: 'Changed Session', createdAt: '2026-05-28T04:00:00.000Z', backendName: 'opencode' },
     ]);
-    vi.mocked(readSessionEvents).mockResolvedValue([
+    vi.mocked(readLegacySessionEvents).mockResolvedValue([
       {
         type: 'session.diff',
         sessionId: 'ses_changes',
@@ -399,7 +399,7 @@ describe('createSessionContentProvider', () => {
         timestamp: '2026-06-05T00:00:01.000Z',
       },
     ]);
-    vi.mocked(readSessionEvents).mockResolvedValue([
+    vi.mocked(readLegacySessionEvents).mockResolvedValue([
       {
         type: 'session.diff',
         sessionId: 'ses_checkpoint_summary',
@@ -428,7 +428,7 @@ describe('createSessionContentProvider', () => {
 
   it('derives a restored session title from first user message when backend title is empty', async () => {
     state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
-    vi.mocked(readSessionEvents).mockResolvedValue([
+    vi.mocked(readLegacySessionEvents).mockResolvedValue([
       makeTextEvent('Need help with session titles') as any,
     ]);
 
@@ -466,7 +466,7 @@ describe('createSessionContentProvider', () => {
         end: { turnIndex: 0, timestamp: '2026-06-13T00:00:01.000Z' },
       },
     ]);
-    vi.mocked(readSessionTurnEvents).mockResolvedValue([
+    vi.mocked(readLegacySessionTurnEvents).mockResolvedValue([
       {
         turnIndex: 0,
         start: { turnIndex: 0, prompt: 'Legacy prompt', timestamp: '2026-06-13T00:00:00.000Z' },
@@ -489,7 +489,7 @@ describe('createSessionContentProvider', () => {
       { inputState: {} as vscode.ChatSessionInputState },
     );
 
-    expect(readSessionTurnEvents).toHaveBeenCalled();
+    expect(readLegacySessionTurnEvents).toHaveBeenCalled();
     const requestTurns = session.history.filter((turn): turn is vscode.ChatRequestTurn => 'prompt' in (turn as any));
     expect(requestTurns.map(turn => turn.prompt)).toEqual(['Legacy prompt']);
   });
@@ -517,7 +517,7 @@ describe('createSessionContentProvider', () => {
         getHadSubagentTasks: vi.fn().mockReturnValue(false),
       };
     });
-    vi.mocked(readSessionTurnEvents).mockResolvedValue([
+    vi.mocked(readLegacySessionTurnEvents).mockResolvedValue([
       {
         turnIndex: 0,
         start: { turnIndex: 0, prompt: 'First question', timestamp: '2026-06-07T00:00:00.000Z' },
@@ -584,7 +584,7 @@ describe('createSessionContentProvider', () => {
       };
     });
 
-    vi.mocked(readSessionTurnEvents).mockResolvedValue([
+    vi.mocked(readLegacySessionTurnEvents).mockResolvedValue([
       {
         turnIndex: 0,
         start: { turnIndex: 0, prompt: 'Edit the file', timestamp: '2026-06-07T00:00:00.000Z' },
@@ -677,7 +677,7 @@ describe('createSessionContentProvider', () => {
       };
     });
 
-    vi.mocked(readSessionTurnEvents).mockResolvedValue([
+    vi.mocked(readLegacySessionTurnEvents).mockResolvedValue([
       {
         turnIndex: 0,
         start: { turnIndex: 0, prompt: 'Edit with record', timestamp: '2026-06-07T00:00:00.000Z' },
@@ -831,8 +831,8 @@ describe('createSessionContentProvider', () => {
         end: { turnIndex: 0, timestamp: '2026-06-13T00:00:03.000Z' },
       },
     ]);
-    vi.mocked(readSessionTurnEvents).mockResolvedValue([]);
-    vi.mocked(readSessionEvents).mockResolvedValue([]);
+    vi.mocked(readLegacySessionTurnEvents).mockResolvedValue([]);
+    vi.mocked(readLegacySessionEvents).mockResolvedValue([]);
     vi.mocked(readCheckpoints).mockResolvedValue([
       {
         uri: checkpointUri,
@@ -854,7 +854,7 @@ describe('createSessionContentProvider', () => {
       },
     ]);
     vi.mocked(state.sessionStore.readMeta).mockResolvedValue({ id: 'ses_restore' });
-    vi.mocked(readSessionTurnEvents).mockClear();
+    vi.mocked(readLegacySessionTurnEvents).mockClear();
 
     const { provider } = createSessionContentProvider(
       state,
@@ -867,7 +867,7 @@ describe('createSessionContentProvider', () => {
       { inputState: {} as vscode.ChatSessionInputState },
     );
 
-    expect(readSessionTurnEvents).not.toHaveBeenCalled();
+    expect(readLegacySessionTurnEvents).not.toHaveBeenCalled();
     expectRestoredTextEditParts(getFirstResponseParts(session), 'ssp-undo-stop-1');
     const requestTurn = session.history.find((turn): turn is vscode.ChatRequestTurn => 'prompt' in (turn as any));
     expect((requestTurn as any)?.id).toBe('request-from-ssp-0');
@@ -877,7 +877,7 @@ describe('createSessionContentProvider', () => {
   it('does not publish a session-list change just from restoring content', async () => {
     const sessionListChanged = vi.fn();
     state.bus.on('session-list-changed', sessionListChanged);
-    vi.mocked(readSessionEvents).mockResolvedValue([
+    vi.mocked(readLegacySessionEvents).mockResolvedValue([
       makeTextEvent('Need help with session titles') as any,
     ]);
 
@@ -921,7 +921,7 @@ describe('createSessionContentProvider', () => {
       };
     });
 
-    vi.mocked(readSessionTurnEvents).mockResolvedValue([
+    vi.mocked(readLegacySessionTurnEvents).mockResolvedValue([
       {
         turnIndex: 0,
         start: { turnIndex: 0, prompt: 'Restore edited file', timestamp: '2026-06-05T00:00:00.000Z' },
@@ -995,7 +995,7 @@ describe('createSessionContentProvider', () => {
     fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
     const uri = vscode.Uri.file(file);
 
-    vi.mocked(readSessionTurnEvents).mockResolvedValue([
+    vi.mocked(readLegacySessionTurnEvents).mockResolvedValue([
       {
         turnIndex: 1,
         start: { turnIndex: 1, prompt: 'Restore pending edit', timestamp: '2026-06-05T00:00:00.000Z' },
@@ -1071,7 +1071,7 @@ describe('createSessionContentProvider', () => {
     fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
     const uri = vscode.Uri.file(file);
 
-    vi.mocked(readSessionTurnEvents).mockResolvedValue([
+    vi.mocked(readLegacySessionTurnEvents).mockResolvedValue([
       {
         turnIndex: 1,
         start: { turnIndex: 1, prompt: 'Restore previously replayed pending edit', timestamp: '2026-06-05T00:00:00.000Z' },
@@ -1146,7 +1146,7 @@ describe('createSessionContentProvider', () => {
     state.backend.sessions.get = vi.fn(async () => ({
       data: { id: 'ses_live', title: 'Live Session', createdAt: liveState.createdAt },
     }));
-    vi.mocked(readSessionEvents).mockResolvedValue([
+    vi.mocked(readLegacySessionEvents).mockResolvedValue([
       makeTextEvent('Restore pending edit') as any,
     ]);
     vi.mocked(readCheckpoints).mockResolvedValue([
@@ -1199,7 +1199,7 @@ describe('createSessionContentProvider', () => {
   });
 
   // =========================================================================
-  // Title persistence tests â€” verify fix for titles reverting to placeholder
+  // Title persistence tests â€?verify fix for titles reverting to placeholder
   // after tab switches (backend stores placeholder at create time).
   // =========================================================================
 
@@ -1207,7 +1207,7 @@ describe('createSessionContentProvider', () => {
     state.backend.sessions.get = vi.fn(async () => ({
       data: { id: 'ses_placeholder', title: 'New OpenCode Session', createdAt: new Date('2026-05-28T03:00:00Z') },
     }));
-    vi.mocked(readSessionEvents).mockResolvedValue([
+    vi.mocked(readLegacySessionEvents).mockResolvedValue([
       makeTextEvent('How do I fix the auth bug?') as any,
     ]);
 
@@ -1229,7 +1229,7 @@ describe('createSessionContentProvider', () => {
     state.backend.sessions.get = vi.fn(async () => ({
       data: { id: 'ses_abc12345', title: 'OpenCode Session abc12345', createdAt: new Date('2026-05-28T03:00:00Z') },
     }));
-    vi.mocked(readSessionEvents).mockResolvedValue([
+    vi.mocked(readLegacySessionEvents).mockResolvedValue([
       makeTextEvent('Refactor the database layer') as any,
     ]);
 
@@ -1344,7 +1344,7 @@ describe('createSessionContentProvider', () => {
   });
 
   // =========================================================================
-  // Agent filtering tests â€” ensures isUserSelectableAgent works correctly
+  // Agent filtering tests â€?ensures isUserSelectableAgent works correctly
   // for both hidden and subagent-mode agents.
   // =========================================================================
 

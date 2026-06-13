@@ -3,7 +3,6 @@ import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
 import { SerializableSessionStream } from '../acp/streaming/session-stream';
 import type { SerializableSessionMeta } from '../acp/serializable/types';
-import { useSerializableStreamParts } from '../acp/serializable/features';
 import { applyProvisionalSessionTitle, applySessionTitle, isPlaceholderSessionTitle } from './session-title';
 
 import type { ExtensionState, TurnMapping } from '../types';
@@ -819,7 +818,6 @@ export function createParticipantHandler(
           `[handler] workspaceRoot="${workspaceRoot}" backend="${state.backend.name}" ` +
           `backendSessionId="${backendSessionId}" requestId="${request.id}" turn=${liveTurnIndex}`,
         );
-        const streamPartsEnabled = useSerializableStreamParts();
         const sessionStream = new SerializableSessionStream(
           workspaceRoot,
           state.backend.name,
@@ -828,7 +826,6 @@ export function createParticipantHandler(
           liveTurnIndex,
           request.prompt,
           request.id,
-          streamPartsEnabled,
         );
         tracker = new ExternalEditTracker(
           snapshot => sessionStream.onSnapshot(snapshot),

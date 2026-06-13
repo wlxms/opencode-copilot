@@ -138,11 +138,22 @@ export interface ReasoningDeltaStreamPartPayload {
   field?: string;
 }
 
+export interface SerializableToolState {
+  status: 'pending' | 'running' | 'completed' | 'error';
+  input: Record<string, unknown>;
+  output?: string;
+  title?: string;
+  error?: string;
+  metadata?: Record<string, unknown>;
+  startTime?: number;
+  endTime?: number;
+}
+
 export interface ToolInvocationStreamPartPayload {
   partId: string;
   toolName: string;
   callId?: string;
-  state: SerializableToolPart['state'];
+  state: SerializableToolState;
   messageId?: string;
   sessionId?: string;
 }
@@ -202,104 +213,6 @@ export type KnownSerializableStreamPart =
   | SerializableStreamPart<'externalEdit', ExternalEditStreamPartPayload>
   | SerializableStreamPart<'externalEditMetadata', ExternalEditStreamPartPayload>
   | RawAcpEventStreamPart;
-
-// ===========================================================================
-// Part variants (v1)
-// ===========================================================================
-
-export interface SerializableTextPart {
-  type: 'text';
-  text: string;
-  synthetic?: boolean;
-}
-
-export interface SerializableReasoningPart {
-  type: 'reasoning';
-  text: string;
-  signature?: string;
-}
-
-export interface SerializableToolPart {
-  type: 'tool';
-  toolName: string;
-  callId?: string;
-  state: {
-    status: 'pending' | 'running' | 'completed' | 'error';
-    input: Record<string, unknown>;
-    output?: string;
-    title?: string;
-    error?: string;
-    metadata?: Record<string, unknown>;
-    startTime?: number;
-    endTime?: number;
-  };
-}
-
-export interface SerializableStepPart {
-  type: 'step-start' | 'step-finish';
-  reason?: string;
-  snapshot?: string;
-  cost?: number;
-  tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } };
-}
-
-// ===========================================================================
-// Part union
-// ===========================================================================
-
-export type SerializablePart =
-  | SerializableTextPart
-  | SerializableReasoningPart
-  | SerializableToolPart
-  | SerializableStepPart;
-
-// ===========================================================================
-// Line types
-// ===========================================================================
-
-export type SerializableLineType =
-  | 'version' | 'meta' | 'turn-start' | 'part' | 'turn-end'   // v1
-  | 'event' | 'snapshot'                                        // v2
-  | 'stream-part';                                              // v3 concept model
-
-export interface SerializableTurnStart {
-  turnIndex: number;
-  prompt?: string;
-  messageId?: string;
-  timestamp: string;
-}
-
-export interface SerializableTurnEnd {
-  turnIndex: number;
-  messageId?: string;
-  timestamp: string;
-}
-
-// ===========================================================================
-// Envelope
-// ===========================================================================
-
-export interface SerializableLine {
-  v: number;
-  t: string;     // Runtime-checked via parseLine(); see SerializableLineType for known values
-  d: unknown;
-}
-
-// ===========================================================================
-// Turns
-// ===========================================================================
-
-export interface SerializableRequestTurn {
-  type: 'request';
-  parts: SerializablePart[];
-}
-
-export interface SerializableResponseTurn {
-  type: 'response';
-  parts: SerializablePart[];
-}
-
-export type SerializableTurn = SerializableRequestTurn | SerializableResponseTurn;
 
 // ===========================================================================
 // Meta

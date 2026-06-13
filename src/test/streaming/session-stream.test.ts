@@ -332,33 +332,6 @@ describe('SerializableSessionStream', () => {
     }));
   });
 
-  it('writes legacy event lines when stream parts are disabled', async () => {
-    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-ev-legacy-'));
-    const meta: SerializableSessionMeta = {
-      id: 'test-session',
-      title: 'Test Session',
-      createdAt: new Date().toISOString(),
-    };
-    const stream = new SerializableSessionStream(
-      tmpDir,
-      'test-backend',
-      'test-session',
-      meta,
-      0,
-      'Test prompt',
-      'turn-0',
-      false,
-    );
-    await stream.initialize();
-
-    const event = makeEvent({ type: 'part.updated', part: { id: 'p1', type: 'text', text: 'hello' } });
-    stream.onEvent(event);
-    await stream.flush();
-
-    const lines = await readParsedLines(stream.getFilePath()!);
-    expect(lines[3]).toEqual(expect.objectContaining({ t: 'event', d: event }));
-  });
-
   it('writes multiple events in order', async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-me-'));
     const stream = makeStream(tmpDir);

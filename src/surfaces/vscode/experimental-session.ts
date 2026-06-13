@@ -77,13 +77,12 @@ import {
 
 import { CollectorStream } from '../../acp/streaming/collector-stream';
 import {
-  readSessionEvents,
-  readSessionTurnEvents,
+  readLegacySessionEvents,
+  readLegacySessionTurnEvents,
   readSessionTurnStreamParts,
-  type SessionTurnEvents,
+  type LegacySessionTurnEvents,
   type SessionTurnStreamParts,
 } from '../../acp/serializable/serializer';
-import { useSerializableStreamParts } from '../../acp/serializable/features';
 import {
   projectStreamPartToAcpEvent,
   requestDetailsFromStreamParts,
@@ -658,7 +657,7 @@ export function createSessionContentProvider(
 
   function getToolCompleteReplaySnapshots(
     snapshots: readonly FileSnapshotRecord[],
-    turnEvents: readonly SessionTurnEvents<AcpEvent>[],
+    turnEvents: readonly LegacySessionTurnEvents<AcpEvent>[],
   ): FileSnapshotRecord[] {
     if (snapshots.length === 0 || turnEvents.length === 0) {
       return [];
@@ -1457,7 +1456,7 @@ export function createSessionContentProvider(
 
   function streamTurnToEventTurn(
     turn: SessionTurnStreamParts<SerializableStreamPart>,
-  ): SessionTurnEvents<AcpEvent> {
+  ): LegacySessionTurnEvents<AcpEvent> {
     return {
       turnIndex: turn.turnIndex,
       start: turn.start,
@@ -1469,29 +1468,29 @@ export function createSessionContentProvider(
   async function readRestorableTurnEvents(
     turnsPath: string,
   ): Promise<{
-    turnEvents: SessionTurnEvents<AcpEvent>[];
+    turnEvents: LegacySessionTurnEvents<AcpEvent>[];
     streamParts: SerializableStreamPart[];
-    source: 'stream-parts' | 'events';
+    source: 'stream-parts' | 'legacy-events' | 'empty';
   }> {
-    if (useSerializableStreamParts()) {
-      const streamTurns = await readSessionTurnStreamParts<SerializableStreamPart>(turnsPath);
-      const hasStreamParts = streamTurns.some(turn => turn.parts.length > 0);
-      const eventTurns = streamTurns
-        .map(streamTurnToEventTurn)
-        .filter(turn => turn.events.length > 0 || turn.start || turn.end);
-      if (hasStreamParts && eventTurns.length > 0) {
-        return {
-          turnEvents: eventTurns,
-          streamParts: streamTurns.flatMap(turn => turn.parts),
-          source: 'stream-parts',
-        };
-      }
+    const streamTurns = await readSessionTurnStreamParts<SerializableStreamPart>(turnsPath);
+    const hasStreamParts = streamTurns.some(turn => turn.parts.length > 0);
+    const eventTurns = streamTurns
+      .map(streamTurnToEventTurn)
+      .filter(turn => turn.events.length > 0 || turn.start || turn.end);
+    if (hasStreamParts && eventTurns.length > 0) {
+      return {
+        turnEvents: eventTurns,
+        streamParts: streamTurns.flatMap(turn => turn.parts),
+        source: 'stream-parts',
+      };
     }
 
+    const legacyTurns = await readLegacySessionTurnEvents<AcpEvent>(turnsPath);
+    const hasLegacyEvents = legacyTurns.some(turn => turn.events.length > 0);
     return {
-      turnEvents: await readSessionTurnEvents<AcpEvent>(turnsPath),
+      turnEvents: legacyTurns,
       streamParts: [],
-      source: 'events',
+      source: hasLegacyEvents ? 'legacy-events' : 'empty',
     };
   }
 
@@ -1585,7 +1584,7 @@ export function createSessionContentProvider(
     const hasPersistedTurns = turnEvents.some(turn => turn.start);
     const events = hasPersistedTurns
       ? turnEvents.flatMap(turn => turn.events)
-      : await readSessionEvents<AcpEvent>(turnsPath);
+      : await readLegacySessionEvents<AcpEvent>(turnsPath);
     const snapshots = await readCheckpoints(sessionDir);
     const meta = await state.sessionStore.readMeta(sessionId);
     const toolIdEditMap = getToolIdEditMap(meta, streamParts);
@@ -1611,7 +1610,7 @@ export function createSessionContentProvider(
     logRestorableEditSnapshotSummary(sessionId, restorableEditSnapshots, toolIdEditMap);
 
     logger.appendLine(
-      `[session-provider] fetchSessionHistory: read ${events.length} events + ${snapshots.length} snapshots from ${turnsPath} ` +
+      `[session-provider] fetchSessionHistory: projectedEvents=${events.length} snapshots=${snapshots.length} from ${turnsPath} ` +
       `(source=${persistedSource}, acceptedThroughTurn=${checkpointApproval.acceptedThroughTurn}, ` +
       `pending=${checkpointApproval.pendingSnapshots.length}, ` +
       `restoreReplay=${restoreReplaySnapshots.length}, editRecords=${toolIdEditMap.size}, replayPending=${options?.replayPendingChanges !== false})`,

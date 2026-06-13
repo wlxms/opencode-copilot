@@ -156,12 +156,12 @@ export async function writeTurnEnd(
 // ===========================================================================
 
 /**
- * Write a single AcpEvent as a JSONL line (append-mode).
+ * Write a legacy raw ACP event as a JSONL line (append-mode).
  *
  * @param filePath - Absolute path to the session events file
  * @param event    - The ACP event to persist
  */
-export async function writeEvent(
+export async function writeLegacyEvent(
   filePath: string,
   event: unknown,
 ): Promise<void> {
@@ -223,12 +223,12 @@ export async function writeSnapshotLine(
 }
 
 /**
- * Read all AcpEvents from a JSONL file.
+ * Read all legacy raw ACP events from a JSONL file.
  *
  * @param filePath - Absolute path to the session events file
  * @returns Array of deserialized ACP events
  */
-export async function readSessionEvents<T = unknown>(
+export async function readLegacySessionEvents<T = unknown>(
   filePath: string,
 ): Promise<T[]> {
   let content: string;
@@ -250,7 +250,7 @@ export async function readSessionEvents<T = unknown>(
   return events;
 }
 
-export interface SessionTurnEvents<T = unknown> {
+export interface LegacySessionTurnEvents<T = unknown> {
   turnIndex: number;
   start?: unknown;
   events: T[];
@@ -264,9 +264,9 @@ export interface SessionTurnStreamParts<T extends SerializableStreamPart = Seria
   end?: unknown;
 }
 
-export async function readSessionTurnEvents<T = unknown>(
+export async function readLegacySessionTurnEvents<T = unknown>(
   filePath: string,
-): Promise<SessionTurnEvents<T>[]> {
+): Promise<LegacySessionTurnEvents<T>[]> {
   let content: string;
   try {
     content = await fs.readFile(filePath, 'utf-8');
@@ -275,10 +275,10 @@ export async function readSessionTurnEvents<T = unknown>(
   }
   if (!content.trim()) return [];
 
-  const turns: SessionTurnEvents<T>[] = [];
-  let current: SessionTurnEvents<T> | undefined;
+  const turns: LegacySessionTurnEvents<T>[] = [];
+  let current: LegacySessionTurnEvents<T> | undefined;
 
-  const ensureTurn = (turnIndex: number): SessionTurnEvents<T> => {
+  const ensureTurn = (turnIndex: number): LegacySessionTurnEvents<T> => {
     if (!current || current.turnIndex !== turnIndex) {
       current = { turnIndex, events: [] };
       turns.push(current);

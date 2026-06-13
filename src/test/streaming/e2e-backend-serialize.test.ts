@@ -7,7 +7,7 @@ import 'vscode';
 import { registerBackend, createBackend } from '../../acp/backend-registry';
 import { OpenCodeBackend } from '../../backends/opencode/adapter';
 import { CollectorStream } from '../../acp/streaming/collector-stream';
-import { readSessionEvents, writeVersionHeader, writeMeta, writeEvent } from '../../acp/serializable/serializer';
+import { readLegacySessionEvents, writeVersionHeader, writeMeta, writeLegacyEvent } from '../../acp/serializable/serializer';
 import type { SerializableSessionMeta } from '../../acp/serializable/types';
 import type { AcpBackend } from '../../acp/backend';
 
@@ -50,13 +50,13 @@ describe('E2E JSONL Roundtrip', () => {
     const meta: SerializableSessionMeta = { id: sid, title: 'E2E', createdAt: new Date().toISOString(), backendName: 'opencode' };
     await writeVersionHeader(turnsPath);
     await writeMeta(turnsPath, meta);
-    await writeEvent(turnsPath, { type: 'part.updated', part: { type: 'text', id: 'user', text: 'Read hello.ts' } } as any);
-    for (const evt of MOCK_EVENTS) await writeEvent(turnsPath, evt);
+    await writeLegacyEvent(turnsPath, { type: 'part.updated', part: { type: 'text', id: 'user', text: 'Read hello.ts' } } as any);
+    for (const evt of MOCK_EVENTS) await writeLegacyEvent(turnsPath, evt);
 
     console.log(`[E2E] Wrote ${MOCK_EVENTS.length + 1} events`);
 
     // ── READ ──
-    const events = await readSessionEvents(turnsPath);
+    const events = await readLegacySessionEvents(turnsPath);
     console.log(`[E2E] Read ${events.length} events back`);
     expect(events.length).toBe(MOCK_EVENTS.length + 1);
     expect(events.map(e => e.type)).toContain('session.idle');
