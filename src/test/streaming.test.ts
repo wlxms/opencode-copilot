@@ -700,6 +700,65 @@ describe('OpenCodeBridge', () => {
       expect(stream.markdown).toHaveBeenCalledWith('Edit applied');
     });
 
+    it('persists permission.asked events through callbacks', async () => {
+      const stream = mockStream();
+      const onEvent = vi.fn();
+      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
+        sessionId: 'ses_target',
+      });
+      permBridge.setTracker(mockTracker as any);
+      permBridge.setCallbacks({
+        onEvent,
+        onSnapshot: vi.fn(),
+        onError: vi.fn(),
+      });
+      const permissionEvent = permissionAskedEvent();
+      const events = eventStream([
+        permissionEvent,
+        idleEvent(),
+      ]);
+
+      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+
+      expect(onEvent).toHaveBeenCalledWith(permissionEvent);
+      expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ type: 'session.idle' }));
+    });
+
+    it('persists question.asked events through callbacks', async () => {
+      const stream = {
+        ...mockStream(),
+        questionCarousel: vi.fn(async () => ({ q_0: 'Yes' })),
+      } as any;
+      const onEvent = vi.fn();
+      const questions = { reply: vi.fn(async () => ({ data: true })) };
+      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, questions as any, {
+        sessionId: 'ses_target',
+      });
+      permBridge.setCallbacks({
+        onEvent,
+        onSnapshot: vi.fn(),
+        onError: vi.fn(),
+      });
+      const questionEvent = {
+        type: 'question.asked',
+        questionId: 'question-1',
+        sessionId: 'ses_target',
+        questions: [
+          {
+            question: 'Continue?',
+            header: 'Continue',
+            options: [],
+          },
+        ],
+      } as AcpEvent;
+
+      await permBridge.bridgeEventsToStream(eventStream([questionEvent, idleEvent()]), stream, mockToken());
+
+      expect(questions.reply).toHaveBeenCalledWith('ses_target', 'question-1', [['Yes']], undefined);
+      expect(onEvent).toHaveBeenCalledWith(questionEvent);
+      expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ type: 'session.idle' }));
+    });
+
     it('session.idle stops the bridge after permission.asked flow', async () => {
       const stream = mockStream();
       const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {

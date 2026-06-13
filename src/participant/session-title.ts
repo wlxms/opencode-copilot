@@ -14,6 +14,16 @@ export interface ApplySessionTitleOptions {
   source?: SessionTitleSource;
 }
 
+export interface ApplyProvisionalSessionTitleOptions {
+  backendSessionId: string;
+  vscodeSessionId?: string;
+  title: string | undefined;
+  directory?: string;
+  createdAt?: Date;
+  updateBackend?: boolean;
+  emitListChanged?: boolean;
+}
+
 export function isPlaceholderSessionTitle(title: string | undefined): boolean {
   const normalized = title?.trim() ?? '';
   return !normalized
@@ -118,6 +128,76 @@ export async function applySessionTitle(
   } catch (err) {
     logger.appendLine(
       `[session-title] SessionStore title write failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  if (options.emitListChanged !== false) {
+    state.bus.emit('session-list-changed', void 0);
+  }
+  return title;
+}
+
+export async function applyProvisionalSessionTitle(
+  state: ExtensionState,
+  options: ApplyProvisionalSessionTitleOptions,
+): Promise<string | undefined> {
+  let title = options.title?.replace(/\s+/g, ' ').trim();
+  if (!title || isPlaceholderSessionTitle(title)) {
+    return undefined;
+  }
+
+  const logger = state.outputChannel;
+  if (options.updateBackend) {
+    try {
+      const updateResult = await state.backend.sessions.update(options.backendSessionId, {
+        title,
+        directory: options.directory,
+      });
+      title = updateResult.data?.title?.trim() || title;
+      logger.appendLine(`[session-title] Provisional backend title updated: "${title}"`);
+    } catch (err) {
+      logger.appendLine(
+        `[session-title] Provisional backend title update failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  let createdAt = options.createdAt;
+  const updateState = (stateKey?: string) => {
+    if (!stateKey) return;
+    const sessionState = state.sessions.get(stateKey);
+    if (!sessionState || sessionState.backendSessionId !== options.backendSessionId) return;
+    createdAt = createdAt ?? sessionState.createdAt;
+    if (isPlaceholderSessionTitle(sessionState.title) || sessionState.provisionalTitle) {
+      sessionState.title = title;
+      sessionState.titleSource = 'history';
+      sessionState.provisionalTitle = true;
+    }
+  };
+
+  updateState(options.vscodeSessionId);
+  for (const sessionState of state.sessions.values()) {
+    if (sessionState.backendSessionId !== options.backendSessionId) continue;
+    createdAt = createdAt ?? sessionState.createdAt;
+    if (isPlaceholderSessionTitle(sessionState.title) || sessionState.provisionalTitle) {
+      sessionState.title = title;
+      sessionState.titleSource = 'history';
+      sessionState.provisionalTitle = true;
+    }
+  }
+
+  try {
+    await state.sessionStore.updateMeta(options.backendSessionId, {
+      title,
+      titleSource: 'history',
+      titleUpdatedAt: new Date().toISOString(),
+      provisionalTitle: true,
+      createdAt: (createdAt ?? new Date()).toISOString(),
+      backendName: state.backend.name,
+    });
+  } catch (err) {
+    logger.appendLine(
+      `[session-title] Provisional SessionStore title write failed: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
 

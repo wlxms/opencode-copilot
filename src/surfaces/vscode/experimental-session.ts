@@ -49,7 +49,12 @@ import * as path from 'path';
 import type { ExtensionState } from '../../types';
 import type { AcpEvent } from '../../acp/types';
 import type { AcpEventStream } from '../../acp/backend';
-import type { FileSnapshotRecord, SerializableSessionMeta } from '../../acp/serializable/types';
+import type {
+  FileSnapshotRecord,
+  SerializableRequestDetails,
+  SerializableSessionMeta,
+  SerializableStreamPart,
+} from '../../acp/serializable/types';
 import { createParticipantHandler } from '../../participant/handler';
 import { isUserSelectableAgent } from '../../acp/types';
 
@@ -71,7 +76,18 @@ import {
 } from './capabilities';
 
 import { CollectorStream } from '../../acp/streaming/collector-stream';
-import { readSessionEvents, readSessionTurnEvents, type SessionTurnEvents } from '../../acp/serializable/serializer';
+import {
+  readSessionEvents,
+  readSessionTurnEvents,
+  readSessionTurnStreamParts,
+  type SessionTurnEvents,
+  type SessionTurnStreamParts,
+} from '../../acp/serializable/serializer';
+import { useSerializableStreamParts } from '../../acp/serializable/features';
+import {
+  projectStreamPartToAcpEvent,
+  requestDetailsFromStreamParts,
+} from '../../acp/serializable/stream-parts';
 import { readCheckpoints } from '../../acp/checkpoint/checkpoint-store';
 import { getCheckpointApproval, snapshotTurnIndex } from '../../acp/checkpoint/approval-state';
 import { pushSnapshotTextEditParts, replaySnapshotsToWorkspace } from '../../acp/checkpoint/replay';
@@ -117,7 +133,7 @@ interface RestoredSessionHistory {
 
 type ToolIdEditMap = Map<string, string>;
 
-type RestoredRequestIdSource = 'request-details' | 'turn-index';
+type RestoredRequestIdSource = 'request-details' | 'stream-parts' | 'turn-index';
 
 interface RestoredRequestId {
   id: string;
@@ -734,9 +750,47 @@ export function createSessionContentProvider(
     return replaySnapshots;
   }
 
-  function getToolIdEditMap(meta?: SerializableSessionMeta): ToolIdEditMap {
-    const result: ToolIdEditMap = new Map();
+  function getMergedRequestDetails(
+    meta: SerializableSessionMeta | undefined,
+    streamParts: readonly SerializableStreamPart[] | undefined,
+  ): SerializableRequestDetails[] {
+    const result: SerializableRequestDetails[] = [];
+    const append = (details: SerializableRequestDetails): void => {
+      const existing = result.find(item =>
+        (details.turnIndex !== undefined && item.turnIndex === details.turnIndex) ||
+        item.vscodeRequestId === details.vscodeRequestId
+      );
+      if (existing) {
+        existing.turnIndex = details.turnIndex ?? existing.turnIndex;
+        existing.vscodeRequestId = details.vscodeRequestId || existing.vscodeRequestId;
+        existing.backendRequestId = details.backendRequestId ?? existing.backendRequestId;
+        existing.toolIdEditMap = {
+          ...existing.toolIdEditMap,
+          ...(details.toolIdEditMap ?? {}),
+        };
+        return;
+      }
+      result.push({
+        ...details,
+        toolIdEditMap: { ...(details.toolIdEditMap ?? {}) },
+      });
+    };
+
     for (const details of meta?.requestDetails ?? []) {
+      append(details);
+    }
+    for (const details of requestDetailsFromStreamParts(streamParts ?? [])) {
+      append(details);
+    }
+    return result;
+  }
+
+  function getToolIdEditMap(
+    meta?: SerializableSessionMeta,
+    streamParts?: readonly SerializableStreamPart[],
+  ): ToolIdEditMap {
+    const result: ToolIdEditMap = new Map();
+    for (const details of getMergedRequestDetails(meta, streamParts)) {
       for (const [toolCallId, editId] of Object.entries(details.toolIdEditMap ?? {})) {
         if (editId) {
           result.set(toolCallId, editId);
@@ -746,29 +800,42 @@ export function createSessionContentProvider(
     return result;
   }
 
-  function getRestoredRequestIdByTurnIndex(meta?: SerializableSessionMeta): Map<number, string> {
-    const result = new Map<number, string>();
-    for (const details of meta?.requestDetails ?? []) {
+  function getRestoredRequestIdByTurnIndex(
+    meta?: SerializableSessionMeta,
+    streamParts?: readonly SerializableStreamPart[],
+  ): Map<number, RestoredRequestId> {
+    const result = new Map<number, RestoredRequestId>();
+    const add = (details: SerializableRequestDetails, source: RestoredRequestIdSource) => {
       if (typeof details.turnIndex === 'number' && Number.isFinite(details.turnIndex)) {
-        result.set(details.turnIndex, details.vscodeRequestId);
-        continue;
+        result.set(details.turnIndex, { id: details.vscodeRequestId, source });
+        return;
       }
 
       const match = /^turn-(\d+)$/.exec(details.vscodeRequestId);
       if (match) {
-        result.set(Number(match[1]), details.vscodeRequestId);
+        result.set(Number(match[1]), { id: details.vscodeRequestId, source });
       }
+    };
+
+    for (const details of meta?.requestDetails ?? []) {
+      add(details, 'request-details');
+    }
+    for (const details of requestDetailsFromStreamParts(streamParts ?? [])) {
+      if (typeof details.turnIndex === 'number' && result.has(details.turnIndex)) {
+        continue;
+      }
+      add(details, 'stream-parts');
     }
     return result;
   }
 
   function getRestoredRequestId(
     turnIndex: number,
-    requestIdByTurnIndex: ReadonlyMap<number, string>,
+    requestIdByTurnIndex: ReadonlyMap<number, RestoredRequestId>,
   ): RestoredRequestId {
     const persisted = requestIdByTurnIndex.get(turnIndex);
     if (persisted) {
-      return { id: persisted, source: 'request-details' };
+      return persisted;
     }
     return { id: `turn-${turnIndex}`, source: 'turn-index' };
   }
@@ -1388,6 +1455,46 @@ export function createSessionContentProvider(
     });
   }
 
+  function streamTurnToEventTurn(
+    turn: SessionTurnStreamParts<SerializableStreamPart>,
+  ): SessionTurnEvents<AcpEvent> {
+    return {
+      turnIndex: turn.turnIndex,
+      start: turn.start,
+      events: turn.parts.map(projectStreamPartToAcpEvent).filter((event): event is AcpEvent => !!event),
+      end: turn.end,
+    };
+  }
+
+  async function readRestorableTurnEvents(
+    turnsPath: string,
+  ): Promise<{
+    turnEvents: SessionTurnEvents<AcpEvent>[];
+    streamParts: SerializableStreamPart[];
+    source: 'stream-parts' | 'events';
+  }> {
+    if (useSerializableStreamParts()) {
+      const streamTurns = await readSessionTurnStreamParts<SerializableStreamPart>(turnsPath);
+      const hasStreamParts = streamTurns.some(turn => turn.parts.length > 0);
+      const eventTurns = streamTurns
+        .map(streamTurnToEventTurn)
+        .filter(turn => turn.events.length > 0 || turn.start || turn.end);
+      if (hasStreamParts && eventTurns.length > 0) {
+        return {
+          turnEvents: eventTurns,
+          streamParts: streamTurns.flatMap(turn => turn.parts),
+          source: 'stream-parts',
+        };
+      }
+    }
+
+    return {
+      turnEvents: await readSessionTurnEvents<AcpEvent>(turnsPath),
+      streamParts: [],
+      source: 'events',
+    };
+  }
+
   /**
    * Create a forkHandler function for use by both the ChatSessionItemController
    * and the ChatSession objects returned by provideChatSessionContent().
@@ -1474,14 +1581,14 @@ export function createSessionContentProvider(
     const sessionDir = state.sessionStore.getSessionDir(sessionId);
 
     // 1. Read events and snapshots
-    const turnEvents = await readSessionTurnEvents<AcpEvent>(turnsPath);
+    const { turnEvents, streamParts, source: persistedSource } = await readRestorableTurnEvents(turnsPath);
     const hasPersistedTurns = turnEvents.some(turn => turn.start);
     const events = hasPersistedTurns
       ? turnEvents.flatMap(turn => turn.events)
       : await readSessionEvents<AcpEvent>(turnsPath);
     const snapshots = await readCheckpoints(sessionDir);
     const meta = await state.sessionStore.readMeta(sessionId);
-    const toolIdEditMap = getToolIdEditMap(meta);
+    const toolIdEditMap = getToolIdEditMap(meta, streamParts);
     const checkpointApproval = getCheckpointApproval(snapshots, meta);
     const restoreReplaySnapshots = hasPersistedTurns
       ? getToolCompleteReplaySnapshots(snapshots, turnEvents)
@@ -1505,11 +1612,12 @@ export function createSessionContentProvider(
 
     logger.appendLine(
       `[session-provider] fetchSessionHistory: read ${events.length} events + ${snapshots.length} snapshots from ${turnsPath} ` +
-      `(acceptedThroughTurn=${checkpointApproval.acceptedThroughTurn}, pending=${checkpointApproval.pendingSnapshots.length}, ` +
+      `(source=${persistedSource}, acceptedThroughTurn=${checkpointApproval.acceptedThroughTurn}, ` +
+      `pending=${checkpointApproval.pendingSnapshots.length}, ` +
       `restoreReplay=${restoreReplaySnapshots.length}, editRecords=${toolIdEditMap.size}, replayPending=${options?.replayPendingChanges !== false})`,
     );
 
-    const requestIdByTurnIndex = getRestoredRequestIdByTurnIndex(meta);
+    const requestIdByTurnIndex = getRestoredRequestIdByTurnIndex(meta, streamParts);
     const makeRequestTurn = (
       prompt: string,
       requestId: RestoredRequestId,

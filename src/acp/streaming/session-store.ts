@@ -1,12 +1,12 @@
 /**
- * SessionStore — filesystem-backed session metadata store.
+ * SessionStore: filesystem-backed session metadata store.
  *
  * Manages the directory layout for persisted ACP session data and provides
- * path helpers used by the event-stream persistence system.
+ * path helpers used by the stream persistence system.
  *
  * Directory layout:
  *   {workspaceRoot}/.acpilot/{backendName}/{sessionId}/
- *     turns.jsonl          — event stream (v2 JSONL)
+ *     turns.jsonl          stream parts/events (JSONL)
  */
 
 import { promises as fs } from 'node:fs';

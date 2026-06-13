@@ -3,7 +3,8 @@ import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
 import { SerializableSessionStream } from '../acp/streaming/session-stream';
 import type { SerializableSessionMeta } from '../acp/serializable/types';
-import { applySessionTitle, isPlaceholderSessionTitle } from './session-title';
+import { useSerializableStreamParts } from '../acp/serializable/features';
+import { applyProvisionalSessionTitle, applySessionTitle, isPlaceholderSessionTitle } from './session-title';
 
 import type { ExtensionState, TurnMapping } from '../types';
 import type { AcpChildSessionInfo, AcpSessionStatus, AcpResult, AcpModel, AcpAgent } from '../acp/types';
@@ -421,15 +422,21 @@ async function resolveSession(
     chatState.titleSource = isPlaceholderSessionTitle(result.data.title) ? 'placeholder' : 'backend';
     chatState.createdAt = result.data.createdAt;
     stream.progress('Session ready');
-    // Write session metadata to filesystem for session list
-    state.sessionStore.writeMeta(result.data.id, {
-      id: result.data.id,
-      title: result.data.title ?? getInitialSessionTitle(vscodeSessionId),
-      titleSource: chatState.titleSource,
-      titleUpdatedAt: new Date().toISOString(),
-      createdAt: result.data.createdAt?.toISOString() ?? new Date().toISOString(),
-      backendName: state.backend.name,
-    }).catch(err => state.outputChannel.appendLine(`[handler] writeMeta failed: ${err}`));
+    // Write session metadata before title lifecycle patches can run. If this is
+    // left fire-and-forget, the initial placeholder write can race with the
+    // first-prompt provisional title update and overwrite it.
+    try {
+      await state.sessionStore.writeMeta(result.data.id, {
+        id: result.data.id,
+        title: result.data.title ?? getInitialSessionTitle(vscodeSessionId),
+        titleSource: chatState.titleSource,
+        titleUpdatedAt: new Date().toISOString(),
+        createdAt: result.data.createdAt?.toISOString() ?? new Date().toISOString(),
+        backendName: state.backend.name,
+      });
+    } catch (err) {
+      state.outputChannel.appendLine(`[handler] writeMeta failed: ${err}`);
+    }
     state.bus.emit('session-list-changed', void 0);
     state.outputChannel.appendLine(
       `[handler] Created new session ${chatState.backendSessionId} for VSCode chat ${vscodeSessionId}`,
@@ -584,33 +591,66 @@ export function createParticipantHandler(
         activeChatState.createdAt = activeChatState.createdAt ?? new Date();
       }
 
-      const shouldStartTitleGeneration =
+      const shouldInitializeTitle =
         !!activeChatState &&
         activeChatState.turnMap.length === 0 &&
-        isPlaceholderSessionTitle(activeChatState.title) &&
+        (isPlaceholderSessionTitle(activeChatState.title) || !!activeChatState.provisionalTitle) &&
         !isPlaceholderSessionTitle(request.prompt);
-      const earlyTitlePromise = shouldStartTitleGeneration
-        ? generateSessionTitleWithVsCodeLm(request.prompt, state)
-          .then(async (title) => {
-            if (!title || isPlaceholderSessionTitle(title)) {
-              return undefined;
-            }
-            return applySessionTitle(state, {
-              backendSessionId,
-              vscodeSessionId,
-                title,
-                directory,
-                updateBackend: false,
-                overwrite: false,
-                source: 'copilot-style',
-              });
-          })
-          .catch((err: unknown) => {
+      if (shouldInitializeTitle) {
+        const provisionalTitle = request.prompt.length > 60
+          ? `${request.prompt.slice(0, 57).trimEnd()}...`
+          : request.prompt;
+        await applyProvisionalSessionTitle(state, {
+          backendSessionId,
+          vscodeSessionId,
+          title: provisionalTitle,
+          directory,
+          updateBackend: true,
+          createdAt: activeChatState.createdAt,
+        });
+        state.outputChannel.appendLine(
+          `[handler] Applied provisional first-prompt title: "${provisionalTitle}"`,
+        );
+      }
+
+      const earlyTitlePromise = shouldInitializeTitle
+        ? (async (): Promise<string | undefined> => {
+          let generatedTitle = await generateSessionTitleWithVsCodeLm(request.prompt, state);
+          if (!generatedTitle || isPlaceholderSessionTitle(generatedTitle)) {
             state.outputChannel.appendLine(
-              `[handler] early title generation failed: ${err instanceof Error ? err.message : String(err)}`,
+              `[handler] VS Code LM title unavailable for ${backendSessionId}; trying backend title generator`,
             );
+            generatedTitle = await generateTitleWithBackendSession(request.prompt, state, backendSessionId, directory);
+            if (generatedTitle) {
+              state.outputChannel.appendLine(
+                `[handler] Backend title generator produced: "${generatedTitle}"`,
+              );
+            }
+          }
+          if (!generatedTitle || isPlaceholderSessionTitle(generatedTitle)) {
             return undefined;
-          })
+          }
+          const applied = await applySessionTitle(state, {
+            backendSessionId,
+            vscodeSessionId,
+            title: generatedTitle,
+            directory,
+            updateBackend: true,
+            overwrite: false,
+            source: 'copilot-style',
+          });
+          if (applied) {
+            state.outputChannel.appendLine(
+              `[handler] Applied generated first-prompt title: "${applied}"`,
+            );
+          }
+          return applied;
+        })().catch((err: unknown) => {
+          state.outputChannel.appendLine(
+            `[handler] early title generation failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return undefined;
+        })
         : Promise.resolve(undefined);
 
       const executeTurnWithBridge = async (): Promise<void> => {
@@ -779,13 +819,21 @@ export function createParticipantHandler(
           `[handler] workspaceRoot="${workspaceRoot}" backend="${state.backend.name}" ` +
           `backendSessionId="${backendSessionId}" requestId="${request.id}" turn=${liveTurnIndex}`,
         );
-          const sessionStream = new SerializableSessionStream(
-            workspaceRoot, state.backend.name, backendSessionId, meta, liveTurnIndex, request.prompt, request.id,
-          );
-          tracker = new ExternalEditTracker(
-            snapshot => sessionStream.onSnapshot(snapshot),
-            () => liveTurnIndex,
-          );
+        const streamPartsEnabled = useSerializableStreamParts();
+        const sessionStream = new SerializableSessionStream(
+          workspaceRoot,
+          state.backend.name,
+          backendSessionId,
+          meta,
+          liveTurnIndex,
+          request.prompt,
+          request.id,
+          streamPartsEnabled,
+        );
+        tracker = new ExternalEditTracker(
+          snapshot => sessionStream.onSnapshot(snapshot),
+          () => liveTurnIndex,
+        );
         await sessionStream.initialize();
         state.outputChannel.appendLine(`[handler] SessionStream initialized`);
         // Write the user prompt as a turn-start (event format)
@@ -908,63 +956,31 @@ export function createParticipantHandler(
           }
         }
 
-        // If still no meaningful title, use the early title generation that
-        // started as soon as the user prompt was sent. Prompt truncation is
-        // only fallback when VS Code LM naming is unavailable.
-        // Skip if chatState already has a non-placeholder title (e.g. from a
-        // previous turn or manual rename).
+        void earlyTitlePromise;
+
+        // Turn-end naming is only reconciliation. The first-prompt provisional
+        // title and async generated title are both applied near session start.
         const existingChatTitle = chatState?.title;
         const hasExistingGoodTitle = existingChatTitle
           && !chatState?.provisionalTitle
           && !isPlaceholderSessionTitle(existingChatTitle);
-        const shouldDeriveTitle = (!resolvedTitle || isPlaceholderSessionTitle(resolvedTitle))
-          && wasFirstTurn
-          && !isPlaceholderSessionTitle(request.prompt)
+        const shouldApplyReconciledTitle = !!resolvedTitle
+          && !isPlaceholderSessionTitle(resolvedTitle)
           && !hasExistingGoodTitle;
-        let earlyTitleApplied: string | undefined;
-        let generatedTitle: string | undefined;
-        if (shouldDeriveTitle) {
-          earlyTitleApplied = await earlyTitlePromise;
-          generatedTitle = earlyTitleApplied;
-
-          if (!generatedTitle) {
-            state.outputChannel.appendLine(
-              `[handler] VS Code LM title unavailable for ${backendSessionId}; trying backend title generator`,
-            );
-            generatedTitle = await generateTitleWithBackendSession(request.prompt, state, backendSessionId, directory);
-            if (generatedTitle) {
-              state.outputChannel.appendLine(
-                `[handler] Backend title generator produced: "${generatedTitle}"`,
-              );
-            }
-          }
-
-          const derived = generatedTitle ?? (request.prompt.length > 60
-            ? `${request.prompt.slice(0, 57).trimEnd()}...`
-            : request.prompt);
-          if (!generatedTitle) {
-            state.outputChannel.appendLine(
-              `[handler] Title generators unavailable; falling back to prompt-derived title: "${derived}"`,
-            );
-          }
-          if (derived && !isPlaceholderSessionTitle(derived)) {
-            resolvedTitle = derived;
-          }
-        }
 
         // Persist resolved title across backend/sessionMap/SessionStore.
-        if (resolvedTitle && !isPlaceholderSessionTitle(resolvedTitle)) {
+        if (shouldApplyReconciledTitle) {
           await applySessionTitle(state, {
             backendSessionId,
             vscodeSessionId,
             title: resolvedTitle,
             directory,
-            updateBackend: shouldDeriveTitle,
+            updateBackend: false,
             overwrite: false,
-            source: generatedTitle ? 'copilot-style' : (shouldDeriveTitle ? 'history' : 'backend'),
+            source: 'backend',
           });
           state.outputChannel.appendLine(
-            `[handler] Applied session title (${generatedTitle ? 'copilot-style' : (shouldDeriveTitle ? 'history' : 'backend')}): "${resolvedTitle}"`,
+            `[handler] Applied reconciled session title (backend): "${resolvedTitle}"`,
           );
         }
 

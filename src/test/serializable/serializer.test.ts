@@ -19,12 +19,15 @@ import {
   writeTurnStart,
   writeTurnEnd,
   writeEvent,
+  writeStreamPart,
   writeSnapshotLine,
   readSessionEvents,
   readSessionTurnEvents,
+  readSessionStreamParts,
+  readSessionTurnStreamParts,
   readSessionSnapshots,
 } from '../../acp/serializable/serializer';
-import type { FileSnapshotRecord } from '../../acp/serializable/types';
+import type { FileSnapshotRecord, SerializableStreamPart } from '../../acp/serializable/types';
 
 // ===========================================================================
 // Helpers
@@ -329,6 +332,55 @@ describe('turn envelope serialization', () => {
     expect(turns[1].turnIndex).toBe(1);
     expect((turns[1].start as any).prompt).toBe('second');
     expect(turns[1].events).toHaveLength(1);
+  });
+
+  it('groups stream parts by persisted turn-start and part metadata', async () => {
+    const dir = await getTmpDir();
+    const fp = testFile('turn-stream-parts.jsonl');
+    const part0: SerializableStreamPart = {
+      kind: 'rawAcpEvent',
+      version: 1,
+      id: 'ssp-0-0',
+      payload: { event: { type: 'part.updated' } },
+      meta: {
+        turnIndex: 0,
+        requestId: 'req-0',
+        sequence: 0,
+        createdAt: '2026-06-13T00:00:00.000Z',
+        source: 'acp-event',
+        sourceType: 'part.updated',
+      },
+    };
+    const part1: SerializableStreamPart = {
+      kind: 'rawAcpEvent',
+      version: 1,
+      id: 'ssp-1-0',
+      payload: { event: { type: 'session.idle' } },
+      meta: {
+        turnIndex: 1,
+        requestId: 'req-1',
+        sequence: 0,
+        createdAt: '2026-06-13T00:00:01.000Z',
+        source: 'acp-event',
+        sourceType: 'session.idle',
+      },
+    };
+
+    await writeVersionHeader(fp);
+    await writeTurnStart(fp, { turnIndex: 0, prompt: 'first' });
+    await writeStreamPart(fp, part0);
+    await writeTurnEnd(fp, { turnIndex: 0 });
+    await writeTurnStart(fp, { turnIndex: 1, prompt: 'second' });
+    await writeStreamPart(fp, part1);
+    await writeTurnEnd(fp, { turnIndex: 1 });
+
+    const allParts = await readSessionStreamParts(fp);
+    expect(allParts).toEqual([part0, part1]);
+
+    const turns = await readSessionTurnStreamParts(fp);
+    expect(turns).toHaveLength(2);
+    expect(turns[0].parts).toEqual([part0]);
+    expect(turns[1].parts).toEqual([part1]);
   });
 });
 

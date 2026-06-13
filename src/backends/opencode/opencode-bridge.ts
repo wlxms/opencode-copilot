@@ -331,12 +331,14 @@ export class OpenCodeBridge implements AcpBridge {
           // Handle permission.asked as sync barrier (async, blocks loop until baseline captured + auto-reply)
           if (event.type === 'permission.asked') {
             await this.handlePermissionAsked(event, stream);
+            this.persistEvent(event);
             this.logTag('timing', `permission.asked took ${Date.now() - tEnter}ms`);
             continue;
           }
           // Handle question.asked as sync barrier (async, blocks loop until user answers)
           if (event.type === 'question.asked') {
             await this.handleQuestionAsked(event, stream);
+            this.persistEvent(event);
             this.logTag('timing', `question.asked took ${Date.now() - tEnter}ms`);
             this.log('[lifecycle] question.asked completed, continuing bridge loop to wait for next event');
             continue;
@@ -397,6 +399,14 @@ export class OpenCodeBridge implements AcpBridge {
   ): Promise<boolean> {
     this.setStream(stream);
     return this.run(events.stream, token);
+  }
+
+  private persistEvent(event: AcpEvent): void {
+    if (this.callbacks) {
+      this.callbacks.onEvent(event);
+    } else {
+      console.log(`[OpenCodeBridge] no callbacks set - event ${event.type} not persisted`);
+    }
   }
 
   // -------------------------------------------------------------------

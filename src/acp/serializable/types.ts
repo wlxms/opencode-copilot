@@ -46,6 +46,164 @@ export interface SerializableRequestDetails {
 }
 
 // ===========================================================================
+// Serializable stream parts (v3 concept model)
+// ===========================================================================
+
+export interface SerializableStreamPartMeta {
+  /** 0-based user turn that owns this stream part. */
+  turnIndex: number;
+  /** Stable VS Code request id when available; turn-index fallback otherwise. */
+  requestId: string;
+  /** Monotonic sequence within the turn. */
+  sequence: number;
+  /** ISO-8601 creation timestamp. */
+  createdAt: string;
+  /** Where this part came from. */
+  source: 'acp-event' | 'synthetic' | 'restore' | 'unknown';
+  /** Backend event type or other source discriminator. */
+  sourceType?: string;
+  /** Backend part id, when the source has one. */
+  sourcePartId?: string;
+  /** Backend tool call id, when this part belongs to a tool. */
+  toolCallId?: string;
+  /** VS Code edit/undo stop id, when this part belongs to an external edit. */
+  editId?: string;
+  /** File URI associated with this part, when any. */
+  uri?: string;
+}
+
+export type SerializableStreamPartKind =
+  | 'userPrompt'
+  | 'assistantText'
+  | 'assistantTextDelta'
+  | 'reasoning'
+  | 'reasoningDelta'
+  | 'toolInvocation'
+  | 'sessionLifecycle'
+  | 'sessionDiff'
+  | 'interactionRequest'
+  | 'interactionResponse'
+  | 'externalEdit'
+  | 'externalEditMetadata'
+  | 'rawAcpEvent';
+
+export interface SerializableStreamPart<
+  TKind extends SerializableStreamPartKind | string = string,
+  TPayload = unknown,
+> {
+  kind: TKind;
+  version: number;
+  id: string;
+  payload: TPayload;
+  meta: SerializableStreamPartMeta;
+}
+
+export interface RawAcpEventStreamPartPayload<TEvent = unknown> {
+  event: TEvent;
+}
+
+export type RawAcpEventStreamPart<TEvent = unknown> = SerializableStreamPart<
+  'rawAcpEvent',
+  RawAcpEventStreamPartPayload<TEvent>
+>;
+
+export interface UserPromptStreamPartPayload {
+  text: string;
+  partId?: string;
+  messageId?: string;
+}
+
+export interface AssistantTextStreamPartPayload {
+  partId: string;
+  text: string;
+  messageId?: string;
+  synthetic?: boolean;
+}
+
+export interface AssistantTextDeltaStreamPartPayload {
+  partId: string;
+  delta: string;
+  field?: string;
+}
+
+export interface ReasoningStreamPartPayload {
+  partId: string;
+  text: string;
+  messageId?: string;
+}
+
+export interface ReasoningDeltaStreamPartPayload {
+  partId: string;
+  delta: string;
+  field?: string;
+}
+
+export interface ToolInvocationStreamPartPayload {
+  partId: string;
+  toolName: string;
+  callId?: string;
+  state: SerializableToolPart['state'];
+  messageId?: string;
+  sessionId?: string;
+}
+
+export interface SessionLifecycleStreamPartPayload {
+  eventType: 'session.created' | 'session.updated' | 'session.deleted' | 'session.error' | 'session.idle' | 'session.status' | 'server.connected' | 'server.heartbeat';
+  sessionId?: string;
+  title?: string;
+  error?: string;
+  status?: unknown;
+}
+
+export interface SessionDiffStreamPartPayload {
+  sessionId: string;
+  diffs: unknown[];
+}
+
+export interface InteractionRequestStreamPartPayload {
+  interactionType: 'permission' | 'question';
+  permissionId?: string;
+  questionId?: string;
+  sessionId?: string;
+  permission?: string;
+  patterns?: string[];
+  metadata?: Record<string, unknown>;
+  always?: string[];
+  questions?: unknown[];
+  tool?: { messageId?: string; callId?: string };
+}
+
+export interface InteractionResponseStreamPartPayload {
+  interactionType: 'permission' | 'question';
+  eventType: 'permission.replied' | 'question.replied' | 'question.rejected';
+  sessionId?: string;
+  permissionId?: string;
+  requestId?: string;
+  response?: string;
+}
+
+export interface ExternalEditStreamPartPayload {
+  toolCallId: string;
+  editId: string;
+  uri?: string;
+}
+
+export type KnownSerializableStreamPart =
+  | SerializableStreamPart<'userPrompt', UserPromptStreamPartPayload>
+  | SerializableStreamPart<'assistantText', AssistantTextStreamPartPayload>
+  | SerializableStreamPart<'assistantTextDelta', AssistantTextDeltaStreamPartPayload>
+  | SerializableStreamPart<'reasoning', ReasoningStreamPartPayload>
+  | SerializableStreamPart<'reasoningDelta', ReasoningDeltaStreamPartPayload>
+  | SerializableStreamPart<'toolInvocation', ToolInvocationStreamPartPayload>
+  | SerializableStreamPart<'sessionLifecycle', SessionLifecycleStreamPartPayload>
+  | SerializableStreamPart<'sessionDiff', SessionDiffStreamPartPayload>
+  | SerializableStreamPart<'interactionRequest', InteractionRequestStreamPartPayload>
+  | SerializableStreamPart<'interactionResponse', InteractionResponseStreamPartPayload>
+  | SerializableStreamPart<'externalEdit', ExternalEditStreamPartPayload>
+  | SerializableStreamPart<'externalEditMetadata', ExternalEditStreamPartPayload>
+  | RawAcpEventStreamPart;
+
+// ===========================================================================
 // Part variants (v1)
 // ===========================================================================
 
@@ -101,7 +259,8 @@ export type SerializablePart =
 
 export type SerializableLineType =
   | 'version' | 'meta' | 'turn-start' | 'part' | 'turn-end'   // v1
-  | 'event' | 'snapshot';                                       // v2
+  | 'event' | 'snapshot'                                        // v2
+  | 'stream-part';                                              // v3 concept model
 
 export interface SerializableTurnStart {
   turnIndex: number;

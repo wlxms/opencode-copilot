@@ -248,7 +248,7 @@ describe('SerializableSessionStream', () => {
     const parsed = await readParsedLines(filePath!);
     expect(parsed).toEqual(expect.arrayContaining([
       expect.objectContaining({ t: 'turn-start', d: expect.objectContaining({ turnIndex: 3, prompt: 'Fix bug' }) }),
-      expect.objectContaining({ t: 'event' }),
+      expect.objectContaining({ t: 'stream-part' }),
       expect.objectContaining({ t: 'turn-end', d: expect.objectContaining({ turnIndex: 3 }) }),
     ]));
   });
@@ -275,13 +275,13 @@ describe('SerializableSessionStream', () => {
 
     const parsed = await readParsedLines(second.getFilePath()!);
     const turnStarts = parsed.filter((line: any) => line.t === 'turn-start');
-    const events = parsed.filter((line: any) => line.t === 'event');
+    const events = parsed.filter((line: any) => line.t === 'stream-part');
     expect(turnStarts.map((line: any) => line.d.prompt)).toEqual(['First', 'Second']);
-    expect(events.map((line: any) => line.d.part.id)).toEqual(['p1', 'p2']);
+    expect(events.map((line: any) => line.d.payload.partId)).toEqual(['p1', 'p2']);
   });
   // 鈹€鈹€ onEvent 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
-  it('writes event line to turns.jsonl', async () => {
+  it('writes stream-part line to turns.jsonl by default', async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-ev-'));
     const stream = makeStream(tmpDir);
     await stream.initialize();
@@ -301,7 +301,7 @@ describe('SerializableSessionStream', () => {
     );
     const lines = await readParsedLines(filePath);
 
-    // Should have version, meta, turn-start, event
+    // Should have version, meta, turn-start, stream-part
     expect(lines).toHaveLength(4);
 
     // First line is version
@@ -312,11 +312,51 @@ describe('SerializableSessionStream', () => {
     expect(lines[1]).toHaveProperty('v', 2);
     expect((lines[1] as any).t).toBe('meta');
 
-    // Third line is the event
+    // Third line is the turn start, fourth line is the stream part
     expect(lines[2]).toHaveProperty('v', 2);
     expect((lines[2] as any).t).toBe('turn-start');
-    expect((lines[3] as any).t).toBe('event');
-    expect((lines[3] as any).d).toEqual(event);
+    expect((lines[3] as any).t).toBe('stream-part');
+    expect((lines[3] as any).d).toEqual(expect.objectContaining({
+      kind: 'assistantText',
+      payload: {
+        partId: 'p1',
+        text: 'hello',
+      },
+      meta: expect.objectContaining({
+        turnIndex: 0,
+        requestId: 'turn-0',
+        sequence: 0,
+        source: 'acp-event',
+        sourceType: 'part.updated',
+      }),
+    }));
+  });
+
+  it('writes legacy event lines when stream parts are disabled', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-ev-legacy-'));
+    const meta: SerializableSessionMeta = {
+      id: 'test-session',
+      title: 'Test Session',
+      createdAt: new Date().toISOString(),
+    };
+    const stream = new SerializableSessionStream(
+      tmpDir,
+      'test-backend',
+      'test-session',
+      meta,
+      0,
+      'Test prompt',
+      'turn-0',
+      false,
+    );
+    await stream.initialize();
+
+    const event = makeEvent({ type: 'part.updated', part: { id: 'p1', type: 'text', text: 'hello' } });
+    stream.onEvent(event);
+    await stream.flush();
+
+    const lines = await readParsedLines(stream.getFilePath()!);
+    expect(lines[3]).toEqual(expect.objectContaining({ t: 'event', d: event }));
   });
 
   it('writes multiple events in order', async () => {
@@ -340,10 +380,12 @@ describe('SerializableSessionStream', () => {
     );
     const lines = await readParsedLines(filePath);
 
-    // version + meta + turn-start + 2 events = 5
+    // version + meta + turn-start + 2 stream parts = 5
     expect(lines).toHaveLength(5);
-    expect((lines[3] as any).d).toEqual(event1);
-    expect((lines[4] as any).d).toEqual(event2);
+    expect((lines[3] as any).d.kind).toBe('assistantText');
+    expect((lines[3] as any).d.payload).toEqual(expect.objectContaining({ partId: 'p1', text: 'first' }));
+    expect((lines[4] as any).d.kind).toBe('sessionLifecycle');
+    expect((lines[4] as any).d.payload).toEqual(expect.objectContaining({ eventType: 'session.idle' }));
   });
 
   // 鈹€鈹€ onSnapshot 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -445,7 +487,7 @@ describe('SerializableSessionStream', () => {
     const exists = await fs.stat(turnsPath).then(() => true).catch(() => false);
     expect(exists).toBe(true);
     const lines = await readParsedLines(turnsPath);
-    expect(lines.some((line: any) => line.t === 'event')).toBe(false);
+    expect(lines.some((line: any) => line.t === 'event' || line.t === 'stream-part')).toBe(false);
 
     consoleSpy.mockRestore();
   });
@@ -472,10 +514,10 @@ describe('SerializableSessionStream', () => {
     );
     const lines = await readParsedLines(turnsPath);
 
-    // version + meta + turn-start + 1 event + turn-end = 5 (the after-close event should not appear)
+    // version + meta + turn-start + 1 stream-part + turn-end = 5 (the after-close event should not appear)
     expect(lines).toHaveLength(5);
-    expect((lines[3] as any).d).toHaveProperty('part');
-    expect((lines[3] as any).d.part).toHaveProperty('id', 'p1');
+    expect((lines[3] as any).t).toBe('stream-part');
+    expect((lines[3] as any).d.payload).toHaveProperty('partId', 'p1');
   });
 
   it('stops writing snapshots after close', async () => {

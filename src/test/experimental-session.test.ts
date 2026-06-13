@@ -9,12 +9,13 @@ import type { AcpAgent } from '../acp/types';
 import type { AcpBackend } from '../acp/backend';
 import type { ExtensionState } from '../types';
 import { AppEventBus } from '../acp/app-event-bus';
-import { readSessionEvents, readSessionTurnEvents } from '../acp/serializable/serializer';
+import { readSessionEvents, readSessionTurnEvents, readSessionTurnStreamParts } from '../acp/serializable/serializer';
 import { readCheckpoints } from '../acp/checkpoint/checkpoint-store';
 
 vi.mock('../acp/serializable/serializer', () => ({
   readSessionEvents: vi.fn(),
   readSessionTurnEvents: vi.fn(),
+  readSessionTurnStreamParts: vi.fn(),
 }));
 vi.mock('../acp/checkpoint/checkpoint-store', () => ({
   readCheckpoints: vi.fn(),
@@ -78,6 +79,7 @@ describe('createSessionContentProvider', () => {
 
     vi.mocked(readSessionEvents).mockResolvedValue([]);
     vi.mocked(readSessionTurnEvents).mockResolvedValue([]);
+    vi.mocked(readSessionTurnStreamParts).mockResolvedValue([]);
     vi.mocked(readCheckpoints).mockResolvedValue([]);
 
     state = {
@@ -454,6 +456,44 @@ describe('createSessionContentProvider', () => {
     );
   });
 
+  it('falls back to legacy turn events when stream-part turns contain no parts', async () => {
+    state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
+    vi.mocked(readSessionTurnStreamParts).mockResolvedValue([
+      {
+        turnIndex: 0,
+        start: { turnIndex: 0, prompt: 'Legacy prompt', timestamp: '2026-06-13T00:00:00.000Z' },
+        parts: [],
+        end: { turnIndex: 0, timestamp: '2026-06-13T00:00:01.000Z' },
+      },
+    ]);
+    vi.mocked(readSessionTurnEvents).mockResolvedValue([
+      {
+        turnIndex: 0,
+        start: { turnIndex: 0, prompt: 'Legacy prompt', timestamp: '2026-06-13T00:00:00.000Z' },
+        events: [
+          makeTextEvent('Legacy prompt') as any,
+          { type: 'session.idle', sessionId: 'ses_restore' } as any,
+        ],
+        end: { turnIndex: 0, timestamp: '2026-06-13T00:00:01.000Z' },
+      },
+    ]);
+
+    const { provider } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    const session = await provider.provideChatSessionContent(
+      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+      { inputState: {} as vscode.ChatSessionInputState },
+    );
+
+    expect(readSessionTurnEvents).toHaveBeenCalled();
+    const requestTurns = session.history.filter((turn): turn is vscode.ChatRequestTurn => 'prompt' in (turn as any));
+    expect(requestTurns.map(turn => turn.prompt)).toEqual(['Legacy prompt']);
+  });
+
   it('restores multiple persisted turns instead of collapsing them into one response', async () => {
     state.backend.sessions.list = vi.fn(async () => ({ data: [] }));
     (state.backend.createBridge as any).mockImplementation(() => {
@@ -702,6 +742,135 @@ describe('createSessionContentProvider', () => {
     expectRestoredTextEditParts(responses, 'persisted-undo-stop-1');
     const requestTurn = session.history.find((turn): turn is vscode.ChatRequestTurn => 'prompt' in (turn as any));
     expect((requestTurn as any)?.id).toBe('request-live-restore-0');
+    expect(session.activeResponseCallback).toBeUndefined();
+  });
+
+  it('restores edit bubble ids and request ids from stream part metadata', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-restore-ssp-edit-record-'));
+    const file = path.join(dir, 'ssp-recorded.txt');
+    fs.writeFileSync(file, 'after\n', 'utf-8');
+    const checkpointUri = vscode.Uri.file(file).toString();
+    const callId = 'tool-ssp-edit-record-1';
+    (state.backend.createBridge as any).mockImplementation(() => {
+      let stream: { push(part: unknown): void } | undefined;
+      return {
+        setStream: vi.fn((next: unknown) => { stream = next as { push(part: unknown): void }; }),
+        setCallbacks: vi.fn(),
+        setTracker: vi.fn(),
+        processEvent: vi.fn((event: any) => {
+          if (event.type === 'part.updated' && event.part?.type === 'tool') {
+            const ToolPart = (vscode as any).ChatToolInvocationPart;
+            stream?.push(new ToolPart(event.part.toolName, event.part.callId));
+          }
+        }),
+        run: vi.fn().mockResolvedValue(true),
+        getUserMessageId: vi.fn().mockReturnValue(null),
+        getSessionTitle: vi.fn().mockReturnValue(null),
+        getHadSubagentTasks: vi.fn().mockReturnValue(false),
+      };
+    });
+
+    vi.mocked(readSessionTurnStreamParts).mockResolvedValue([
+      {
+        turnIndex: 0,
+        start: { turnIndex: 0, prompt: 'Edit with stream parts', timestamp: '2026-06-13T00:00:00.000Z' },
+        parts: [
+          {
+            kind: 'userPrompt',
+            version: 1,
+            id: 'ssp-0-0',
+            payload: { text: 'Edit with stream parts', partId: 'user-part' },
+            meta: {
+              turnIndex: 0,
+              requestId: 'request-from-ssp-0',
+              sequence: 0,
+              createdAt: '2026-06-13T00:00:00.000Z',
+              source: 'acp-event',
+              sourceType: 'part.updated',
+              sourcePartId: 'user-part',
+            },
+          },
+          {
+            kind: 'toolInvocation',
+            version: 1,
+            id: 'ssp-0-1',
+            payload: {
+              partId: 'tool-part-1',
+              toolName: 'edit',
+              callId,
+              state: { status: 'completed', input: { filePath: file }, output: 'ok', title: 'ssp-recorded.txt' },
+            },
+            meta: {
+              turnIndex: 0,
+              requestId: 'request-from-ssp-0',
+              sequence: 1,
+              createdAt: '2026-06-13T00:00:01.000Z',
+              source: 'acp-event',
+              sourceType: 'part.updated',
+              sourcePartId: 'tool-part-1',
+              toolCallId: callId,
+            },
+          },
+          {
+            kind: 'externalEdit',
+            version: 1,
+            id: 'ssp-0-2',
+            payload: { toolCallId: callId, editId: 'ssp-undo-stop-1' },
+            meta: {
+              turnIndex: 0,
+              requestId: 'request-from-ssp-0',
+              sequence: 2,
+              createdAt: '2026-06-13T00:00:02.000Z',
+              source: 'synthetic',
+              sourceType: 'externalEdit',
+              toolCallId: callId,
+              editId: 'ssp-undo-stop-1',
+            },
+          },
+        ] as any,
+        end: { turnIndex: 0, timestamp: '2026-06-13T00:00:03.000Z' },
+      },
+    ]);
+    vi.mocked(readSessionTurnEvents).mockResolvedValue([]);
+    vi.mocked(readSessionEvents).mockResolvedValue([]);
+    vi.mocked(readCheckpoints).mockResolvedValue([
+      {
+        uri: checkpointUri,
+        content: 'before\n',
+        phase: 'before',
+        turnIndex: 0,
+        editIndex: 1,
+        toolCallId: callId,
+        timestamp: '2026-06-13T00:00:01.500Z',
+      },
+      {
+        uri: checkpointUri,
+        content: 'after\n',
+        phase: 'after',
+        turnIndex: 0,
+        editIndex: 1,
+        toolCallId: callId,
+        timestamp: '2026-06-13T00:00:02.000Z',
+      },
+    ]);
+    vi.mocked(state.sessionStore.readMeta).mockResolvedValue({ id: 'ses_restore' });
+    vi.mocked(readSessionTurnEvents).mockClear();
+
+    const { provider } = createSessionContentProvider(
+      state,
+      { subscriptions: [] } as unknown as vscode.ExtensionContext,
+    );
+
+    const session = await provider.provideChatSessionContent(
+      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+      { inputState: {} as vscode.ChatSessionInputState },
+    );
+
+    expect(readSessionTurnEvents).not.toHaveBeenCalled();
+    expectRestoredTextEditParts(getFirstResponseParts(session), 'ssp-undo-stop-1');
+    const requestTurn = session.history.find((turn): turn is vscode.ChatRequestTurn => 'prompt' in (turn as any));
+    expect((requestTurn as any)?.id).toBe('request-from-ssp-0');
     expect(session.activeResponseCallback).toBeUndefined();
   });
 

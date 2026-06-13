@@ -1,15 +1,15 @@
 /**
- * SerializableSessionStream — persists ACP events and file snapshots to JSONL.
+ * SerializableSessionStream persists stream parts and file snapshots to JSONL.
  *
- * This replaces the v1 approach of serialising `SerializablePart` arrays with
- * a v2 approach that writes raw `AcpEvent` lines and delegates snapshot storage
- * to the checkpoint store. Turn-start/turn-end markers are removed — events are
- * the fundamental persistence unit.
+ * The default path writes SerializableStreamPart records, the extension's
+ * stable concept model for chat, tool, interaction, and edit metadata. A legacy
+ * raw ACP event mode remains available behind the feature flag for fallback.
+ * File snapshots continue to be delegated to the checkpoint store.
  *
  * Layout per session:
  *   {workspaceRoot}/.acpilot/{backendName}/{sessionId}/
- *     turns.jsonl          — event stream + inline snapshots (v2 JSONL)
- *     _checkpoints.jsonl   — dedicated checkpoint-store file
+ *     turns.jsonl          stream parts/events + inline snapshots
+ *     _checkpoints.jsonl   dedicated checkpoint-store file
  */
 
 import path from 'node:path';
@@ -21,11 +21,18 @@ import {
   writeTurnStart,
   writeTurnEnd,
   writeEvent,
+  writeStreamPart,
   writeSnapshotLine,
 } from '../serializable/serializer';
 import { writeSnapshot } from '../checkpoint/checkpoint-store';
+import { SerializableStreamPartEventHandler } from '../serializable/stream-parts';
 import type { StreamingBridgeCallbacks } from '../../acp/backend';
-import type { SerializableSessionMeta, FileSnapshotRecord, SerializableRequestDetails } from '../serializable/types';
+import type {
+  SerializableSessionMeta,
+  FileSnapshotRecord,
+  SerializableRequestDetails,
+  SerializableStreamPart,
+} from '../serializable/types';
 import type { AcpEvent } from '../types';
 
 const LOG_PREFIX = '[SerializableSessionStream]';
@@ -38,6 +45,7 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
   private writeQueue: Promise<void> = Promise.resolve();
   private requestDetails: SerializableRequestDetails[] = [];
   private persistedMeta: SerializableSessionMeta;
+  private readonly streamPartHandler: SerializableStreamPartEventHandler;
 
   constructor(
     private readonly workspaceRoot: string,
@@ -47,8 +55,14 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
     private readonly turnIndex = 0,
     private readonly prompt?: string,
     private readonly vscodeRequestId = `turn-${turnIndex}`,
+    private readonly useStreamParts = true,
   ) {
     this.persistedMeta = meta;
+    this.streamPartHandler = new SerializableStreamPartEventHandler({
+      turnIndex,
+      requestId: vscodeRequestId,
+      prompt,
+    });
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────
@@ -113,16 +127,20 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
 
   // ── Callbacks ─────────────────────────────────────────────────────────
 
-  /**
-   * Persist an ACP event as a JSONL line.
-   * Replaces the v1 `onPartComplete` — entire events are written, not parts.
-   */
+  /** Persist an ACP event as SSP records, or as a legacy raw event when disabled. */
   onEvent(event: AcpEvent): void {
     if (!this.isActive) return;
     this.enqueueWrite(async () => {
       if (!this.filePath) return;
       await this.ensureHeader();
-      await writeEvent(this.filePath, event);
+      if (this.useStreamParts) {
+        const parts = this.streamPartHandler.serializeEvent(event);
+        for (const part of parts) {
+          await writeStreamPart(this.filePath, part);
+        }
+      } else {
+        await writeEvent(this.filePath, event);
+      }
     });
   }
 
@@ -184,6 +202,9 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
         }, null, 2),
         'utf-8',
       );
+      if (this.useStreamParts) {
+        await writeStreamPart(this.filePath, this.createExternalEditPart(toolCallId, undoStopId));
+      }
     });
   }
 
@@ -229,6 +250,13 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
   /** Wait for all pending writes to complete */
   async flush(): Promise<void> {
     await this.writeQueue;
+  }
+
+  private createExternalEditPart(
+    toolCallId: string,
+    editId: string,
+  ): SerializableStreamPart<'externalEdit', { toolCallId: string; editId: string }> {
+    return this.streamPartHandler.createExternalEditPart(toolCallId, editId);
   }
 }
 

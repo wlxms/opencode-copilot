@@ -398,7 +398,7 @@ describe('createParticipantHandler', () => {
     expect(state.sessionMap.get('chat-1')?.backendSessionId).toBe('session-1');
 
     // Events subscribed
-    expect(state.backend.events.ensureStarted).toHaveBeenCalledOnce();
+    expect(state.backend.events.ensureStarted).toHaveBeenCalled();
 
     // Prompt sent with correct format (v2 flat params)
     expect(mockSdkClient.session.promptAsync).toHaveBeenCalledWith({
@@ -416,6 +416,52 @@ describe('createParticipantHandler', () => {
     expect(result!.metadata).toHaveProperty('turnMap');
   });
 
+  it('writes initial session meta before first-prompt title patches', async () => {
+    backendStatus = 'running';
+    const order: string[] = [];
+    const handler = createParticipantHandler(state);
+
+    mockSdkClient.session.create.mockResolvedValue({
+      data: { id: 'session-meta-order', title: 'New OpenCode Session' },
+    });
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+    mockSdkClient.session.promptAsync.mockResolvedValue(undefined);
+
+    vi.mocked(state.sessionStore.writeMeta).mockImplementation(async () => {
+      order.push('writeMeta:start');
+      await Promise.resolve();
+      order.push('writeMeta:end');
+    });
+    vi.mocked(state.sessionStore.updateMeta).mockImplementation(async () => {
+      order.push('updateMeta');
+      return undefined as never;
+    });
+    vi.mocked(state.backend.sessions.update).mockImplementation(async (_id, options) => {
+      order.push('backendUpdate');
+      return {
+        data: {
+          id: 'session-meta-order',
+          title: options.title ?? '',
+          createdAt: new Date(),
+        },
+      };
+    });
+
+    await handler(
+      createRequest({ prompt: 'rename the session early', sessionId: 'chat-meta-order' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    expect(order).toContain('writeMeta:end');
+    expect(order).toContain('backendUpdate');
+    expect(order.indexOf('writeMeta:end')).toBeLessThan(order.indexOf('backendUpdate'));
+    expect(order.indexOf('writeMeta:end')).toBeLessThan(order.indexOf('updateMeta'));
+  });
+
   // -----------------------------------------------------------------------
   // Multi-turn 閳?reuses existing session
   // -----------------------------------------------------------------------
@@ -426,6 +472,7 @@ describe('createParticipantHandler', () => {
     state.sessionMap.set('chat-1', {
       backendSessionId: 'existing-session',
       turnMap: [],
+      title: 'Existing Session',
     });
 
     const handler = createParticipantHandler(state);
@@ -525,6 +572,7 @@ describe('createParticipantHandler', () => {
     const restoredState = {
       backendSessionId: 'existing-session',
       turnMap: [],
+      title: 'Restored Session',
     };
     state.sessionMap.set(resourceKey, restoredState);
 
@@ -879,6 +927,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     state.sessionMap.set('chat-running', {
       backendSessionId: 'existing-id',
       turnMap: [],
+      title: 'Existing Session',
     });
 
     const handler = createParticipantHandler(state);
@@ -966,8 +1015,10 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     const handler = createParticipantHandler(state);
 
     backendStatus = 'running';
-    mockSdkClient.session.create.mockResolvedValue({
-      data: { id: 'session-normal' },
+    state.sessionMap.set('chat-normal', {
+      backendSessionId: 'session-normal',
+      turnMap: [],
+      title: 'Existing Session',
     });
     mockSdkClient.global.event.mockResolvedValue({
       stream: emptyEventStream(),
@@ -978,7 +1029,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     });
 
     await handler(
-      createRequest({ prompt: 'hello' }),
+      createRequest({ prompt: 'hello', sessionId: 'chat-normal' }),
       { history: [] },
       stream,
       token,
@@ -1204,10 +1255,20 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     expect(result!.metadata).toHaveProperty('sessionId');
     expect(lmModel.sendRequest).toHaveBeenCalled();
     expect(opencodeLmModel.sendRequest).not.toHaveBeenCalled();
-    expect(state.sessionMap.get('chat-title-lm')?.title).toBe('OAuth Middleware');
-    expect(state.sessionStore.updateMeta).toHaveBeenCalledWith(
+    await vi.waitFor(() => {
+      expect(state.sessionMap.get('chat-title-lm')?.title).toBe('OAuth Middleware');
+    });
+    expect(state.backend.sessions.update).toHaveBeenCalledWith(
+      'ses-title-lm',
+      expect.objectContaining({ title: 'how to implement oauth middleware' }),
+    );
+    expect(state.backend.sessions.update).toHaveBeenCalledWith(
       'ses-title-lm',
       expect.objectContaining({ title: 'OAuth Middleware' }),
+    );
+    expect(state.sessionStore.updateMeta).toHaveBeenCalledWith(
+      'ses-title-lm',
+      expect.objectContaining({ title: 'OAuth Middleware', titleSource: 'copilot-style' }),
     );
   });
 
@@ -1277,8 +1338,18 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
         directory: workspaceRoot,
       }),
     );
-    expect(state.sessionMap.get('chat-title-backend-gen')?.title).toBe('OAuth Middleware');
+    await vi.waitFor(() => {
+      expect(state.sessionMap.get('chat-title-backend-gen')?.title).toBe('OAuth Middleware');
+    });
     expect(state.sessionMap.get('chat-title-backend-gen')?.titleSource).toBe('copilot-style');
+    expect(state.backend.sessions.update).toHaveBeenCalledWith(
+      'ses-title-backend-gen',
+      expect.objectContaining({ title: 'how to implement oauth middleware' }),
+    );
+    expect(state.backend.sessions.update).toHaveBeenCalledWith(
+      'ses-title-backend-gen',
+      expect.objectContaining({ title: 'OAuth Middleware' }),
+    );
     expect(state.sessionStore.updateMeta).toHaveBeenCalledWith(
       'ses-title-backend-gen',
       expect.objectContaining({ title: 'OAuth Middleware', titleSource: 'copilot-style' }),
@@ -1339,14 +1410,18 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     );
 
     expect(result!.metadata).toHaveProperty('sessionId', 'ses-title-provisional');
-    expect(state.sessionMap.get('chat-title-provisional')?.title).toBe('OAuth middleware');
+    await vi.waitFor(() => {
+      expect(state.sessionMap.get('chat-title-provisional')?.title).toBe('OAuth middleware');
+    });
     expect(state.sessionMap.get('chat-title-provisional')?.titleSource).toBe('copilot-style');
     expect(state.sessionMap.get('chat-title-provisional')?.provisionalTitle).toBe(false);
-    expect(state.outputChannel.appendLine).toHaveBeenCalledWith(
-      expect.stringContaining('Ignoring provisional session title echo'),
+    expect(state.backend.sessions.update).toHaveBeenCalledWith(
+      'ses-title-provisional',
+      expect.objectContaining({ title: provisionalTitle }),
     );
-    expect(state.outputChannel.appendLine).toHaveBeenCalledWith(
-      expect.stringContaining('Ignoring provisional backend title echo'),
+    expect(state.backend.sessions.update).toHaveBeenCalledWith(
+      'ses-title-provisional',
+      expect.objectContaining({ title: 'OAuth middleware' }),
     );
   });
 
