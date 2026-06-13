@@ -16,7 +16,7 @@
  * - `stream.beginToolInvocation()` / `updateToolInvocation()`  — streaming tool spinner
  * - `ChatToolInvocationPart`                        — rich expandable tool cards
  * - `ChatResponseMultiDiffPart`                     — file diff display
- * - `ChatResponseExternalEditPart`                  — external edit tracking
+ * - `stream.externalEdit()`                         — external edit tracking
  * - `ChatResponseWorkspaceEditPart`                 — new file creation tracking
  * - `ChatSubagentToolInvocationData`                — subagent expandable card
  *
@@ -88,13 +88,17 @@ export function hasChatResponseMultiDiffPart(): boolean {
 }
 
 /**
- * `true` if `ChatResponseExternalEditPart` is available at runtime.
- * Tracks file edits made outside of VS Code.
+ * `true` if the stream supports `externalEdit()` for tracking edits
+ * made outside of VS Code.
  */
-export function hasChatResponseExternalEditPart(): boolean {
-  return (
-    typeof (vscode as Record<string, unknown>).ChatResponseExternalEditPart === 'function'
-  );
+export function hasExternalEdit(
+  stream: vscode.ChatResponseStream,
+): stream is vscode.ChatResponseStream & {
+  externalEdit(target: vscode.Uri | vscode.Uri[], callback: () => Thenable<unknown>): Thenable<string>;
+} {
+  return typeof (stream as {
+    externalEdit?: unknown;
+  }).externalEdit === 'function';
 }
 
 /**
@@ -125,7 +129,6 @@ export function hasChatSubagentToolInvocationData(): boolean {
 export interface ToolInvocationCapabilities {
   toolInvocationPart: boolean;
   multiDiffPart: boolean;
-  externalEditPart: boolean;
   workspaceEditPart: boolean;
   subagentData: boolean;
 }
@@ -138,7 +141,6 @@ export function getToolInvocationCapabilities(): ToolInvocationCapabilities {
   return {
     toolInvocationPart: hasChatToolInvocationPart(),
     multiDiffPart: hasChatResponseMultiDiffPart(),
-    externalEditPart: hasChatResponseExternalEditPart(),
     workspaceEditPart: hasChatResponseWorkspaceEditPart(),
     subagentData: hasChatSubagentToolInvocationData(),
   };

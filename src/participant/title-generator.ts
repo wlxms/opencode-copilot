@@ -1,17 +1,18 @@
+import * as vscode from 'vscode';
 import type { AcpEvent, AcpPartUpdatedEvent } from '../acp/types';
 import type { ExtensionState } from '../types';
-import { isPlaceholderSessionTitle } from '../surfaces/vscode/experimental-session';
+import { applySessionTitle, isPlaceholderSessionTitle } from './session-title';
 
 // ===========================================================================
 // Title Generation via lightweight LLM
 // ===========================================================================
 
 /**
- * Generate a short, descriptive session title from the first user prompt
- * using a lightweight LLM call.
+ * Generate a short, descriptive session title from the first user prompt.
  *
- * Creates a temporary child session, sends a focused title-generation prompt,
- * captures the plain-text response, cleans up, and returns the title.
+ * Copilot-style path: use VS Code's built-in language model API first so
+ * naming is independent from the active OpenCode backend/model. If no VS Code
+ * model is available, fall back to the older backend child-session strategy.
  *
  * The caller should call `sessions.update()` on the real session with the
  * returned title.
@@ -26,13 +27,117 @@ export async function generateSessionTitle(
   directory: string | undefined,
 ): Promise<string | undefined> {
   const logger = state.outputChannel;
-  let childSessionId: string | undefined;
 
   // Guard against empty or very short prompts
   const normalized = firstPrompt.replace(/\s+/g, ' ').trim();
   if (!normalized || normalized.length < 3) {
     return undefined;
   }
+
+  const vscodeTitle = await generateTitleWithVsCodeLm(normalized, logger);
+  if (vscodeTitle) {
+    logger.appendLine(`[title-generator] VS Code LM generated title: "${vscodeTitle}"`);
+    return vscodeTitle;
+  }
+
+  return generateTitleWithBackendSession(normalized, state, parentSessionId, directory);
+}
+
+export async function generateSessionTitleWithVsCodeLm(
+  firstPrompt: string,
+  state: ExtensionState,
+): Promise<string | undefined> {
+  const normalized = firstPrompt.replace(/\s+/g, ' ').trim();
+  if (!normalized || normalized.length < 3) {
+    return undefined;
+  }
+
+  return generateTitleWithVsCodeLm(normalized, state.outputChannel);
+}
+
+async function generateTitleWithVsCodeLm(
+  normalizedPrompt: string,
+  logger: { appendLine(message: string): void },
+): Promise<string | undefined> {
+  const lm = vscode.lm as unknown as {
+    selectChatModels?: (selector?: vscode.LanguageModelChatSelector) => Thenable<vscode.LanguageModelChat[]>;
+    languageModelAccessInformation?: { canSendRequest(chat: vscode.LanguageModelChat): boolean | undefined };
+  };
+
+  if (typeof lm.selectChatModels !== 'function' || !vscode.LanguageModelChatMessage?.User) {
+    return undefined;
+  }
+
+  try {
+    const allModels = await lm.selectChatModels();
+    const model = pickTitleModel(allModels, lm.languageModelAccessInformation);
+    if (!model) {
+      logger.appendLine('[title-generator] No VS Code LM available for title generation');
+      return undefined;
+    }
+
+    const response = await model.sendRequest(
+      [vscode.LanguageModelChatMessage.User(buildTitlePrompt(normalizedPrompt))],
+      {},
+      undefined,
+    );
+
+    const text = await collectLmText(response.text);
+    const cleaned = cleanGeneratedTitle(text);
+    if (!cleaned) {
+      logger.appendLine(`[title-generator] VS Code LM unusable response: "${text.slice(0, 80)}"`);
+      return undefined;
+    }
+
+    return cleaned;
+  } catch (err) {
+    logger.appendLine(
+      `[title-generator] VS Code LM title generation failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return undefined;
+  }
+}
+
+function pickTitleModel(
+  models: readonly vscode.LanguageModelChat[],
+  access: { canSendRequest(chat: vscode.LanguageModelChat): boolean | undefined } | undefined,
+): vscode.LanguageModelChat | undefined {
+  const allowed = models.filter((model) =>
+    model.vendor === 'copilot' &&
+    access?.canSendRequest(model) !== false,
+  );
+  if (allowed.length === 0) {
+    return undefined;
+  }
+
+  const score = (model: vscode.LanguageModelChat): number => {
+    const haystack = `${model.vendor} ${model.id} ${model.name} ${model.family}`.toLowerCase();
+    let value = 0;
+    value += 100;
+    if (/nano|mini|small|fast|flash|haiku|lite/.test(haystack)) value += 25;
+    if (/gpt-4\.1|gpt-4o|gpt-5/.test(haystack)) value += 10;
+    return value;
+  };
+
+  return [...allowed].sort((a, b) => score(b) - score(a))[0];
+}
+
+async function collectLmText(text: AsyncIterable<string>): Promise<string> {
+  let result = '';
+  for await (const chunk of text) {
+    result += chunk;
+  }
+  return result.trim();
+}
+
+export async function generateTitleWithBackendSession(
+  normalized: string,
+  state: ExtensionState,
+  parentSessionId: string,
+  directory: string | undefined,
+): Promise<string | undefined> {
+  const logger = state.outputChannel;
+  let childSessionId: string | undefined;
 
   try {
     // 1. Create a child session for title generation.
@@ -102,7 +207,7 @@ export async function generateSessionTitle(
         state.backend.events.closeSessionStream(childSessionId);
         await state.backend.sessions.abort(childSessionId, directory);
       } catch {
-        // Best effort — nothing we can do if cleanup fails.
+        // Best effort - nothing we can do if cleanup fails.
       }
     }
   }
@@ -118,26 +223,23 @@ export async function generateSessionTitle(
 export async function retitleSession(
   prompt: string,
   state: ExtensionState,
-  sessionId: string,
+  backendSessionId: string,
   vscodeSessionId: string,
   directory: string | undefined,
 ): Promise<string | undefined> {
   const logger = state.outputChannel;
-  const llmTitle = await generateSessionTitle(prompt, state, sessionId, directory);
+  const llmTitle = await generateSessionTitle(prompt, state, backendSessionId, directory);
   if (llmTitle && !isPlaceholderSessionTitle(llmTitle)) {
-    try {
-      await state.backend.sessions.update(sessionId, { title: llmTitle, directory });
-      const cs = state.sessions.get(vscodeSessionId);
-      if (cs && isPlaceholderSessionTitle(cs.title)) {
-        cs.title = llmTitle;
-      }
-      logger.appendLine(`[title-gen] Refreshing session list after LLM title: "${llmTitle}"`);
-      state.bus.emit('session-list-changed', void 0);
-      logger.appendLine(`[title-gen] Title pushed via sessions.update(): "${llmTitle}"`);
-    } catch (updateErr: unknown) {
-      const msg = updateErr instanceof Error ? updateErr.message : String(updateErr);
-      logger.appendLine(`[title-gen] sessions.update() failed: ${msg}`);
-    }
+    await applySessionTitle(state, {
+      backendSessionId,
+      vscodeSessionId,
+      title: llmTitle,
+      directory,
+      updateBackend: true,
+      overwrite: true,
+      source: 'manual',
+    });
+    logger.appendLine(`[title-gen] Title applied: "${llmTitle}"`);
   } else {
     logger.appendLine(`[title-gen] LLM returned unusable title: ${llmTitle ?? 'undefined'}`);
   }
@@ -153,20 +255,25 @@ export async function retitleSession(
  * title.  Rules are included inline so every model (not just instruction-tuned
  * ones) produces something useable.
  */
-function buildTitlePrompt(userMessage: string): string {
+export function buildTitlePrompt(userMessage: string): string {
   const truncated =
-    userMessage.length > 500
-      ? `${userMessage.slice(0, 497)}…`
+    userMessage.length > 360
+      ? `${userMessage.slice(0, 357)}...`
       : userMessage;
 
   return [
-    'Generate a short, descriptive title (2-8 words) for a coding conversation.',
+    'Generate a short, descriptive title for a coding conversation.',
     '',
     'Rules:',
-    '- Respond with ONLY the title text — no quotes, no explanation, no punctuation at the end',
+    '- Respond with ONLY the title text; no quotes, no explanation, no punctuation at the end',
     '- The title must capture the main topic or task the user is asking about',
+    '- Write the title in the same natural language as the user request when clear',
+    '- If the request mixes languages, use the dominant natural language',
+    '- Preserve product names, APIs, file names, commands, code symbols, and proper nouns exactly',
     '- Keep it concise and specific to coding',
-    '- Examples: "TypeScript Database Pool" | "React Auth Middleware" | "API Error Handling"',
+    '- Aim for 3-6 words; for languages without spaces, keep it similarly brief',
+    '- Drop filler like "help with", "question about", "request for", or their equivalents',
+    '- Examples: "React auth middleware" | "\u4fee\u590d session \u6807\u9898" | "VS Code tree view"',
     '',
     `User message: "${truncated}"`,
   ].join('\n');
@@ -215,7 +322,7 @@ async function collectTextResponse(stream: AsyncIterable<AcpEvent>): Promise<str
  * Returns `undefined` if the result is unusable.
  */
 export function cleanGeneratedTitle(raw: string): string | undefined {
-  // Remove formatting artifacts — order matters:
+  // Remove formatting artifacts - order matters:
   // bold markers first, then surrounding quotes, so `**"title"**` works correctly.
   const cleaned = raw
     .replace(/\*\*/g, '')

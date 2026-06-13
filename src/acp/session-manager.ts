@@ -17,14 +17,18 @@ import type { TurnMapping } from '../types';
 // ===========================================================================
 
 export interface SessionState {
-  /** Backend session ID (was `opencodeSessionId`) */
-  sessionId: string;
+  /** Real backend session ID, e.g. an OpenCode session ID. */
+  backendSessionId: string;
   /** Mapping of VSCode chat turns to backend message IDs */
   turnMap: TurnMapping[];
   /** Optional human-readable title */
   title?: string;
   /** When the session was created */
   createdAt?: Date;
+  /** Where the current title came from. */
+  titleSource?: import('./serializable/types').SessionTitleSource;
+  /** True when the title is only a UI placeholder derived before generation. */
+  provisionalTitle?: boolean;
 }
 
 // ===========================================================================
@@ -64,6 +68,15 @@ export class SessionManager {
     return this.sessionMap.values();
   }
 
+  /**
+   * Iterate over all session mappings.
+   * Used when a provider resource needs to be reconciled with an already-live
+   * VS Code chat resource for the same backend session.
+   */
+  entries(): IterableIterator<[string, SessionState]> {
+    return this.sessionMap.entries();
+  }
+
   // -- write --------------------------------------------------------------
 
   /**
@@ -72,6 +85,31 @@ export class SessionManager {
    */
   set(vscodeSessionId: string, state: SessionState): void {
     this.sessionMap.set(vscodeSessionId, state);
+  }
+
+  /**
+   * Bind a second VS Code/resource key to an existing session state.
+   * This keeps target switches from creating detached backend sessions.
+   */
+  bindAlias(sourceKey: string | undefined, targetKey: string | undefined): void {
+    if (!sourceKey || !targetKey || sourceKey === targetKey) {
+      return;
+    }
+
+    const existing = this.sessionMap.get(sourceKey);
+    if (existing && !this.sessionMap.has(targetKey)) {
+      this.sessionMap.set(targetKey, existing);
+    }
+  }
+
+  /** Find a live state by real backend session id. */
+  findByBackendSessionId(backendSessionId: string): { key: string; state: SessionState } | undefined {
+    for (const [key, state] of this.sessionMap.entries()) {
+      if (state.backendSessionId === backendSessionId) {
+        return { key, state };
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -94,7 +132,7 @@ export class SessionManager {
     vscodeSessionId: string,
     directory?: string,
     recoveredState?: {
-      sessionId: string | null;
+      backendSessionId: string | null;
       turnMap: TurnMapping[];
     },
     currentTurnIndex?: number,
@@ -102,18 +140,18 @@ export class SessionManager {
     // 1. If we already have a mapping for this VSCode session, return it.
     const existing = this.sessionMap.get(vscodeSessionId);
     if (existing && !recoveredState) {
-      return existing.sessionId;
+      return existing.backendSessionId;
     }
 
     // 2. Recovery from chat history metadata
-    if (recoveredState?.sessionId) {
+    if (recoveredState?.backendSessionId) {
       const state: SessionState = {
-        sessionId: recoveredState.sessionId,
+        backendSessionId: recoveredState.backendSessionId,
         turnMap: recoveredState.turnMap ?? [],
       };
       this.sessionMap.set(vscodeSessionId, state);
       this.bus.emit('session-list-changed', void 0);
-      return state.sessionId;
+      return state.backendSessionId;
     }
 
     // 3. Create a new backend session
@@ -123,14 +161,14 @@ export class SessionManager {
     }
 
     const state: SessionState = {
-      sessionId: result.data.id,
+      backendSessionId: result.data.id,
       turnMap: [],
       title: result.data.title,
       createdAt: result.data.createdAt,
     };
     this.sessionMap.set(vscodeSessionId, state);
     this.bus.emit('session-list-changed', void 0);
-    return state.sessionId;
+    return state.backendSessionId;
   }
 
   /**

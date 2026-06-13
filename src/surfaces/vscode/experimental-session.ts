@@ -45,9 +45,16 @@
  * @module
  */
 import * as vscode from 'vscode';
+import * as path from 'path';
 import type { ExtensionState } from '../../types';
 import type { AcpEvent } from '../../acp/types';
 import type { AcpEventStream } from '../../acp/backend';
+import type {
+  FileSnapshotRecord,
+  SerializableRequestDetails,
+  SerializableSessionMeta,
+  SerializableStreamPart,
+} from '../../acp/serializable/types';
 import { createParticipantHandler } from '../../participant/handler';
 import { isUserSelectableAgent } from '../../acp/types';
 
@@ -65,9 +72,26 @@ import {
   hasThinkingProgress,
   hasToolUI,
   hasChatToolInvocationPart,
-  hasChatResponseMultiDiffPart,
   hasFullProposedSurface,
 } from './capabilities';
+
+import { CollectorStream } from '../../acp/streaming/collector-stream';
+import {
+  readLegacySessionEvents,
+  readLegacySessionTurnEvents,
+  readSessionTurnStreamParts,
+  type LegacySessionTurnEvents,
+  type SessionTurnStreamParts,
+} from '../../acp/serializable/serializer';
+import {
+  projectStreamPartToAcpEvent,
+  requestDetailsFromStreamParts,
+} from '../../acp/serializable/stream-parts';
+import { readCheckpoints } from '../../acp/checkpoint/checkpoint-store';
+import { getCheckpointApproval, snapshotTurnIndex } from '../../acp/checkpoint/approval-state';
+import { pushSnapshotTextEditParts, replaySnapshotsToWorkspace } from '../../acp/checkpoint/replay';
+import { applySessionTitle } from '../../participant/session-title';
+import type { SessionTitleSource } from '../../acp/serializable/types';
 
 // ---------------------------------------------------------------------------
 // Internal types for session content rendering (not part of the VS Code API)
@@ -87,8 +111,6 @@ export interface SessionFrameContent {
   hasReasoning?: boolean;
   /** Reasoning text content, if any */
   reasoningText?: string;
-  /** File diffs from this response */
-  diffs?: SessionDiffEntry[];
 }
 
 export interface SessionToolInvocation {
@@ -101,11 +123,34 @@ export interface SessionToolInvocation {
   isComplete?: boolean;
 }
 
-export interface SessionDiffEntry {
-  file: string;
-  additions?: number;
-  deletions?: number;
-  status: 'added' | 'modified';
+interface RestoredSessionHistory {
+  history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[];
+  snapshots: FileSnapshotRecord[];
+  pendingReplaySnapshots: FileSnapshotRecord[];
+  restoreReplaySnapshots: FileSnapshotRecord[];
+}
+
+type ToolIdEditMap = Map<string, string>;
+
+type RestoredRequestIdSource = 'request-details' | 'stream-parts' | 'turn-index';
+
+interface RestoredRequestId {
+  id: string;
+  source: RestoredRequestIdSource;
+}
+
+interface SessionListEntry {
+  id: string;
+  title: string;
+  createdAt: Date;
+  description?: string;
+  status?: vscode.ChatSessionStatus;
+  archived?: boolean;
+  legacyResource?: vscode.Uri;
+  changeApprovalState?: SerializableSessionMeta['changeApprovalState'];
+  resource?: vscode.Uri;
+  source: 'persisted' | 'runtime';
+  hasLiveTurns?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +191,7 @@ export class ExperimentalChatSession {
         this.handlePartDelta(evt);
         break;
       case 'session.diff':
-        this.handleSessionDiff(evt);
+        break;
         break;
       case 'session.idle':
         this.flushFrame();
@@ -209,25 +254,6 @@ export class ExperimentalChatSession {
     }
   }
 
-  private handleSessionDiff(evt: AcpEvent): void {
-    if (evt.type !== 'session.diff') {return;}
-    const diffs = evt.diffs;
-    if (!diffs?.length) {return;}
-
-    const entries: SessionDiffEntry[] = diffs
-      .filter((d) => d.status !== 'deleted')
-      .map((d) => ({
-        file: d.file,
-        additions: d.additions,
-        deletions: d.deletions,
-        status: d.status === 'added' ? 'added' as const : 'modified' as const,
-      }));
-
-    if (entries.length > 0) {
-      this.currentFrame.diffs = entries;
-    }
-  }
-
   private handleToolState(toolPart: {
     callID?: string;
     tool?: string;
@@ -277,8 +303,7 @@ export class ExperimentalChatSession {
     if (
       this.currentFrame.markdown ||
       this.currentFrame.toolInvocations ||
-      this.currentFrame.hasReasoning ||
-      this.currentFrame.diffs
+      this.currentFrame.hasReasoning
     ) {
       this.frames.push(this.currentFrame);
     }
@@ -296,7 +321,6 @@ export class ExperimentalChatSession {
  * in package.json.
  */
 export const OPENCODE_SESSION_SCHEME = 'opencode-copilot.opencode';
-
 function getWorkspaceDirectory(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
 }
@@ -367,6 +391,9 @@ export function createSessionContentProvider(
   let cachedOptionGroups: vscode.ChatSessionProviderOptionGroup[] = [];
   /** Guard against re-entrant refreshOptionGroups() calls (e.g. event fire → VSCode re-query loop) */
   let optionGroupsRefreshInFlight: Promise<void> | null = null;
+  let backendStartInFlight: Promise<void> | null = null;
+  let loggedOfflineOptionGroups = false;
+  let loggedOfflineSessionRefresh = false;
   /**
    * Reference to the most recently created inputState.
    * VSCode's provideChatSessionProviderOptions only affects NEW sessions;
@@ -376,16 +403,18 @@ export function createSessionContentProvider(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let currentInputState: any = undefined;
 
+  const CONNECTING_OPTION_GROUPS: vscode.ChatSessionProviderOptionGroup[] = [
+    {
+      id: 'agents',
+      name: 'Agent',
+      items: [{ id: 'agent-connecting', name: '--', description: 'Waiting for backend' }],
+      selected: { id: 'agent-connecting', name: '--', description: 'Waiting for backend' },
+    },
+  ];
+
   /** Placeholder option groups shown while the backend is not yet running */
   function buildConnectingOptionGroups(): vscode.ChatSessionProviderOptionGroup[] {
-    return [
-      {
-        id: 'agents',
-        name: 'Agent',
-        items: [{ id: 'agent-connecting', name: '--', description: 'Waiting for backend' }],
-        selected: { id: 'agent-connecting', name: '--', description: 'Waiting for backend' },
-      },
-    ];
+    return CONNECTING_OPTION_GROUPS;
   }
 
   /** Check whether cached option groups are still placeholder/stub groups */
@@ -422,10 +451,15 @@ export function createSessionContentProvider(
         if (prevGroups !== cachedOptionGroups) {
           onDidChangeOptionsEmitter.fire();
         }
+        if (loggedOfflineOptionGroups) {
+          return;
+        }
+        loggedOfflineOptionGroups = true;
         logger.appendLine('[session-provider] Backend not running — showing "Connecting…" option groups');
         return;
       }
 
+      loggedOfflineOptionGroups = false;
       logger.appendLine(`[session-provider] Refreshing option groups (backend running=true)...`);
 
       // Fetch agents (model selection is delegated to VS Code's native model picker)
@@ -475,11 +509,42 @@ export function createSessionContentProvider(
     if (state.backend.getStatus() === 'running') {
       return;
     }
-
-    const result = await state.backend.start(directory);
-    if (result.error) {
-      throw new Error(typeof result.error === 'string' ? result.error : 'Failed to start backend');
+    if (state.backend.getStatus() === 'starting' && backendStartInFlight) {
+      return backendStartInFlight;
     }
+    if (backendStartInFlight) {
+      return backendStartInFlight;
+    }
+
+    backendStartInFlight = (async () => {
+      const result = await state.backend.start(directory);
+      if (result.error) {
+        throw new Error(typeof result.error === 'string' ? result.error : 'Failed to start backend');
+      }
+    })();
+
+    try {
+      await backendStartInFlight;
+    } finally {
+      backendStartInFlight = null;
+    }
+  }
+
+  function kickBackendStart(reason: string): void {
+    const status = state.backend.getStatus();
+    if (status === 'running' || status === 'starting') {
+      return;
+    }
+
+    logger.appendLine(`[session-provider] Backend ${status}; starting backend (${reason})`);
+    ensureBackendRunning()
+      .then(() => {
+        logger.appendLine('[session-provider] Backend ready from provider startup');
+        state.bus.emit('backend-ready', void 0);
+      })
+      .catch((err) => {
+        logger.appendLine(`[session-provider] Backend provider startup failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
   }
 
   function createSessionLabelFromPrompt(prompt: string | undefined, sessionId: string): string {
@@ -501,16 +566,20 @@ export function createSessionContentProvider(
     return createSessionLabelFromPrompt(firstRequest?.prompt, sessionId);
   }
 
-  function collectRuntimeSessions(): Array<{ id: string; title: string; createdAt: Date }> {
-    const runtimeSessions = new Map<string, { id: string; title: string; createdAt: Date }>();
+  function collectRuntimeSessions(): SessionListEntry[] {
+    const runtimeSessions = new Map<string, SessionListEntry>();
 
-    for (const chatState of state.sessions.values()) {
-      if (!chatState.sessionId) {
+    for (const [stateKey, chatState] of state.sessions.entries()) {
+      if (!chatState.backendSessionId) {
         continue;
       }
+      const resource = stateKey.startsWith('opencode-copilot.opencode:')
+        ? vscode.Uri.parse(stateKey)
+        : createSessionResource(stateKey);
 
-      const existing = runtimeSessions.get(chatState.sessionId);
+      const existing = runtimeSessions.get(chatState.backendSessionId);
       const newTitle = chatState.title ?? '';
+      const hasLiveTurns = chatState.turnMap.length > 0;
 
       // Prefer non-placeholder titles when multiple sessionMap entries share
       // the same sessionId (e.g. untitled-N vs opencode-copilot.opencode:/ses_xxx).
@@ -518,17 +587,25 @@ export function createSessionContentProvider(
         const existingIsPlaceholder = isPlaceholderSessionTitle(existing.title);
         const newIsPlaceholder = isPlaceholderSessionTitle(newTitle);
         if (existingIsPlaceholder && !newIsPlaceholder) {
-          runtimeSessions.set(chatState.sessionId, {
-            id: chatState.sessionId,
+          runtimeSessions.set(chatState.backendSessionId, {
+            id: chatState.backendSessionId,
             title: newTitle,
             createdAt: chatState.createdAt ?? existing.createdAt,
+            resource,
+            source: 'runtime',
+            hasLiveTurns,
           });
+        } else if (hasLiveTurns && !existing.hasLiveTurns) {
+          existing.hasLiveTurns = true;
         }
       } else {
-        runtimeSessions.set(chatState.sessionId, {
-          id: chatState.sessionId,
+        runtimeSessions.set(chatState.backendSessionId, {
+          id: chatState.backendSessionId,
           title: newTitle,
           createdAt: chatState.createdAt ?? new Date(),
+          resource,
+          source: 'runtime',
+          hasLiveTurns,
         });
       }
     }
@@ -541,15 +618,428 @@ export function createSessionContentProvider(
     return title.length > 0 ? title : `Session ${session.id.slice(0, 8)}`;
   }
 
-  function getSessionDescription(_session: { id: string; title: string }): string | undefined {
-    return undefined;
+  function getSessionDescription(session: SessionListEntry): string | undefined {
+    return session.description;
+  }
+
+  function toChatSessionStatus(status: SerializableSessionMeta['status']): vscode.ChatSessionStatus | undefined {
+    switch (status) {
+      case 'inProgress':
+        return vscode.ChatSessionStatus.InProgress;
+      case 'needsInput':
+        return vscode.ChatSessionStatus.NeedsInput;
+      case 'failed':
+        return vscode.ChatSessionStatus.Failed;
+      case 'completed':
+        return vscode.ChatSessionStatus.Completed;
+      default:
+        return undefined;
+    }
+  }
+
+  function maxSnapshotTurn(snapshots: readonly FileSnapshotRecord[]): number | undefined {
+    if (snapshots.length === 0) {
+      return undefined;
+    }
+    return Math.max(...snapshots.map(snapshotTurnIndex));
+  }
+
+  function getRestoreReplaySnapshots(
+    snapshots: readonly FileSnapshotRecord[],
+    meta?: SerializableSessionMeta,
+  ): FileSnapshotRecord[] {
+    const acceptedThroughTurn = meta?.checkpointCursor?.acceptedThroughTurn;
+    const lastAccepted = typeof acceptedThroughTurn === 'number' && Number.isFinite(acceptedThroughTurn)
+      ? acceptedThroughTurn
+      : -1;
+    return snapshots.filter(snapshot => snapshotTurnIndex(snapshot) > lastAccepted);
+  }
+
+  function getToolCompleteReplaySnapshots(
+    snapshots: readonly FileSnapshotRecord[],
+    turnEvents: readonly LegacySessionTurnEvents<AcpEvent>[],
+  ): FileSnapshotRecord[] {
+    if (snapshots.length === 0 || turnEvents.length === 0) {
+      return [];
+    }
+
+    const snapshotsByCallId = new Map<string, FileSnapshotRecord[]>();
+    for (const snapshot of snapshots) {
+      if (!snapshot.toolCallId) {
+        continue;
+      }
+      const entries = snapshotsByCallId.get(snapshot.toolCallId) ?? [];
+      entries.push(snapshot);
+      snapshotsByCallId.set(snapshot.toolCallId, entries);
+    }
+
+    const replaySnapshots: FileSnapshotRecord[] = [];
+    const appendedCallIds = new Set<string>();
+    for (const turn of turnEvents) {
+      for (const event of turn.events) {
+        if (event.type !== 'part.updated' || event.part.type !== 'tool') {
+          continue;
+        }
+        const state = event.part.state as { status?: string };
+        if (state.status !== 'completed' && state.status !== 'error') {
+          continue;
+        }
+        if (!isRestoredEditToolName(event.part.toolName)) {
+          continue;
+        }
+        const callId = event.part.callId;
+        if (!callId || appendedCallIds.has(callId)) {
+          continue;
+        }
+        const entries = snapshotsByCallId.get(callId);
+        if (!entries?.length) {
+          continue;
+        }
+        appendedCallIds.add(callId);
+        replaySnapshots.push(...entries);
+      }
+    }
+
+    return replaySnapshots;
+  }
+
+  function getToolCompleteReplaySnapshotsForEvents(
+    snapshots: readonly FileSnapshotRecord[],
+    events: readonly AcpEvent[],
+  ): FileSnapshotRecord[] {
+    if (snapshots.length === 0 || events.length === 0) {
+      return [];
+    }
+
+    const snapshotsByCallId = new Map<string, FileSnapshotRecord[]>();
+    for (const snapshot of snapshots) {
+      if (!snapshot.toolCallId) {
+        continue;
+      }
+      const entries = snapshotsByCallId.get(snapshot.toolCallId) ?? [];
+      entries.push(snapshot);
+      snapshotsByCallId.set(snapshot.toolCallId, entries);
+    }
+
+    const replaySnapshots: FileSnapshotRecord[] = [];
+    const appendedCallIds = new Set<string>();
+    for (const event of events) {
+      if (event.type !== 'part.updated' || event.part.type !== 'tool') {
+        continue;
+      }
+      const state = event.part.state as { status?: string };
+      if (state.status !== 'completed' && state.status !== 'error') {
+        continue;
+      }
+      if (!isRestoredEditToolName(event.part.toolName)) {
+        continue;
+      }
+      const callId = event.part.callId;
+      if (!callId || appendedCallIds.has(callId)) {
+        continue;
+      }
+      const entries = snapshotsByCallId.get(callId);
+      if (!entries?.length) {
+        continue;
+      }
+      appendedCallIds.add(callId);
+      replaySnapshots.push(...entries);
+    }
+
+    return replaySnapshots;
+  }
+
+  function getMergedRequestDetails(
+    meta: SerializableSessionMeta | undefined,
+    streamParts: readonly SerializableStreamPart[] | undefined,
+  ): SerializableRequestDetails[] {
+    const result: SerializableRequestDetails[] = [];
+    const append = (details: SerializableRequestDetails): void => {
+      const existing = result.find(item =>
+        (details.turnIndex !== undefined && item.turnIndex === details.turnIndex) ||
+        item.vscodeRequestId === details.vscodeRequestId
+      );
+      if (existing) {
+        existing.turnIndex = details.turnIndex ?? existing.turnIndex;
+        existing.vscodeRequestId = details.vscodeRequestId || existing.vscodeRequestId;
+        existing.backendRequestId = details.backendRequestId ?? existing.backendRequestId;
+        existing.toolIdEditMap = {
+          ...existing.toolIdEditMap,
+          ...(details.toolIdEditMap ?? {}),
+        };
+        return;
+      }
+      result.push({
+        ...details,
+        toolIdEditMap: { ...(details.toolIdEditMap ?? {}) },
+      });
+    };
+
+    for (const details of meta?.requestDetails ?? []) {
+      append(details);
+    }
+    for (const details of requestDetailsFromStreamParts(streamParts ?? [])) {
+      append(details);
+    }
+    return result;
+  }
+
+  function getToolIdEditMap(
+    meta?: SerializableSessionMeta,
+    streamParts?: readonly SerializableStreamPart[],
+  ): ToolIdEditMap {
+    const result: ToolIdEditMap = new Map();
+    for (const details of getMergedRequestDetails(meta, streamParts)) {
+      for (const [toolCallId, editId] of Object.entries(details.toolIdEditMap ?? {})) {
+        if (editId) {
+          result.set(toolCallId, editId);
+        }
+      }
+    }
+    return result;
+  }
+
+  function getRestoredRequestIdByTurnIndex(
+    meta?: SerializableSessionMeta,
+    streamParts?: readonly SerializableStreamPart[],
+  ): Map<number, RestoredRequestId> {
+    const result = new Map<number, RestoredRequestId>();
+    const add = (details: SerializableRequestDetails, source: RestoredRequestIdSource) => {
+      if (typeof details.turnIndex === 'number' && Number.isFinite(details.turnIndex)) {
+        result.set(details.turnIndex, { id: details.vscodeRequestId, source });
+        return;
+      }
+
+      const match = /^turn-(\d+)$/.exec(details.vscodeRequestId);
+      if (match) {
+        result.set(Number(match[1]), { id: details.vscodeRequestId, source });
+      }
+    };
+
+    for (const details of meta?.requestDetails ?? []) {
+      add(details, 'request-details');
+    }
+    for (const details of requestDetailsFromStreamParts(streamParts ?? [])) {
+      if (typeof details.turnIndex === 'number' && result.has(details.turnIndex)) {
+        continue;
+      }
+      add(details, 'stream-parts');
+    }
+    return result;
+  }
+
+  function getRestoredRequestId(
+    turnIndex: number,
+    requestIdByTurnIndex: ReadonlyMap<number, RestoredRequestId>,
+  ): RestoredRequestId {
+    const persisted = requestIdByTurnIndex.get(turnIndex);
+    if (persisted) {
+      return persisted;
+    }
+    return { id: `turn-${turnIndex}`, source: 'turn-index' };
+  }
+
+  function filterSnapshotsWithRestoredEditRecords(
+    snapshots: readonly FileSnapshotRecord[],
+    toolIdEditMap: ToolIdEditMap,
+  ): FileSnapshotRecord[] {
+    if (toolIdEditMap.size === 0) {
+      return [];
+    }
+    return snapshots.filter(snapshot => !!snapshot.toolCallId && toolIdEditMap.has(snapshot.toolCallId));
+  }
+
+  function excludeSnapshots(
+    snapshots: readonly FileSnapshotRecord[],
+    excluded: readonly FileSnapshotRecord[],
+  ): FileSnapshotRecord[] {
+    if (snapshots.length === 0 || excluded.length === 0) {
+      return [...snapshots];
+    }
+    const excludedSet = new Set(excluded);
+    return snapshots.filter(snapshot => !excludedSet.has(snapshot));
+  }
+
+  function getRestoreSnapshotsForToolCompleteEvent(
+    snapshots: readonly FileSnapshotRecord[],
+    event: AcpEvent,
+  ): FileSnapshotRecord[] {
+    if (event.type !== 'part.updated' || event.part.type !== 'tool') {
+      return [];
+    }
+    const state = event.part.state as { status?: string };
+    if (state.status !== 'completed' && state.status !== 'error') {
+      return [];
+    }
+    const part = event.part as { toolName?: string; callId?: string };
+    if (!isRestoredEditToolName(part.toolName) || !part.callId) {
+      return [];
+    }
+    return snapshots.filter(snapshot => snapshot.toolCallId === part.callId);
+  }
+
+  function isRestoredEditToolName(toolName: string | undefined): boolean {
+    return toolName === 'edit' || toolName === 'write';
+  }
+
+  function logRestorableEditSnapshotSummary(
+    sessionId: string,
+    snapshots: readonly FileSnapshotRecord[],
+    toolIdEditMap: ToolIdEditMap,
+  ): void {
+    if (snapshots.length === 0) {
+      logger.appendLine(
+        `[session-provider] Restored edit snapshot summary for ${sessionId}: none ` +
+        `(toolIdEditMap=${toolIdEditMap.size})`,
+      );
+      return;
+    }
+
+    const byToolCall = new Map<string, FileSnapshotRecord[]>();
+    for (const snapshot of snapshots) {
+      const key = snapshot.toolCallId || '(missing-tool-call)';
+      const entries = byToolCall.get(key) ?? [];
+      entries.push(snapshot);
+      byToolCall.set(key, entries);
+    }
+
+    for (const [toolCallId, entries] of byToolCall) {
+      const after = entries.find(snapshot => snapshot.phase === 'after');
+      const before = entries.find(snapshot => snapshot.phase === 'before');
+      logger.appendLine(
+        `[session-provider] Restored edit snapshot summary for ${sessionId}: ` +
+        `toolCallId=${toolCallId} editId=${toolIdEditMap.get(toolCallId) ?? after?.undoStopId ?? '(none)'} ` +
+        `turn=${after?.turnIndex ?? before?.turnIndex ?? '(none)'} ` +
+        `editIndex=${after?.editIndex ?? before?.editIndex ?? '(none)'} ` +
+        `uri=${after?.uri ?? before?.uri ?? '(none)'}`,
+      );
+    }
+  }
+
+  async function replayPendingSnapshotsForSession(
+    sessionId: string,
+    pendingSnapshots: readonly FileSnapshotRecord[],
+    stream: vscode.ChatResponseStream,
+    token: vscode.CancellationToken,
+  ): Promise<void> {
+    if (pendingSnapshots.length === 0) {
+      return;
+    }
+
+    const result = await replaySnapshotsToWorkspace(pendingSnapshots, logger, {
+      stream,
+      token,
+      preferExternalEdit: true,
+      redoAlreadyApplied: true,
+    });
+    await persistPendingReplayResult(sessionId, pendingSnapshots, result);
+  }
+
+  async function persistPendingReplayResult(
+    sessionId: string,
+    pendingSnapshots: readonly FileSnapshotRecord[],
+    result: Awaited<ReturnType<typeof replaySnapshotsToWorkspace>>,
+  ): Promise<void> {
+    const maxTurn = maxSnapshotTurn(pendingSnapshots);
+    const hasConflicts = result.conflicts.length > 0;
+    const update: Partial<SerializableSessionMeta> = {
+      changeApprovalState: hasConflicts ? 'partial' : 'pending',
+      checkpointCursor: {
+        acceptedThroughTurn: -1,
+        replayedThroughTurn: maxTurn,
+        lastConflictTurn: hasConflicts ? maxTurn : undefined,
+      },
+      replaySummary: {
+        appliedFiles: result.applied,
+        skippedFiles: result.skipped,
+        appliedHunks: result.appliedHunks,
+        skippedHunks: result.skippedHunks,
+        conflicts: result.conflicts,
+      },
+    };
+
+    try {
+      const current = await state.sessionStore.readMeta(sessionId);
+      const acceptedThroughTurn = current?.checkpointCursor?.acceptedThroughTurn ?? -1;
+      const previousReplayedThroughTurn = current?.checkpointCursor?.replayedThroughTurn;
+      update.checkpointCursor = {
+        acceptedThroughTurn,
+        replayedThroughTurn: hasConflicts ? previousReplayedThroughTurn : maxTurn,
+        lastConflictTurn: hasConflicts ? maxTurn : current?.checkpointCursor?.lastConflictTurn,
+      };
+      if (!hasConflicts && maxTurn !== undefined && acceptedThroughTurn >= maxTurn) {
+        update.changeApprovalState = 'accepted';
+      }
+      await state.sessionStore.updateMeta(sessionId, update);
+      logger.appendLine(
+        `[session-provider] Replayed ${result.applied} checkpoint file(s) for ${sessionId} via active response ` +
+        `(external=${result.externalEdits}, fallback=${result.fallbackEdits}, conflicts=${result.conflicts.length})`,
+      );
+    } catch (err) {
+      logger.appendLine(
+        `[session-provider] Failed to persist checkpoint replay state for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  function pushSnapshotsForRestoredEditTools(
+    sessionId: string,
+    restoreSnapshots: readonly FileSnapshotRecord[],
+    stream: { parts?: readonly unknown[]; markdown?: (value: string) => void; push?: (part: unknown) => void },
+    toolIdEditMap: ToolIdEditMap,
+  ): void {
+    if (restoreSnapshots.length === 0) {
+      return;
+    }
+
+    hideRestoredEditToolParts(restoreSnapshots, stream.parts);
+    const snapshotsWithEditIds = restoreSnapshots.map(snapshot => {
+      const editId = snapshot.toolCallId ? toolIdEditMap.get(snapshot.toolCallId) : undefined;
+      return editId && snapshot.phase === 'after'
+        ? { ...snapshot, undoStopId: editId }
+        : snapshot;
+    });
+    const result = pushSnapshotTextEditParts(snapshotsWithEditIds, stream, logger);
+    logger.appendLine(
+      `[session-provider] Pushed ${result.pushed} restored text edit part(s) for ${sessionId} in restored history ` +
+      `(skipped=${result.skipped}, conflicts=${result.conflicts.length})`,
+    );
+  }
+
+  function hideRestoredEditToolParts(
+    restoreSnapshots: readonly FileSnapshotRecord[],
+    parts: readonly unknown[] | undefined,
+  ): void {
+    if (!parts?.length) {
+      return;
+    }
+    const callIds = new Set(restoreSnapshots.map(snapshot => snapshot.toolCallId).filter(Boolean));
+    for (const part of parts) {
+      const toolPart = part as { toolCallId?: string; presentation?: 'hidden' | 'hiddenAfterComplete' };
+      if (toolPart.toolCallId && callIds.has(toolPart.toolCallId)) {
+        toolPart.presentation = 'hidden';
+      }
+    }
+  }
+
+  async function toSessionListEntry(meta: SerializableSessionMeta): Promise<SessionListEntry> {
+    return {
+      id: meta.id,
+      title: meta.title ?? meta.id,
+      createdAt: new Date(meta.createdAt ?? Date.now()),
+      description: meta.description,
+      status: toChatSessionStatus(meta.status) ?? vscode.ChatSessionStatus.Completed,
+      archived: meta.archived,
+      changeApprovalState: meta.changeApprovalState,
+      source: 'persisted',
+    };
   }
 
   function mergeSessions(
-    listedSessions: readonly { id: string; title: string; createdAt: Date }[],
-    runtimeSessions: readonly { id: string; title: string; createdAt: Date }[],
-  ): Array<{ id: string; title: string; createdAt: Date }> {
-    const merged = new Map<string, { id: string; title: string; createdAt: Date }>();
+    listedSessions: readonly SessionListEntry[],
+    runtimeSessions: readonly SessionListEntry[],
+  ): SessionListEntry[] {
+    const merged = new Map<string, SessionListEntry>();
 
     for (const session of listedSessions) {
       merged.set(session.id, session);
@@ -566,20 +1056,34 @@ export function createSessionContentProvider(
         id: session.id,
         title: !isPlaceholderSessionTitle(existing.title) ? existing.title : session.title,
         createdAt: existing.createdAt ?? session.createdAt,
+        description: existing.description ?? session.description,
+        status: existing.status ?? session.status,
+        archived: existing.archived ?? session.archived,
+        changeApprovalState: existing.changeApprovalState ?? session.changeApprovalState,
+        resource: session.resource ?? existing.resource,
+        source: 'runtime',
+        hasLiveTurns: session.hasLiveTurns,
       });
     }
 
     return Array.from(merged.values()).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
   }
 
-  function publishSessionItems(controller: vscode.ChatSessionItemController, sessions: readonly { id: string; title: string; createdAt: Date }[]): void {
+  function publishSessionItems(controller: vscode.ChatSessionItemController, sessions: readonly SessionListEntry[]): void {
     const sessionThemeIcon = new vscode.ThemeIcon('opencode-logo');
     const items = sessions.map((session) => {
-      const resource = createSessionResource(session.id);
+      const resource = session.resource ?? createSessionResource(session.id);
       const item = controller.createChatSessionItem(resource, getSessionLabel(session));
       item.iconPath = sessionThemeIcon;
       item.description = getSessionDescription(session);
-      item.status = vscode.ChatSessionStatus.Completed;
+      item.archived = session.archived ?? false;
+      if (session.legacyResource) {
+        (item as { legacyResource?: vscode.Uri }).legacyResource = session.legacyResource;
+      }
+      if (session.changeApprovalState === 'pending' || session.changeApprovalState === 'partial') {
+        item.badge = session.changeApprovalState === 'partial' ? 'Partial' : 'Changes';
+      }
+      item.status = session.status ?? vscode.ChatSessionStatus.Completed;
       item.timing = { created: session.createdAt.getTime() };
       item.tooltip = session.id;
       return item;
@@ -622,96 +1126,19 @@ export function createSessionContentProvider(
 
     sessionRefreshInFlight = true;
     try {
-      const sessionsResult = await state.backend.sessions.list(directory);
-      const runtimeSessions = collectRuntimeSessions();
+      // Use filesystem-backed SessionStore (single source of truth)
+      const sessions = await state.sessionStore.listSessions();
 
       logger.appendLine(
-        `[session-provider] Refreshing Session list (directory=${directory ?? 'none'}, ` +
-        `listError=${sessionsResult.error ?? 'none'}, listCount=${sessionsResult.data?.length ?? 0}, runtimeCount=${runtimeSessions.length})`,
+        `[session-provider] Refreshing Session list from SessionStore (count=${sessions.length})`,
       );
 
-      if (sessionsResult.error) {
-        logger.appendLine(`[session-provider] Session list source error: ${sessionsResult.error}`);
-      }
+      const listedItems = await Promise.all(sessions.map(toSessionListEntry));
+      const items = mergeSessions(listedItems, [
+        ...collectRuntimeSessions(),
+      ]);
 
-      const listedSessions = sessionsResult.data ?? [];
-      let mergedSessions = mergeSessions(listedSessions, runtimeSessions);
-
-      logger.appendLine(
-        `[session-provider] Session list merged result: ${mergedSessions.map(s => `${s.id}:${getSessionLabel(s)}`).join(', ') || '(empty)'}`,
-      );
-
-      // ---- Cache-as-floor protection ----
-      // The daemon's session.list() may be unreliable for directory-scoped
-      // queries (observed to return 0 even when sessions exist and their
-      // history is retrievable).  When the daemon returns fewer sessions than
-      // the cache, supplement missing entries from the cache.  This is always
-      // safe because the cache is updated every time we publish — if a session
-      // were legitimately deleted, the next daemon-scoped refresh would include
-      // it in the cache update, and eventually the stale entry ages out.
-      let cached: CachedSessionItem[] | undefined;
-      try {
-        cached = context.globalState.get<CachedSessionItem[]>(SESSION_CACHE_KEY);
-      } catch {
-        cached = undefined;
-      }
-
-      // Determine if the daemon returned suspiciously few sessions.
-      // "Suspicious" means: runs gave back 0 sessions but the cache or runtime
-      // has sessions — this indicates the daemon's list API is broken.
-      const daemonReturnedZero = listedSessions.length === 0;
-      const hasSourceOfTruth = (cached && cached.length > 0) || runtimeSessions.length > 0;
-      const shouldSupplement = daemonReturnedZero && hasSourceOfTruth;
-
-      if (shouldSupplement && cached && cached.length > mergedSessions.length) {
-        const mergedIds = new Set(mergedSessions.map(s => s.id));
-        const missingFromCache = cached
-          .filter(c => !mergedIds.has(c.id))
-          .map(c => ({
-            id: c.id, title: c.title, createdAt: new Date(c.createdAt),
-          }));
-        if (missingFromCache.length > 0) {
-          logger.appendLine(
-            `[session-provider] Daemon returned 0 sessions — supplementing ${missingFromCache.length} session(s) from cache ` +
-            `(runtime=${runtimeSessions.length}, cache=${cached.length})`,
-          );
-          mergedSessions = [...mergedSessions, ...missingFromCache]
-            .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-        }
-      } else if (isRace && cached && cached.length > mergedSessions.length) {
-        // Race-specific fallback: daemon returned some sessions but may be
-        // incomplete due to concurrent turn processing.
-        const mergedIds = new Set(mergedSessions.map(s => s.id));
-        const missingFromCache = cached
-          .filter(c => !mergedIds.has(c.id))
-          .map(c => ({
-            id: c.id, title: c.title, createdAt: new Date(c.createdAt),
-          }));
-        if (missingFromCache.length > 0) {
-          logger.appendLine(
-            `[session-provider] Race detected — supplementing ${missingFromCache.length} session(s) from cache ` +
-            `(daemon returned ${mergedSessions.length}, cache has ${cached.length})`,
-          );
-          mergedSessions = [...mergedSessions, ...missingFromCache]
-            .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-        }
-      }
-
-      // Daemon has no sessions and sessionMap is empty → restore from cache
-      if (mergedSessions.length === 0 && runtimeSessions.length === 0) {
-        if (cached && cached.length > 0) {
-          const restored = cached.map(c => ({
-            id: c.id, title: c.title, createdAt: new Date(c.createdAt),
-          }));
-          logger.appendLine(`[session-provider] Restored ${restored.length} session(s) from local cache`);
-          publishSessionItems(controller, restored);
-          return;
-        }
-        logger.appendLine('[session-provider] Skipping publish — no sessions available');
-        return;
-      }
-
-      publishSessionItems(controller, mergedSessions);
+      publishSessionItems(controller, items);
     } finally {
       sessionRefreshInFlight = false;
     }
@@ -740,6 +1167,62 @@ export function createSessionContentProvider(
   };
   const backendReadyDispose = state.bus.on('backend-ready', onBackendReadyHandler);
 
+  async function createNewSessionItemFromInitialRequest(
+    ctrl: vscode.ChatSessionItemController,
+    request: { readonly prompt: string; readonly command?: string },
+  ): Promise<vscode.ChatSessionItem> {
+    const directory = getWorkspaceDirectory();
+    const title = createSessionLabelFromPrompt(request.prompt, 'new');
+    const result = await state.backend.sessions.create({
+      title,
+      directory,
+    });
+    if (result.error || !result.data) {
+      const message = String(result.error ?? 'unknown error');
+      logger.appendLine(`[session-provider] Failed to create new session item: ${message}`);
+      throw new Error(`Failed to create new session item: ${message}`);
+    }
+
+    const sessionId = result.data.id;
+    const createdAt = result.data.createdAt ?? new Date();
+    const resource = createSessionResource(sessionId);
+    const resolvedTitle = result.data.title?.trim() || title;
+    const titleSource: SessionTitleSource = isPlaceholderSessionTitle(resolvedTitle) ? 'placeholder' : 'history';
+    const provisionalTitle = !isPlaceholderSessionTitle(resolvedTitle);
+    const chatState = {
+      backendSessionId: sessionId,
+      turnMap: [],
+      title: resolvedTitle,
+      titleSource,
+      provisionalTitle,
+      createdAt,
+    };
+
+    state.sessions.set(sessionId, chatState);
+    state.sessions.set(resource.toString(), chatState);
+    await state.sessionStore.writeMeta(sessionId, {
+      id: sessionId,
+      title: resolvedTitle,
+      titleSource,
+      titleUpdatedAt: new Date().toISOString(),
+      provisionalTitle,
+      createdAt: createdAt.toISOString(),
+      backendName: state.backend.name,
+    });
+
+    const item = ctrl.createChatSessionItem(resource, resolvedTitle);
+    item.iconPath = new vscode.ThemeIcon('opencode-logo');
+    item.status = vscode.ChatSessionStatus.InProgress;
+    item.timing = { created: createdAt.getTime() };
+    item.tooltip = sessionId;
+    ctrl.items.add(item);
+
+    logger.appendLine(
+      `[session-provider] Created new session item ${sessionId} from initial request resource=${resource.toString()}`,
+    );
+    return item;
+  }
+
   // -- ChatSessionItemController: Picker Tracking --------------------------
   // The controller creates tracked inputState objects via createChatSessionInputState().
   // VSCode monitors these objects, so onDidChange actually fires when the user
@@ -752,6 +1235,7 @@ export function createSessionContentProvider(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let controller: vscode.ChatSessionItemController | undefined;
   let sessionListChangedDispose: (() => void) | undefined;
+  let sessionItemStateChangedDispose: { dispose(): void } | undefined;
 
   if (hasControllerAPI) {
     controller = (vscode.chat as any).createChatSessionItemController(
@@ -772,10 +1256,30 @@ export function createSessionContentProvider(
       },
     ) as vscode.ChatSessionItemController;
 
+    controller.newChatSessionItemHandler = async (handlerContext, token) => {
+      if (token.isCancellationRequested) {
+        throw new Error('New session creation cancelled');
+      }
+      return createNewSessionItemFromInitialRequest(controller!, handlerContext.request);
+    };
+
     sessionListChangedDispose = state.bus.on('session-list-changed', () => {
       refreshSessionItems().catch((err) => {
         logger.appendLine(
           `[session-provider] Session list refresh on event failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    });
+
+    sessionItemStateChangedDispose = controller.onDidChangeChatSessionItemState?.((item) => {
+      const sessionId = resolveOpenCodeSessionId(item.resource) ?? extractSessionId(item.resource);
+      if (!sessionId || sessionId === 'new' || sessionId.startsWith('untitled-')) {
+        return;
+      }
+
+      state.sessionStore.updateMeta(sessionId, { archived: !!item.archived }).catch((err) => {
+        logger.appendLine(
+          `[session-provider] Failed to persist archived state for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
         );
       });
     });
@@ -798,7 +1302,7 @@ export function createSessionContentProvider(
       // this inputState so the picker text updates in real time.
       const syncListener = onDidChangeOptionsEmitter.event(() => {
         if (currentInputState && !isPlaceholderGroups(cachedOptionGroups)) {
-          logger.appendLine('[session-provider] Pushing updated groups to current inputState');
+          // [debug] logger.appendLine('[session-provider] Pushing updated groups to current inputState');
           currentInputState.groups = cachedOptionGroups;
         }
       });
@@ -806,10 +1310,10 @@ export function createSessionContentProvider(
       // Subscribe to changes — update selection in real-time.
       inputState.onDidChange(() => {
         const groups = inputState.groups ?? [];
-        logger.appendLine(
-          `[session-provider] Picker changed: ${groups.length} groups` +
-          groups.map(g => ` [${g.id}] selected=${g.selected?.id ?? '(none)'}`).join(''),
-        );
+        // [debug] logger.appendLine(
+        //   `[session-provider] Picker changed: ${groups.length} groups` +
+        //   groups.map(g => ` [${g.id}] selected=${g.selected?.id ?? '(none)'}`).join(''),
+        // );
 
         for (const group of groups) {
           const selected = group.selected;
@@ -817,7 +1321,7 @@ export function createSessionContentProvider(
 
           // Skip placeholder items — they shouldn't leak into state
           if (selected.id.endsWith('-connecting')) {
-            logger.appendLine(`[session-provider] Picker ignored placeholder selection: ${selected.id}`);
+            // [debug] logger.appendLine(`[session-provider] Picker ignored placeholder selection: ${selected.id}`);
             continue;
           }
 
@@ -826,7 +1330,7 @@ export function createSessionContentProvider(
             state.selection.setAgent(agentId).catch((err: unknown) => {
               logger.appendLine(`[session-provider] Failed to set agent: ${err}`);
             });
-            logger.appendLine(`[session-provider] Picker set currentAgent=${agentId}`);
+            // [debug] logger.appendLine(`[session-provider] Picker set currentAgent=${agentId}`);
           }
         }
       });
@@ -863,6 +1367,7 @@ export function createSessionContentProvider(
     dispose: () => {
       backendReadyDispose();
       sessionListChangedDispose?.();
+      sessionItemStateChangedDispose?.dispose();
     },
   });
 
@@ -897,19 +1402,96 @@ export function createSessionContentProvider(
     // Untitled sessions: look up the OpenCode session ID via sessions
     if (rawId) {
       const chatState = state.sessions.get(rawId);
-      if (chatState?.sessionId) {
-        return chatState.sessionId;
+      if (chatState?.backendSessionId) {
+        return chatState.backendSessionId;
       }
 
       // Also check by the full URI string (sessionResource-based keys)
       const uriKey = sessionResource.toString();
       const uriState = state.sessions.get(uriKey);
-      if (uriState?.sessionId) {
-        return uriState.sessionId;
+      if (uriState?.backendSessionId) {
+        return uriState.backendSessionId;
       }
     }
 
     return undefined;
+  }
+
+  function findLiveSessionEntryByBackendId(
+    sessionId: string,
+  ): { key: string; state: import('../../types').SessionState } | undefined {
+    for (const [key, chatState] of state.sessions.entries()) {
+      if (chatState.backendSessionId === sessionId && chatState.turnMap.length > 0) {
+        return { key, state: chatState };
+      }
+    }
+    return undefined;
+  }
+
+  function getPromptFromTurnEvents(events: readonly AcpEvent[]): string | undefined {
+    for (const event of events) {
+      if (event.type === 'part.updated' && event.part.type === 'text') {
+        const text = (event.part as { text?: string }).text?.trim();
+        if (text) {
+          return text;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  function dropFirstPromptEvent(events: readonly AcpEvent[], prompt: string): AcpEvent[] {
+    let dropped = false;
+    return events.filter((event) => {
+      if (!dropped && event.type === 'part.updated' && event.part.type === 'text') {
+        const text = (event.part as { text?: string }).text;
+        if (text === prompt) {
+          dropped = true;
+          return false;
+        }
+      }
+      return true;
+    });
+  }
+
+  function streamTurnToEventTurn(
+    turn: SessionTurnStreamParts<SerializableStreamPart>,
+  ): LegacySessionTurnEvents<AcpEvent> {
+    return {
+      turnIndex: turn.turnIndex,
+      start: turn.start,
+      events: turn.parts.map(projectStreamPartToAcpEvent).filter((event): event is AcpEvent => !!event),
+      end: turn.end,
+    };
+  }
+
+  async function readRestorableTurnEvents(
+    turnsPath: string,
+  ): Promise<{
+    turnEvents: LegacySessionTurnEvents<AcpEvent>[];
+    streamParts: SerializableStreamPart[];
+    source: 'stream-parts' | 'legacy-events' | 'empty';
+  }> {
+    const streamTurns = await readSessionTurnStreamParts<SerializableStreamPart>(turnsPath);
+    const hasStreamParts = streamTurns.some(turn => turn.parts.length > 0);
+    const eventTurns = streamTurns
+      .map(streamTurnToEventTurn)
+      .filter(turn => turn.events.length > 0 || turn.start || turn.end);
+    if (hasStreamParts && eventTurns.length > 0) {
+      return {
+        turnEvents: eventTurns,
+        streamParts: streamTurns.flatMap(turn => turn.parts),
+        source: 'stream-parts',
+      };
+    }
+
+    const legacyTurns = await readLegacySessionTurnEvents<AcpEvent>(turnsPath);
+    const hasLegacyEvents = legacyTurns.some(turn => turn.events.length > 0);
+    return {
+      turnEvents: legacyTurns,
+      streamParts: [],
+      source: hasLegacyEvents ? 'legacy-events' : 'empty',
+    };
   }
 
   /**
@@ -967,6 +1549,7 @@ export function createSessionContentProvider(
 
       const item = ctrl.createChatSessionItem(newResource, getSessionLabel({ id: newSessionId, title }));
       item.status = vscode.ChatSessionStatus.Completed;
+      item.archived = false;
       item.timing = { created: Date.now() };
       ctrl.items.add(item);
 
@@ -983,64 +1566,184 @@ export function createSessionContentProvider(
 
   /**
    * Fetch message history from the backend and map to VSCode turn format.
+   *
+   * Replays persisted ACP events through a CollectorStream + bridge instead of
+   * fetching from the backend API directly. This ensures the restored session
+   * matches the original rendering exactly.
    */
   async function fetchSessionHistory(
     sessionId: string,
     token: vscode.CancellationToken,
-  ): Promise<(vscode.ChatRequestTurn | vscode.ChatResponseTurn)[]> {
-    const result = await state.backend.sessions.messages(sessionId);
-    if (result.error || !result.data) {
+    options?: { replayPendingChanges?: boolean },
+  ): Promise<RestoredSessionHistory> {
+    const turnsPath = state.sessionStore.getTurnsPath(sessionId);
+    const sessionDir = state.sessionStore.getSessionDir(sessionId);
+
+    // 1. Read events and snapshots
+    const { turnEvents, streamParts, source: persistedSource } = await readRestorableTurnEvents(turnsPath);
+    const hasPersistedTurns = turnEvents.some(turn => turn.start);
+    const events = hasPersistedTurns
+      ? turnEvents.flatMap(turn => turn.events)
+      : await readLegacySessionEvents<AcpEvent>(turnsPath);
+    const snapshots = await readCheckpoints(sessionDir);
+    const meta = await state.sessionStore.readMeta(sessionId);
+    const toolIdEditMap = getToolIdEditMap(meta, streamParts);
+    const checkpointApproval = getCheckpointApproval(snapshots, meta);
+    const restoreReplaySnapshots = hasPersistedTurns
+      ? getToolCompleteReplaySnapshots(snapshots, turnEvents)
+      : getToolCompleteReplaySnapshotsForEvents(snapshots, events);
+    const restorableMappedEditSnapshots = filterSnapshotsWithRestoredEditRecords(restoreReplaySnapshots, toolIdEditMap);
+    const restorableSnapshotEditCallIds = new Set(
+      restoreReplaySnapshots
+        .filter(snapshot => snapshot.phase === 'after' && !!snapshot.undoStopId && snapshot.toolCallId)
+        .map(snapshot => snapshot.toolCallId!),
+    );
+    const restorableSnapshotEditSnapshots = restoreReplaySnapshots.filter(snapshot =>
+      !!snapshot.toolCallId && restorableSnapshotEditCallIds.has(snapshot.toolCallId)
+    );
+    const restorableEditSnapshots = restorableMappedEditSnapshots.length > 0
+      ? restorableMappedEditSnapshots
+      : restorableSnapshotEditSnapshots;
+    const pendingReplaySnapshots = options?.replayPendingChanges === false
+      ? []
+      : excludeSnapshots(getRestoreReplaySnapshots(snapshots, meta), restorableEditSnapshots);
+    logRestorableEditSnapshotSummary(sessionId, restorableEditSnapshots, toolIdEditMap);
+
+    logger.appendLine(
+      `[session-provider] fetchSessionHistory: projectedEvents=${events.length} snapshots=${snapshots.length} from ${turnsPath} ` +
+      `(source=${persistedSource}, acceptedThroughTurn=${checkpointApproval.acceptedThroughTurn}, ` +
+      `pending=${checkpointApproval.pendingSnapshots.length}, ` +
+      `restoreReplay=${restoreReplaySnapshots.length}, editRecords=${toolIdEditMap.size}, replayPending=${options?.replayPendingChanges !== false})`,
+    );
+
+    const requestIdByTurnIndex = getRestoredRequestIdByTurnIndex(meta, streamParts);
+    const makeRequestTurn = (
+      prompt: string,
+      requestId: RestoredRequestId,
+      turnIndex: number,
+    ): vscode.ChatRequestTurn => {
       logger.appendLine(
-        `[session-provider] Failed to fetch history for ${sessionId}: ${result.error ?? 'no data'}`,
+        `[session-provider] Restored request id for ${sessionId}: ` +
+        `turn=${turnIndex} requestId=${requestId.id} source=${requestId.source}`,
       );
-      return [];
-    }
+      const Ctor = vscode.ChatRequestTurn as unknown as new (
+        prompt: string,
+        command: string | undefined,
+        references: unknown[],
+        participant: string,
+        toolReferences: readonly unknown[],
+        editedFileEvents: readonly unknown[] | undefined,
+        id: string | undefined,
+      ) => vscode.ChatRequestTurn;
+      return new Ctor(
+        prompt,
+        undefined,
+        [],
+        'opencode-copilot.opencode',
+        [],
+        undefined,
+        requestId.id,
+      );
+    };
 
-    const messages = result.data.items;
     const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
-    const turnMap: Array<{ vscodeTurn: number; messageId: string }> = [];
-    let turnIndex = 0;
 
-    for (const msg of messages) {
-      if (token.isCancellationRequested) { break; }
+    const buildResponseTurn = (
+      turnEventsForResponse: readonly AcpEvent[],
+      snapshotsForResponse: readonly FileSnapshotRecord[],
+    ): vscode.ChatResponseTurn | undefined => {
+      const collector = new CollectorStream();
+      const bridge = state.backend.createBridge(sessionId);
+      bridge.setStream(collector);
 
-      if (msg.role === 'user') {
-        history.push(createRequestTurn(
-          msg.text,
-          undefined, // command
-          [],        // references
-        ));
-      } else if (msg.role === 'assistant') {
-        const responses: vscode.ChatResponseMarkdownPart[] = [];
+      for (const event of turnEventsForResponse) {
+        if (token.isCancellationRequested) break;
+        bridge.processEvent(event);
+        pushSnapshotsForRestoredEditTools(
+          sessionId,
+          getRestoreSnapshotsForToolCompleteEvent(snapshotsForResponse, event),
+          collector,
+          toolIdEditMap,
+        );
+      }
 
-        // Add text as markdown response
-        if (msg.text) {
-          responses.push(new vscode.ChatResponseMarkdownPart(msg.text));
+      if (collector.parts.length === 0) {
+        return undefined;
+      }
+      return collector.buildTurn();
+    };
+
+    if (hasPersistedTurns) {
+      for (const turn of turnEvents) {
+        if (token.isCancellationRequested) break;
+
+        const start = turn.start as { prompt?: unknown } | undefined;
+        const prompt = typeof start?.prompt === 'string' ? start.prompt : getPromptFromTurnEvents(turn.events);
+        if (prompt) {
+          history.push(makeRequestTurn(prompt, getRestoredRequestId(turn.turnIndex, requestIdByTurnIndex), turn.turnIndex));
         }
 
-        // Build turn metadata for session recovery
-        const turnMetadata: Record<string, unknown> = {
-          sessionId,
-          turnMap: [...turnMap],
-        };
-
-        history.push(createResponseTurn(
-          responses,
-          { metadata: turnMetadata },
-        ));
-
-        turnMap.push({
-          vscodeTurn: turnIndex,
-          messageId: msg.id,
-        });
-        turnIndex++;
+        const responseEvents = prompt ? dropFirstPromptEvent(turn.events, prompt) : turn.events;
+        const responseTurn = buildResponseTurn(responseEvents, getToolCompleteReplaySnapshotsForEvents(snapshots, responseEvents));
+        if (responseTurn) {
+          history.push(responseTurn);
+        }
       }
+    } else {
+      let collector = new CollectorStream();
+      let bridge = state.backend.createBridge(sessionId);
+      bridge.setStream(collector);
+
+      const flushAssistantTurn = (): void => {
+        if (collector.parts.length === 0) {
+          return;
+        }
+        history.push(collector.buildTurn());
+        collector = new CollectorStream();
+        bridge = state.backend.createBridge(sessionId);
+        bridge.setStream(collector);
+      };
+
+      let expectingUserMessage = true;
+      let legacyTurnIndex = 0;
+      for (const event of events) {
+        if (token.isCancellationRequested) break;
+
+        if (event.type === 'part.updated' && event.part.type === 'text' && expectingUserMessage) {
+          const textPart = event.part as { text?: string };
+          if (textPart.text && textPart.text.length > 0) {
+            history.push(makeRequestTurn(textPart.text, getRestoredRequestId(legacyTurnIndex, requestIdByTurnIndex), legacyTurnIndex));
+            expectingUserMessage = false;
+            bridge.processEvent(event);
+            continue;
+          }
+        }
+
+        if (event.type === 'session.idle') {
+          bridge.processEvent(event);
+          flushAssistantTurn();
+          expectingUserMessage = true;
+          legacyTurnIndex++;
+          continue;
+        }
+
+        bridge.processEvent(event);
+        pushSnapshotsForRestoredEditTools(
+          sessionId,
+          getRestoreSnapshotsForToolCompleteEvent(snapshots, event),
+          collector,
+          toolIdEditMap,
+        );
+      }
+
+      flushAssistantTurn();
     }
 
     logger.appendLine(
       `[session-provider] Restored ${history.length} turns for session ${sessionId}`,
     );
-    return history;
+
+    return { history, snapshots, pendingReplaySnapshots, restoreReplaySnapshots };
   }
 
   // -- The Provider --------------------------------------------------------
@@ -1065,6 +1768,8 @@ export function createSessionContentProvider(
       if (cachedOptionGroups.length > 0 && !isPlaceholderGroups(cachedOptionGroups)) {
         return Promise.resolve({ optionGroups: cachedOptionGroups });
       }
+
+      kickBackendStart('provider options requested');
 
       // If a refresh is already in-flight, return the in-flight promise.
       // This prevents re-entrant loops where fire() → VSCode re-query → refresh again.
@@ -1126,9 +1831,10 @@ export function createSessionContentProvider(
       // request.sessionId which matches the untitled-* ID from the URI path.
       if (sessionId.startsWith('untitled-')) {
         const chatState = state.sessions.get(sessionId);
-        if (chatState?.sessionId) {
+        if (chatState?.backendSessionId) {
+          const backendSessionId = chatState.backendSessionId;
           logger.appendLine(
-            `[session-provider] Found existing OpenCode session ${chatState.sessionId} for VSCode session ${sessionId}`,
+            `[session-provider] Found existing OpenCode session ${backendSessionId} for VSCode session ${sessionId}`,
           );
 
           // Fetch history from the OpenCode backend
@@ -1136,7 +1842,9 @@ export function createSessionContentProvider(
             try {
               await ensureBackendRunning();
 
-              const history = await fetchSessionHistory(chatState.sessionId, token);
+              const { history } = await fetchSessionHistory(backendSessionId, token, {
+                replayPendingChanges: false,
+              });
 
               // Determine title with priority:
               // 1. Non-placeholder chatState title (already fetched from backend earlier)
@@ -1149,18 +1857,32 @@ export function createSessionContentProvider(
                 // Try fetching the latest title from backend — it may have been
                 // auto-generated after the first response completed.
                 try {
-                  const sessionInfo = await state.backend.sessions.get(chatState.sessionId);
+                  const sessionInfo = await state.backend.sessions.get(backendSessionId);
                   const backendTitle = sessionInfo.data?.title?.trim() ?? '';
                   if (!isPlaceholderSessionTitle(backendTitle)) {
                     title = backendTitle;
-                    // Persist to sessions so subsequent tab switches skip the fetch
-                    chatState.title = backendTitle;
+                    await applySessionTitle(state, {
+                      backendSessionId,
+                      title: backendTitle,
+                      overwrite: false,
+                      emitListChanged: false,
+                      source: 'backend',
+                    });
                   } else {
-                    title = getHistoryDerivedSessionTitle(history, chatState.sessionId);
+                    title = getHistoryDerivedSessionTitle(history, backendSessionId);
                   }
                 } catch {
-                  title = getHistoryDerivedSessionTitle(history, chatState.sessionId);
+                  title = getHistoryDerivedSessionTitle(history, backendSessionId);
                 }
+              }
+              if (!isPlaceholderSessionTitle(title)) {
+                await applySessionTitle(state, {
+                  backendSessionId,
+                  title,
+                  overwrite: false,
+                  emitListChanged: false,
+                  source: chatState.title === title ? 'restore' : 'history',
+                });
               }
 
               return {
@@ -1199,9 +1921,20 @@ export function createSessionContentProvider(
 
           // Get session info for title
           const sessionInfo = await state.backend.sessions.get(sessionId);
+          const vscodeSessionKey = resource.toString();
+          const liveEntry = findLiveSessionEntryByBackendId(sessionId);
+          const isLiveInMemory = !!liveEntry;
+          if (liveEntry && !state.sessions.has(vscodeSessionKey)) {
+            state.sessions.set(vscodeSessionKey, liveEntry.state);
+            logger.appendLine(
+              `[session-provider] Aliased provider resource ${vscodeSessionKey} to live session ${sessionId} from ${liveEntry.key}`,
+            );
+          }
 
           // Fetch message history
-          const history = await fetchSessionHistory(sessionId, token);
+          const { history, pendingReplaySnapshots } = await fetchSessionHistory(sessionId, token, {
+            replayPendingChanges: !isLiveInMemory,
+          });
           const backendTitle = sessionInfo.data?.title?.trim() ?? '';
           // Use backend title only if it's a meaningful (non-placeholder) title;
           // otherwise derive from the first user message in history.
@@ -1210,13 +1943,13 @@ export function createSessionContentProvider(
             : getHistoryDerivedSessionTitle(history, sessionId);
 
           // Store in session map for request handler continuity
-          const vscodeSessionKey = resource.toString();
           const existingState = state.sessions.get(vscodeSessionKey);
           let bestTitle = title;
           if (existingState) {
-            existingState.sessionId = sessionId;
+            existingState.backendSessionId = sessionId;
             if (!existingState.title?.trim() || isPlaceholderSessionTitle(existingState.title)) {
               existingState.title = title;
+              existingState.titleSource = !isPlaceholderSessionTitle(backendTitle) ? 'backend' : 'history';
             }
             bestTitle = existingState.title;
             existingState.createdAt = sessionInfo.data?.createdAt ?? existingState.createdAt ?? new Date();
@@ -1226,17 +1959,29 @@ export function createSessionContentProvider(
             // already has a non-placeholder title (from a previous handler run).
             if (isPlaceholderSessionTitle(title)) {
               for (const cs of state.sessions.values()) {
-                if (cs.sessionId === sessionId && !isPlaceholderSessionTitle(cs.title)) {
+                if (cs.backendSessionId === sessionId && !isPlaceholderSessionTitle(cs.title)) {
                   bestTitle = cs.title ?? bestTitle;
                   break;
                 }
               }
             }
             state.sessions.set(vscodeSessionKey, {
-              sessionId: sessionId,
+              backendSessionId: sessionId,
               turnMap: [],
               title: bestTitle,
+              titleSource: !isPlaceholderSessionTitle(backendTitle) ? 'backend' : 'history',
               createdAt: sessionInfo.data?.createdAt ?? new Date(),
+            });
+          }
+
+          if (!isPlaceholderSessionTitle(bestTitle)) {
+            await applySessionTitle(state, {
+              backendSessionId: sessionId,
+              title: bestTitle,
+              createdAt: sessionInfo.data?.createdAt,
+              overwrite: false,
+              emitListChanged: false,
+              source: !isPlaceholderSessionTitle(backendTitle) ? 'backend' : 'history',
             });
           }
 
@@ -1244,6 +1989,16 @@ export function createSessionContentProvider(
             title: bestTitle,
             history,
             requestHandler: createParticipantHandler(state),
+            ...(pendingReplaySnapshots.length > 0
+              ? {
+                  activeResponseCallback: async (
+                    stream: vscode.ChatResponseStream,
+                    activeToken: vscode.CancellationToken,
+                  ) => {
+                    await replayPendingSnapshotsForSession(sessionId, pendingReplaySnapshots, stream, activeToken);
+                  },
+                }
+              : {}),
             ...(sessionForkHandler ? { forkHandler: sessionForkHandler } : {}),
           };
         } catch (err) {
@@ -1295,13 +2050,12 @@ export async function renderWithExperimentalSurface(
   // Check stream capabilities at runtime (may or may not be available)
   const hasFullProposed = hasFullProposedSurface(stream);
   const hasToolPart = hasChatToolInvocationPart();
-  const hasMultiDiff = hasChatResponseMultiDiffPart();
 
   const logger = { appendLine: (m: string) => { console.log(m); } };
 
   logger.appendLine(
     `[experimental-session] caps: fullProposed=${hasFullProposed}, ` +
-    `toolPart=${hasToolPart}, multiDiff=${hasMultiDiff}`,
+    `toolPart=${hasToolPart}`,
   );
 
   renderer.probeStream(stream);
@@ -1344,40 +2098,47 @@ export async function renderWithExperimentalSurface(
 // ---------------------------------------------------------------------------
 
 /**
+ * The participant ID used to construct ChatRequestTurn / ChatResponseTurn
+ * objects. Must match the ID passed to `vscode.chat.createChatParticipant()`.
+ */
+const PARTICIPANT_ID = 'opencode-copilot.opencode';
+
+/**
  * Create a ChatRequestTurn for session history restoration.
  *
- * VSCode's stable types mark the constructor as @hidden/private, but the
- * proposed chatSessionsProvider API allows extensions to construct these objects.
- * We use a type-safe factory to avoid `as any` at call sites.
+ * VSCode's internal ChatRequestTurn constructor requires 5 arguments:
+ *   (prompt, command, references, participant, toolReferences)
+ * The proposed ChatRequestTurn2 form also accepts restored metadata after
+ * those arguments, including the stable request id used by edit sessions.
+ * The stable @types/vscode hides the constructor, but the proposed
+ * chatSessionsProvider API permits construction at runtime.
  */
 function createRequestTurn(
   prompt: string,
   command: string | undefined,
   references: readonly vscode.ChatPromptReference[],
+  requestId?: string,
 ): vscode.ChatRequestTurn {
-  // The proposed API exposes the constructor at runtime despite @types marking it private.
   const Ctor = vscode.ChatRequestTurn as unknown as new (
     p: string,
     c: string | undefined,
     r: readonly vscode.ChatPromptReference[],
+    participant: string,
+    toolReferences: readonly vscode.ChatLanguageModelToolReference[],
+    editedFileEvents: readonly unknown[] | undefined,
+    id: string | undefined,
   ) => vscode.ChatRequestTurn;
-  return new Ctor(prompt, command, references);
+  return new Ctor(prompt, command, references, PARTICIPANT_ID, [], undefined, requestId);
 }
 
 /**
  * Create a ChatResponseTurn for session history restoration.
+ *
+ * VSCode's internal ChatResponseTurn constructor requires 3–4 arguments:
+ *   (response, result, participant, command?)
+ * Missing the `participant` parameter causes VS Code to reject or silently
+ * drop the turn during rendering.
  */
-function createResponseTurn(
-  response: readonly vscode.ChatResponseMarkdownPart[],
-  result: vscode.ChatResult,
-): vscode.ChatResponseTurn {
-  const Ctor = vscode.ChatResponseTurn as unknown as new (
-    r: readonly vscode.ChatResponseMarkdownPart[],
-    res: vscode.ChatResult,
-  ) => vscode.ChatResponseTurn;
-  return new Ctor(response, result);
-}
-
 function getTitle(state: { title?: string }): string | undefined {
   return state.title;
 }

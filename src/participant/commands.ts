@@ -151,7 +151,7 @@ async function handleModelCommand(
 /**
  * Test command: simulates an externalEdit lifecycle to verify bubble pushing.
  *
- * Creates a temporary file, pushes a ChatResponseExternalEditPart (bubble),
+ * Creates a temporary file, starts stream.externalEdit tracking,
  * writes content to the file (simulating an external edit), then completes
  * the edit. Cleans up the temp file afterwards.
  */
@@ -182,7 +182,7 @@ async function handleTestExternalEditCommand(
     await vscode.workspace.fs.writeFile(tmpPath, encoder.encode('// original content\n'));
 
     // 2. Push the externalEdit bubble
-    stream.markdown('📤 Pushing `ChatResponseExternalEditPart` bubble...\n\n');
+    stream.markdown('📤 Starting `stream.externalEdit` tracking...\n\n');
 
     const trackPromise = tracker.trackEdit(editKey, [tmpPath], stream, token);
     await trackPromise;
@@ -352,7 +352,7 @@ async function handleTestExternalEditRealCommand(
       );
 
       // 2. Push externalEdit bubble
-      roundStream.markdown('2️⃣ Pushing `ChatResponseExternalEditPart` bubble...\n\n');
+      roundStream.markdown('2️⃣ Starting `stream.externalEdit` tracking...\n\n');
 
       const trackPromise = tracker.trackEdit(editKey, [uri], roundStream, token);
       await trackPromise;
@@ -477,7 +477,7 @@ async function handleTestExternalEditRealCommand(
       } else {
         roundStream.markdown(
           '   ⚠️ `completeEdit` returned undefined — edit was not tracked.\n\n' +
-          '   This likely means `ChatResponseExternalEditPart` is not available.\n\n',
+          '   This likely means `stream.externalEdit` is not available.\n\n',
         );
       }
     } catch (err) {
@@ -524,7 +524,7 @@ async function handleTestExternalEditRealCommand(
     '  before `completeEdit`).\n\n' +
     '- If **all rounds succeed** → externalEdit works with all write methods.\n\n' +
     '- If **Round 4/5 fail** but **1-3 succeed** → child process writes have issues.\n\n' +
-    '- If **all fail** → `ChatResponseExternalEditPart` not available.\n',
+    '- If **all fail** → `stream.externalEdit` not available.\n',
   );
 
   state.outputChannel.appendLine('[commands] test-external-edit-real completed');

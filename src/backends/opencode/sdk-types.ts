@@ -165,6 +165,13 @@ export interface OpenCodeClient {
       model?: unknown;
       agent?: string;
     }): Promise<SdkResponse<unknown>>;
+    promptAsync(parameters: {
+      sessionID: string;
+      directory?: string;
+      parts?: unknown;
+      model?: unknown;
+      agent?: string;
+    }): Promise<SdkResponse<unknown>>;
     revert(parameters: {
       sessionID: string;
       directory?: string;
@@ -186,7 +193,7 @@ export interface OpenCodeClient {
       directory?: string;
     }): Promise<SdkResponse<Record<string, AcpSessionStatus>>>;
     messages(parameters: {
-      id: string;
+      sessionID: string;
       directory?: string;
       limit?: number;
     }): Promise<SdkResponse<Array<{ info: SdkMessage; parts: SdkPart[] }>>>;

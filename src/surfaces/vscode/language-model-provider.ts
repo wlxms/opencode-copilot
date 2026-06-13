@@ -135,7 +135,7 @@ export function createLanguageModelChatProvider(
           }));
 
         cachedModels = entries;
-        logger.appendLine(`[lm-provider:${vendorId}] Reported ${cachedModels.length} models`);
+        // [debug] logger.appendLine(`[lm-provider:${vendorId}] Reported ${cachedModels.length} models`);
         return cachedModels;
       } catch (err) {
         logger.appendLine(`[lm-provider:${vendorId}] Error: ${err instanceof Error ? err.message : String(err)}`);

@@ -5,6 +5,8 @@
  * The participant layer consumes this — never the raw SDK or VSCode APIs.
  */
 
+import type { CancellationToken } from 'vscode';
+
 import type {
   AcpChildSessionInfo,
   AcpSessionInfo,
@@ -21,6 +23,8 @@ import type {
   AcpMessageHistory,
   BackendSettingsDescriptor,
 } from './types';
+
+import type { FileSnapshotRecord } from '../acp/serializable/types';
 
 // ===========================================================================
 // Event stream
@@ -197,6 +201,47 @@ export interface AcpAuthOperations {
 }
 
 // ===========================================================================
+// Streaming bridge callbacks (event persistence)
+// ===========================================================================
+
+export interface StreamingBridgeCallbacks {
+  /** An ACP event has been fully processed — persist it */
+  onEvent(event: AcpEvent): void;
+  /** A file snapshot was captured (before write/edit) */
+  onSnapshot(snapshot: FileSnapshotRecord): void;
+  /** VS Code returned a real external edit id for a backend tool call. */
+  onExternalEdit?(toolCallId: string, undoStopId: string): void;
+  /** A non-recoverable error occurred */
+  onError(error: Error): void;
+}
+
+// ===========================================================================
+// AcpBridge — backend-specific event interpreter
+// ===========================================================================
+
+/** A bridge that interprets ACP events and renders them to a chat stream.
+ *  Each backend provides its own implementation via {@link AcpBackend.createBridge}.
+ *  The same bridge is used for live rendering and session restore (replay). */
+export interface AcpBridge {
+  /** Set the rendering target (VSCode ChatResponseStream or CollectorStream) */
+  setStream(stream: unknown): void;
+  /** Set persistence callbacks (for JSONL event storage) */
+  setCallbacks(callbacks: StreamingBridgeCallbacks): void;
+  /** Set the external edit tracker (for checkpoint capture) */
+  setTracker(tracker: unknown): void;
+  /** Process a single ACP event — used during session restore (replay) */
+  processEvent(event: AcpEvent): void;
+  /** Run the full event loop — used during live streaming */
+  run(events: AsyncIterable<AcpEvent>, token: CancellationToken): Promise<boolean>;
+  /** Get the captured user message ID, or null if no text part was seen */
+  getUserMessageId(): string | null;
+  /** Get the backend-generated session title, or null */
+  getSessionTitle(): string | null;
+  /** Whether at least one subagent (task) tool completed during this session */
+  getHadSubagentTasks(): boolean;
+}
+
+// ===========================================================================
 // Complete backend contract
 // ===========================================================================
 
@@ -219,6 +264,13 @@ export interface AcpBackend {
   events: AcpEventOperations;
   permissions: AcpPermissionOperations;
   questions: AcpQuestionOperations;
+
+  /** Create a streaming bridge for interpreting events from this backend.
+   *  The bridge handles both live rendering and session restore (replay).
+   *  @param sessionId - the session to bridge events for
+   *  @param directory - optional workspace directory */
+  createBridge(sessionId: string, directory?: string, knownFileUris?: Set<string>): AcpBridge;
+
   auth: AcpAuthOperations;
 
   // -- pluggable settings UI -------------------------------------------

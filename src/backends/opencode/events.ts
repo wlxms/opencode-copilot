@@ -167,6 +167,39 @@ function toAcpFileDiff(d: RawFileDiff): AcpFileDiff {
   };
 }
 
+function formatError(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (value instanceof Error) {
+    return value.message;
+  }
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+  const data = record.data;
+  if (data && typeof data === 'object') {
+    const message = (data as Record<string, unknown>).message;
+    if (typeof message === 'string' && message.trim()) {
+      return message;
+    }
+  }
+  if (typeof record.message === 'string' && record.message.trim()) {
+    return record.message;
+  }
+  if (typeof record.name === 'string' && record.name.trim()) {
+    return record.name;
+  }
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
 // ===========================================================================
 // PermissionAskedEvent → AcpPermissionRequestEvent
 // ===========================================================================
@@ -255,7 +288,7 @@ export function normalizeEvent(event: OpenCodeEvent): AcpEvent[] {
       const err: AcpSessionLifecycleEvent = {
         type: 'session.error',
         sessionId: props?.sessionID as string ?? '',
-        error: props?.error as string | undefined,
+        error: formatError(props?.error),
       };
       return [err];
     }

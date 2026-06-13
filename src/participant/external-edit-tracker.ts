@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import { existsSync, readFileSync } from 'node:fs';
+import type { FileSnapshotRecord } from '../acp/serializable/types';
 
 /**
  * Manages per-edit external edit lifecycles for VSCode's checkpoint/undo mechanism.
@@ -21,12 +23,11 @@ import * as vscode from 'vscode';
  *
  * IMPORTANT — Windows URI Casing:
  *   VSCode's ExternalEditPart performs strict URI path comparison internally.
- *   On Windows, vscode.Uri.file("D:\\path") produces path="/D:/path" (uppercase drive),
- *   but VSCode workspace URIs normalize to "/d:/path" (lowercase drive). This casing
- *   mismatch causes diff capture to silently fail (shows +0-0 instead of actual diff).
- *   Callers MUST normalize the URI before passing it to trackEdit(), e.g.:
+ *   On Windows, URI casing mismatches can cause VSCode's strict internal URI
+ *   comparison to miss the edited file (shows +0-0 instead of actual diff).
+ *   Callers MUST normalize the file URI path before passing it to trackEdit(), e.g.:
  *     const rawUri = vscode.Uri.file(filepath);
- *     const norm = rawUri.path.replace(/^\/([A-Z]):\//, (_, d) => `/${d.toLowerCase()}:`);
+ *     const norm = /^\/[a-zA-Z]:(?=\/)/.test(rawUri.path) ? rawUri.path.toLowerCase() : rawUri.path;
  *     const fileUri = norm !== rawUri.path ? rawUri.with({ path: norm }) : rawUri;
  */
 export class ExternalEditTracker {
@@ -36,8 +37,14 @@ export class ExternalEditTracker {
       complete: () => void;
       onDidComplete: Thenable<string>;
       uris: readonly vscode.Uri[];
+      beforeSnapshots: FileSnapshotRecord[];
     }
   >();
+
+  constructor(
+    private readonly onSnapshot?: (snapshot: FileSnapshotRecord) => void,
+    private readonly getTurnIndex?: () => number,
+  ) {}
 
   hasEdit(editKey: string): boolean {
     return this._ongoingEdits.has(editKey);
@@ -68,15 +75,20 @@ export class ExternalEditTracker {
     if (!uris.length || token?.isCancellationRequested) {
       return;
     }
+    const beforeSnapshots = uris.map((uri, index) => captureSnapshot(uri, editKey, 'before', index, this.getTurnIndex?.()));
 
+    const externalEdit = (stream as {
+      externalEdit?: (target: vscode.Uri | vscode.Uri[], callback: () => Thenable<unknown>) => Thenable<string>;
+    }).externalEdit;
     const ExternalEditCtor = (vscode as any).ChatResponseExternalEditPart as
       | (new (
           uris: readonly vscode.Uri[],
           callback: () => Thenable<unknown>,
         ) => { applied: Thenable<string> })
       | undefined;
+    const push = (stream as { push?: (part: unknown) => void }).push;
 
-    if (!ExternalEditCtor) {
+    if (typeof externalEdit !== 'function' && (!ExternalEditCtor || typeof push !== 'function')) {
       return;
     }
 
@@ -94,18 +106,28 @@ export class ExternalEditTracker {
         });
       }
 
-      const part = new ExternalEditCtor(uris, async () => {
+      const callback = async () => {
+        for (const snapshot of beforeSnapshots) {
+          this.onSnapshot?.(snapshot);
+        }
         resolveTrackEdit();
         await deferredPromise;
         cancelDisposable?.dispose();
-      });
+      };
 
-      (stream as any).push(part);
+      const onDidComplete = typeof externalEdit === 'function'
+        ? externalEdit.call(stream, uris, callback)
+        : (() => {
+            const part = new ExternalEditCtor!(uris, callback);
+            push!.call(stream, part);
+            return part.applied;
+          })();
 
       this._ongoingEdits.set(editKey, {
-        onDidComplete: part.applied,
+        onDidComplete,
         complete: () => deferredResolve?.(),
         uris,
+        beforeSnapshots,
       });
     });
   }
@@ -117,7 +139,23 @@ export class ExternalEditTracker {
     }
     this._ongoingEdits.delete(editKey);
     edit.complete();
-    return edit.onDidComplete;
+    const completed = Promise.resolve(edit.onDidComplete);
+    completed.then(
+      (undoStopId) => {
+        edit.uris.forEach((uri, index) => {
+          this.onSnapshot?.({
+            ...captureSnapshot(uri, editKey, 'after', edit.beforeSnapshots.length + index, this.getTurnIndex?.()),
+            undoStopId: undoStopId || undefined,
+          });
+        });
+      },
+      () => {
+        edit.uris.forEach((uri, index) => {
+          this.onSnapshot?.(captureSnapshot(uri, editKey, 'after', edit.beforeSnapshots.length + index, this.getTurnIndex?.()));
+        });
+      },
+    );
+    return completed;
   }
 
   dispose(): void {
@@ -126,4 +164,24 @@ export class ExternalEditTracker {
     }
     this._ongoingEdits.clear();
   }
+}
+
+function captureSnapshot(
+  uri: vscode.Uri,
+  toolCallId: string,
+  phase: 'before' | 'after',
+  editIndex: number,
+  turnIndex?: number,
+): FileSnapshotRecord {
+  const missing = !existsSync(uri.fsPath);
+  return {
+    uri: uri.toString(),
+    content: missing ? '' : readFileSync(uri.fsPath, 'utf-8'),
+    phase,
+    turnIndex,
+    editIndex,
+    toolCallId,
+    timestamp: new Date().toISOString(),
+    missing,
+  };
 }

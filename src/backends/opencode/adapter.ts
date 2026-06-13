@@ -10,6 +10,7 @@ import { OpenCodeServerManager } from '../../opencode/server';
 import { GlobalEventBroker } from './event-broker';
 import type {
   AcpBackend,
+  AcpBridge,
   AcpSessionOperations,
   AcpConfigOperations,
   AcpEventOperations,
@@ -36,6 +37,7 @@ import type {
 import { normalizeStreamEvent } from './events';
 import type { OpenCodeEventStream } from './sdk-events';
 import type { OpenCodeClient, SdkAgentData } from './sdk-types';
+import { OpenCodeBridge } from './opencode-bridge';
 import { OpenCodeSettingsProvider } from './settings';
 
 // ===========================================================================
@@ -120,6 +122,10 @@ function safeStringify(value: unknown): string {
   }
 }
 
+function formatResultError(value: unknown, fallback: string): string {
+  return `${extractErrorMessage(value, fallback)} | raw=${safeStringify(value)}`;
+}
+
 // ===========================================================================
 // Adapter
 // ===========================================================================
@@ -170,6 +176,15 @@ export class OpenCodeBackend implements AcpBackend {
 
   isRunning(): boolean {
     return this.serverManager.isRunning();
+  }
+
+  /** @inheritdoc */
+  createBridge(sessionId: string, directory?: string, knownFileUris?: Set<string>): AcpBridge {
+    const bridge = new OpenCodeBridge(this.sessions, this.permissions, this.questions);
+    bridge.setSessionId(sessionId);
+    if (directory) bridge.setDirectory(directory);
+    if (knownFileUris) bridge.setKnownFileUris(knownFileUris);
+    return bridge;
   }
 
   // =======================================================================
@@ -295,7 +310,7 @@ export class OpenCodeBackend implements AcpBackend {
           parts.unshift(...fileParts);
         }
 
-        const result = await this.sdk.session.prompt({
+        const result = await this.sdk.session.promptAsync({
           sessionID: id,
           directory,
           parts,
@@ -304,14 +319,12 @@ export class OpenCodeBackend implements AcpBackend {
         });
         const error = getResultError(result);
         if (error !== undefined) {
-          return {
-            error: `${extractErrorMessage(error, 'Prompt failed')} | raw=${safeStringify(error)}`,
-          };
+          return { error: formatResultError(error, 'Prompt failed') };
         }
         return { data: result };
       } catch (err) {
         return {
-          error: `${err instanceof Error ? err.message : String(err)} | raw=${safeStringify(err)}`,
+          error: formatResultError(err, 'Prompt failed'),
         };
       }
     },
