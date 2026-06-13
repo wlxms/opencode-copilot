@@ -773,6 +773,43 @@ describe('OpenCodeBridge', () => {
       expect(editParts).toHaveLength(0);
     });
 
+    it('persists externalEdit undo stop ids through callbacks', async () => {
+      const stream = mockStream();
+      const onExternalEdit = vi.fn();
+      mockTracker.trackEdit.mockResolvedValue(undefined);
+      mockTracker.completeEdit.mockReturnValue(Promise.resolve('undo-stop-from-vscode'));
+      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
+        sessionId: 'ses_target',
+      });
+      permBridge.setTracker(mockTracker as any);
+      permBridge.setCallbacks({
+        onEvent: vi.fn(),
+        onSnapshot: vi.fn(),
+        onExternalEdit,
+        onError: vi.fn(),
+      });
+      const callId = 'call_edit_001';
+      const partId = 'prt_edit_tool';
+      const events = eventStream([
+        permissionAskedEvent({ tool: { messageId: 'msg_t1', callId } }),
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'edit',
+            id: partId,
+            callId,
+            state: { status: 'completed', input: { filePath: '/src/app.ts' }, output: 'ok' },
+          },
+        },
+        idleEvent(),
+      ]);
+
+      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+
+      expect(onExternalEdit).toHaveBeenCalledWith(callId, 'undo-stop-from-vscode');
+    });
+
     it('hides an edit tool card that was pushed before permission.asked marks it as externalEdit', async () => {
       const stream = mockStream();
       mockTracker.trackEdit.mockResolvedValue(undefined);

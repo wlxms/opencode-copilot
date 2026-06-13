@@ -35,6 +35,8 @@ export interface FileSnapshotRecord {
 }
 
 export interface SerializableRequestDetails {
+  /** 0-based user turn that owns this request. */
+  turnIndex?: number;
   /** Stable provider request id when available; turn index fallback otherwise. */
   vscodeRequestId: string;
   /** Backend request id if exposed by the backend. */
@@ -144,9 +146,21 @@ export type SerializableTurn = SerializableRequestTurn | SerializableResponseTur
 // Meta
 // ===========================================================================
 
+export type SessionTitleSource =
+  | 'manual'
+  | 'copilot-style'
+  | 'backend'
+  | 'history'
+  | 'placeholder'
+  | 'restore'
+  | 'legacy';
+
 export interface SerializableSessionMeta {
   id: string;
   title?: string;
+  titleSource?: SessionTitleSource;
+  titleUpdatedAt?: string;
+  provisionalTitle?: boolean;
   createdAt?: string;
   backendName?: string;
   description?: string;

@@ -1,8 +1,7 @@
 import * as vscode from 'vscode';
 import type { AcpEvent, AcpPartUpdatedEvent } from '../acp/types';
 import type { ExtensionState } from '../types';
-import { isPlaceholderSessionTitle } from '../surfaces/vscode/experimental-session';
-import { applySessionTitle } from './session-title';
+import { applySessionTitle, isPlaceholderSessionTitle } from './session-title';
 
 // ===========================================================================
 // Title Generation via lightweight LLM
@@ -131,7 +130,7 @@ async function collectLmText(text: AsyncIterable<string>): Promise<string> {
   return result.trim();
 }
 
-async function generateTitleWithBackendSession(
+export async function generateTitleWithBackendSession(
   normalized: string,
   state: ExtensionState,
   parentSessionId: string,
@@ -208,7 +207,7 @@ async function generateTitleWithBackendSession(
         state.backend.events.closeSessionStream(childSessionId);
         await state.backend.sessions.abort(childSessionId, directory);
       } catch {
-        // Best effort — nothing we can do if cleanup fails.
+        // Best effort - nothing we can do if cleanup fails.
       }
     }
   }
@@ -224,21 +223,21 @@ async function generateTitleWithBackendSession(
 export async function retitleSession(
   prompt: string,
   state: ExtensionState,
-  sessionId: string,
+  backendSessionId: string,
   vscodeSessionId: string,
   directory: string | undefined,
 ): Promise<string | undefined> {
   const logger = state.outputChannel;
-  const llmTitle = await generateSessionTitle(prompt, state, sessionId, directory);
+  const llmTitle = await generateSessionTitle(prompt, state, backendSessionId, directory);
   if (llmTitle && !isPlaceholderSessionTitle(llmTitle)) {
     await applySessionTitle(state, {
-      sessionId,
+      backendSessionId,
       vscodeSessionId,
       title: llmTitle,
       directory,
       updateBackend: true,
       overwrite: true,
-      source: 'llm-retitle',
+      source: 'manual',
     });
     logger.appendLine(`[title-gen] Title applied: "${llmTitle}"`);
   } else {
@@ -256,20 +255,25 @@ export async function retitleSession(
  * title.  Rules are included inline so every model (not just instruction-tuned
  * ones) produces something useable.
  */
-function buildTitlePrompt(userMessage: string): string {
+export function buildTitlePrompt(userMessage: string): string {
   const truncated =
-    userMessage.length > 500
-      ? `${userMessage.slice(0, 497)}…`
+    userMessage.length > 360
+      ? `${userMessage.slice(0, 357)}...`
       : userMessage;
 
   return [
-    'Generate a short, descriptive title (2-8 words) for a coding conversation.',
+    'Generate a short, descriptive title for a coding conversation.',
     '',
     'Rules:',
-    '- Respond with ONLY the title text — no quotes, no explanation, no punctuation at the end',
+    '- Respond with ONLY the title text; no quotes, no explanation, no punctuation at the end',
     '- The title must capture the main topic or task the user is asking about',
+    '- Write the title in the same natural language as the user request when clear',
+    '- If the request mixes languages, use the dominant natural language',
+    '- Preserve product names, APIs, file names, commands, code symbols, and proper nouns exactly',
     '- Keep it concise and specific to coding',
-    '- Examples: "TypeScript Database Pool" | "React Auth Middleware" | "API Error Handling"',
+    '- Aim for 3-6 words; for languages without spaces, keep it similarly brief',
+    '- Drop filler like "help with", "question about", "request for", or their equivalents',
+    '- Examples: "React auth middleware" | "\u4fee\u590d session \u6807\u9898" | "VS Code tree view"',
     '',
     `User message: "${truncated}"`,
   ].join('\n');
@@ -318,7 +322,7 @@ async function collectTextResponse(stream: AsyncIterable<AcpEvent>): Promise<str
  * Returns `undefined` if the result is unusable.
  */
 export function cleanGeneratedTitle(raw: string): string | undefined {
-  // Remove formatting artifacts — order matters:
+  // Remove formatting artifacts - order matters:
   // bold markers first, then surrounding quotes, so `**"title"**` works correctly.
   const cleaned = raw
     .replace(/\*\*/g, '')

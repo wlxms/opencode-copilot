@@ -103,10 +103,11 @@ describe('createParticipantHandler', () => {
       getUrl: vi.fn(() => 'http://127.0.0.1:51777'),
       isRunning: vi.fn(() => backendStatus === 'running'),
       sessions: {
-        create: vi.fn(async (options?: { title?: string; directory?: string }) => {
+        create: vi.fn(async (options?: { title?: string; directory?: string; parentId?: string }) => {
           const result = await mockSdkClient.session.create({
             directory: options?.directory,
             title: options?.title,
+            parentId: options?.parentId,
           });
           return { data: result.data ? { id: result.data.id ?? '', title: result.data.title ?? '', createdAt: new Date() } : undefined, error: result.error };
         }),
@@ -159,7 +160,7 @@ describe('createParticipantHandler', () => {
         removeKey: vi.fn(async () => ({ data: undefined })),
       },
       events: {
-        openSessionStream: vi.fn((sessionId: string) => ({
+        openSessionStream: vi.fn((backendSessionId: string) => ({
           stream: (async function* () {
             const global = await mockSdkClient.global.event();
             for await (const event of global.stream) {
@@ -179,7 +180,7 @@ describe('createParticipantHandler', () => {
                       : payload.type === 'permission.asked'
                         ? payload.sessionId
                         : undefined;
-              if (!payloadSession || payloadSession === sessionId) {
+              if (!payloadSession || payloadSession === backendSessionId) {
                 yield event;
               }
             }
@@ -246,6 +247,7 @@ describe('createParticipantHandler', () => {
         getSessionDir: vi.fn().mockReturnValue(''),
         initialize: vi.fn().mockResolvedValue(undefined),
         writeMeta: vi.fn().mockResolvedValue(undefined),
+        updateMeta: vi.fn().mockResolvedValue(undefined),
       } as any,
     };
 
@@ -393,7 +395,7 @@ describe('createParticipantHandler', () => {
       title: 'OpenCode Session chat-1',
     });
     // Session stored in sessionMap under the vscode chat session ID
-    expect(state.sessionMap.get('chat-1')?.sessionId).toBe('session-1');
+    expect(state.sessionMap.get('chat-1')?.backendSessionId).toBe('session-1');
 
     // Events subscribed
     expect(state.backend.events.ensureStarted).toHaveBeenCalledOnce();
@@ -422,7 +424,7 @@ describe('createParticipantHandler', () => {
     backendStatus = 'running';
     // Pre-populate sessionMap with existing session
     state.sessionMap.set('chat-1', {
-      sessionId: 'existing-session',
+      backendSessionId: 'existing-session',
       turnMap: [],
     });
 
@@ -453,11 +455,75 @@ describe('createParticipantHandler', () => {
     expect(result!.metadata).toHaveProperty('sessionId', 'existing-session');
   });
 
+  it('should persist the live VS Code request id for external edit restore metadata', async () => {
+    backendStatus = 'running';
+    state.sessionMap.set('chat-edit-request-id', {
+      backendSessionId: 'existing-session',
+      turnMap: [],
+    });
+
+    let callbacks: { onExternalEdit?: (toolCallId: string, undoStopId: string) => void } | undefined;
+    vi.mocked(state.backend.createBridge).mockReturnValue({
+      setStream: vi.fn(),
+      setCallbacks: vi.fn((next: unknown) => {
+        callbacks = next as typeof callbacks;
+      }),
+      setTracker: vi.fn(),
+      processEvent: vi.fn(),
+      run: vi.fn().mockImplementation(async () => {
+        callbacks?.onExternalEdit?.('tool-live', 'undo-live');
+      }),
+      getUserMessageId: vi.fn().mockReturnValue('msg-live'),
+      getSessionTitle: vi.fn().mockReturnValue(null),
+      getHadSubagentTasks: vi.fn().mockReturnValue(false),
+    } as unknown as ReturnType<AcpBackend['createBridge']>);
+
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+    mockSdkClient.session.promptAsync.mockResolvedValue(undefined);
+
+    const handler = createParticipantHandler(state);
+    await handler(
+      createRequest({
+        prompt: 'edit file',
+        id: 'request-live-handler-0',
+        sessionId: 'chat-edit-request-id',
+      }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    const metaPath = path.join(
+      workspaceRoot,
+      '.acpilot',
+      'opencode',
+      'existing-session',
+      '_meta.json',
+    );
+    const persisted = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as {
+      requestDetails?: Array<{
+        turnIndex?: number;
+        vscodeRequestId: string;
+        toolIdEditMap: Record<string, string>;
+      }>;
+    };
+
+    expect(persisted.requestDetails).toEqual([
+      {
+        turnIndex: 0,
+        vscodeRequestId: 'request-live-handler-0',
+        toolIdEditMap: { 'tool-live': 'undo-live' },
+      },
+    ]);
+  });
+
   it('should reuse restored target session when state exists under sessionResource', async () => {
     backendStatus = 'running';
     const resourceKey = 'opencode-copilot.opencode:///session-existing';
     const restoredState = {
-      sessionId: 'existing-session',
+      backendSessionId: 'existing-session',
       turnMap: [],
     };
     state.sessionMap.set(resourceKey, restoredState);
@@ -531,7 +597,7 @@ describe('createParticipantHandler', () => {
     backendStatus = 'running';
     // Simulate 2 completed turns: turnMap has 2 entries
     state.sessionMap.set('chat-revert-1', {
-      sessionId: 'revert-session',
+      backendSessionId: 'revert-session',
       turnMap: [
         { vscodeTurn: 0, messageId: 'msg-0' },
         { vscodeTurn: 1, messageId: 'msg-1' },
@@ -585,7 +651,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     backendStatus = 'running';
     // Simulate 3 completed turns
     state.sessionMap.set('chat-revert-3', {
-      sessionId: 'revert-session-3',
+      backendSessionId: 'revert-session-3',
       turnMap: [
         { vscodeTurn: 0, messageId: 'msg-0' },
         { vscodeTurn: 1, messageId: 'msg-1' },
@@ -634,7 +700,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     backendStatus = 'running';
     // Simulate 2 completed turns
     state.sessionMap.set('chat-revert-full', {
-      sessionId: 'full-rewind-session',
+      backendSessionId: 'full-rewind-session',
       turnMap: [
         { vscodeTurn: 0, messageId: 'msg-0' },
         { vscodeTurn: 1, messageId: 'msg-1' },
@@ -672,7 +738,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
   it('should fall back to new session on revert failure', async () => {
     backendStatus = 'running';
     state.sessionMap.set('chat-revert-fail', {
-      sessionId: 'fail-session',
+      backendSessionId: 'fail-session',
       turnMap: [
         { vscodeTurn: 0, messageId: 'msg-0' },
         { vscodeTurn: 1, messageId: 'msg-1' },
@@ -811,7 +877,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     backendStatus = 'running';
     // Pre-populate sessionMap so session is reused
     state.sessionMap.set('chat-running', {
-      sessionId: 'existing-id',
+      backendSessionId: 'existing-id',
       turnMap: [],
     });
 
@@ -932,7 +998,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Set up full flow mocks
     backendStatus = 'running';
     state.sessionMap.set('chat-cp-1', {
-      sessionId: 'existing-session',
+      backendSessionId: 'existing-session',
       turnMap: [],
     });
 
@@ -968,7 +1034,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Set up full flow mocks
     backendStatus = 'running';
     state.sessionMap.set('chat-cp-2', {
-      sessionId: 'existing-session',
+      backendSessionId: 'existing-session',
       turnMap: [],
     });
 
@@ -997,7 +1063,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // Set up so that the handler starts but prompt throws
     backendStatus = 'running';
     state.sessionMap.set('chat-cp-3', {
-      sessionId: 'existing-session',
+      backendSessionId: 'existing-session',
       turnMap: [],
     });
 
@@ -1028,7 +1094,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
 
     backendStatus = 'running';
     state.sessionMap.set('chat-title-test', {
-      sessionId: 'ses-title-123',
+      backendSessionId: 'ses-title-123',
       turnMap: [],
       title: 'New OpenCode Session',
     });
@@ -1055,10 +1121,9 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     // sessionMap should be updated with the backend title
     const chatState = state.sessionMap.get('chat-title-test');
     expect(chatState?.title).toBe('How to implement OAuth');
-    expect(state.sessionStore.writeMeta).toHaveBeenCalledWith(
+    expect(state.sessionStore.updateMeta).toHaveBeenCalledWith(
       'ses-title-123',
       expect.objectContaining({
-        id: 'ses-title-123',
         title: 'How to implement OAuth',
         backendName: 'opencode',
       }),
@@ -1070,7 +1135,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
 
     backendStatus = 'running';
     state.sessionMap.set('chat-title-lm', {
-      sessionId: 'ses-title-lm',
+      backendSessionId: 'ses-title-lm',
       turnMap: [],
       title: 'New OpenCode Session',
     });
@@ -1140,9 +1205,148 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     expect(lmModel.sendRequest).toHaveBeenCalled();
     expect(opencodeLmModel.sendRequest).not.toHaveBeenCalled();
     expect(state.sessionMap.get('chat-title-lm')?.title).toBe('OAuth Middleware');
-    expect(state.sessionStore.writeMeta).toHaveBeenCalledWith(
+    expect(state.sessionStore.updateMeta).toHaveBeenCalledWith(
       'ses-title-lm',
       expect.objectContaining({ title: 'OAuth Middleware' }),
+    );
+  });
+
+  it('should generate first-turn title using backend title generator when VS Code LM is unavailable', async () => {
+    const handler = createParticipantHandler(state);
+
+    backendStatus = 'running';
+    state.sessionMap.set('chat-title-backend-gen', {
+      backendSessionId: 'ses-title-backend-gen',
+      turnMap: [],
+      title: 'New OpenCode Session',
+    });
+
+    vi.spyOn(vscode.lm, 'selectChatModels').mockResolvedValue([]);
+    vi.mocked(state.backend.sessions.get).mockResolvedValue({
+      data: { id: 'ses-title-backend-gen', title: 'New OpenCode Session', createdAt: new Date() },
+    });
+    vi.mocked(state.backend.sessions.update).mockImplementation(async (_id, options) => ({
+      data: { id: 'ses-title-backend-gen', title: options.title ?? '', createdAt: new Date() },
+    }));
+    mockSdkClient.session.create.mockResolvedValueOnce({
+      data: { id: 'title-child-session', title: 'Title Generator' },
+    });
+
+    vi.mocked(state.backend.events.openSessionStream).mockImplementation((backendSessionId: string) => ({
+      stream: (async function* () {
+        if (backendSessionId === 'title-child-session') {
+          yield {
+            type: 'part.updated',
+            part: { type: 'text', id: 'title-text', text: 'OAuth Middleware' },
+          } as any;
+          yield { type: 'session.idle', sessionId: backendSessionId } as any;
+        }
+      })(),
+    }));
+    vi.mocked(state.backend.createBridge).mockReturnValue({
+      setStream: vi.fn(),
+      setCallbacks: vi.fn(),
+      setTracker: vi.fn(),
+      processEvent: vi.fn(),
+      run: vi.fn().mockResolvedValue(true),
+      getUserMessageId: vi.fn().mockReturnValue('user-title-backend-gen'),
+      getSessionTitle: vi.fn().mockReturnValue(null),
+      getHadSubagentTasks: vi.fn().mockReturnValue(false),
+    } as unknown as ReturnType<AcpBackend['createBridge']>);
+
+    mockSdkClient.global.event.mockResolvedValue({
+      stream: emptyEventStream(),
+    });
+
+    const result = await handler(
+      createRequest({ prompt: 'how to implement oauth middleware', sessionId: 'chat-title-backend-gen' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    expect(result!.metadata).toHaveProperty('sessionId', 'ses-title-backend-gen');
+    expect(mockSdkClient.session.create).toHaveBeenCalledWith({
+      parentId: 'ses-title-backend-gen',
+      directory: workspaceRoot,
+      title: 'Title Generator',
+    });
+    expect(mockSdkClient.session.promptAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionID: 'title-child-session',
+        directory: workspaceRoot,
+      }),
+    );
+    expect(state.sessionMap.get('chat-title-backend-gen')?.title).toBe('OAuth Middleware');
+    expect(state.sessionMap.get('chat-title-backend-gen')?.titleSource).toBe('copilot-style');
+    expect(state.sessionStore.updateMeta).toHaveBeenCalledWith(
+      'ses-title-backend-gen',
+      expect.objectContaining({ title: 'OAuth Middleware', titleSource: 'copilot-style' }),
+    );
+  });
+
+  it('should ignore provisional prompt-derived backend title and still generate a title', async () => {
+    const handler = createParticipantHandler(state);
+    const provisionalTitle = 'how to implement oauth middleware';
+
+    backendStatus = 'running';
+    state.sessionMap.set('chat-title-provisional', {
+      backendSessionId: 'ses-title-provisional',
+      turnMap: [],
+      title: provisionalTitle,
+      titleSource: 'history',
+      provisionalTitle: true,
+    });
+
+    vi.spyOn(vscode.lm, 'selectChatModels').mockResolvedValue([]);
+    vi.mocked(state.backend.sessions.get).mockResolvedValue({
+      data: { id: 'ses-title-provisional', title: provisionalTitle, createdAt: new Date() },
+    });
+    vi.mocked(state.backend.sessions.update).mockImplementation(async (_id, options) => ({
+      data: { id: 'ses-title-provisional', title: options.title ?? '', createdAt: new Date() },
+    }));
+    mockSdkClient.session.create.mockResolvedValueOnce({
+      data: { id: 'title-child-provisional', title: 'Title Generator' },
+    });
+
+    vi.mocked(state.backend.events.openSessionStream).mockImplementation((backendSessionId: string) => ({
+      stream: (async function* () {
+        if (backendSessionId === 'title-child-provisional') {
+          yield {
+            type: 'part.updated',
+            part: { type: 'text', id: 'title-text', text: 'OAuth middleware' },
+          } as any;
+          yield { type: 'session.idle', sessionId: backendSessionId } as any;
+        }
+      })(),
+    }));
+    vi.mocked(state.backend.createBridge).mockReturnValue({
+      setStream: vi.fn(),
+      setCallbacks: vi.fn(),
+      setTracker: vi.fn(),
+      processEvent: vi.fn(),
+      run: vi.fn().mockResolvedValue(true),
+      getUserMessageId: vi.fn().mockReturnValue('user-title-provisional'),
+      getSessionTitle: vi.fn().mockReturnValue(provisionalTitle),
+      getHadSubagentTasks: vi.fn().mockReturnValue(false),
+    } as unknown as ReturnType<AcpBackend['createBridge']>);
+
+    const result = await handler(
+      createRequest({ prompt: provisionalTitle, sessionId: 'chat-title-provisional' }),
+      { history: [] },
+      stream,
+      token,
+    );
+
+    expect(result!.metadata).toHaveProperty('sessionId', 'ses-title-provisional');
+    expect(state.sessionMap.get('chat-title-provisional')?.title).toBe('OAuth middleware');
+    expect(state.sessionMap.get('chat-title-provisional')?.titleSource).toBe('copilot-style');
+    expect(state.sessionMap.get('chat-title-provisional')?.provisionalTitle).toBe(false);
+    expect(state.outputChannel.appendLine).toHaveBeenCalledWith(
+      expect.stringContaining('Ignoring provisional session title echo'),
+    );
+    expect(state.outputChannel.appendLine).toHaveBeenCalledWith(
+      expect.stringContaining('Ignoring provisional backend title echo'),
     );
   });
 
@@ -1151,7 +1355,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
 
     backendStatus = 'running';
     state.sessionMap.set('chat-title-keep', {
-      sessionId: 'ses-title-456',
+      backendSessionId: 'ses-title-456',
       turnMap: [],
       title: 'Existing Good Title',
     });

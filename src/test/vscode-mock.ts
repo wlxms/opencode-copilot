@@ -629,6 +629,10 @@ export class ChatRequestTurn {
         public readonly references: Array<{ id: string; name: string }> = [],
         public readonly participant: string = 'opencode',
         public readonly toolReferences: readonly unknown[] = [],
+        public readonly editedFileEvents?: readonly unknown[],
+        public readonly id?: string,
+        public readonly modelId?: string,
+        public readonly modeInstructions2?: unknown,
     ) {}
 }
 

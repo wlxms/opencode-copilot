@@ -76,6 +76,7 @@ import { readCheckpoints } from '../../acp/checkpoint/checkpoint-store';
 import { getCheckpointApproval, snapshotTurnIndex } from '../../acp/checkpoint/approval-state';
 import { pushSnapshotTextEditParts, replaySnapshotsToWorkspace } from '../../acp/checkpoint/replay';
 import { applySessionTitle } from '../../participant/session-title';
+import type { SessionTitleSource } from '../../acp/serializable/types';
 
 // ---------------------------------------------------------------------------
 // Internal types for session content rendering (not part of the VS Code API)
@@ -115,6 +116,13 @@ interface RestoredSessionHistory {
 }
 
 type ToolIdEditMap = Map<string, string>;
+
+type RestoredRequestIdSource = 'request-details' | 'turn-index';
+
+interface RestoredRequestId {
+  id: string;
+  source: RestoredRequestIdSource;
+}
 
 interface SessionListEntry {
   id: string;
@@ -547,14 +555,14 @@ export function createSessionContentProvider(
     const runtimeSessions = new Map<string, SessionListEntry>();
 
     for (const [stateKey, chatState] of state.sessions.entries()) {
-      if (!chatState.sessionId) {
+      if (!chatState.backendSessionId) {
         continue;
       }
       const resource = stateKey.startsWith('opencode-copilot.opencode:')
         ? vscode.Uri.parse(stateKey)
         : createSessionResource(stateKey);
 
-      const existing = runtimeSessions.get(chatState.sessionId);
+      const existing = runtimeSessions.get(chatState.backendSessionId);
       const newTitle = chatState.title ?? '';
       const hasLiveTurns = chatState.turnMap.length > 0;
 
@@ -564,8 +572,8 @@ export function createSessionContentProvider(
         const existingIsPlaceholder = isPlaceholderSessionTitle(existing.title);
         const newIsPlaceholder = isPlaceholderSessionTitle(newTitle);
         if (existingIsPlaceholder && !newIsPlaceholder) {
-          runtimeSessions.set(chatState.sessionId, {
-            id: chatState.sessionId,
+          runtimeSessions.set(chatState.backendSessionId, {
+            id: chatState.backendSessionId,
             title: newTitle,
             createdAt: chatState.createdAt ?? existing.createdAt,
             resource,
@@ -576,8 +584,8 @@ export function createSessionContentProvider(
           existing.hasLiveTurns = true;
         }
       } else {
-        runtimeSessions.set(chatState.sessionId, {
-          id: chatState.sessionId,
+        runtimeSessions.set(chatState.backendSessionId, {
+          id: chatState.backendSessionId,
           title: newTitle,
           createdAt: chatState.createdAt ?? new Date(),
           resource,
@@ -738,6 +746,33 @@ export function createSessionContentProvider(
     return result;
   }
 
+  function getRestoredRequestIdByTurnIndex(meta?: SerializableSessionMeta): Map<number, string> {
+    const result = new Map<number, string>();
+    for (const details of meta?.requestDetails ?? []) {
+      if (typeof details.turnIndex === 'number' && Number.isFinite(details.turnIndex)) {
+        result.set(details.turnIndex, details.vscodeRequestId);
+        continue;
+      }
+
+      const match = /^turn-(\d+)$/.exec(details.vscodeRequestId);
+      if (match) {
+        result.set(Number(match[1]), details.vscodeRequestId);
+      }
+    }
+    return result;
+  }
+
+  function getRestoredRequestId(
+    turnIndex: number,
+    requestIdByTurnIndex: ReadonlyMap<number, string>,
+  ): RestoredRequestId {
+    const persisted = requestIdByTurnIndex.get(turnIndex);
+    if (persisted) {
+      return { id: persisted, source: 'request-details' };
+    }
+    return { id: `turn-${turnIndex}`, source: 'turn-index' };
+  }
+
   function filterSnapshotsWithRestoredEditRecords(
     snapshots: readonly FileSnapshotRecord[],
     toolIdEditMap: ToolIdEditMap,
@@ -779,6 +814,40 @@ export function createSessionContentProvider(
 
   function isRestoredEditToolName(toolName: string | undefined): boolean {
     return toolName === 'edit' || toolName === 'write';
+  }
+
+  function logRestorableEditSnapshotSummary(
+    sessionId: string,
+    snapshots: readonly FileSnapshotRecord[],
+    toolIdEditMap: ToolIdEditMap,
+  ): void {
+    if (snapshots.length === 0) {
+      logger.appendLine(
+        `[session-provider] Restored edit snapshot summary for ${sessionId}: none ` +
+        `(toolIdEditMap=${toolIdEditMap.size})`,
+      );
+      return;
+    }
+
+    const byToolCall = new Map<string, FileSnapshotRecord[]>();
+    for (const snapshot of snapshots) {
+      const key = snapshot.toolCallId || '(missing-tool-call)';
+      const entries = byToolCall.get(key) ?? [];
+      entries.push(snapshot);
+      byToolCall.set(key, entries);
+    }
+
+    for (const [toolCallId, entries] of byToolCall) {
+      const after = entries.find(snapshot => snapshot.phase === 'after');
+      const before = entries.find(snapshot => snapshot.phase === 'before');
+      logger.appendLine(
+        `[session-provider] Restored edit snapshot summary for ${sessionId}: ` +
+        `toolCallId=${toolCallId} editId=${toolIdEditMap.get(toolCallId) ?? after?.undoStopId ?? '(none)'} ` +
+        `turn=${after?.turnIndex ?? before?.turnIndex ?? '(none)'} ` +
+        `editIndex=${after?.editIndex ?? before?.editIndex ?? '(none)'} ` +
+        `uri=${after?.uri ?? before?.uri ?? '(none)'}`,
+      );
+    }
   }
 
   async function replayPendingSnapshotsForSession(
@@ -1052,10 +1121,14 @@ export function createSessionContentProvider(
     const createdAt = result.data.createdAt ?? new Date();
     const resource = createSessionResource(sessionId);
     const resolvedTitle = result.data.title?.trim() || title;
+    const titleSource: SessionTitleSource = isPlaceholderSessionTitle(resolvedTitle) ? 'placeholder' : 'history';
+    const provisionalTitle = !isPlaceholderSessionTitle(resolvedTitle);
     const chatState = {
-      sessionId,
+      backendSessionId: sessionId,
       turnMap: [],
       title: resolvedTitle,
+      titleSource,
+      provisionalTitle,
       createdAt,
     };
 
@@ -1064,6 +1137,9 @@ export function createSessionContentProvider(
     await state.sessionStore.writeMeta(sessionId, {
       id: sessionId,
       title: resolvedTitle,
+      titleSource,
+      titleUpdatedAt: new Date().toISOString(),
+      provisionalTitle,
       createdAt: createdAt.toISOString(),
       backendName: state.backend.name,
     });
@@ -1260,15 +1336,15 @@ export function createSessionContentProvider(
     // Untitled sessions: look up the OpenCode session ID via sessions
     if (rawId) {
       const chatState = state.sessions.get(rawId);
-      if (chatState?.sessionId) {
-        return chatState.sessionId;
+      if (chatState?.backendSessionId) {
+        return chatState.backendSessionId;
       }
 
       // Also check by the full URI string (sessionResource-based keys)
       const uriKey = sessionResource.toString();
       const uriState = state.sessions.get(uriKey);
-      if (uriState?.sessionId) {
-        return uriState.sessionId;
+      if (uriState?.backendSessionId) {
+        return uriState.backendSessionId;
       }
     }
 
@@ -1279,7 +1355,7 @@ export function createSessionContentProvider(
     sessionId: string,
   ): { key: string; state: import('../../types').SessionState } | undefined {
     for (const [key, chatState] of state.sessions.entries()) {
-      if (chatState.sessionId === sessionId && chatState.turnMap.length > 0) {
+      if (chatState.backendSessionId === sessionId && chatState.turnMap.length > 0) {
         return { key, state: chatState };
       }
     }
@@ -1425,6 +1501,7 @@ export function createSessionContentProvider(
     const pendingReplaySnapshots = options?.replayPendingChanges === false
       ? []
       : excludeSnapshots(getRestoreReplaySnapshots(snapshots, meta), restorableEditSnapshots);
+    logRestorableEditSnapshotSummary(sessionId, restorableEditSnapshots, toolIdEditMap);
 
     logger.appendLine(
       `[session-provider] fetchSessionHistory: read ${events.length} events + ${snapshots.length} snapshots from ${turnsPath} ` +
@@ -1432,14 +1509,35 @@ export function createSessionContentProvider(
       `restoreReplay=${restoreReplaySnapshots.length}, editRecords=${toolIdEditMap.size}, replayPending=${options?.replayPendingChanges !== false})`,
     );
 
-    const makeRequestTurn = (prompt: string): vscode.ChatRequestTurn => new (vscode.ChatRequestTurn as unknown as new (
-      prompt: string, command: string | undefined, references: unknown[], participant: string
-    ) => vscode.ChatRequestTurn)(
-      prompt,
-      undefined,
-      [],
-      'opencode-copilot.opencode',
-    );
+    const requestIdByTurnIndex = getRestoredRequestIdByTurnIndex(meta);
+    const makeRequestTurn = (
+      prompt: string,
+      requestId: RestoredRequestId,
+      turnIndex: number,
+    ): vscode.ChatRequestTurn => {
+      logger.appendLine(
+        `[session-provider] Restored request id for ${sessionId}: ` +
+        `turn=${turnIndex} requestId=${requestId.id} source=${requestId.source}`,
+      );
+      const Ctor = vscode.ChatRequestTurn as unknown as new (
+        prompt: string,
+        command: string | undefined,
+        references: unknown[],
+        participant: string,
+        toolReferences: readonly unknown[],
+        editedFileEvents: readonly unknown[] | undefined,
+        id: string | undefined,
+      ) => vscode.ChatRequestTurn;
+      return new Ctor(
+        prompt,
+        undefined,
+        [],
+        'opencode-copilot.opencode',
+        [],
+        undefined,
+        requestId.id,
+      );
+    };
 
     const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
 
@@ -1475,7 +1573,7 @@ export function createSessionContentProvider(
         const start = turn.start as { prompt?: unknown } | undefined;
         const prompt = typeof start?.prompt === 'string' ? start.prompt : getPromptFromTurnEvents(turn.events);
         if (prompt) {
-          history.push(makeRequestTurn(prompt));
+          history.push(makeRequestTurn(prompt, getRestoredRequestId(turn.turnIndex, requestIdByTurnIndex), turn.turnIndex));
         }
 
         const responseEvents = prompt ? dropFirstPromptEvent(turn.events, prompt) : turn.events;
@@ -1500,13 +1598,14 @@ export function createSessionContentProvider(
       };
 
       let expectingUserMessage = true;
+      let legacyTurnIndex = 0;
       for (const event of events) {
         if (token.isCancellationRequested) break;
 
         if (event.type === 'part.updated' && event.part.type === 'text' && expectingUserMessage) {
           const textPart = event.part as { text?: string };
           if (textPart.text && textPart.text.length > 0) {
-            history.push(makeRequestTurn(textPart.text));
+            history.push(makeRequestTurn(textPart.text, getRestoredRequestId(legacyTurnIndex, requestIdByTurnIndex), legacyTurnIndex));
             expectingUserMessage = false;
             bridge.processEvent(event);
             continue;
@@ -1517,6 +1616,7 @@ export function createSessionContentProvider(
           bridge.processEvent(event);
           flushAssistantTurn();
           expectingUserMessage = true;
+          legacyTurnIndex++;
           continue;
         }
 
@@ -1624,9 +1724,10 @@ export function createSessionContentProvider(
       // request.sessionId which matches the untitled-* ID from the URI path.
       if (sessionId.startsWith('untitled-')) {
         const chatState = state.sessions.get(sessionId);
-        if (chatState?.sessionId) {
+        if (chatState?.backendSessionId) {
+          const backendSessionId = chatState.backendSessionId;
           logger.appendLine(
-            `[session-provider] Found existing OpenCode session ${chatState.sessionId} for VSCode session ${sessionId}`,
+            `[session-provider] Found existing OpenCode session ${backendSessionId} for VSCode session ${sessionId}`,
           );
 
           // Fetch history from the OpenCode backend
@@ -1634,7 +1735,7 @@ export function createSessionContentProvider(
             try {
               await ensureBackendRunning();
 
-              const { history } = await fetchSessionHistory(chatState.sessionId, token, {
+              const { history } = await fetchSessionHistory(backendSessionId, token, {
                 replayPendingChanges: false,
               });
 
@@ -1649,31 +1750,31 @@ export function createSessionContentProvider(
                 // Try fetching the latest title from backend — it may have been
                 // auto-generated after the first response completed.
                 try {
-                  const sessionInfo = await state.backend.sessions.get(chatState.sessionId);
+                  const sessionInfo = await state.backend.sessions.get(backendSessionId);
                   const backendTitle = sessionInfo.data?.title?.trim() ?? '';
                   if (!isPlaceholderSessionTitle(backendTitle)) {
                     title = backendTitle;
                     await applySessionTitle(state, {
-                      sessionId: chatState.sessionId,
+                      backendSessionId,
                       title: backendTitle,
                       overwrite: false,
                       emitListChanged: false,
-                      source: 'restore-backend',
+                      source: 'backend',
                     });
                   } else {
-                    title = getHistoryDerivedSessionTitle(history, chatState.sessionId);
+                    title = getHistoryDerivedSessionTitle(history, backendSessionId);
                   }
                 } catch {
-                  title = getHistoryDerivedSessionTitle(history, chatState.sessionId);
+                  title = getHistoryDerivedSessionTitle(history, backendSessionId);
                 }
               }
               if (!isPlaceholderSessionTitle(title)) {
                 await applySessionTitle(state, {
-                  sessionId: chatState.sessionId,
+                  backendSessionId,
                   title,
                   overwrite: false,
                   emitListChanged: false,
-                  source: 'restore',
+                  source: chatState.title === title ? 'restore' : 'history',
                 });
               }
 
@@ -1738,9 +1839,10 @@ export function createSessionContentProvider(
           const existingState = state.sessions.get(vscodeSessionKey);
           let bestTitle = title;
           if (existingState) {
-            existingState.sessionId = sessionId;
+            existingState.backendSessionId = sessionId;
             if (!existingState.title?.trim() || isPlaceholderSessionTitle(existingState.title)) {
               existingState.title = title;
+              existingState.titleSource = !isPlaceholderSessionTitle(backendTitle) ? 'backend' : 'history';
             }
             bestTitle = existingState.title;
             existingState.createdAt = sessionInfo.data?.createdAt ?? existingState.createdAt ?? new Date();
@@ -1750,28 +1852,29 @@ export function createSessionContentProvider(
             // already has a non-placeholder title (from a previous handler run).
             if (isPlaceholderSessionTitle(title)) {
               for (const cs of state.sessions.values()) {
-                if (cs.sessionId === sessionId && !isPlaceholderSessionTitle(cs.title)) {
+                if (cs.backendSessionId === sessionId && !isPlaceholderSessionTitle(cs.title)) {
                   bestTitle = cs.title ?? bestTitle;
                   break;
                 }
               }
             }
             state.sessions.set(vscodeSessionKey, {
-              sessionId: sessionId,
+              backendSessionId: sessionId,
               turnMap: [],
               title: bestTitle,
+              titleSource: !isPlaceholderSessionTitle(backendTitle) ? 'backend' : 'history',
               createdAt: sessionInfo.data?.createdAt ?? new Date(),
             });
           }
 
           if (!isPlaceholderSessionTitle(bestTitle)) {
             await applySessionTitle(state, {
-              sessionId,
+              backendSessionId: sessionId,
               title: bestTitle,
               createdAt: sessionInfo.data?.createdAt,
               overwrite: false,
               emitListChanged: false,
-              source: 'restore-existing',
+              source: !isPlaceholderSessionTitle(backendTitle) ? 'backend' : 'history',
             });
           }
 
@@ -1898,6 +2001,8 @@ const PARTICIPANT_ID = 'opencode-copilot.opencode';
  *
  * VSCode's internal ChatRequestTurn constructor requires 5 arguments:
  *   (prompt, command, references, participant, toolReferences)
+ * The proposed ChatRequestTurn2 form also accepts restored metadata after
+ * those arguments, including the stable request id used by edit sessions.
  * The stable @types/vscode hides the constructor, but the proposed
  * chatSessionsProvider API permits construction at runtime.
  */
@@ -1905,6 +2010,7 @@ function createRequestTurn(
   prompt: string,
   command: string | undefined,
   references: readonly vscode.ChatPromptReference[],
+  requestId?: string,
 ): vscode.ChatRequestTurn {
   const Ctor = vscode.ChatRequestTurn as unknown as new (
     p: string,
@@ -1912,8 +2018,10 @@ function createRequestTurn(
     r: readonly vscode.ChatPromptReference[],
     participant: string,
     toolReferences: readonly vscode.ChatLanguageModelToolReference[],
+    editedFileEvents: readonly unknown[] | undefined,
+    id: string | undefined,
   ) => vscode.ChatRequestTurn;
-  return new Ctor(prompt, command, references, PARTICIPANT_ID, []);
+  return new Ctor(prompt, command, references, PARTICIPANT_ID, [], undefined, requestId);
 }
 
 /**

@@ -234,9 +234,9 @@ async function resolveSession(
   const vscodeSessionId = _request.sessionId;
   if (vscodeSessionId) {
     const existing = state.sessions.get(vscodeSessionId);
-    if (existing?.sessionId) {
-      logger.appendLine(`[stable-participant] Reusing session ${existing.sessionId}`);
-      return existing.sessionId;
+    if (existing?.backendSessionId) {
+      logger.appendLine(`[stable-participant] Reusing session ${existing.backendSessionId}`);
+      return existing.backendSessionId;
     }
   }
 
@@ -253,7 +253,7 @@ async function resolveSession(
 
     if (vscodeSessionId) {
       state.sessions.set(vscodeSessionId, {
-        sessionId,
+        backendSessionId: sessionId,
         turnMap: [],
       });
     }

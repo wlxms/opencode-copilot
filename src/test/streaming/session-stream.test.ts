@@ -124,6 +124,7 @@ describe('SerializableSessionStream', () => {
       },
       2,
       'Edit a file',
+      'request-live-2',
     );
 
     await stream.initialize();
@@ -135,11 +136,94 @@ describe('SerializableSessionStream', () => {
     const meta = JSON.parse(await fs.readFile(metaPath, 'utf-8')) as SerializableSessionMeta;
     expect(meta.requestDetails).toEqual([
       {
-        vscodeRequestId: 'turn-2',
+        turnIndex: 2,
+        vscodeRequestId: 'request-live-2',
         toolIdEditMap: {
           'tool-1': 'undo-stop-1',
           'tool-2': 'undo-stop-2',
         },
+      },
+    ]);
+  });
+
+  it('falls back to turn-index request ids when no VS Code request id is supplied', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-edit-map-fallback-'));
+    const stream = new SerializableSessionStream(
+      tmpDir,
+      'test-backend',
+      'test-session',
+      {
+        id: 'test-session',
+        title: 'Test Session',
+        createdAt: new Date().toISOString(),
+      },
+      2,
+      'Edit a file',
+    );
+
+    await stream.initialize();
+    stream.onExternalEdit('tool-1', 'undo-stop-1');
+    await stream.flush();
+
+    const metaPath = path.join(tmpDir, '.acpilot', 'test-backend', 'test-session', '_meta.json');
+    const meta = JSON.parse(await fs.readFile(metaPath, 'utf-8')) as SerializableSessionMeta;
+    expect(meta.requestDetails).toEqual([
+      {
+        turnIndex: 2,
+        vscodeRequestId: 'turn-2',
+        toolIdEditMap: {
+          'tool-1': 'undo-stop-1',
+        },
+      },
+    ]);
+  });
+
+  it('preserves request details from earlier turns when appending a new turn', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sst-edit-map-append-'));
+    const meta: SerializableSessionMeta = {
+      id: 'test-session',
+      title: 'Test Session',
+      createdAt: new Date().toISOString(),
+    };
+
+    const first = new SerializableSessionStream(
+      tmpDir,
+      'test-backend',
+      'test-session',
+      meta,
+      0,
+      'First edit',
+      'request-live-0',
+    );
+    await first.initialize();
+    first.onExternalEdit('tool-0', 'undo-stop-0');
+    await first.flush();
+
+    const second = new SerializableSessionStream(
+      tmpDir,
+      'test-backend',
+      'test-session',
+      meta,
+      1,
+      'Second edit',
+      'request-live-1',
+    );
+    await second.initialize();
+    second.onExternalEdit('tool-1', 'undo-stop-1');
+    await second.flush();
+
+    const metaPath = path.join(tmpDir, '.acpilot', 'test-backend', 'test-session', '_meta.json');
+    const persisted = JSON.parse(await fs.readFile(metaPath, 'utf-8')) as SerializableSessionMeta;
+    expect(persisted.requestDetails).toEqual([
+      {
+        turnIndex: 0,
+        vscodeRequestId: 'request-live-0',
+        toolIdEditMap: { 'tool-0': 'undo-stop-0' },
+      },
+      {
+        turnIndex: 1,
+        vscodeRequestId: 'request-live-1',
+        toolIdEditMap: { 'tool-1': 'undo-stop-1' },
       },
     ]);
   });

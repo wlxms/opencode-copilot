@@ -27,6 +27,12 @@ export interface TextEditPartsReplayResult {
   conflicts: Array<{ uri: string; reason: string }>;
 }
 
+export interface SnapshotLineDiffSummary {
+  added: number;
+  removed: number;
+  replacements: number;
+}
+
 type ApplyPatchResult =
   | { ok: true; text: string }
   | { ok: false; reason: string };
@@ -248,6 +254,14 @@ export function pushSnapshotTextEditParts(
       continue;
     }
 
+    const summary = summarizeLineDiff(before, after);
+    logger?.appendLine(
+      `[checkpoint-replay] restored text edit diff: uri=${uri.toString()} ` +
+      `toolCallId=${pair.after.toolCallId || pair.before.toolCallId || '(none)'} ` +
+      `editId=${editId} added=${summary.added} removed=${summary.removed} ` +
+      `replacements=${summary.replacements} textEditPayload=empty+done`,
+    );
+
     target.markdown?.call(target, '\n````\n');
     target.push.call(target, new CodeblockUriCtor(uri, true, editId));
     target.push.call(target, new TextEditPartCtor(uri, []));
@@ -261,6 +275,13 @@ export function pushSnapshotTextEditParts(
   }
 
   return result;
+}
+
+export function summarizeSnapshotLineDiff(
+  before: string,
+  after: string,
+): SnapshotLineDiffSummary {
+  return summarizeLineDiff(before, after);
 }
 
 async function writeWithBestCheckpointIntegration(
@@ -586,6 +607,19 @@ function buildChangeRanges(before: string, after: string): ChangeRange[] {
   }
   flush();
   return changes;
+}
+
+function summarizeLineDiff(before: string, after: string): SnapshotLineDiffSummary {
+  let added = 0;
+  let removed = 0;
+  const changes = buildChangeRanges(before, after);
+
+  for (const change of changes) {
+    added += Math.max(0, change.newEnd - change.newStart);
+    removed += Math.max(0, change.oldEnd - change.oldStart);
+  }
+
+  return { added, removed, replacements: changes.length };
 }
 
 function lineOffset(lines: readonly string[], line: number): number {

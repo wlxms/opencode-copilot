@@ -231,13 +231,15 @@ describe('createSessionContentProvider', () => {
     expect(item.resource.path).toBe('/ses_new_real');
     expect(item.label).toBe('Fix restored edits');
     expect(controller!.items.get(item.resource)).toBe(item);
-    expect(state.sessions.get(item.resource.toString())?.sessionId).toBe('ses_new_real');
-    expect(state.sessionStore.writeMeta).toHaveBeenCalledWith('ses_new_real', {
+    expect(state.sessions.get(item.resource.toString())?.backendSessionId).toBe('ses_new_real');
+    expect(state.sessionStore.writeMeta).toHaveBeenCalledWith('ses_new_real', expect.objectContaining({
       id: 'ses_new_real',
       title: 'Fix restored edits',
+      titleSource: 'history',
+      provisionalTitle: true,
       createdAt: createdAt.toISOString(),
       backendName: 'opencode',
-    });
+    }));
   });
 
   it('publishes runtime session when backend list is empty', async () => {
@@ -443,10 +445,9 @@ describe('createSessionContentProvider', () => {
     expect(state.sessionStore.getTurnsPath).toHaveBeenCalledWith('ses_restore');
     expect(session.title).toBe('Need help with session titles');
     expect(state.sessions.get(restoredResourceKey)?.title).toBe('Need help with session titles');
-    expect(state.sessionStore.writeMeta).toHaveBeenCalledWith(
+    expect(state.sessionStore.updateMeta).toHaveBeenCalledWith(
       'ses_restore',
       expect.objectContaining({
-        id: 'ses_restore',
         title: 'Need help with session titles',
         backendName: 'opencode',
       }),
@@ -513,6 +514,7 @@ describe('createSessionContentProvider', () => {
     const requestTurns = session.history.filter((turn): turn is vscode.ChatRequestTurn => 'prompt' in (turn as any));
     const responseTurns = session.history.filter(turn => !('prompt' in (turn as any)));
     expect(requestTurns.map(turn => turn.prompt)).toEqual(['First question', 'Second question']);
+    expect(requestTurns.map(turn => (turn as any).id)).toEqual(['turn-0', 'turn-1']);
     expect(responseTurns).toHaveLength(2);
     expect(session.history).toHaveLength(4);
   });
@@ -678,7 +680,8 @@ describe('createSessionContentProvider', () => {
       id: 'ses_restore',
       requestDetails: [
         {
-          vscodeRequestId: 'turn-0',
+          turnIndex: 0,
+          vscodeRequestId: 'request-live-restore-0',
           toolIdEditMap: { [callId]: 'persisted-undo-stop-1' },
         },
       ],
@@ -697,6 +700,8 @@ describe('createSessionContentProvider', () => {
 
     const responses = getFirstResponseParts(session);
     expectRestoredTextEditParts(responses, 'persisted-undo-stop-1');
+    const requestTurn = session.history.find((turn): turn is vscode.ChatRequestTurn => 'prompt' in (turn as any));
+    expect((requestTurn as any)?.id).toBe('request-live-restore-0');
     expect(session.activeResponseCallback).toBeUndefined();
   });
 
@@ -962,7 +967,7 @@ describe('createSessionContentProvider', () => {
     fs.writeFileSync(file, 'a\nb\nc\n', 'utf-8');
     const uri = vscode.Uri.file(file);
     const liveState = {
-      sessionId: 'ses_live',
+      backendSessionId: 'ses_live',
       turnMap: [{ vscodeTurn: 0, messageId: 'msg_1' }],
       title: 'Live Session',
       createdAt: new Date('2026-06-05T00:00:00.000Z'),
@@ -1015,7 +1020,13 @@ describe('createSessionContentProvider', () => {
     expect(session.title).toBe('Live Session');
     expect(state.sessions.get(resource.toString())).toBe(liveState);
     expect(fs.readFileSync(file, 'utf-8')).toBe('a\nb\nc\n');
-    expect(state.sessionStore.updateMeta).not.toHaveBeenCalled();
+    expect(state.sessionStore.updateMeta).toHaveBeenCalledWith(
+      'ses_live',
+      expect.objectContaining({
+        title: 'Live Session',
+        titleSource: 'backend',
+      }),
+    );
   });
 
   // =========================================================================
@@ -1074,7 +1085,7 @@ describe('createSessionContentProvider', () => {
 
     // Original tab entry with derived title
     state.sessions.set('opencode-copilot.opencode:/untitled-1', {
-      sessionId: 'ses_dup',
+      backendSessionId: 'ses_dup',
       turnMap: [],
       title: 'Derived From Prompt',
       createdAt: new Date('2026-05-28T01:00:00Z'),
@@ -1082,7 +1093,7 @@ describe('createSessionContentProvider', () => {
 
     // Session list click created a duplicate entry with placeholder title
     state.sessions.set('opencode-copilot.opencode:/ses_dup', {
-      sessionId: 'ses_dup',
+      backendSessionId: 'ses_dup',
       turnMap: [],
       title: 'New OpenCode Session',
       createdAt: new Date('2026-05-28T01:00:00Z'),
@@ -1109,7 +1120,7 @@ describe('createSessionContentProvider', () => {
     ]);
 
     state.sessions.set('opencode-copilot.opencode:/untitled-rename', {
-      sessionId: 'ses_renamed',
+      backendSessionId: 'ses_renamed',
       turnMap: [],
       title: 'Runtime Rename Title',
       createdAt: new Date('2026-05-28T01:00:00Z'),
@@ -1133,7 +1144,7 @@ describe('createSessionContentProvider', () => {
   it('restoring existing session reuses non-placeholder title from another sessionMap entry', async () => {
     // Pre-populate sessionMap with the original entry that has the derived title
     state.sessions.set('opencode-copilot.opencode:/untitled-1', {
-      sessionId: 'ses_existing',
+      backendSessionId: 'ses_existing',
       turnMap: [],
       title: 'My original prompt title',
       createdAt: new Date('2026-05-28T01:00:00Z'),

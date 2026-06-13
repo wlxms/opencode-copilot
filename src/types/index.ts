@@ -44,10 +44,13 @@ export interface TurnMapping {
 
 /** Per-VSCode-chat session state (one per VSCode chat panel) */
 export interface SessionState {
-  sessionId: string;
+  /** Real backend session id, e.g. an OpenCode session id. */
+  backendSessionId: string;
   turnMap: TurnMapping[];
   title?: string;
   createdAt?: Date;
+  titleSource?: import('../acp/serializable/types').SessionTitleSource;
+  provisionalTitle?: boolean;
 }
 
 // ===========================================================================

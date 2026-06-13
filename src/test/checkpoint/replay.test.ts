@@ -3,11 +3,29 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { applyPatchSafely, replaySnapshotsToWorkspace } from '../../acp/checkpoint/replay';
+import { applyPatchSafely, replaySnapshotsToWorkspace, summarizeSnapshotLineDiff } from '../../acp/checkpoint/replay';
 import type { FileSnapshotRecord } from '../../acp/serializable/types';
 import { ExternalEditTracker } from '../../participant/external-edit-tracker';
 
 describe('checkpoint replay', () => {
+  it('summarizes restored snapshot line diffs for edit bubble diagnostics', () => {
+    expect(summarizeSnapshotLineDiff('a\nb\nc\n', 'a\nB\nc\n')).toEqual({
+      added: 1,
+      removed: 1,
+      replacements: 1,
+    });
+    expect(summarizeSnapshotLineDiff('a\nc\n', 'a\nb\nc\n')).toEqual({
+      added: 1,
+      removed: 0,
+      replacements: 1,
+    });
+    expect(summarizeSnapshotLineDiff('a\nb\nc\n', 'a\nc\n')).toEqual({
+      added: 0,
+      removed: 1,
+      replacements: 1,
+    });
+  });
+
   it('replays agent edits when current still equals baseline', () => {
     const result = applyPatchSafely(
       'a\nb\nc\n',

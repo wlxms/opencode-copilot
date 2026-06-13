@@ -37,6 +37,7 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
   private isActive = true;
   private writeQueue: Promise<void> = Promise.resolve();
   private requestDetails: SerializableRequestDetails[] = [];
+  private persistedMeta: SerializableSessionMeta;
 
   constructor(
     private readonly workspaceRoot: string,
@@ -45,7 +46,10 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
     private readonly meta: SerializableSessionMeta,
     private readonly turnIndex = 0,
     private readonly prompt?: string,
-  ) {}
+    private readonly vscodeRequestId = `turn-${turnIndex}`,
+  ) {
+    this.persistedMeta = meta;
+  }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -61,12 +65,21 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
     );
     this.sessionDir = sessionDir;
     this.filePath = path.join(sessionDir, 'turns.jsonl');
+    const existingMeta = await readExistingSessionMeta(sessionDir);
+    this.persistedMeta = existingMeta ? { ...this.meta, ...existingMeta } : this.meta;
+    this.requestDetails = mergeRequestDetails(
+      this.persistedMeta.requestDetails,
+      this.meta.requestDetails,
+    );
+    this.persistedMeta = {
+      ...this.persistedMeta,
+      requestDetails: this.requestDetails,
+    };
     const hasExistingContent = await fileHasContent(this.filePath);
     if (!hasExistingContent) {
       await writeVersionHeader(this.filePath);
-      await writeMeta(this.filePath, this.meta as unknown as Record<string, unknown>);
+      await writeMeta(this.filePath, this.persistedMeta as unknown as Record<string, unknown>);
     }
-    this.requestDetails = [...(this.meta.requestDetails ?? [])];
     await writeTurnStart(this.filePath, {
       turnIndex: this.turnIndex,
       prompt: this.prompt,
@@ -135,16 +148,27 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
 
   onExternalEdit(toolCallId: string, undoStopId: string): void {
     if (!this.isActive || !undoStopId) return;
-    const vscodeRequestId = `turn-${this.turnIndex}`;
-    const existing = this.requestDetails.find(details => details.vscodeRequestId === vscodeRequestId);
+    console.log(
+      `${LOG_PREFIX} externalEdit recorded session=${this.sessionId} turn=${this.turnIndex} ` +
+      `requestId=${this.vscodeRequestId} toolCallId=${toolCallId} undoStopId=${undoStopId}`,
+    );
+    const turnIndexRequestId = `turn-${this.turnIndex}`;
+    const existing = this.requestDetails.find(details =>
+      details.turnIndex === this.turnIndex ||
+      details.vscodeRequestId === this.vscodeRequestId ||
+      details.vscodeRequestId === turnIndexRequestId
+    );
     if (existing) {
+      existing.turnIndex = existing.turnIndex ?? this.turnIndex;
+      existing.vscodeRequestId = this.vscodeRequestId;
       existing.toolIdEditMap = {
         ...existing.toolIdEditMap,
         [toolCallId]: undoStopId,
       };
     } else {
       this.requestDetails.push({
-        vscodeRequestId,
+        turnIndex: this.turnIndex,
+        vscodeRequestId: this.vscodeRequestId,
         toolIdEditMap: { [toolCallId]: undoStopId },
       });
     }
@@ -155,7 +179,7 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
       await fs.writeFile(
         path.join(this.sessionDir, '_meta.json'),
         JSON.stringify({
-          ...this.meta,
+          ...this.persistedMeta,
           requestDetails: this.requestDetails,
         }, null, 2),
         'utf-8',
@@ -182,7 +206,7 @@ export class SerializableSessionStream implements StreamingBridgeCallbacks {
     const hasExistingContent = await fileHasContent(this.filePath);
     if (!hasExistingContent) {
       await writeVersionHeader(this.filePath);
-      await writeMeta(this.filePath, this.meta as unknown as Record<string, unknown>);
+      await writeMeta(this.filePath, this.persistedMeta as unknown as Record<string, unknown>);
     }
     await writeTurnStart(this.filePath, {
       turnIndex: this.turnIndex,
@@ -215,4 +239,44 @@ async function fileHasContent(filePath: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function readExistingSessionMeta(sessionDir: string): Promise<SerializableSessionMeta | undefined> {
+  try {
+    const raw = await fs.readFile(path.join(sessionDir, '_meta.json'), 'utf-8');
+    return JSON.parse(raw) as SerializableSessionMeta;
+  } catch {
+    return undefined;
+  }
+}
+
+function mergeRequestDetails(
+  ...sources: Array<readonly SerializableRequestDetails[] | undefined>
+): SerializableRequestDetails[] {
+  const result: SerializableRequestDetails[] = [];
+
+  for (const source of sources) {
+    for (const details of source ?? []) {
+      const existing = result.find(item =>
+        (details.turnIndex !== undefined && item.turnIndex === details.turnIndex) ||
+        item.vscodeRequestId === details.vscodeRequestId
+      );
+      if (existing) {
+        existing.turnIndex = details.turnIndex ?? existing.turnIndex;
+        existing.vscodeRequestId = details.vscodeRequestId || existing.vscodeRequestId;
+        existing.backendRequestId = details.backendRequestId ?? existing.backendRequestId;
+        existing.toolIdEditMap = {
+          ...existing.toolIdEditMap,
+          ...(details.toolIdEditMap ?? {}),
+        };
+      } else {
+        result.push({
+          ...details,
+          toolIdEditMap: { ...(details.toolIdEditMap ?? {}) },
+        });
+      }
+    }
+  }
+
+  return result;
 }
