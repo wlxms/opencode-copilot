@@ -1,255 +1,304 @@
 /**
- * SerializableSessionStream persists stream parts and file snapshots to JSONL.
+ * SerializableSessionStream (SSS) — owns the VS Code stream, provides push/update API.
  *
- * Writes SerializableStreamPart records, the extension's stable concept model
- * for chat, tool, interaction, and edit metadata.
- * File snapshots continue to be delegated to the checkpoint store.
+ * Architecture (v2):
+ * - SSS holds the vscode.ChatResponseStream — Bridge does NOT touch it directly
+ * - push(ssp): render to stream + append to session.jsonl + syncMetadata
+ * - update(id, data): merge mutable part + render + append + syncMetadata
+ * - subsession(id): returns SubsessionStream for child session events
+ * - writeMeta(patch): append session-level metadata to meta.jsonl
+ * - syncMetadata(ssp): collect IMetadataProvider data → meta.jsonl
  *
- * Layout per session:
+ * File layout:
  *   {workspaceRoot}/.acpilot/{backendName}/{sessionId}/
- *     turns.jsonl          stream parts/events + inline snapshots
- *     _checkpoints.jsonl   dedicated checkpoint-store file
+ *     session.jsonl     ← stream parts (pure append, never rewritten)
+ *     meta.jsonl        ← metadata (pure append, last-write-wins per id)
+ *     subsessions/      ← child session files (SubsessionStream)
+ *
+ * Serialization strategy: write without merge, read with merge (materializeRecords).
  */
 
+import * as vscode from 'vscode';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { ensureSessionDir } from './workspace-setup';
 import {
-  writeVersionHeader,
-  writeMeta,
-  writeTurnStart,
-  writeTurnEnd,
-  writeStreamPart,
-  writeSnapshotLine,
-} from '../serializable/serializer';
-import { writeSnapshot } from '../checkpoint/checkpoint-store';
-import { SerializableStreamPartEventHandler } from '../serializable/stream-parts';
-import type { StreamingBridgeCallbacks } from '../../acp/backend';
-import type {
-  SerializableSessionMeta,
-  FileSnapshotRecord,
-  SerializableRequestDetails,
-  SerializableStreamPart,
-} from '../serializable/types';
-import type { AcpEvent } from '../types';
+  type AnySerializableStreamPart,
+  type StreamPartRecord,
+  type SspStream,
+  isMutable,
+  isMetadataProvider,
+} from '../../ssp/types';
+import { buildLine } from '../serializable/serializer';
+import { ensureSessionDir } from './workspace-setup';
+import { SubsessionStream } from './subsession-stream';
+import type { FileSnapshotRecord } from '../serializable/types';
 
 const LOG_PREFIX = '[SerializableSessionStream]';
 
-export class SerializableSessionStream implements StreamingBridgeCallbacks {
-  private filePath: string | null = null;
+export interface SSSConfig {
+  workspaceRoot: string;
+  backendName: string;
+  sessionId: string;
+  turnIndex: number;
+  requestId: string;
+}
+
+export class SerializableSessionStream {
+  private readonly stream: vscode.ChatResponseStream;
+  private readonly config: SSSConfig;
+
   private sessionDir: string | null = null;
+  private sessionPath: string | null = null;
+  private metaPath: string | null = null;
   private headerWritten = false;
   private isActive = true;
+
+  private parts = new Map<string, AnySerializableStreamPart>();
+  private subsessions = new Map<string, SubsessionStream>();
   private writeQueue: Promise<void> = Promise.resolve();
-  private requestDetails: SerializableRequestDetails[] = [];
-  private persistedMeta: SerializableSessionMeta;
-  private readonly streamPartHandler: SerializableStreamPartEventHandler;
 
-  constructor(
-    private readonly workspaceRoot: string,
-    private readonly backendName: string,
-    private readonly sessionId: string,
-    private readonly meta: SerializableSessionMeta,
-    private readonly turnIndex = 0,
-    private readonly prompt?: string,
-    private readonly vscodeRequestId = `turn-${turnIndex}`,
-  ) {
-    this.persistedMeta = meta;
-    this.streamPartHandler = new SerializableStreamPartEventHandler({
-      turnIndex,
-      requestId: vscodeRequestId,
-      prompt,
-    });
+  constructor(stream: vscode.ChatResponseStream, config: SSSConfig) {
+    this.stream = stream;
+    this.config = config;
   }
 
-  // ── Lifecycle ──────────────────────────────────────────────────────────
+  // ════════════════════════════════════════════════════════════════════════
+  // Core API: push / update
+  // ════════════════════════════════════════════════════════════════════════
 
   /**
-   * Initialise the session directory and write the JSONL header (version + meta).
-   * Must be called once before any onEvent/onSnapshot calls.
+   * Push a new SSP to the stream.
+   * Renders immediately, appends to session.jsonl, collects metadata.
    */
-  async initialize(): Promise<void> {
-    const sessionDir = await ensureSessionDir(
-      this.workspaceRoot,
-      this.backendName,
-      this.sessionId,
-    );
-    this.sessionDir = sessionDir;
-    this.filePath = path.join(sessionDir, 'turns.jsonl');
-    const existingMeta = await readExistingSessionMeta(sessionDir);
-    this.persistedMeta = existingMeta ? { ...this.meta, ...existingMeta } : this.meta;
-    this.requestDetails = mergeRequestDetails(
-      this.persistedMeta.requestDetails,
-      this.meta.requestDetails,
-    );
-    this.persistedMeta = {
-      ...this.persistedMeta,
-      requestDetails: this.requestDetails,
-    };
-    const hasExistingContent = await fileHasContent(this.filePath);
-    if (!hasExistingContent) {
-      await writeVersionHeader(this.filePath);
-      await writeMeta(this.filePath, this.persistedMeta as unknown as Record<string, unknown>);
-    }
-    await writeTurnStart(this.filePath, {
-      turnIndex: this.turnIndex,
-      prompt: this.prompt,
-      timestamp: new Date().toISOString(),
-    });
-    this.headerWritten = true;
-  }
-
-  /**
-   * Gracefully shut down the stream. Subsequent onEvent/onSnapshot calls
-   * become no-ops.
-   */
-  close(): void {
-    if (this.isActive) {
-      this.enqueueWrite(async () => {
-        if (!this.filePath) return;
-        await this.ensureHeader();
-        await writeTurnEnd(this.filePath, {
-          turnIndex: this.turnIndex,
-          timestamp: new Date().toISOString(),
-        });
-      });
-    }
-    this.isActive = false;
-  }
-
-  /** Get the JSONL file path (for diagnostics) */
-  getFilePath(): string | null {
-    return this.filePath;
-  }
-
-  // ── Callbacks ─────────────────────────────────────────────────────────
-
-  /** Persist an ACP event as SSP records. */
-  onEvent(event: AcpEvent): void {
+  push(ssp: AnySerializableStreamPart): void {
     if (!this.isActive) return;
-    this.enqueueWrite(async () => {
-      if (!this.filePath) return;
-      await this.ensureHeader();
-      const parts = this.streamPartHandler.serializeEvent(event);
-      for (const part of parts) {
-        await writeStreamPart(this.filePath, part);
-      }
+    this.parts.set(ssp.id, ssp);
+
+    // Subscribe to async state changes (only fires for SSP-internal async events)
+    // Plan: async SSP-internal changes (questionCarousel answer, externalEdit undoStopId)
+    // should only sync metadata to meta.jsonl, not re-render or append to session.jsonl.
+    ssp.onStateChange((s) => {
+      this.syncMetadata(s);
     });
+
+    ssp.render(this.stream as unknown as SspStream);
+    this.appendSession(ssp.toJSON());
+    this.syncMetadata(ssp);
   }
 
   /**
-   * Persist a file snapshot — both inline in `turns.jsonl` (for chronological
-   * replay) and to the dedicated checkpoint store for structural access.
+   * Update an existing mutable SSP.
+   * Merges data, re-renders, appends updated record to session.jsonl.
+   * Throws if the part is append-only (does not implement IMutableStreamPart).
    */
-  onSnapshot(snapshot: FileSnapshotRecord): void {
+  update(id: string, data: Record<string, unknown>): void {
+    if (!this.isActive) return;
+    const ssp = this.parts.get(id);
+    if (!ssp) {
+      console.warn(`${LOG_PREFIX} update: part ${id} not found`);
+      return;
+    }
+    if (!isMutable(ssp)) {
+      throw new Error(`${LOG_PREFIX} Part ${id} (kind=${ssp.kind}) is append-only, update not allowed`);
+    }
+
+    ssp.update(data);
+    ssp.render(this.stream as unknown as SspStream);
+    this.appendSession(ssp.toJSON());
+    this.syncMetadata(ssp);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // Subsession API
+  // ════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get or create a SubsessionStream for child session events.
+   * Child events are written to a separate file to avoid interleaving.
+   */
+  subsession(subAgentInvocationId: string): SubsessionStream {
+    let sub = this.subsessions.get(subAgentInvocationId);
+    if (!sub) {
+      if (!this.sessionDir) {
+        throw new Error(`${LOG_PREFIX} Cannot create subsession before initialize()`);
+      }
+      sub = new SubsessionStream(
+        this.sessionDir,
+        subAgentInvocationId,
+        this.stream as unknown as SspStream,
+      );
+      this.subsessions.set(subAgentInvocationId, sub);
+    }
+    return sub;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // Metadata API
+  // ════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Write session-level metadata (title, status, etc.) to meta.jsonl.
+   * Called by Bridge on session.updated / session.idle / session.diff events.
+   */
+  writeMeta(patch: Record<string, unknown>): void {
+    if (!this.isActive) return;
+    this.appendMeta({ type: 'session', ...patch });
+  }
+
+  /**
+   * Collect metadata from an SSP via IMetadataProvider and write to meta.jsonl.
+   * Called after push/update and on async state change.
+   */
+  private syncMetadata(ssp: AnySerializableStreamPart): void {
+    if (!isMetadataProvider(ssp)) return;
+    const meta = ssp.getMetadata();
+    if (!meta) return;
+    this.appendMeta({ type: 'part-meta', id: ssp.metaId, ...meta });
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // Snapshot API
+  // ════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Serialize a file snapshot to session.jsonl.
+   * Called by ExternalEditSSP callbacks (onSnapshot).
+   */
+  serializeSnapshot(snapshot: FileSnapshotRecord): void {
     if (!this.isActive) return;
     const snapshotWithTurn: FileSnapshotRecord = {
       ...snapshot,
-      turnIndex: snapshot.turnIndex ?? this.turnIndex,
+      turnIndex: snapshot.turnIndex ?? this.config.turnIndex,
     };
     this.enqueueWrite(async () => {
-      if (!this.filePath || !this.sessionDir) return;
+      if (!this.sessionPath) return;
       await this.ensureHeader();
-      // Write inline to turns.jsonl for chronological replay
-      await writeSnapshotLine(this.filePath, snapshotWithTurn);
-      // Write to checkpoint store (_checkpoints.jsonl) for structural access
-      await writeSnapshot(this.sessionDir, snapshotWithTurn);
+      await fs.appendFile(this.sessionPath, buildLine('snapshot', snapshotWithTurn));
     });
   }
 
-  onExternalEdit(toolCallId: string, undoStopId: string): void {
-    if (!this.isActive || !undoStopId) return;
-    console.log(
-      `${LOG_PREFIX} externalEdit recorded session=${this.sessionId} turn=${this.turnIndex} ` +
-      `requestId=${this.vscodeRequestId} toolCallId=${toolCallId} undoStopId=${undoStopId}`,
-    );
-    const turnIndexRequestId = `turn-${this.turnIndex}`;
-    const existing = this.requestDetails.find(details =>
-      details.turnIndex === this.turnIndex ||
-      details.vscodeRequestId === this.vscodeRequestId ||
-      details.vscodeRequestId === turnIndexRequestId
-    );
-    if (existing) {
-      existing.turnIndex = existing.turnIndex ?? this.turnIndex;
-      existing.vscodeRequestId = this.vscodeRequestId;
-      existing.toolIdEditMap = {
-        ...existing.toolIdEditMap,
-        [toolCallId]: undoStopId,
-      };
-    } else {
-      this.requestDetails.push({
-        turnIndex: this.turnIndex,
-        vscodeRequestId: this.vscodeRequestId,
-        toolIdEditMap: { [toolCallId]: undoStopId },
-      });
-    }
+  // ════════════════════════════════════════════════════════════════════════
+  // Lifecycle
+  // ════════════════════════════════════════════════════════════════════════
 
-    this.enqueueWrite(async () => {
-      if (!this.filePath || !this.sessionDir) return;
-      await this.ensureHeader();
-      await fs.writeFile(
-        path.join(this.sessionDir, '_meta.json'),
-        JSON.stringify({
-          ...this.persistedMeta,
-          requestDetails: this.requestDetails,
-        }, null, 2),
-        'utf-8',
-      );
-      await writeStreamPart(this.filePath, this.createExternalEditPart(toolCallId, undoStopId));
+  /**
+   * Initialize session directory and write version header + turn-start.
+   * Must be called once before any push/update calls.
+   */
+  async initialize(): Promise<void> {
+    const sessionDir = await ensureSessionDir(
+      this.config.workspaceRoot,
+      this.config.backendName,
+      this.config.sessionId,
+    );
+    this.sessionDir = sessionDir;
+    this.sessionPath = path.join(sessionDir, 'session.jsonl');
+    this.metaPath = path.join(sessionDir, 'meta.jsonl');
+
+    // Write initial session metadata
+    this.appendMeta({
+      type: 'session',
+      id: this.config.sessionId,
+      backendName: this.config.backendName,
+      createdAt: new Date().toISOString(),
     });
-  }
 
-  /**
-   * Handle a bridge error — logged but not written to the event stream.
-   */
-  onError(error: Error): void {
-    console.error(`${LOG_PREFIX} Bridge error`, error);
-  }
-
-  // ── Internal helpers ───────────────────────────────────────────────────
-
-  /**
-   * Ensure the version header and metadata lines have been written.
-   * Idempotent after the first call.
-   */
-  private async ensureHeader(): Promise<void> {
-    if (this.headerWritten || !this.filePath) return;
-    this.headerWritten = true;
-    const hasExistingContent = await fileHasContent(this.filePath);
-    if (!hasExistingContent) {
-      await writeVersionHeader(this.filePath);
-      await writeMeta(this.filePath, this.persistedMeta as unknown as Record<string, unknown>);
+    // Write version header if new file
+    const hasContent = await fileHasContent(this.sessionPath);
+    if (!hasContent) {
+      await fs.writeFile(this.sessionPath, buildLine('version', '2.0'), 'utf-8');
     }
-    await writeTurnStart(this.filePath, {
-      turnIndex: this.turnIndex,
-      prompt: this.prompt,
+
+    // Write turn-start
+    await fs.appendFile(this.sessionPath, buildLine('turn-start', {
+      turnIndex: this.config.turnIndex,
       timestamp: new Date().toISOString(),
-    });
+    }));
+
+    this.headerWritten = true;
   }
 
   /**
-   * Queue an async write operation, ensuring sequential execution.
+   * Close the stream — writes turn-end. Subsequent push/update calls become no-ops.
    */
-  private enqueueWrite(fn: () => Promise<void>): void {
-    this.writeQueue = this.writeQueue
-      .then(() => fn())
-      .catch((err: unknown) => {
-        console.error(`${LOG_PREFIX} Write error to ${this.filePath}`, err);
-      });
+  close(): void {
+    if (!this.isActive) return;
+    this.isActive = false;
+    this.enqueueWrite(async () => {
+      if (!this.sessionPath) return;
+      await this.ensureHeader();
+      await fs.appendFile(this.sessionPath, buildLine('turn-end', {
+        turnIndex: this.config.turnIndex,
+        timestamp: new Date().toISOString(),
+      }));
+    });
   }
 
-  /** Wait for all pending writes to complete */
+  /** Wait for all pending writes to session.jsonl + meta.jsonl */
   async flush(): Promise<void> {
     await this.writeQueue;
   }
 
-  private createExternalEditPart(
-    toolCallId: string,
-    editId: string,
-  ): SerializableStreamPart<'externalEdit', { toolCallId: string; editId: string }> {
-    return this.streamPartHandler.createExternalEditPart(toolCallId, editId);
+  /**
+   * Drain: flush main session + all subsessions.
+   * Called by handler in finally block to ensure all async writes complete.
+   */
+  async drain(): Promise<void> {
+    for (const sub of this.subsessions.values()) {
+      await sub.flush();
+    }
+    await this.flush();
+  }
+
+  /** Get session directory path (for diagnostics and subsession access) */
+  getSessionDir(): string | null { return this.sessionDir; }
+  /** Get session.jsonl path (for diagnostics) */
+  getSessionPath(): string | null { return this.sessionPath; }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // Internal: file I/O
+  // ════════════════════════════════════════════════════════════════════════
+
+  private appendSession(record: StreamPartRecord): void {
+    // Serialize NOW (synchronous) to capture payload state at this moment.
+    // toJSON() returns a reference to this.payload, so deferring serialization
+    // would capture the mutated state (e.g. after update changes status).
+    const line = buildLine('stream-part', record);
+    this.enqueueWrite(async () => {
+      if (!this.sessionPath) return;
+      await this.ensureHeader();
+      await fs.appendFile(this.sessionPath, line);
+    });
+  }
+
+  private appendMeta(data: Record<string, unknown>): void {
+    this.enqueueWrite(async () => {
+      if (!this.metaPath) return;
+      await fs.appendFile(this.metaPath, JSON.stringify({ v: 2, ...data }) + '\n');
+    });
+  }
+
+  private async ensureHeader(): Promise<void> {
+    if (this.headerWritten || !this.sessionPath) return;
+    this.headerWritten = true;
+    const hasContent = await fileHasContent(this.sessionPath);
+    if (!hasContent) {
+      await fs.writeFile(this.sessionPath, buildLine('version', '2.0'), 'utf-8');
+    }
+    await fs.appendFile(this.sessionPath, buildLine('turn-start', {
+      turnIndex: this.config.turnIndex,
+      timestamp: new Date().toISOString(),
+    }));
+  }
+
+  private enqueueWrite(fn: () => Promise<void>): void {
+    this.writeQueue = this.writeQueue.then(fn).catch(err => {
+      console.error(`${LOG_PREFIX} Write error`, err);
+    });
   }
 }
+
+// ─── Helpers ─────────────────────────────────────────────────────────────
 
 async function fileHasContent(filePath: string): Promise<boolean> {
   try {
@@ -258,44 +307,4 @@ async function fileHasContent(filePath: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-async function readExistingSessionMeta(sessionDir: string): Promise<SerializableSessionMeta | undefined> {
-  try {
-    const raw = await fs.readFile(path.join(sessionDir, '_meta.json'), 'utf-8');
-    return JSON.parse(raw) as SerializableSessionMeta;
-  } catch {
-    return undefined;
-  }
-}
-
-function mergeRequestDetails(
-  ...sources: Array<readonly SerializableRequestDetails[] | undefined>
-): SerializableRequestDetails[] {
-  const result: SerializableRequestDetails[] = [];
-
-  for (const source of sources) {
-    for (const details of source ?? []) {
-      const existing = result.find(item =>
-        (details.turnIndex !== undefined && item.turnIndex === details.turnIndex) ||
-        item.vscodeRequestId === details.vscodeRequestId
-      );
-      if (existing) {
-        existing.turnIndex = details.turnIndex ?? existing.turnIndex;
-        existing.vscodeRequestId = details.vscodeRequestId || existing.vscodeRequestId;
-        existing.backendRequestId = details.backendRequestId ?? existing.backendRequestId;
-        existing.toolIdEditMap = {
-          ...existing.toolIdEditMap,
-          ...(details.toolIdEditMap ?? {}),
-        };
-      } else {
-        result.push({
-          ...details,
-          toolIdEditMap: { ...(details.toolIdEditMap ?? {}) },
-        });
-      }
-    }
-  }
-
-  return result;
 }

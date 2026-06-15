@@ -201,37 +201,20 @@ export interface AcpAuthOperations {
 }
 
 // ===========================================================================
-// Streaming bridge callbacks (event persistence)
-// ===========================================================================
-
-export interface StreamingBridgeCallbacks {
-  /** An ACP event has been fully processed — persist it */
-  onEvent(event: AcpEvent): void;
-  /** A file snapshot was captured (before write/edit) */
-  onSnapshot(snapshot: FileSnapshotRecord): void;
-  /** VS Code returned a real external edit id for a backend tool call. */
-  onExternalEdit?(toolCallId: string, undoStopId: string): void;
-  /** A non-recoverable error occurred */
-  onError(error: Error): void;
-}
-
-// ===========================================================================
 // AcpBridge — backend-specific event interpreter
 // ===========================================================================
 
-/** A bridge that interprets ACP events and renders them to a chat stream.
- *  Each backend provides its own implementation via {@link AcpBackend.createBridge}.
- *  The same bridge is used for live rendering and session restore (replay). */
+/** A bridge that interprets ACP events and translates them to push/update
+ *  calls on the SerializableSessionStream (SSS).
+ *
+ *  The bridge does NOT touch the VS Code stream directly — SSS owns it.
+ *  The bridge only calls sss.push(ssp) / sss.update(id, data).
+ *
+ *  Each backend provides its own implementation via {@link AcpBackend.createBridge}. */
 export interface AcpBridge {
-  /** Set the rendering target (VSCode ChatResponseStream or CollectorStream) */
-  setStream(stream: unknown): void;
-  /** Set persistence callbacks (for JSONL event storage) */
-  setCallbacks(callbacks: StreamingBridgeCallbacks): void;
-  /** Set the external edit tracker (for checkpoint capture) */
-  setTracker(tracker: unknown): void;
-  /** Process a single ACP event — used during session restore (replay) */
-  processEvent(event: AcpEvent): void;
-  /** Run the full event loop — used during live streaming */
+  /** Inject the SerializableSessionStream (which owns the VS Code stream) */
+  setSSS(sss: unknown): void;
+  /** Run the full event loop — translates events to push/update calls */
   run(events: AsyncIterable<AcpEvent>, token: CancellationToken): Promise<boolean>;
   /** Get the captured user message ID, or null if no text part was seen */
   getUserMessageId(): string | null;
@@ -269,7 +252,7 @@ export interface AcpBackend {
    *  The bridge handles both live rendering and session restore (replay).
    *  @param sessionId - the session to bridge events for
    *  @param directory - optional workspace directory */
-  createBridge(sessionId: string, directory?: string, knownFileUris?: Set<string>): AcpBridge;
+  createBridge(sessionId: string, directory?: string): AcpBridge;
 
   auth: AcpAuthOperations;
 

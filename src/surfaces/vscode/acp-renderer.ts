@@ -50,7 +50,7 @@ import {
   hasChatToolInvocationPart,
   hasChatSubagentToolInvocationData,
 } from './capabilities';
-import { type SubagentScope, formatSubagentProgress } from '../../participant/subagent';
+import { type SubagentScope, formatSubagentProgress } from '../../ssp/impl/subagent';
 
 // ---------------------------------------------------------------------------
 // Extended stream type for proposed API methods

@@ -1,0 +1,401 @@
+{
+  "active_plan": "H:\\PyProjects\\opencode-copilot\\.sisyphus\\plans\\ssp-architecture-v2.md",
+  "started_at": "2026-06-14T00:05:00.000Z",
+  "session_ids": [
+    "opencode:ses_13eb754b0ffebOwYlszUST0WtZ",
+    "opencode:ses_13e3ea434ffeZK50rOO5TxttKa",
+    "opencode:ses_13e3e6b62ffeM87qcYF5lLZDjO"
+  ],
+  "session_origins": {
+    "opencode:ses_13eb754b0ffebOwYlszUST0WtZ": "direct",
+    "opencode:ses_13e3ea434ffeZK50rOO5TxttKa": "appended",
+    "opencode:ses_13e3e6b62ffeM87qcYF5lLZDjO": "appended"
+  },
+  "plan_name": "ssp-architecture-v2",
+  "agent": "atlas",
+  "status": "in_progress",
+  "task_sessions": {
+    "todo:1": {
+      "task_key": "todo:1",
+      "task_label": "1",
+      "task_title": "**SSP base class + types**",
+      "session_id": "ses_13e3b7213ffe9i5U8TRVVHkej1",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "updated_at": "2026-06-13T16:17:52.113Z"
+    },
+    "todo:2": {
+      "task_key": "todo:2",
+      "task_label": "2",
+      "task_title": "**Projector interface**",
+      "session_id": "ses_13e34c631ffelr4s9M5s4nHZzs",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-13T16:26:41.224Z"
+    },
+    "todo:3": {
+      "task_key": "todo:3",
+      "task_label": "3",
+      "task_title": "**SessionSerializer interface + JSONL implementation**",
+      "session_id": "ses_13e312c4cffeMt8mNfDCVgqhsS",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-13T16:29:26.595Z"
+    },
+    "todo:4": {
+      "task_key": "todo:4",
+      "task_label": "4",
+      "task_title": "**SSPFactory (create + fromJSON)**",
+      "session_id": "ses_13e2e4a53ffeGTuLfBm395ujMG",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-13T16:31:32.884Z"
+    },
+    "todo:5": {
+      "task_key": "todo:5",
+      "task_label": "5",
+      "task_title": "**SerializableStreamPart 兼容层**",
+      "session_id": "ses_13e2c8f46ffex4fPzhHYXXzbEM",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-13T16:33:02.128Z"
+    },
+    "todo:6": {
+      "task_key": "todo:6",
+      "task_label": "6",
+      "task_title": "**ToolInvocationSSP**",
+      "session_id": "ses_13e2a8247ffev0FgXduVsS5fe2",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "updated_at": "2026-06-13T16:36:21.965Z"
+    },
+    "todo:7": {
+      "task_key": "todo:7",
+      "task_label": "7",
+      "task_title": "**AssistantTextSSP**",
+      "session_id": "ses_13e2843a5ffel58M7Oi0INra5r",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-13T16:38:49.380Z"
+    },
+    "todo:8": {
+      "task_key": "todo:8",
+      "task_label": "8",
+      "task_title": "**ReasoningSSP**",
+      "session_id": "ses_13e25dcbbffeFYe8IDPxhL4NJO",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-13T16:40:21.018Z"
+    },
+    "todo:9": {
+      "task_key": "todo:9",
+      "task_label": "9",
+      "task_title": "**ExternalEditSSP**",
+      "session_id": "ses_13e24a28effe7zMwlOoon0fm0N",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "updated_at": "2026-06-13T16:42:31.858Z"
+    },
+    "todo:10": {
+      "task_key": "todo:10",
+      "task_label": "10",
+      "task_title": "**SubagentSSP**",
+      "session_id": "ses_13e22a237fferGJkEEkbhEeN2H",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "updated_at": "2026-06-13T16:44:24.915Z"
+    },
+    "todo:11": {
+      "task_key": "todo:11",
+      "task_label": "11",
+      "task_title": "**SessionLifecycleSSP + SessionDiffSSP**",
+      "session_id": "ses_13e20ac16ffe5IBxGlZgXHWi2r",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-13T16:48:40.703Z"
+    },
+    "todo:14": {
+      "task_key": "todo:14",
+      "task_label": "14",
+      "task_title": "**VSCSPProjector (capabilities-aware rendering)**",
+      "session_id": "ses_13e182244ffeDg1e7BTMwxzgKJ",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-13T16:56:50.536Z"
+    },
+    "todo:15": {
+      "task_key": "todo:15",
+      "task_label": "15",
+      "task_title": "**CollectorProjector (恢复用)**",
+      "session_id": "ses_13e157de0ffeJP1IM3Ow36ecYM",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-13T16:58:51.232Z"
+    },
+    "todo:16": {
+      "task_key": "todo:16",
+      "task_label": "16",
+      "task_title": "**Projector toolSpecificData mapping (从 Bridge 提取)**",
+      "session_id": "ses_13e136713ffepnihiYp00GvPJB",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-13T17:01:29.288Z"
+    },
+    "todo:17": {
+      "task_key": "todo:17",
+      "task_label": "17",
+      "task_title": "**Bridge rewrite: 路由 + 子代理管理**",
+      "session_id": "ses_13e10cc1fffelMSrPg97aM1Oys",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "updated_at": "2026-06-13T17:07:58.295Z"
+    },
+    "todo:18": {
+      "task_key": "todo:18",
+      "task_label": "18",
+      "task_title": "**Handler cleanup: 移除 ExternalEditTracker 耦合**",
+      "session_id": "ses_13e0a2b63ffeF5HqlRju9HY0LE",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "updated_at": "2026-06-13T17:12:07.595Z"
+    },
+    "todo:19": {
+      "task_key": "todo:19",
+      "task_label": "19",
+      "task_title": "**Extension + Server cleanup: 移除 opencode.json 写入**",
+      "session_id": "ses_13e07334fffeDFLkUIN7bEu92v",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-13T17:18:12.953Z"
+    },
+    "todo:22": {
+      "task_key": "todo:22",
+      "task_label": "22",
+      "task_title": "**Update handler.test.ts + streaming.test.ts**",
+      "session_id": "ses_13df1127fffe47zN3ih2NPhk8F",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-13T17:39:31.569Z"
+    },
+    "todo:24": {
+      "task_key": "todo:24",
+      "task_label": "24",
+      "task_title": "**Update checkpoint/replay tests + remove ExternalEditTracker tests**",
+      "session_id": "ses_13dee528effeiu2OPouaO3kXGa",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "updated_at": "2026-06-13T17:48:55.503Z"
+    },
+    "final-wave:f1": {
+      "task_key": "final-wave:f1",
+      "task_label": "F1",
+      "task_title": "**Plan Compliance Audit** — `oracle`",
+      "session_id": "ses_13ddff13bffe48b4iKvK2xOPcU",
+      "agent": "oracle",
+      "updated_at": "2026-06-13T17:59:06.808Z"
+    }
+  },
+  "schema_version": 2,
+  "active_work_id": "ssp-architecture-v2-legacy",
+  "works": {
+    "ssp-architecture-v2-legacy": {
+      "work_id": "ssp-architecture-v2-legacy",
+      "active_plan": "H:\\PyProjects\\opencode-copilot\\.sisyphus\\plans\\ssp-architecture-v2.md",
+      "plan_name": "ssp-architecture-v2",
+      "status": "in_progress",
+      "started_at": "2026-06-14T00:05:00.000Z",
+      "session_ids": [
+        "opencode:ses_13eb754b0ffebOwYlszUST0WtZ",
+        "opencode:ses_13e3ea434ffeZK50rOO5TxttKa",
+        "opencode:ses_13e3e6b62ffeM87qcYF5lLZDjO"
+      ],
+      "session_origins": {
+        "opencode:ses_13eb754b0ffebOwYlszUST0WtZ": "direct",
+        "opencode:ses_13e3ea434ffeZK50rOO5TxttKa": "appended",
+        "opencode:ses_13e3e6b62ffeM87qcYF5lLZDjO": "appended"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:1": {
+          "task_key": "todo:1",
+          "task_label": "1",
+          "task_title": "**SSP base class + types**",
+          "session_id": "ses_13e3b7213ffe9i5U8TRVVHkej1",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "updated_at": "2026-06-13T16:17:52.113Z"
+        },
+        "todo:2": {
+          "task_key": "todo:2",
+          "task_label": "2",
+          "task_title": "**Projector interface**",
+          "session_id": "ses_13e34c631ffelr4s9M5s4nHZzs",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-13T16:26:41.224Z"
+        },
+        "todo:3": {
+          "task_key": "todo:3",
+          "task_label": "3",
+          "task_title": "**SessionSerializer interface + JSONL implementation**",
+          "session_id": "ses_13e312c4cffeMt8mNfDCVgqhsS",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-13T16:29:26.595Z"
+        },
+        "todo:4": {
+          "task_key": "todo:4",
+          "task_label": "4",
+          "task_title": "**SSPFactory (create + fromJSON)**",
+          "session_id": "ses_13e2e4a53ffeGTuLfBm395ujMG",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-13T16:31:32.884Z"
+        },
+        "todo:5": {
+          "task_key": "todo:5",
+          "task_label": "5",
+          "task_title": "**SerializableStreamPart 兼容层**",
+          "session_id": "ses_13e2c8f46ffex4fPzhHYXXzbEM",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-13T16:33:02.128Z"
+        },
+        "todo:6": {
+          "task_key": "todo:6",
+          "task_label": "6",
+          "task_title": "**ToolInvocationSSP**",
+          "session_id": "ses_13e2a8247ffev0FgXduVsS5fe2",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "updated_at": "2026-06-13T16:36:21.965Z"
+        },
+        "todo:7": {
+          "task_key": "todo:7",
+          "task_label": "7",
+          "task_title": "**AssistantTextSSP**",
+          "session_id": "ses_13e2843a5ffel58M7Oi0INra5r",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-13T16:38:49.380Z"
+        },
+        "todo:8": {
+          "task_key": "todo:8",
+          "task_label": "8",
+          "task_title": "**ReasoningSSP**",
+          "session_id": "ses_13e25dcbbffeFYe8IDPxhL4NJO",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-13T16:40:21.018Z"
+        },
+        "todo:9": {
+          "task_key": "todo:9",
+          "task_label": "9",
+          "task_title": "**ExternalEditSSP**",
+          "session_id": "ses_13e24a28effe7zMwlOoon0fm0N",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "updated_at": "2026-06-13T16:42:31.858Z"
+        },
+        "todo:10": {
+          "task_key": "todo:10",
+          "task_label": "10",
+          "task_title": "**SubagentSSP**",
+          "session_id": "ses_13e22a237fferGJkEEkbhEeN2H",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "updated_at": "2026-06-13T16:44:24.915Z"
+        },
+        "todo:11": {
+          "task_key": "todo:11",
+          "task_label": "11",
+          "task_title": "**SessionLifecycleSSP + SessionDiffSSP**",
+          "session_id": "ses_13e20ac16ffe5IBxGlZgXHWi2r",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-13T16:48:40.703Z"
+        },
+        "todo:14": {
+          "task_key": "todo:14",
+          "task_label": "14",
+          "task_title": "**VSCSPProjector (capabilities-aware rendering)**",
+          "session_id": "ses_13e182244ffeDg1e7BTMwxzgKJ",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-13T16:56:50.536Z"
+        },
+        "todo:15": {
+          "task_key": "todo:15",
+          "task_label": "15",
+          "task_title": "**CollectorProjector (恢复用)**",
+          "session_id": "ses_13e157de0ffeJP1IM3Ow36ecYM",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-13T16:58:51.232Z"
+        },
+        "todo:16": {
+          "task_key": "todo:16",
+          "task_label": "16",
+          "task_title": "**Projector toolSpecificData mapping (从 Bridge 提取)**",
+          "session_id": "ses_13e136713ffepnihiYp00GvPJB",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-13T17:01:29.288Z"
+        },
+        "todo:17": {
+          "task_key": "todo:17",
+          "task_label": "17",
+          "task_title": "**Bridge rewrite: 路由 + 子代理管理**",
+          "session_id": "ses_13e10cc1fffelMSrPg97aM1Oys",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "updated_at": "2026-06-13T17:07:58.295Z"
+        },
+        "todo:18": {
+          "task_key": "todo:18",
+          "task_label": "18",
+          "task_title": "**Handler cleanup: 移除 ExternalEditTracker 耦合**",
+          "session_id": "ses_13e0a2b63ffeF5HqlRju9HY0LE",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "updated_at": "2026-06-13T17:12:07.595Z"
+        },
+        "todo:19": {
+          "task_key": "todo:19",
+          "task_label": "19",
+          "task_title": "**Extension + Server cleanup: 移除 opencode.json 写入**",
+          "session_id": "ses_13e07334fffeDFLkUIN7bEu92v",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-13T17:18:12.953Z"
+        },
+        "todo:22": {
+          "task_key": "todo:22",
+          "task_label": "22",
+          "task_title": "**Update handler.test.ts + streaming.test.ts**",
+          "session_id": "ses_13df1127fffe47zN3ih2NPhk8F",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-13T17:39:31.569Z"
+        },
+        "todo:24": {
+          "task_key": "todo:24",
+          "task_label": "24",
+          "task_title": "**Update checkpoint/replay tests + remove ExternalEditTracker tests**",
+          "session_id": "ses_13dee528effeiu2OPouaO3kXGa",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "updated_at": "2026-06-13T17:48:55.503Z"
+        },
+        "final-wave:f1": {
+          "task_key": "final-wave:f1",
+          "task_label": "F1",
+          "task_title": "**Plan Compliance Audit** — `oracle`",
+          "session_id": "ses_13ddff13bffe48b4iKvK2xOPcU",
+          "agent": "oracle",
+          "updated_at": "2026-06-13T17:59:06.808Z"
+        }
+      }
+    }
+  }
+}

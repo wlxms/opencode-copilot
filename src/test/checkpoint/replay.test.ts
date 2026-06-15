@@ -5,7 +5,6 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { applyPatchSafely, replaySnapshotsToWorkspace, summarizeSnapshotLineDiff } from '../../acp/checkpoint/replay';
 import type { FileSnapshotRecord } from '../../acp/serializable/types';
-import { ExternalEditTracker } from '../../participant/external-edit-tracker';
 
 describe('checkpoint replay', () => {
   it('summarizes restored snapshot line diffs for edit bubble diagnostics', () => {
@@ -823,27 +822,70 @@ async function recordTrackedEdit(
   turnIndex?: number,
 ): Promise<{ snapshots: FileSnapshotRecord[]; beforeDisk: Array<{ exists: boolean; content: string | undefined }>; afterDisk: Array<{ exists: boolean; content: string | undefined }> }> {
   const snapshots: FileSnapshotRecord[] = [];
-  const pushed: Array<{ applied?: Thenable<string> }> = [];
-  const stream = {
-    push: (part: unknown) => pushed.push(part as { applied?: Thenable<string> }),
-  } as unknown as vscode.ChatResponseStream;
-  const tracker = new ExternalEditTracker((snapshot) => {
-    snapshots.push({
-      ...snapshot,
-      editIndex: snapshot.editIndex + editIndexOffset,
+  const captureSnapshot = (uri: vscode.Uri, phase: 'before' | 'after', i: number): FileSnapshotRecord => {
+    const missing = !existsSync(uri.fsPath);
+    return {
+      uri: uri.toString(),
+      content: missing ? '' : readFileSync(uri.fsPath, 'utf-8'),
+      phase,
       turnIndex,
-    });
-  }, () => turnIndex ?? 0);
+      editIndex: i + editIndexOffset,
+      toolCallId: editKey,
+      timestamp: new Date().toISOString(),
+      missing,
+    };
+  };
+
+  // Inline externalEdit lifecycle (replaces deleted ExternalEditTracker)
+  let resolveDeferred: () => void = () => {};
+  const beforeSnapshots = uris.map((uri, i) => captureSnapshot(uri, 'before', i));
+  const stream = {
+    externalEdit: (_target: unknown, callback: () => Thenable<unknown>): Thenable<string> => {
+      return new Promise<string>(resolveComplete => {
+        const run = async () => {
+          for (const s of beforeSnapshots) snapshots.push(s);
+          resolveDeferred = () => {};
+          const deferred = new Promise<void>(r => { resolveDeferred = r; });
+          await callback();
+          await deferred;
+          resolveComplete('test-undo-stop');
+        };
+        run();
+        // Resolve baseline immediately (mock: baseline captured synchronously)
+        callback().then(() => {}).catch(() => {});
+      });
+    },
+  } as unknown as vscode.ChatResponseStream;
 
   const beforeDisk = uris.map(uri => fileState(uri.fsPath));
-  await tracker.trackEdit(editKey, uris, stream);
+
+  // Start externalEdit (baseline captured)
+  await new Promise<void>(resolve => {
+    const cb = async () => {
+      for (const s of beforeSnapshots) snapshots.push(s);
+      resolve();
+      await new Promise<void>(r => { resolveDeferred = r; });
+    };
+    const externalEdit = (stream as unknown as { externalEdit: (t: unknown, cb: () => Thenable<unknown>) => Thenable<string> }).externalEdit;
+    if (externalEdit) {
+      externalEdit(uris, cb);
+    }
+    // Fallback if no externalEdit: just resolve
+    if (!externalEdit) resolve();
+  });
+
   mutate();
+
   const afterDisk = uris.map(uri => fileState(uri.fsPath));
-  const completion = tracker.completeEdit(editKey);
-  if (completion) {
-    await completion;
-  }
-  tracker.dispose();
+
+  // Complete: resolve deferred + capture after snapshots
+  resolveDeferred();
+  uris.map((uri, i) => {
+    const after = captureSnapshot(uri, 'after', beforeSnapshots.length + i);
+    after.undoStopId = 'test-undo-stop';
+    snapshots.push(after);
+  });
+
   return { snapshots, beforeDisk, afterDisk };
 }
 

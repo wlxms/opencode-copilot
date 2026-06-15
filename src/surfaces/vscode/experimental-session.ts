@@ -76,6 +76,7 @@ import {
 } from './capabilities';
 
 import { CollectorStream } from '../../acp/streaming/collector-stream';
+import { SerializableSessionStream } from '../../acp/streaming/session-stream';
 import {
   readLegacySessionEvents,
   readLegacySessionTurnEvents,
@@ -1648,24 +1649,34 @@ export function createSessionContentProvider(
 
     const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
 
-    const buildResponseTurn = (
+    const buildResponseTurn = async (
       turnEventsForResponse: readonly AcpEvent[],
       snapshotsForResponse: readonly FileSnapshotRecord[],
-    ): vscode.ChatResponseTurn | undefined => {
+    ): Promise<vscode.ChatResponseTurn | undefined> => {
       const collector = new CollectorStream();
+      // SSS without initialize() → no disk writes during replay
+      const sss = new SerializableSessionStream(
+        collector as unknown as vscode.ChatResponseStream,
+        { workspaceRoot: '', backendName: state.backend.name, sessionId, turnIndex: 0, requestId: '' },
+      );
       const bridge = state.backend.createBridge(sessionId);
-      bridge.setStream(collector);
+      bridge.setSSS(sss);
 
-      for (const event of turnEventsForResponse) {
-        if (token.isCancellationRequested) break;
-        bridge.processEvent(event);
-        pushSnapshotsForRestoredEditTools(
-          sessionId,
-          getRestoreSnapshotsForToolCompleteEvent(snapshotsForResponse, event),
-          collector,
-          toolIdEditMap,
-        );
+      // Async generator: yields events, interleaves snapshot restoration between them
+      async function* eventStream() {
+        for (const event of turnEventsForResponse) {
+          if (token.isCancellationRequested) return;
+          yield event;
+          pushSnapshotsForRestoredEditTools(
+            sessionId,
+            getRestoreSnapshotsForToolCompleteEvent(snapshotsForResponse, event),
+            collector,
+            toolIdEditMap,
+          );
+        }
       }
+
+      await bridge.run(eventStream(), token);
 
       if (collector.parts.length === 0) {
         return undefined;
@@ -1684,15 +1695,20 @@ export function createSessionContentProvider(
         }
 
         const responseEvents = prompt ? dropFirstPromptEvent(turn.events, prompt) : turn.events;
-        const responseTurn = buildResponseTurn(responseEvents, getToolCompleteReplaySnapshotsForEvents(snapshots, responseEvents));
+        const responseTurn = await buildResponseTurn(responseEvents, getToolCompleteReplaySnapshotsForEvents(snapshots, responseEvents));
         if (responseTurn) {
           history.push(responseTurn);
         }
       }
     } else {
+      // Legacy fallback: process events sequentially, flushing at session.idle
       let collector = new CollectorStream();
+      let sss = new SerializableSessionStream(
+        collector as unknown as vscode.ChatResponseStream,
+        { workspaceRoot: '', backendName: state.backend.name, sessionId, turnIndex: 0, requestId: '' },
+      );
       let bridge = state.backend.createBridge(sessionId);
-      bridge.setStream(collector);
+      bridge.setSSS(sss);
 
       const flushAssistantTurn = (): void => {
         if (collector.parts.length === 0) {
@@ -1700,8 +1716,12 @@ export function createSessionContentProvider(
         }
         history.push(collector.buildTurn());
         collector = new CollectorStream();
+        sss = new SerializableSessionStream(
+          collector as unknown as vscode.ChatResponseStream,
+          { workspaceRoot: '', backendName: state.backend.name, sessionId, turnIndex: 0, requestId: '' },
+        );
         bridge = state.backend.createBridge(sessionId);
-        bridge.setStream(collector);
+        bridge.setSSS(sss);
       };
 
       let expectingUserMessage = true;
@@ -1714,20 +1734,23 @@ export function createSessionContentProvider(
           if (textPart.text && textPart.text.length > 0) {
             history.push(makeRequestTurn(textPart.text, getRestoredRequestId(legacyTurnIndex, requestIdByTurnIndex), legacyTurnIndex));
             expectingUserMessage = false;
-            bridge.processEvent(event);
             continue;
           }
         }
 
         if (event.type === 'session.idle') {
-          bridge.processEvent(event);
           flushAssistantTurn();
           expectingUserMessage = true;
           legacyTurnIndex++;
           continue;
         }
 
-        bridge.processEvent(event);
+        // Feed event to bridge via run() — but since we need per-event control,
+        // use a single-event async generator
+        // The bridge.handleEvent is called internally by run()
+        // For legacy path, we process events individually
+        async function* singleEvent() { yield event; }
+        await bridge.run(singleEvent(), token);
         pushSnapshotsForRestoredEditTools(
           sessionId,
           getRestoreSnapshotsForToolCompleteEvent(snapshots, event),
