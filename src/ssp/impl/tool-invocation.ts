@@ -183,13 +183,24 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       const output = state.output ?? '';
       const title = state.title ?? '';
 
-      const ToolInvocationPartCtor = VS.ChatToolInvocationPart;
-      if (!ToolInvocationPartCtor) {
-        this.renderFallback(stream, callId, toolName, state, isError);
-        return;
-      }
+    const ToolInvocationPartCtor = VS.ChatToolInvocationPart;
+    if (!ToolInvocationPartCtor) {
+      this.renderFallback(stream, callId, toolName, state, isError);
+      return;
+    }
 
-      const part = new ToolInvocationPartCtor(
+    // ★ Contract C3: subsequent running → updateToolInvocation (progressive update).
+    // First running pushes a new part (isComplete=false); later running only
+    // updates the invocationMessage via the streaming API — no redundant push.
+    if (state.status === 'running' && this._progressivePushed) {
+      const msg = this.formatInvocationMsg(toolName, input, title);
+      stream.updateToolInvocation?.(callId, {
+        invocationMessage: typeof msg === 'string' ? msg : msg.value,
+      } as any);
+      return;
+    }
+
+    const part = new ToolInvocationPartCtor(
         toolName,
         callId,
         isError ? (state.error ?? 'Error') : undefined,

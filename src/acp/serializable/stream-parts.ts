@@ -386,6 +386,7 @@ export function projectStreamPartToAcpEvent(part: SerializableStreamPart): AcpEv
 
 export function requestDetailsFromStreamParts(
   parts: readonly SerializableStreamPart[],
+  metaIndex?: ReadonlyMap<string, Record<string, unknown>>,
 ): SerializableRequestDetails[] {
   const byRequest = new Map<string, SerializableRequestDetails>();
 
@@ -395,7 +396,16 @@ export function requestDetailsFromStreamParts(
     }
     const payload = part.payload as Partial<ExternalEditStreamPartPayload>;
     const toolCallId = payload.toolCallId ?? part.meta.toolCallId;
-    const editId = payload.editId ?? part.meta.editId;
+    let editId = payload.editId ?? part.meta.editId;
+
+    // editId arrives asynchronously (undoStopId from VS Code externalEdit);
+    // it is persisted to meta.jsonl via IMetadataProvider, not session.jsonl.
+    // Fall back to meta.jsonl when the stream part record has an empty editId.
+    if (!editId && metaIndex) {
+      const partMeta = metaIndex.get(part.id);
+      editId = (partMeta?.undoStopId as string | undefined) ?? (partMeta?.editId as string | undefined);
+    }
+
     if (!toolCallId || !editId) {
       continue;
     }

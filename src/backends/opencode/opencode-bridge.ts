@@ -71,8 +71,6 @@ interface StreamNodeState {
   userMessageId: string | null;
   assistantStarted: boolean;
   partRoutes: Map<string, PartRouteKind>;
-  externalEditCallIds: Set<string>;
-  externalEditParts: Map<string, ExternalEditSSP>;
   toolCallIds: Set<string>;
 }
 
@@ -183,6 +181,12 @@ export class OpenCodeBridge implements AcpBridge {
     const nodeState = this.getNodeState(target);
     switch (part.type) {
       case 'text': {
+        // Skip if already routed — part.updated fires again at completion
+        // with the full accumulated text; deltas already rendered the content.
+        if (nodeState.partRoutes.has(part.id)) {
+          this.partTargets.set(part.id, target);
+          return;
+        }
         // User echo detection: before assistant output starts, the first text
         // message belongs to the user. Restored or user-echo-less streams may
         // begin directly with assistant text, so do not claim that id then.
@@ -205,6 +209,11 @@ export class OpenCodeBridge implements AcpBridge {
         break;
       }
       case 'reasoning':
+        // Skip if already routed — same dedup as text (see above)
+        if (nodeState.partRoutes.has(part.id)) {
+          this.partTargets.set(part.id, target);
+          return;
+        }
         nodeState.assistantStarted = true;
         target.push(new ReasoningSSP({ partId: part.id, delta: part.text ?? '' }));
         nodeState.partRoutes.set(part.id, 'reasoning');
@@ -239,8 +248,6 @@ export class OpenCodeBridge implements AcpBridge {
         userMessageId: null,
         assistantStarted: false,
         partRoutes: new Map(),
-        externalEditCallIds: new Set(),
-        externalEditParts: new Map(),
         toolCallIds: new Set(),
       };
       this.nodeStates.set(target, state);
@@ -259,7 +266,6 @@ export class OpenCodeBridge implements AcpBridge {
 
     const status = state.status;
     const targetState = this.getNodeState(target);
-    const isExternalEdit = targetState.externalEditCallIds.has(key);
     const eventScope = part.sessionId && part.sessionId !== this.sessionId
       ? this.findScopeForSession(part.sessionId)
       : undefined;
@@ -269,11 +275,19 @@ export class OpenCodeBridge implements AcpBridge {
       return;
     }
 
-    if (isExternalEdit && this.isWriteEditTool(part.toolName)) {
-      if (status === 'completed' || status === 'error') {
-        this.completeExternalEdit(key, state, target);
+    // Write/edit tools: defer SSP creation until permission.asked creates ExternalEditSSP.
+    // If permission never comes (auto-approve), create ToolInvocationSSP at completion.
+    if (this.isWriteEditTool(part.toolName)) {
+      if (target.has(key)) {
+        // ExternalEditSSP exists → external edit path
+        if (status === 'completed' || status === 'error') {
+          this.completeExternalEdit(key, target);
+        }
+        return;
       }
-      return;
+      // No ExternalEditSSP yet — keep deferring at pending/running
+      if (status === 'pending' || status === 'running') return;
+      // completed/error without permission → fall through to normal tool handling
     }
 
     if (status === 'pending') {
@@ -335,13 +349,6 @@ export class OpenCodeBridge implements AcpBridge {
           this.subagents.completeSubagent(key, state.output);
         }
       }
-
-      // Write/edit completion → complete ExternalEditSSP
-      if ((status === 'completed' || status === 'error') && this.isWriteEditTool(part.toolName)) {
-        if (targetState.externalEditCallIds.has(key)) {
-          this.completeExternalEdit(key, state, target);
-        }
-      }
     }
   }
 
@@ -349,24 +356,8 @@ export class OpenCodeBridge implements AcpBridge {
   // Permission → ExternalEditSSP with callbacks
   // ════════════════════════════════════════════════════════════════════════
 
-  private completeExternalEdit(
-    callId: string,
-    state: AcpToolState,
-    target: SessionStreamNode,
-  ): void {
-    const targetState = this.getNodeState(target);
-    const externalEdit = targetState.externalEditParts.get(callId);
-    if (externalEdit) {
-      target.update(externalEdit.id, { status: 'completed' });
-    }
-    if (targetState.toolCallIds.has(callId) && target.has(callId)) {
-      target.update(callId, {
-        state: {
-          ...state,
-          metadata: { ...state.metadata, externalEdit: true, presentation: 'hidden' },
-        },
-      });
-    }
+  private completeExternalEdit(callId: string, target: SessionStreamNode): void {
+    target.update(callId, { status: 'completed' });
   }
 
   private handlePermissionAsked(event: AcpPermissionRequestEvent): void {
@@ -384,10 +375,8 @@ export class OpenCodeBridge implements AcpBridge {
     }
 
     const uri = createExternalEditUri(filepath, this.directory);
-    const targetState = this.getNodeState(target);
-    targetState.externalEditCallIds.add(callId);
 
-    const externalEdit = new ExternalEditSSP(
+    target.push(new ExternalEditSSP(
       {
         toolCallId: callId,
         editId: '',
@@ -409,9 +398,7 @@ export class OpenCodeBridge implements AcpBridge {
           this.sss.serializeSnapshot(snapshot);
         },
       },
-    );
-    targetState.externalEditParts.set(callId, externalEdit);
-    target.push(externalEdit);
+    ));
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -693,18 +680,24 @@ export class OpenCodeBridge implements AcpBridge {
     const childStatus = toolPart.state?.status ?? 'running';
     const sub = this.getSubsessionStream(scope.subAgentInvocationId!);
     const subState = this.getNodeState(sub);
-    const isExternalEdit = subState.externalEditCallIds.has(childCallId) && this.isWriteEditTool(toolPart.toolName);
-    if (isExternalEdit) {
-      if (childStatus === 'completed' || childStatus === 'error') {
-        this.completeExternalEdit(childCallId, toolPart.state!, sub);
-        this.subagents.recordChildToolCall(scope.callId, {
-          name: toolPart.toolName,
-          title: toolPart.state?.title,
-          status: childStatus,
-        });
-        this.updateScopeTool(scope, { title: formatSubagentProgress(scope) });
+
+    // Write/edit tools: defer until permission.asked creates ExternalEditSSP.
+    if (this.isWriteEditTool(toolPart.toolName)) {
+      if (sub.has(childCallId)) {
+        if (childStatus === 'completed' || childStatus === 'error') {
+          this.completeExternalEdit(childCallId, sub);
+          this.subagents.recordChildToolCall(scope.callId, {
+            name: toolPart.toolName,
+            title: toolPart.state?.title,
+            status: childStatus,
+          });
+          this.updateScopeTool(scope, { title: formatSubagentProgress(scope) });
+        }
+        return;
       }
-      return;
+      // No ExternalEditSSP yet — keep deferring at pending/running
+      if (childStatus === 'pending' || childStatus === 'running') return;
+      // completed/error without permission → fall through to normal handling
     }
     let nestedScope: SubagentScope | undefined;
     if (toolPart.toolName === 'task' || toolPart.toolName === 'subagent') {
@@ -742,9 +735,6 @@ export class OpenCodeBridge implements AcpBridge {
     }
 
     if (childStatus === 'completed' || childStatus === 'error') {
-      if (subState.externalEditCallIds.has(childCallId) && this.isWriteEditTool(toolPart.toolName)) {
-        this.completeExternalEdit(childCallId, toolPart.state!, sub);
-      }
       if (nestedScope) {
         this.subagents.completeSubagent(childCallId, toolPart.state?.output);
       }

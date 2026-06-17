@@ -71,7 +71,7 @@ export class ExternalEditSSP extends SerializableStreamPart<
       toolCallId: meta?.toolCallId ?? payload.toolCallId,
       editId: meta?.editId ?? payload.editId,
       uri: meta?.uri ?? payload.uri,
-    }, id ?? `externalEdit:${payload.toolCallId}`);
+    }, id ?? payload.toolCallId);
   }
 
   get undoStopId(): string | null { return this._undoStopId; }

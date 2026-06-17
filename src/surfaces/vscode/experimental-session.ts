@@ -769,6 +769,7 @@ export function createSessionContentProvider(
   function getMergedRequestDetails(
     meta: SerializableSessionMeta | undefined,
     streamParts: readonly SerializableStreamPart[] | undefined,
+    metaIndex?: ReadonlyMap<string, Record<string, unknown>>,
   ): SerializableRequestDetails[] {
     const result: SerializableRequestDetails[] = [];
     const append = (details: SerializableRequestDetails): void => {
@@ -795,7 +796,7 @@ export function createSessionContentProvider(
     for (const details of meta?.requestDetails ?? []) {
       append(details);
     }
-    for (const details of requestDetailsFromStreamParts(streamParts ?? [])) {
+    for (const details of requestDetailsFromStreamParts(streamParts ?? [], metaIndex)) {
       append(details);
     }
     return result;
@@ -805,9 +806,10 @@ export function createSessionContentProvider(
     meta?: SerializableSessionMeta,
     streamParts?: readonly SerializableStreamPart[],
     streamEntries?: readonly StreamRecordEntry[],
+    metaIndex?: ReadonlyMap<string, Record<string, unknown>>,
   ): ToolIdEditMap {
     const result: ToolIdEditMap = new Map();
-    for (const details of getMergedRequestDetails(meta, streamParts)) {
+    for (const details of getMergedRequestDetails(meta, streamParts, metaIndex)) {
       for (const [toolCallId, editId] of Object.entries(details.toolIdEditMap ?? {})) {
         if (editId) {
           result.set(toolCallId, editId);
@@ -879,6 +881,7 @@ export function createSessionContentProvider(
   function getRestoredRequestIdByTurnIndex(
     meta?: SerializableSessionMeta,
     streamParts?: readonly SerializableStreamPart[],
+    metaIndex?: ReadonlyMap<string, Record<string, unknown>>,
   ): Map<number, RestoredRequestId> {
     const result = new Map<number, RestoredRequestId>();
     const add = (details: SerializableRequestDetails, source: RestoredRequestIdSource) => {
@@ -896,7 +899,7 @@ export function createSessionContentProvider(
     for (const details of meta?.requestDetails ?? []) {
       add(details, 'request-details');
     }
-    for (const details of requestDetailsFromStreamParts(streamParts ?? [])) {
+    for (const details of requestDetailsFromStreamParts(streamParts ?? [], metaIndex)) {
       if (typeof details.turnIndex === 'number' && result.has(details.turnIndex)) {
         continue;
       }
@@ -1996,7 +1999,7 @@ export function createSessionContentProvider(
         ...await readAllSnapshots(sessionStreamPath),
         ...subsessions.flatMap(sub => sub.snapshots),
       ]);
-      const toolIdEditMap = getToolIdEditMap(meta, streamParts, responseEntries);
+      const toolIdEditMap = getToolIdEditMap(meta, streamParts, responseEntries, rootMetaIndex);
       const restoreReplaySnapshots = getToolCompleteReplaySnapshotsForRestoredRecords(snapshots, responseEntries.map(entry => entry.record));
       const restorableMappedEditSnapshots = filterSnapshotsWithRestoredEditRecords(restoreReplaySnapshots, toolIdEditMap);
       const restorableSnapshotEditCallIds = new Set(
@@ -2014,7 +2017,7 @@ export function createSessionContentProvider(
         ? []
         : excludeSnapshots(getRestoreReplaySnapshots(snapshots, meta), restorableEditSnapshots);
       const checkpointApproval = getCheckpointApproval(snapshots, meta);
-      const requestIdByTurnIndex = getRestoredRequestIdByTurnIndex(meta, streamParts);
+      const requestIdByTurnIndex = getRestoredRequestIdByTurnIndex(meta, streamParts, rootMetaIndex);
       const grouped = groupStreamRecordEntriesByTurn(responseEntries);
       const promptsByTurn = groupPromptsByTurn(mainRecords);
       const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
@@ -2108,7 +2111,8 @@ export function createSessionContentProvider(
       ? turnEvents.flatMap(turn => turn.events)
       : await readLegacySessionEvents<AcpEvent>(turnsPath);
     const snapshots = await readCheckpoints(sessionDir);
-    const toolIdEditMap = getToolIdEditMap(meta, streamParts);
+    const partMetaIndex = await readMetaIndex(metaStreamPath);
+    const toolIdEditMap = getToolIdEditMap(meta, streamParts, undefined, partMetaIndex);
     const checkpointApproval = getCheckpointApproval(snapshots, meta);
     const restoreReplaySnapshots = hasPersistedTurns
       ? getToolCompleteReplaySnapshots(snapshots, turnEvents)
@@ -2137,7 +2141,7 @@ export function createSessionContentProvider(
       `restoreReplay=${restoreReplaySnapshots.length}, editRecords=${toolIdEditMap.size}, replayPending=${options?.replayPendingChanges !== false})`,
     );
 
-    const requestIdByTurnIndex = getRestoredRequestIdByTurnIndex(meta, streamParts);
+    const requestIdByTurnIndex = getRestoredRequestIdByTurnIndex(meta, streamParts, partMetaIndex);
     const makeRequestTurn = (
       prompt: string,
       requestId: RestoredRequestId,

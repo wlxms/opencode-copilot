@@ -56,7 +56,7 @@ task / subagent      → 点击展开子代理完整对话
 # 类型检查
 npm run lint
 
-# 测试（67 个单元测试）
+# 测试（350+ 单元测试）
 npm test
 ```
 
@@ -67,28 +67,58 @@ npm test
 | 聊天 UI | VSCode Chat Participant API (稳定 + `chatParticipantAdditions` proposal) |
 | 流式桥接 | SSE 事件 → `thinkingProgress()` / `markdown()` |
 | 工具渲染 | `ChatToolInvocationPart` + 6 种 `toolSpecificData` |
-| SDK | `@opencode-ai/sdk` v1.14.41 |
+| SDK | `@opencode-ai/sdk` ^1.16.0 |
 | 构建 | esbuild (ESM→CJS) |
 | 测试 | vitest + 自定义 vscode mock |
 
 ### ACP-first 架构
 
-当前代码库已引入 ACP-compatible 分层：
+当前代码库采用 **SSP-first / SSS-owned-stream** 分层架构，彻底解耦协议语义、序列化与平台渲染：
 
 ```txt
 src/
-├── acp/                  # 协议语义层（不依赖 vscode / SDK）
-├── backends/opencode/    # OpenCode → ACP backend 适配
-├── surfaces/vscode/      # VS Code stable / experimental surface
-├── participant/          # 兼容层，逐步迁移中的 participant 入口
-└── extension.ts          # 入口分流：backend + surface 装配
+├── acp/                  # ACP 协议语义层（零 vscode / SDK 依赖）
+│   ├── backend.ts        #   AcpBackend / AcpBridge 核心接口
+│   ├── streaming/        #   可序列化会话流（SSS：拥有 vscode 流，push/update API）
+│   ├── serializable/     #   JSONL 序列化（session.jsonl / meta.jsonl）
+│   └── checkpoint/       #   Checkpoint 审批状态与持久化
+├── ssp/                  # 可序列化流部件层（SSP 自洽：状态 + 渲染 + 序列化）
+│   ├── types.ts          #   SerializableStreamPart 基类 + IMutableStreamPart
+│   └── impl/             #   10+ 具体 SSP（AssistantText / Reasoning / Tool / Edit / Question …）
+├── backends/opencode/    # OpenCode → ACP 后端适配（Bridge 薄路由 ~825 行）
+├── acpmodels/            # Copilot ⇄ ACP 模型双向同步注册表
+├── surfaces/vscode/      # VS Code surface（稳定 participant + 实验 session provider）
+├── participant/          # ChatRequestHandler 编排层（handler + checkpoint + title）
+├── settings/             # Webview 设置面板
+├── opencode/             # SDK 封装（server + client）
+└── extension.ts          # 入口：backend + surface 装配
 ```
 
-- `src/acp/*`：定义统一语义事件、会话、权限、模型接口
-- `src/backends/opencode/*`：把 OpenCode SDK 与事件流归一化到 ACP
-- `src/surfaces/vscode/*`：把 ACP 事件渲染到 VS Code Chat UI
+**数据流**：
 
-这意味着未来可以保留同一套 VS Code surface，同时接入别的 ACP backend，而不把 OpenCode 细节泄漏到 UI 层。
+```
+用户消息 → ChatRequestHandler → SessionManager 解析会话
+  → SerializableSessionStream 创建本回合流
+  → OpenCodeBackend.sessions.prompt → 后端 SSE 事件
+  → OpenCodeBridge.run() 路由事件
+  → SSS.push(SSP) / update(id, data)
+  → SSP 渲染到 ChatResponseStream + 追加到 session.jsonl
+```
+
+- `src/acp/*`：定义统一语义事件、会话、权限、模型接口，后端可替换
+- `src/ssp/*`：每个 SSP 自洽——拥有自身状态、渲染逻辑、序列化契约，直接 import vscode 类型
+- `src/acp/streaming/*`：`SerializableSessionStream` 拥有 vscode 流，Bridge 只调 `push()/update()`，永不直接触达 UI
+- `src/backends/opencode/*`：`OpenCodeBridge` 是 ~825 行薄路由，将 ACP 事件映射到 SSP 调用
+
+3 文件持久化（中断安全）：
+
+```
+{workspaceRoot}/.acpilot/{backend}/{sessionId}/
+├── meta.jsonl                  # 会话元数据（快速索引）
+├── session.jsonl               # 流部件（append-only）
+└── subsessions/{subId}/        # 子代理独立文件（递归嵌套）
+    └── subsession.jsonl
+```
 
 ### 实验性 Session Provider
 
@@ -112,23 +142,25 @@ src/
 
 ```
 src/
-├── acp/                  # ACP 语义层
-├── backends/opencode/    # OpenCode ACP backend
-├── surfaces/vscode/      # VS Code surfaces
-├── extension.ts          # 入口: activate/deactivate
-├── opencode/
-│   └── server.ts         # SDK 封装 (createOpencode)
-├── participant/
-│   ├── handler.ts        # ChatRequestHandler 主流程
-│   ├── streaming.ts      # StreamBridge: SSE → Chat UI
-│   ├── commands.ts       # 斜杠命令路由
-│   └── errors.ts         # 错误处理
-├── types/
-│   ├── index.ts          # ExtensionState
-│   └── events.ts         # SSE 事件类型
-└── test/
-    ├── vscode-mock.ts    # VSCode API mock
-    └── *.test.ts         # 各模块测试
+├── extension.ts              # 入口: activate/deactivate，注册 ChatParticipant
+├── statusbar.ts              # 状态栏管理
+├── acp/                      # ACP 协议语义层
+│   ├── backend.ts            #   AcpBackend / AcpBridge 核心接口
+│   ├── streaming/            #   SSS 会话流（push/update，3 文件持久化）
+│   ├── serializable/         #   JSONL 序列化器
+│   ├── checkpoint/           #   Checkpoint 状态存储
+│   └── ...                   #   事件总线 / 会话映射 / 选择存储
+├── ssp/                      # 可序列化流部件层（自洽状态 + 渲染）
+│   ├── types.ts              #   SerializableStreamPart 基类
+│   └── impl/                 #   10+ 具体 SSP（Text/Reasoning/Tool/Edit/…）
+├── backends/opencode/        # OpenCode 后端（Bridge 薄路由 + 事件归一化）
+├── acpmodels/                # Copilot ⇄ ACP 模型双向同步
+├── surfaces/vscode/          # VS Code surfaces（稳定 + 实验 + 能力检测）
+├── participant/              # ChatRequestHandler 编排（handler/commands/checkpoint）
+├── settings/                 # Webview 设置面板
+├── opencode/                 # SDK 封装（server + client）
+├── types/                    # 共享类型（ExtensionState + vscode proposed API 声明）
+└── test/                     # vitest 测试（350+ 用例）
 ```
 
 详细技术文档见 [doc/tech-summary.md](doc/tech-summary.md)。

@@ -72,7 +72,7 @@
       "npm": "@ai-sdk/openai-compatible",
       "baseURL": "https://opencode.ai/zen/v1",
       "modelDiscoveryEndpoint": "https://opencode.ai/zen/v1/models",
-      "copilotVendorAliases": ["opencode"],
+      "copilotVendorAliases": ["opencode", "opencode-cli", "opencode-zen"],
       "models": {
         "big-pickle":              { "name": "Big Pickle",             "maxInputTokens": 200000,  "maxOutputTokens": 128000, "toolCalling": true,  "imageInput": false },
         "deepseek-v4-flash-free":  { "name": "DeepSeek V4 Flash Free", "maxInputTokens": 1000000, "maxOutputTokens": 384000, "toolCalling": true,  "imageInput": false },

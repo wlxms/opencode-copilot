@@ -91,6 +91,13 @@ export async function resolvePromptModel(
     return state.selection.get().model;
   }
 
+  // Strip vendor prefix (e.g. "opencode-cli/") from nativeModel.id so that
+  // the legacy fuzzy match compares against the bare model identifier that
+  // backend models report (e.g. "deepseek-v4-flash-free").
+  const modelIdForMatch = vendor && nativeModel.id.startsWith(vendor + '/')
+    ? nativeModel.id.substring(vendor.length + 1)
+    : nativeModel.id;
+
   // Attempt matching: native model.id to backend model.id
   // LanguageModelChat.id is opaque but often matches the model's common ID.
   // We also try .family and .name as fallbacks.
@@ -100,11 +107,11 @@ export async function resolvePromptModel(
   for (const bm of backendModels) {
     const providerID = bm.provider ?? 'default';
     // Match by id (exact)
-    if (bm.id === nativeModel.id) {
+    if (bm.id === modelIdForMatch) {
       candidates.push({ providerID, modelID: bm.id });
     }
     // Match by name (exact, case-insensitive)
-    else if (bm.name && bm.name.toLowerCase() === nativeModel.id.toLowerCase()) {
+    else if (bm.name && bm.name.toLowerCase() === modelIdForMatch.toLowerCase()) {
       candidates.push({ providerID, modelID: bm.id });
     }
     // Match by family (exact, case-insensitive)
@@ -113,9 +120,9 @@ export async function resolvePromptModel(
     }
     // Partial match: native id is a substring of backend model id (or vice versa)
     else if (
-      nativeModel.id.length >= 3 &&
-      (bm.id.toLowerCase().includes(nativeModel.id.toLowerCase()) ||
-       nativeModel.id.toLowerCase().includes(bm.id.toLowerCase()))
+      modelIdForMatch.length >= 3 &&
+      (bm.id.toLowerCase().includes(modelIdForMatch.toLowerCase()) ||
+       modelIdForMatch.toLowerCase().includes(bm.id.toLowerCase()))
     ) {
       candidates.push({ providerID, modelID: bm.id });
     }

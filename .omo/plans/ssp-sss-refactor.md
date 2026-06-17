@@ -789,5 +789,38 @@ try {
 | ExternalEditSSP 合并 tracker | 消除三套并行系统 |
 | update 不调 emitStateChange | 防止双重 append |
 | render guard | 防止重复启动生命周期 |
-| SubagentManager 留 bridge | 编排逻辑，非 SSS/SSP 职责 |
+| SubagentManager 留 bridge | 编排逻辑，非 SSS/SSP 职责 — **实际位于 `src/ssp/impl/subagent.ts`**（无 bridge 依赖，放置更合理） |
 | 回放不需要 SubagentManager | subAgentInvocationId 在 payload + 文件路径 |
+
+---
+
+## 九、审计发现与设计偏差（2026-06-16）
+
+3 个并行 explore agent 对 SSP、SSS/deserialize、Bridge/Handler 三层进行了完整审计。以下是发现的偏差及其处置：
+
+### 已修复的代码 Bug（已提交 eb1aa3f）
+
+| Bug | 影响 | 修复 |
+|-----|------|------|
+| `onStateChange` 回调调用了 `render()` + `appendSession()` + `syncMetadata()` | 异步 SSP 内部变更（questionCarousel 回答、undoStopId 到达）会重复渲染和追加到 session.jsonl | 改为仅 `syncMetadata(s)`，匹配方案：异步变更只写 meta.jsonl |
+| `syncMetadata` 使用 `ssp.id` 而非 `ssp.metaId` | 违反 IMetadataProvider 契约。future SSP 的 metaId ≠ id 时出错 | 改为 `ssp.metaId` (`session-stream.ts:156`) |
+| `MUTABLE_KINDS` 包含 `'sessionLifecycle'` | SessionLifecycleSSP 不实现 IMutableStreamPart，但被标记为 mutable，内部不一致 | 移除 `'sessionLifecycle'` (`types.ts:365`) |
+| `createSSPFromRecord` default 包装了完整记录 | 未知 kind 的 event shape 错误 | 改为 `{ event: record.payload }` (`deserialize.ts:285`) |
+
+### 意向性设计偏差（代码正确，方案需更新）
+
+| 偏差 | 方案中的描述 | 实际实现 | 理由 |
+|------|-------------|---------|------|
+| `IMutableStreamPart extends ISerializableStreamPart` | `extends SerializableStreamPart<string, TPayload>` | 扩展结构接口 `ISerializableStreamPart` | 修复 TypeScript 泛型不变性问题。类泛型 `SerializableStreamPart<'assistantText', X>` 不可赋值给 `SerializableStreamPart<SerializableStreamPartKind, unknown>`；结构接口 `ISerializableStreamPart` 通过结构类型检查解决了这一问题 |
+| `SubagentManager` 位于 `src/ssp/impl/subagent.ts` | "SubagentManager 留在 bridge" | 位于 SSP 层，bridge 导入使用 | SubagentManager 是纯状态追踪器，无 bridge 依赖。放在 SSP 层更干净，避免不必要的耦合 |
+| `mergeToolState` 深度合并 | `return curr`（最新覆盖） | `{ ...prev, ...curr }`（保留部分更新的字段） | 深度合并对部分状态更新（仅变更 `status` 时保留 `title`）更正确。方案已更新以反映此行为 |
+| `ISerializableStreamPart` 结构接口 | 方案中不存在 | 作为非泛型接口添加，供方法签名使用 | 解决泛型方差所必需。`AnySerializableStreamPart = ISerializableStreamPart` 类型别名作为简写 |
+
+### 未完成项（非阻塞）
+
+| 项目 | 状态 |
+|------|------|
+| 恢复路径迁移（experimental-session.ts → deserialize.ts） | ⏳ 仍使用旧的 `turns.jsonl` 序列化器。新的 `deserialize.ts` 已实现并经过测试，但尚未接入生产环境 |
+| session-store.ts 迁移（turns.jsonl → session.jsonl） | ⏳ 仍引用旧文件格式 |
+| SerializableStreamPartEventHandler 移除 | ⏳ 仍存在于 `src/acp/serializable/stream-parts.ts` 中 |
+| 4 个集成测试文件已存根 | ⏳ 旧版 bridge API 集成测试需重写 |

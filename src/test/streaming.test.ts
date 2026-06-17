@@ -265,7 +265,8 @@ describe('OpenCodeBridge', () => {
       tools: toolEvents({ toolName: 'write', callId: 'call_wr', input: { filePath: '/src/new.ts' }, output: 'written', title: 'new.ts' }),
     }));
     await runBridge(bridge,events, stream, mockToken());
-    expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_wr', 'write');
+    // Write tools without permission are deferred at pending/running;
+    // ToolInvocationSSP is created at completed state directly.
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
     const writePart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; isComplete?: boolean };
@@ -726,11 +727,11 @@ describe('OpenCodeBridge', () => {
       expect(childSessionMeta?.title).toBe('Child Full Chain');
       expect(childSessionMeta?.changeSummary).toEqual({ files: 1 });
       expect(childSessionMeta?.status).toEqual({ type: 'busy' });
-      expect(sub.metaIndex.get(`externalEdit:${writeCallId}`)?.undoStopId).toBe('undo-child-full-chain');
+      expect(sub.metaIndex.get(writeCallId)?.undoStopId).toBe('undo-child-full-chain');
 
       const rootMeta = await readMetaIndex(path.join(sessionDir, 'meta.jsonl'));
       expect(rootMeta.get('session')?.title).not.toBe('Child Full Chain');
-      expect(rootMeta.get(`externalEdit:${writeCallId}`)).toBeUndefined();
+      expect(rootMeta.get(writeCallId)).toBeUndefined();
 
       const snapshots = await readAllSnapshots(path.join(sessionDir, 'session.jsonl'));
       expect(snapshots).toEqual(expect.arrayContaining([
@@ -1269,7 +1270,7 @@ describe('OpenCodeBridge', () => {
       expect(editParts.filter((p) => p.isComplete === true && p.presentation !== 'hidden')).toHaveLength(0);
     });
 
-    it('hides an edit tool card that was pushed before permission.asked marks it as externalEdit', async () => {
+    it('defers write tool SSP until permission.asked, then uses ExternalEditSSP (no orphaned tool card)', async () => {
       const stream = mockStream();
       const callId = 'call_edit_late_permission';
       const partId = 'prt_edit_tool';
@@ -1310,17 +1311,14 @@ describe('OpenCodeBridge', () => {
 
       await runBridge(permissionBridge(), events, stream, mockToken());
 
+      // No ToolInvocationSSP should be pushed for write tools with external edit
       const writeParts = (stream.push as ReturnType<typeof vi.fn>).mock.calls
         .map((call: unknown[]) => call[0] as {
           toolName?: string;
           toolCallId?: string;
-          isComplete?: boolean;
-          presentation?: string;
         })
         .filter((p) => p?.toolName === 'write' && p?.toolCallId === callId);
-      expect(writeParts.some((p) => p.isComplete === false)).toBe(true);
-      expect(writeParts.some((p) => p.presentation === 'hidden' && p.isComplete === true)).toBe(true);
-      expect(writeParts.filter((p) => p.isComplete === true && p.presentation !== 'hidden')).toHaveLength(0);
+      expect(writeParts).toHaveLength(0);
     });
 
     it('completes child-session ExternalEditSSP when a child write tool completes', async () => {
