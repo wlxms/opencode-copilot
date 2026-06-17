@@ -11,7 +11,7 @@
 
 import { SerializableStreamPart } from '../types';
 import type { SspStream } from '../types';
-import type { ReasoningStreamPartPayload } from '../types';
+import type { ReasoningStreamPartPayload, SerializableStreamPartMeta } from '../types';
 
 export class ReasoningSSP extends SerializableStreamPart<
   'reasoning',
@@ -19,12 +19,19 @@ export class ReasoningSSP extends SerializableStreamPart<
 > {
   readonly kind = 'reasoning' as const;
 
-  constructor(payload: { partId: string; delta: string; messageId?: string }) {
+  constructor(
+    payload: { partId: string; delta: string; messageId?: string },
+    meta?: Partial<SerializableStreamPartMeta>,
+    id?: string,
+  ) {
     super({
       partId: payload.partId,
       text: payload.delta,
       messageId: payload.messageId,
-    });
+    }, {
+      ...meta,
+      sourcePartId: meta?.sourcePartId ?? payload.partId,
+    }, id);
   }
 
   render(stream: SspStream): void {

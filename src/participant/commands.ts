@@ -378,7 +378,7 @@ async function handleTestExternalEditRealCommand(
       // 2. Push externalEdit bubble
       roundStream.markdown('2️⃣ Starting `stream.externalEdit` tracking...\n\n');
 
-      const trackPromise = tracker.trackEdit(editKey, [uri], roundStream, token);
+      const trackPromise = tracker.trackEdit(editKey, [uri], roundStream);
       await trackPromise;
       roundStream.markdown('   ✅ `trackEdit` resolved — baseline captured.\n\n');
 
@@ -657,7 +657,7 @@ async function handleTestExternalEditE2ECommand(
           editCallID = callID;
           stream.markdown(`     🎯 Matched target file — parallel trackEdit + "once"\n`);
           await Promise.all([
-            tracker.trackEdit(editKey, [tmpUri], stream, token).then(() => {
+            tracker.trackEdit(editKey, [tmpUri], stream).then(() => {
               baselineCaptured = true;
               stream.markdown(`     ✅ trackEdit resolved — baseline captured\n`);
             }).catch((err: unknown) => {

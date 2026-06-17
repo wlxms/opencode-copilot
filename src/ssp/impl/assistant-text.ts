@@ -10,7 +10,7 @@
 
 import { SerializableStreamPart } from '../types';
 import type { SspStream } from '../types';
-import type { AssistantTextStreamPartPayload } from '../types';
+import type { AssistantTextStreamPartPayload, SerializableStreamPartMeta } from '../types';
 
 export class AssistantTextSSP extends SerializableStreamPart<
   'assistantText',
@@ -18,12 +18,19 @@ export class AssistantTextSSP extends SerializableStreamPart<
 > {
   readonly kind = 'assistantText' as const;
 
-  constructor(payload: { partId: string; delta: string; messageId?: string }) {
+  constructor(
+    payload: { partId: string; delta: string; messageId?: string },
+    meta?: Partial<SerializableStreamPartMeta>,
+    id?: string,
+  ) {
     super({
       partId: payload.partId,
       text: payload.delta,
       messageId: payload.messageId,
-    });
+    }, {
+      ...meta,
+      sourcePartId: meta?.sourcePartId ?? payload.partId,
+    }, id);
   }
 
   render(stream: SspStream): void {

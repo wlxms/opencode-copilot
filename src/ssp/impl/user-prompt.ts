@@ -12,7 +12,7 @@
 
 import { SerializableStreamPart } from '../types';
 import type { SspStream } from '../types';
-import type { UserPromptStreamPartPayload } from '../types';
+import type { SerializableStreamPartMeta, UserPromptStreamPartPayload } from '../types';
 
 export class UserPromptSSP extends SerializableStreamPart<
   'userPrompt',
@@ -20,13 +20,20 @@ export class UserPromptSSP extends SerializableStreamPart<
 > {
   readonly kind = 'userPrompt' as const;
 
-  constructor(payload: { text: string; partId?: string; command?: string; messageId?: string }) {
+  constructor(
+    payload: { text: string; partId?: string; command?: string; messageId?: string },
+    meta?: Partial<SerializableStreamPartMeta>,
+    id?: string,
+  ) {
     super({
       text: payload.text,
       partId: payload.partId,
       messageId: payload.messageId,
       command: payload.command,
-    });
+    }, {
+      ...meta,
+      sourcePartId: meta?.sourcePartId ?? payload.partId,
+    }, id);
   }
 
   render(_stream: SspStream): void {

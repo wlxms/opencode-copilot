@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
@@ -843,16 +844,10 @@ async function recordTrackedEdit(
     externalEdit: (_target: unknown, callback: () => Thenable<unknown>): Thenable<string> => {
       return new Promise<string>(resolveComplete => {
         const run = async () => {
-          for (const s of beforeSnapshots) snapshots.push(s);
-          resolveDeferred = () => {};
-          const deferred = new Promise<void>(r => { resolveDeferred = r; });
           await callback();
-          await deferred;
           resolveComplete('test-undo-stop');
         };
         run();
-        // Resolve baseline immediately (mock: baseline captured synchronously)
-        callback().then(() => {}).catch(() => {});
       });
     },
   } as unknown as vscode.ChatResponseStream;

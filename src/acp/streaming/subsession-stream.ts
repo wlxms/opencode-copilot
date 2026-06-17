@@ -1,71 +1,81 @@
 /**
- * SubsessionStream — push/update API for child session (subagent) stream parts.
+ * SubsessionStream - semantic stream node for a subagent session.
  *
- * Writes to: {sessionDir}/subsessions/{subAgentInvocationId}/subsession.jsonl
- *
- * Same push/update API as SerializableSessionStream but writes to a separate
- * file so parent and child events don't interleave in session.jsonl.
- *
- * Directory structure supports recursive nesting for nested subagents.
+ * It shares push/update/meta behavior with the root SSS via SessionStreamNodeBase,
+ * but owns subagent-specific paths and ancestry metadata.
  */
 
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import {
-  type AnySerializableStreamPart,
-  type SspStream,
-  type StreamPartRecord,
-  isMutable,
-} from '../../ssp/types';
-import { buildLine } from '../serializable/serializer';
+import type { SspStream } from '../../ssp/types';
+import { SessionStreamNodeBase } from './session-stream-node';
+import type { SessionStreamNodeConfig } from './session-stream-node';
 
-export class SubsessionStream {
-  private parts = new Map<string, AnySerializableStreamPart>();
-  private filePath: string;
-  private subDir: string;
-  private writeQueue: Promise<void> = Promise.resolve();
+export interface SubsessionStreamConfig {
+  turnIndex: number;
+  requestId: string;
+  parentSubAgentInvocationId?: string;
+  subAgentPath?: string[];
+}
+
+export class SubsessionStream extends SessionStreamNodeBase<SubsessionStream> {
+  private readonly subDir: string | null;
 
   constructor(
-    sessionDir: string,
-    subAgentInvocationId: string,
-    private readonly stream: SspStream,
+    parentDir: string | null,
+    private readonly subAgentInvocationId: string,
+    stream: SspStream,
+    config: SubsessionStreamConfig,
   ) {
-    this.subDir = path.join(sessionDir, 'subsessions', subAgentInvocationId);
-    this.filePath = path.join(this.subDir, 'subsession.jsonl');
+    const subAgentPath = config.subAgentPath ?? [subAgentInvocationId];
+    const nodeConfig: SessionStreamNodeConfig = {
+      turnIndex: config.turnIndex,
+      requestId: config.requestId,
+      subAgentInvocationId,
+      parentSubAgentInvocationId: config.parentSubAgentInvocationId,
+      subAgentPath,
+    };
+    const subDir = parentDir ? path.join(parentDir, 'subsessions', subAgentInvocationId) : null;
+    super(stream, nodeConfig, {
+      dir: subDir,
+      streamPath: subDir ? path.join(subDir, 'subsession.jsonl') : null,
+      metaPath: subDir ? path.join(subDir, 'meta.jsonl') : null,
+    }, '[SubsessionStream]');
+    this.subDir = subDir;
   }
 
-  /** Push a new SSP — renders to stream, appends to subsession.jsonl */
-  push(ssp: AnySerializableStreamPart): void {
-    this.parts.set(ssp.id, ssp);
-    ssp.render(this.stream);
-    this.append(ssp.toJSON());
+  getSubDir(): string { return this.subDir ?? ''; }
+
+  writeMeta(patch: Record<string, unknown>): void {
+    if (!this.isActive) return;
+    this.appendMeta({ type: 'session', ...patch });
   }
 
-  /** Update an existing mutable SSP — merge, render, append */
-  update(id: string, data: Record<string, unknown>): void {
-    const ssp = this.parts.get(id);
-    if (!ssp || !isMutable(ssp)) return;
-    ssp.update(data);
-    ssp.render(this.stream);
-    this.append(ssp.toJSON());
+  protected createSubsession(subAgentInvocationId: string): SubsessionStream {
+    return new SubsessionStream(
+      this.subDir,
+      subAgentInvocationId,
+      this.stream,
+      {
+        turnIndex: this.config.turnIndex,
+        requestId: this.config.requestId,
+        parentSubAgentInvocationId: this.subAgentInvocationId,
+        subAgentPath: [...(this.config.subAgentPath ?? [this.subAgentInvocationId]), subAgentInvocationId],
+      },
+    );
   }
 
-  /** Get the subsession directory (for nested subsessions) */
-  getSubDir(): string { return this.subDir; }
-
-  /** Wait for all pending writes */
-  async flush(): Promise<void> { await this.writeQueue; }
-
-  private append(record: StreamPartRecord): void {
-    this.enqueueWrite(async () => {
+  protected override async beforeAppendStream(): Promise<void> {
+    if (this.subDir) {
       await fs.mkdir(this.subDir, { recursive: true });
-      await fs.appendFile(this.filePath, buildLine('stream-part', record));
-    });
+    }
   }
 
-  private enqueueWrite(fn: () => Promise<void>): void {
-    this.writeQueue = this.writeQueue.then(fn).catch(err => {
-      console.error('[SubsessionStream] Write error', err);
+  protected override appendMeta(data: Record<string, unknown>): void {
+    this.enqueueWrite(async () => {
+      if (!this.subDir || !this.metaPath) return;
+      await fs.mkdir(this.subDir, { recursive: true });
+      await fs.appendFile(this.metaPath, JSON.stringify({ v: 2, ...data }) + '\n');
     });
   }
 }

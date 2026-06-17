@@ -78,6 +78,16 @@ import {
 import { CollectorStream } from '../../acp/streaming/collector-stream';
 import { SerializableSessionStream } from '../../acp/streaming/session-stream';
 import {
+  createSSPFromRecord,
+  finalizeIncompleteStates,
+  materializeRecords,
+  readAllSnapshots,
+  readAllStreamParts,
+  readMetaIndex,
+  readSubsessionRecords,
+  type SubsessionRecordSet,
+} from '../../acp/streaming/deserialize';
+import {
   readLegacySessionEvents,
   readLegacySessionTurnEvents,
   readSessionTurnStreamParts,
@@ -88,6 +98,7 @@ import {
   projectStreamPartToAcpEvent,
   requestDetailsFromStreamParts,
 } from '../../acp/serializable/stream-parts';
+import type { StreamPartRecord } from '../../ssp/types';
 import { readCheckpoints } from '../../acp/checkpoint/checkpoint-store';
 import { getCheckpointApproval, snapshotTurnIndex } from '../../acp/checkpoint/approval-state';
 import { pushSnapshotTextEditParts, replaySnapshotsToWorkspace } from '../../acp/checkpoint/replay';
@@ -138,6 +149,11 @@ type RestoredRequestIdSource = 'request-details' | 'stream-parts' | 'turn-index'
 interface RestoredRequestId {
   id: string;
   source: RestoredRequestIdSource;
+}
+
+interface StreamRecordEntry {
+  record: StreamPartRecord;
+  metaIndex: ReadonlyMap<string, Record<string, unknown>>;
 }
 
 interface SessionListEntry {
@@ -788,6 +804,7 @@ export function createSessionContentProvider(
   function getToolIdEditMap(
     meta?: SerializableSessionMeta,
     streamParts?: readonly SerializableStreamPart[],
+    streamEntries?: readonly StreamRecordEntry[],
   ): ToolIdEditMap {
     const result: ToolIdEditMap = new Map();
     for (const details of getMergedRequestDetails(meta, streamParts)) {
@@ -797,7 +814,66 @@ export function createSessionContentProvider(
         }
       }
     }
+    for (const entry of streamEntries ?? []) {
+      addExternalEditRecordToMap(result, entry.record, entry.metaIndex);
+    }
     return result;
+  }
+
+  function addExternalEditRecordToMap(
+    result: ToolIdEditMap,
+    record: StreamPartRecord,
+    metaIndex?: ReadonlyMap<string, Record<string, unknown>>,
+  ): void {
+    if (record.kind !== 'externalEdit' && record.kind !== 'externalEditMetadata') {
+      return;
+    }
+
+    const payload = record.payload as Record<string, unknown> | undefined;
+    const directMeta = metaIndex?.get(record.id);
+    let toolCallId = nonEmptyString(payload?.toolCallId)
+      ?? nonEmptyString(record.meta?.toolCallId)
+      ?? getToolCallIdFromExternalEditRecordId(record.id)
+      ?? nonEmptyString(directMeta?.toolCallId);
+    const partMeta = directMeta ?? (toolCallId ? metaIndex?.get(`externalEdit:${toolCallId}`) : undefined);
+    toolCallId ??= nonEmptyString(partMeta?.toolCallId);
+    const editId = nonEmptyString(payload?.editId)
+      ?? nonEmptyString(payload?.undoStopId)
+      ?? nonEmptyString(record.meta?.editId)
+      ?? nonEmptyString(partMeta?.editId)
+      ?? nonEmptyString(partMeta?.undoStopId);
+
+    if (toolCallId && editId) {
+      result.set(toolCallId, editId);
+    }
+  }
+
+  function nonEmptyString(value: unknown): string | undefined {
+    return typeof value === 'string' && value.length > 0 ? value : undefined;
+  }
+
+  function getToolCallIdFromExternalEditRecordId(id: string): string | undefined {
+    const prefix = 'externalEdit:';
+    return id.startsWith(prefix) && id.length > prefix.length ? id.slice(prefix.length) : undefined;
+  }
+
+  function getRestoredTurnMetadata(
+    snapshots: readonly FileSnapshotRecord[],
+    toolIdEditMap: ToolIdEditMap,
+  ): Record<string, unknown> {
+    const turnToolIdEditMap: Record<string, string> = {};
+    for (const snapshot of snapshots) {
+      if (!snapshot.toolCallId || turnToolIdEditMap[snapshot.toolCallId]) {
+        continue;
+      }
+      const editId = toolIdEditMap.get(snapshot.toolCallId) ?? snapshot.undoStopId;
+      if (editId) {
+        turnToolIdEditMap[snapshot.toolCallId] = editId;
+      }
+    }
+    return Object.keys(turnToolIdEditMap).length > 0
+      ? { toolIdEditMap: turnToolIdEditMap }
+      : {};
   }
 
   function getRestoredRequestIdByTurnIndex(
@@ -1495,6 +1571,322 @@ export function createSessionContentProvider(
     };
   }
 
+  function getSessionStreamPath(sessionDir: string): string {
+    return path.join(sessionDir, 'session.jsonl');
+  }
+
+  function getSessionMetaStreamPath(sessionDir: string): string {
+    return path.join(sessionDir, 'meta.jsonl');
+  }
+
+  function dedupeSnapshots(snapshots: readonly FileSnapshotRecord[]): FileSnapshotRecord[] {
+    const seen = new Set<string>();
+    const result: FileSnapshotRecord[] = [];
+    for (const snapshot of snapshots) {
+      const key = [
+        snapshot.uri,
+        snapshot.toolCallId,
+        snapshot.phase,
+        snapshot.editIndex,
+        snapshot.turnIndex,
+        snapshot.timestamp,
+      ].join('\0');
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      result.push(snapshot);
+    }
+    return result;
+  }
+
+  function sortStreamRecordsWithinNode(records: readonly StreamPartRecord[]): StreamPartRecord[] {
+    return [...records].sort((a, b) => {
+      const turnDelta = (a.meta?.turnIndex ?? 0) - (b.meta?.turnIndex ?? 0);
+      if (turnDelta !== 0) return turnDelta;
+      const sequenceDelta = (a.meta?.sequence ?? 0) - (b.meta?.sequence ?? 0);
+      if (sequenceDelta !== 0) return sequenceDelta;
+      return (a.meta?.createdAt ?? '').localeCompare(b.meta?.createdAt ?? '');
+    });
+  }
+
+  function getRecordTurnIndex(record: StreamPartRecord): number {
+    return typeof record.meta?.turnIndex === 'number' && Number.isFinite(record.meta.turnIndex)
+      ? record.meta.turnIndex
+      : 0;
+  }
+
+  function getRecordSubAgentInvocationId(record: StreamPartRecord): string | undefined {
+    const payload = record.payload as { subAgentInvocationId?: unknown } | undefined;
+    const fromPayload = payload?.subAgentInvocationId;
+    if (typeof fromPayload === 'string' && fromPayload.length > 0) {
+      return fromPayload;
+    }
+    const fromMeta = record.meta?.subAgentInvocationId;
+    return typeof fromMeta === 'string' && fromMeta.length > 0 ? fromMeta : undefined;
+  }
+
+  function getNodeSessionStatus(
+    fallbackStatus: string,
+    metaIndex: ReadonlyMap<string, Record<string, unknown>>,
+  ): string {
+    const streamedStatus = metaIndex.get('session')?.status;
+    return typeof streamedStatus === 'string' ? streamedStatus : fallbackStatus;
+  }
+
+  function materializeStreamNodeEntries(
+    records: readonly StreamPartRecord[],
+    metaIndex: ReadonlyMap<string, Record<string, unknown>>,
+    sessionStatus: string,
+  ): StreamRecordEntry[] {
+    return finalizeIncompleteStates(
+      materializeRecords(sortStreamRecordsWithinNode(records).filter(record => record.kind !== 'userPrompt')),
+      sessionStatus,
+    ).map(record => ({ record, metaIndex }));
+  }
+
+  function expandStreamRecordsByTree(
+    mainRecords: readonly StreamPartRecord[],
+    subsessions: readonly SubsessionRecordSet[],
+    rootMetaIndex: ReadonlyMap<string, Record<string, unknown>>,
+    rootSessionStatus: string,
+  ): StreamRecordEntry[] {
+    const subsByParent = new Map<string | undefined, SubsessionRecordSet[]>();
+    for (const sub of subsessions) {
+      const entries = subsByParent.get(sub.parentSubAgentInvocationId) ?? [];
+      entries.push(sub);
+      subsByParent.set(sub.parentSubAgentInvocationId, entries);
+    }
+    for (const entries of subsByParent.values()) {
+      entries.sort((a, b) =>
+        a.subAgentPath.join('\0').localeCompare(b.subAgentPath.join('\0')) ||
+        a.filePath.localeCompare(b.filePath)
+      );
+    }
+
+    const consumed = new Set<string>();
+    const appendSubtree = (sub: SubsessionRecordSet, output: StreamRecordEntry[]): void => {
+      const key = sub.subAgentPath.join('\0');
+      if (consumed.has(key)) return;
+      consumed.add(key);
+
+      const childByTrigger = new Map<string, SubsessionRecordSet[]>();
+      for (const child of subsByParent.get(sub.subAgentInvocationId) ?? []) {
+        const entries = childByTrigger.get(child.subAgentInvocationId) ?? [];
+        entries.push(child);
+        childByTrigger.set(child.subAgentInvocationId, entries);
+      }
+
+      const subSessionStatus = getNodeSessionStatus(rootSessionStatus, sub.metaIndex);
+      for (const entry of materializeStreamNodeEntries(sub.records, sub.metaIndex, subSessionStatus)) {
+        output.push(entry);
+        const { record } = entry;
+        const triggered = getRecordSubAgentInvocationId(record);
+        if (!triggered) continue;
+        for (const child of childByTrigger.get(triggered) ?? []) {
+          appendSubtree(child, output);
+        }
+        childByTrigger.delete(triggered);
+      }
+
+      for (const remaining of childByTrigger.values()) {
+        for (const child of remaining) {
+          appendSubtree(child, output);
+        }
+      }
+    };
+
+    const rootsByTrigger = new Map<string, SubsessionRecordSet[]>();
+    for (const sub of subsByParent.get(undefined) ?? []) {
+      const entries = rootsByTrigger.get(sub.subAgentInvocationId) ?? [];
+      entries.push(sub);
+      rootsByTrigger.set(sub.subAgentInvocationId, entries);
+    }
+
+    const output: StreamRecordEntry[] = [];
+    for (const entry of materializeStreamNodeEntries(mainRecords, rootMetaIndex, rootSessionStatus)) {
+      output.push(entry);
+      const { record } = entry;
+      const triggered = getRecordSubAgentInvocationId(record);
+      if (!triggered) continue;
+      for (const sub of rootsByTrigger.get(triggered) ?? []) {
+        appendSubtree(sub, output);
+      }
+      rootsByTrigger.delete(triggered);
+    }
+
+    for (const remaining of rootsByTrigger.values()) {
+      for (const sub of remaining) {
+        appendSubtree(sub, output);
+      }
+    }
+    for (const sub of subsessions) {
+      appendSubtree(sub, output);
+    }
+
+    return output;
+  }
+
+  function groupStreamRecordEntriesByTurn(entries: readonly StreamRecordEntry[]): Map<number, StreamRecordEntry[]> {
+    const grouped = new Map<number, StreamRecordEntry[]>();
+    for (const entry of entries) {
+      const turnIndex = getRecordTurnIndex(entry.record);
+      const turnEntries = grouped.get(turnIndex) ?? [];
+      turnEntries.push(entry);
+      grouped.set(turnIndex, turnEntries);
+    }
+    return grouped;
+  }
+
+  function flattenEntryRecords(entries: readonly StreamRecordEntry[]): StreamPartRecord[] {
+    return entries.map(entry => entry.record);
+  }
+
+  function groupPromptsByTurn(records: readonly StreamPartRecord[]): Map<number, StreamPartRecord[]> {
+    const grouped = new Map<number, StreamPartRecord[]>();
+    for (const record of sortStreamRecordsWithinNode(records)) {
+      if (record.kind !== 'userPrompt') {
+        continue;
+      }
+      const turnIndex = getRecordTurnIndex(record);
+      const entries = grouped.get(turnIndex) ?? [];
+      entries.push(record);
+      grouped.set(turnIndex, entries);
+    }
+    return grouped;
+  }
+
+  function getPromptFromStreamRecords(records: readonly StreamPartRecord[]): string | undefined {
+    const promptRecord = records.find(record => record.kind === 'userPrompt');
+    const payload = promptRecord?.payload as { text?: unknown } | undefined;
+    return typeof payload?.text === 'string' && payload.text.length > 0
+      ? payload.text
+      : undefined;
+  }
+
+  function getToolCompleteReplaySnapshotsForRecords(
+    snapshots: readonly FileSnapshotRecord[],
+    records: readonly StreamPartRecord[],
+  ): FileSnapshotRecord[] {
+    if (snapshots.length === 0 || records.length === 0) {
+      return [];
+    }
+
+    const snapshotsByCallId = new Map<string, FileSnapshotRecord[]>();
+    for (const snapshot of snapshots) {
+      if (!snapshot.toolCallId) continue;
+      const entries = snapshotsByCallId.get(snapshot.toolCallId) ?? [];
+      entries.push(snapshot);
+      snapshotsByCallId.set(snapshot.toolCallId, entries);
+    }
+
+    const result: FileSnapshotRecord[] = [];
+    const appendedCallIds = new Set<string>();
+    for (const record of records) {
+      if (record.kind !== 'toolInvocation') continue;
+      const payload = record.payload as {
+        toolName?: string;
+        callId?: string;
+        partId?: string;
+        state?: { status?: string };
+      };
+      const status = payload.state?.status;
+      if (status !== 'completed' && status !== 'error') continue;
+      if (!isRestoredEditToolName(payload.toolName)) continue;
+      const callId = payload.callId ?? payload.partId;
+      if (!callId || appendedCallIds.has(callId)) continue;
+      const entries = snapshotsByCallId.get(callId);
+      if (!entries?.length) continue;
+      appendedCallIds.add(callId);
+      result.push(...entries);
+    }
+
+    return result;
+  }
+
+  function getRestoreSnapshotsForToolCompleteRecord(
+    snapshots: readonly FileSnapshotRecord[],
+    record: StreamPartRecord,
+  ): FileSnapshotRecord[] {
+    const callId = getRestoredEditSnapshotCallId(record);
+    return callId ? snapshots.filter(snapshot => snapshot.toolCallId === callId) : [];
+  }
+
+  function getRestoredEditSnapshotCallId(record: StreamPartRecord): string | undefined {
+    if (record.kind === 'externalEdit' || record.kind === 'externalEditMetadata') {
+      const payload = record.payload as { toolCallId?: unknown } | undefined;
+      return nonEmptyString(payload?.toolCallId)
+        ?? nonEmptyString(record.meta?.toolCallId)
+        ?? getToolCallIdFromExternalEditRecordId(record.id);
+    }
+
+    if (record.kind !== 'toolInvocation') {
+      return undefined;
+    }
+    const payload = record.payload as {
+      toolName?: string;
+      callId?: unknown;
+      partId?: unknown;
+      state?: { status?: string };
+    };
+    const status = payload.state?.status;
+    if (status !== 'completed' && status !== 'error') {
+      return undefined;
+    }
+    if (!isRestoredEditToolName(payload.toolName)) {
+      return undefined;
+    }
+    return nonEmptyString(payload.callId) ?? nonEmptyString(payload.partId);
+  }
+
+  function hasRestorableExternalEditRecord(
+    records: readonly StreamPartRecord[],
+    toolCallId: string,
+  ): boolean {
+    return records.some(record => {
+      if (record.kind !== 'externalEdit' && record.kind !== 'externalEditMetadata') {
+        return false;
+      }
+      return getRestoredEditSnapshotCallId(record) === toolCallId;
+    });
+  }
+
+  function getToolCompleteReplaySnapshotsForRestoredRecords(
+    snapshots: readonly FileSnapshotRecord[],
+    records: readonly StreamPartRecord[],
+  ): FileSnapshotRecord[] {
+    const fromToolCompletion = getToolCompleteReplaySnapshotsForRecords(snapshots, records);
+    if (snapshots.length === 0 || records.length === 0) {
+      return fromToolCompletion;
+    }
+
+    const appendedCallIds = new Set(fromToolCompletion.map(snapshot => snapshot.toolCallId).filter(Boolean));
+    const extra: FileSnapshotRecord[] = [];
+    for (const snapshot of snapshots) {
+      const callId = snapshot.toolCallId;
+      if (!callId || appendedCallIds.has(callId)) {
+        continue;
+      }
+      if (!hasRestorableExternalEditRecord(records, callId)) {
+        continue;
+      }
+      appendedCallIds.add(callId);
+      extra.push(...snapshots.filter(candidate => candidate.toolCallId === callId));
+    }
+    return [...fromToolCompletion, ...extra];
+  }
+
+  function getSessionStatusForRestore(
+    meta: SerializableSessionMeta | undefined,
+    metaIndex: ReadonlyMap<string, Record<string, unknown>>,
+  ): string {
+    const streamedStatus = metaIndex.get('session')?.status;
+    if (typeof streamedStatus === 'string') {
+      return streamedStatus;
+    }
+    return meta?.status ?? 'completed';
+  }
+
   /**
    * Create a forkHandler function for use by both the ChatSessionItemController
    * and the ChatSession objects returned by provideChatSessionContent().
@@ -1579,6 +1971,135 @@ export function createSessionContentProvider(
   ): Promise<RestoredSessionHistory> {
     const turnsPath = state.sessionStore.getTurnsPath(sessionId);
     const sessionDir = state.sessionStore.getSessionDir(sessionId);
+    const sessionStreamPath = getSessionStreamPath(sessionDir);
+    const metaStreamPath = getSessionMetaStreamPath(sessionDir);
+    const meta = await state.sessionStore.readMeta(sessionId);
+
+    const mainRecords = await readAllStreamParts(sessionStreamPath);
+    if (mainRecords.length > 0) {
+      const subsessions = await readSubsessionRecords(sessionDir);
+      const rootMetaIndex = await readMetaIndex(metaStreamPath);
+      const sessionStatus = getSessionStatusForRestore(meta, rootMetaIndex);
+      const responseEntries = expandStreamRecordsByTree(
+        mainRecords,
+        subsessions,
+        rootMetaIndex,
+        sessionStatus,
+      );
+      const allRawRecords = [
+        ...mainRecords,
+        ...subsessions.flatMap(sub => sub.records),
+      ];
+      const streamParts = allRawRecords as SerializableStreamPart[];
+      const snapshots = dedupeSnapshots([
+        ...await readCheckpoints(sessionDir),
+        ...await readAllSnapshots(sessionStreamPath),
+        ...subsessions.flatMap(sub => sub.snapshots),
+      ]);
+      const toolIdEditMap = getToolIdEditMap(meta, streamParts, responseEntries);
+      const restoreReplaySnapshots = getToolCompleteReplaySnapshotsForRestoredRecords(snapshots, responseEntries.map(entry => entry.record));
+      const restorableMappedEditSnapshots = filterSnapshotsWithRestoredEditRecords(restoreReplaySnapshots, toolIdEditMap);
+      const restorableSnapshotEditCallIds = new Set(
+        restoreReplaySnapshots
+          .filter(snapshot => snapshot.phase === 'after' && !!snapshot.undoStopId && snapshot.toolCallId)
+          .map(snapshot => snapshot.toolCallId!),
+      );
+      const restorableSnapshotEditSnapshots = restoreReplaySnapshots.filter(snapshot =>
+        !!snapshot.toolCallId && restorableSnapshotEditCallIds.has(snapshot.toolCallId)
+      );
+      const restorableEditSnapshots = restorableMappedEditSnapshots.length > 0
+        ? restorableMappedEditSnapshots
+        : restorableSnapshotEditSnapshots;
+      const pendingReplaySnapshots = options?.replayPendingChanges === false
+        ? []
+        : excludeSnapshots(getRestoreReplaySnapshots(snapshots, meta), restorableEditSnapshots);
+      const checkpointApproval = getCheckpointApproval(snapshots, meta);
+      const requestIdByTurnIndex = getRestoredRequestIdByTurnIndex(meta, streamParts);
+      const grouped = groupStreamRecordEntriesByTurn(responseEntries);
+      const promptsByTurn = groupPromptsByTurn(mainRecords);
+      const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
+
+      const makeRequestTurn = (
+        prompt: string,
+        requestId: RestoredRequestId,
+        turnIndex: number,
+      ): vscode.ChatRequestTurn => {
+        logger.appendLine(
+          `[session-provider] Restored request id for ${sessionId}: ` +
+          `turn=${turnIndex} requestId=${requestId.id} source=${requestId.source}`,
+        );
+        return createRequestTurn(prompt, undefined, [], requestId.id);
+      };
+
+      const buildResponseTurn = (
+        entriesForResponse: readonly StreamRecordEntry[],
+        snapshotsForResponse: readonly FileSnapshotRecord[],
+      ): vscode.ChatResponseTurn | undefined => {
+        const collector = new CollectorStream();
+        const pushedRestoredEditCallIds = new Set<string>();
+
+        for (const entry of entriesForResponse) {
+          if (token.isCancellationRequested) break;
+          createSSPFromRecord(entry.record, entry.metaIndex).render(collector as never);
+          const restoredEditCallId = getRestoredEditSnapshotCallId(entry.record);
+          if (restoredEditCallId && pushedRestoredEditCallIds.has(restoredEditCallId)) {
+            continue;
+          }
+          const entryRestoreSnapshots = getRestoreSnapshotsForToolCompleteRecord(snapshotsForResponse, entry.record);
+          pushSnapshotsForRestoredEditTools(
+            sessionId,
+            entryRestoreSnapshots,
+            collector,
+            toolIdEditMap,
+          );
+          if (restoredEditCallId && entryRestoreSnapshots.length > 0) {
+            pushedRestoredEditCallIds.add(restoredEditCallId);
+          }
+        }
+
+        return collector.parts.length > 0
+          ? collector.buildTurn(getRestoredTurnMetadata(snapshotsForResponse, toolIdEditMap))
+          : undefined;
+      };
+
+      const turnIndexes = [...new Set([
+        ...promptsByTurn.keys(),
+        ...grouped.keys(),
+      ])].sort((a, b) => a - b);
+
+      for (const turnIndex of turnIndexes) {
+        if (token.isCancellationRequested) break;
+        const prompt = getPromptFromStreamRecords(promptsByTurn.get(turnIndex) ?? []);
+        if (prompt) {
+          history.push(makeRequestTurn(prompt, getRestoredRequestId(turnIndex, requestIdByTurnIndex), turnIndex));
+        }
+        const entries = grouped.get(turnIndex) ?? [];
+        const records = flattenEntryRecords(entries);
+        const responseTurn = buildResponseTurn(
+          entries,
+          getToolCompleteReplaySnapshotsForRestoredRecords(snapshots, records),
+        );
+        if (responseTurn) {
+          history.push(responseTurn);
+        }
+      }
+
+      logRestorableEditSnapshotSummary(sessionId, restorableEditSnapshots, toolIdEditMap);
+      logger.appendLine(
+        `[session-provider] fetchSessionHistory: sspRecords=${allRawRecords.length} ` +
+        `renderedRecords=${responseEntries.length} ` +
+        `subsessions=${subsessions.length} snapshots=${snapshots.length} from ${sessionStreamPath} ` +
+        `(source=ssp-v2, acceptedThroughTurn=${checkpointApproval.acceptedThroughTurn}, ` +
+        `pending=${checkpointApproval.pendingSnapshots.length}, restoreReplay=${restoreReplaySnapshots.length}, ` +
+        `editRecords=${toolIdEditMap.size}, replayPending=${options?.replayPendingChanges !== false})`,
+      );
+
+      logger.appendLine(
+        `[session-provider] Restored ${history.length} turns for session ${sessionId}`,
+      );
+
+      return { history, snapshots, pendingReplaySnapshots, restoreReplaySnapshots };
+    }
 
     // 1. Read events and snapshots
     const { turnEvents, streamParts, source: persistedSource } = await readRestorableTurnEvents(turnsPath);
@@ -1587,7 +2108,6 @@ export function createSessionContentProvider(
       ? turnEvents.flatMap(turn => turn.events)
       : await readLegacySessionEvents<AcpEvent>(turnsPath);
     const snapshots = await readCheckpoints(sessionDir);
-    const meta = await state.sessionStore.readMeta(sessionId);
     const toolIdEditMap = getToolIdEditMap(meta, streamParts);
     const checkpointApproval = getCheckpointApproval(snapshots, meta);
     const restoreReplaySnapshots = hasPersistedTurns
@@ -1649,6 +2169,41 @@ export function createSessionContentProvider(
 
     const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
 
+    const attachRestoreBridge = (
+      bridge: ReturnType<typeof state.backend.createBridge>,
+      collector: CollectorStream,
+      sss: SerializableSessionStream,
+    ): void => {
+      const compat = bridge as unknown as {
+        setSSS?: (next: unknown) => void;
+        setStream?: (next: unknown) => void;
+      };
+      if (typeof compat.setSSS === 'function') {
+        compat.setSSS(sss);
+        return;
+      }
+      compat.setStream?.(collector);
+    };
+
+    const runRestoreBridge = async (
+      bridge: ReturnType<typeof state.backend.createBridge>,
+      eventStreamForResponse: AsyncIterable<AcpEvent>,
+    ): Promise<void> => {
+      const compat = bridge as unknown as {
+        setSSS?: (next: unknown) => void;
+        processEvent?: (event: AcpEvent) => void;
+        run?: (events: AsyncIterable<AcpEvent>, token: vscode.CancellationToken) => Promise<boolean>;
+      };
+      if (typeof compat.setSSS === 'function' || typeof compat.processEvent !== 'function') {
+        await bridge.run(eventStreamForResponse, token);
+        return;
+      }
+      for await (const event of eventStreamForResponse) {
+        if (token.isCancellationRequested) break;
+        compat.processEvent(event);
+      }
+    };
+
     const buildResponseTurn = async (
       turnEventsForResponse: readonly AcpEvent[],
       snapshotsForResponse: readonly FileSnapshotRecord[],
@@ -1660,7 +2215,7 @@ export function createSessionContentProvider(
         { workspaceRoot: '', backendName: state.backend.name, sessionId, turnIndex: 0, requestId: '' },
       );
       const bridge = state.backend.createBridge(sessionId);
-      bridge.setSSS(sss);
+      attachRestoreBridge(bridge, collector, sss);
 
       // Async generator: yields events, interleaves snapshot restoration between them
       async function* eventStream() {
@@ -1676,12 +2231,12 @@ export function createSessionContentProvider(
         }
       }
 
-      await bridge.run(eventStream(), token);
+      await runRestoreBridge(bridge, eventStream());
 
       if (collector.parts.length === 0) {
         return undefined;
       }
-      return collector.buildTurn();
+      return collector.buildTurn(getRestoredTurnMetadata(snapshotsForResponse, toolIdEditMap));
     };
 
     if (hasPersistedTurns) {
@@ -1703,25 +2258,27 @@ export function createSessionContentProvider(
     } else {
       // Legacy fallback: process events sequentially, flushing at session.idle
       let collector = new CollectorStream();
+      let collectorRestoreSnapshots: FileSnapshotRecord[] = [];
       let sss = new SerializableSessionStream(
         collector as unknown as vscode.ChatResponseStream,
         { workspaceRoot: '', backendName: state.backend.name, sessionId, turnIndex: 0, requestId: '' },
       );
       let bridge = state.backend.createBridge(sessionId);
-      bridge.setSSS(sss);
+      attachRestoreBridge(bridge, collector, sss);
 
       const flushAssistantTurn = (): void => {
         if (collector.parts.length === 0) {
           return;
         }
-        history.push(collector.buildTurn());
+        history.push(collector.buildTurn(getRestoredTurnMetadata(collectorRestoreSnapshots, toolIdEditMap)));
         collector = new CollectorStream();
+        collectorRestoreSnapshots = [];
         sss = new SerializableSessionStream(
           collector as unknown as vscode.ChatResponseStream,
           { workspaceRoot: '', backendName: state.backend.name, sessionId, turnIndex: 0, requestId: '' },
         );
         bridge = state.backend.createBridge(sessionId);
-        bridge.setSSS(sss);
+        attachRestoreBridge(bridge, collector, sss);
       };
 
       let expectingUserMessage = true;
@@ -1750,13 +2307,15 @@ export function createSessionContentProvider(
         // The bridge.handleEvent is called internally by run()
         // For legacy path, we process events individually
         async function* singleEvent() { yield event; }
-        await bridge.run(singleEvent(), token);
+        await runRestoreBridge(bridge, singleEvent());
+        const eventRestoreSnapshots = getRestoreSnapshotsForToolCompleteEvent(snapshots, event);
         pushSnapshotsForRestoredEditTools(
           sessionId,
-          getRestoreSnapshotsForToolCompleteEvent(snapshots, event),
+          eventRestoreSnapshots,
           collector,
           toolIdEditMap,
         );
+        collectorRestoreSnapshots.push(...eventRestoreSnapshots);
       }
 
       flushAssistantTurn();

@@ -26,9 +26,9 @@
 
 import * as vscode from 'vscode';
 import { existsSync, readFileSync } from 'node:fs';
-import { SerializableStreamPart, IMutableStreamPart, IMetadataProvider } from '../types';
+import { SerializableStreamPart, IMutableStreamPart, IAsyncMetadataProvider } from '../types';
 import type { SspStream } from '../types';
-import type { ExternalEditStreamPartPayload } from '../types';
+import type { ExternalEditStreamPartPayload, SerializableStreamPartMeta } from '../types';
 import type { FileSnapshotRecord } from '../../acp/serializable/types';
 
 // ---------------------------------------------------------------------------
@@ -49,20 +49,29 @@ export interface ExternalEditSSPCallbacks {
 export class ExternalEditSSP extends SerializableStreamPart<
   'externalEdit',
   ExternalEditStreamPartPayload
-> implements IMutableStreamPart<ExternalEditStreamPartPayload>, IMetadataProvider {
+> implements IMutableStreamPart<ExternalEditStreamPartPayload>, IAsyncMetadataProvider {
 
   readonly kind = 'externalEdit' as const;
 
   private editStarted = false;
+  private baselineCaptured = false;
   private deferred: { resolve: () => void; promise: Promise<void> } | null = null;
   private onDidComplete: Thenable<string> | null = null;
+  private metadataSettled: Promise<void> | null = null;
   private _undoStopId: string | null = null;
 
   constructor(
     payload: ExternalEditStreamPartPayload,
     private readonly callbacks?: ExternalEditSSPCallbacks,
+    meta?: Partial<SerializableStreamPartMeta>,
+    id?: string,
   ) {
-    super(payload);
+    super(payload, {
+      ...meta,
+      toolCallId: meta?.toolCallId ?? payload.toolCallId,
+      editId: meta?.editId ?? payload.editId,
+      uri: meta?.uri ?? payload.uri,
+    }, id ?? `externalEdit:${payload.toolCallId}`);
   }
 
   get undoStopId(): string | null { return this._undoStopId; }
@@ -74,6 +83,10 @@ export class ExternalEditSSP extends SerializableStreamPart<
   getMetadata(): Record<string, unknown> | undefined {
     if (!this._undoStopId) return undefined;
     return { undoStopId: this._undoStopId };
+  }
+
+  async whenMetadataSettled(): Promise<void> {
+    await this.metadataSettled;
   }
 
   // ── Render: start externalEdit lifecycle ───────────────────────────────
@@ -95,11 +108,14 @@ export class ExternalEditSSP extends SerializableStreamPart<
     );
 
     const callback = async () => {
-      for (const s of beforeSnapshots) this.callbacks?.onSnapshot(s);
-      this.callbacks?.onBaselineCaptured();
+      if (!this.baselineCaptured) {
+        this.baselineCaptured = true;
+        for (const s of beforeSnapshots) this.callbacks?.onSnapshot(s);
+        this.callbacks?.onBaselineCaptured();
+      }
 
       // Block until update({status:'completed'}) resolves the deferred
-      this.deferred = createDeferred();
+      this.deferred ??= createDeferred();
       await this.deferred.promise;
     };
 
@@ -117,7 +133,7 @@ export class ExternalEditSSP extends SerializableStreamPart<
       // Wait for VS Code to return undoStopId
       const completion = this.onDidComplete;
       if (completion) {
-        Promise.resolve(completion).then(
+        this.metadataSettled = Promise.resolve(completion).then(
           (undoStopId: string) => {
             this._undoStopId = undoStopId || null;
             if (this._undoStopId) {

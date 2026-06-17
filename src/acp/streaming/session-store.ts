@@ -93,6 +93,7 @@ export class SessionStore {
       ...existing,
       ...update,
       checkpointCursor: {
+        acceptedThroughTurn: existing?.checkpointCursor?.acceptedThroughTurn ?? -1,
         ...existing?.checkpointCursor,
         ...update.checkpointCursor,
       },

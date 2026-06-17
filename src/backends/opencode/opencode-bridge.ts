@@ -24,6 +24,7 @@ import type {
 import type { AcpBridge } from '../../acp/backend';
 import type { SerializableSessionStream } from '../../acp/streaming/session-stream';
 import type { SubsessionStream } from '../../acp/streaming/subsession-stream';
+import type { SessionStreamNode } from '../../acp/streaming/session-stream-node';
 import { SubagentManager, formatSubagentProgress, type SubagentScope } from '../../ssp/impl/subagent';
 import { AssistantTextSSP } from '../../ssp/impl/assistant-text';
 import { ReasoningSSP } from '../../ssp/impl/reasoning';
@@ -32,25 +33,24 @@ import { ExternalEditSSP } from '../../ssp/impl/external-edit';
 import { QuestionSSP } from '../../ssp/impl/question';
 import { ChatQuestion, ChatQuestionType } from '../../types/vscode-proposed-additions';
 import type { AcpBackend } from '../../acp/backend';
+import path from 'node:path';
+import * as vscode from 'vscode';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 function getEventSessionId(event: AcpEvent): string | undefined {
-  const e = event as Record<string, unknown>;
+  const e = event as unknown as Record<string, unknown>;
   return (e.sessionId as string | undefined) ??
     (e.part as { sessionId?: string } | undefined)?.sessionId;
 }
 
 function createExternalEditUri(filePath: string, directory?: string): unknown {
-  // Dynamic import to avoid circular deps at module load
-  const vscode = require('vscode');
-  const baseDir = directory ?? '';
-  const fullPath = vscode.workspace.asRelativePath
-    ? vscode.Uri.file(filePath)
-    : vscode.Uri.file(filePath);
-  const rawUri = vscode.Uri.file(filePath);
+  const resolvedPath = path.isAbsolute(filePath)
+    ? filePath
+    : path.resolve(directory ?? '', filePath);
+  const rawUri = vscode.Uri.file(resolvedPath);
   const normalizedPath = /^\/[a-zA-Z]:(?=\/)/.test(rawUri.path)
     ? rawUri.path.toLowerCase()
     : rawUri.path;
@@ -65,13 +65,26 @@ function createExternalEditUri(filePath: string, directory?: string): unknown {
 
 interface BridgeLogger { appendLine(message: string): void; }
 
+type PartRouteKind = 'text' | 'reasoning' | 'ignored';
+
+interface StreamNodeState {
+  userMessageId: string | null;
+  assistantStarted: boolean;
+  partRoutes: Map<string, PartRouteKind>;
+  externalEditCallIds: Set<string>;
+  externalEditParts: Map<string, ExternalEditSSP>;
+  toolCallIds: Set<string>;
+}
+
 export class OpenCodeBridge implements AcpBridge {
   private sss!: SerializableSessionStream;
   private logger: BridgeLogger = { appendLine: () => {} };
+  private readonly sessionId: string;
 
   // Event state
   private userMessageId: string | null = null;
-  private partKinds = new Map<string, 'text' | 'reasoning' | 'tool'>();
+  private partTargets = new Map<string, SessionStreamNode>();
+  private nodeStates = new WeakMap<SessionStreamNode, StreamNodeState>();
   private sessionTitle: string | undefined;
   private hadSubagentTasks = false;
 
@@ -85,9 +98,12 @@ export class OpenCodeBridge implements AcpBridge {
 
   constructor(
     private readonly backend: AcpBackend,
-    private readonly sessionId: string,
+    sessionId: string,
     private readonly directory?: string,
-  ) {}
+    options?: { sessionId?: string },
+  ) {
+    this.sessionId = options?.sessionId ?? sessionId;
+  }
 
   setSSS(sss: unknown): void {
     this.sss = sss as SerializableSessionStream;
@@ -109,7 +125,7 @@ export class OpenCodeBridge implements AcpBridge {
     try {
       for await (const event of events) {
         if (token.isCancellationRequested) break;
-        this.handleEvent(event);
+        if (this.handleEvent(event)) break;
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Connection lost';
@@ -122,7 +138,7 @@ export class OpenCodeBridge implements AcpBridge {
   // Event dispatch
   // ════════════════════════════════════════════════════════════════════════
 
-  private handleEvent(event: AcpEvent): void {
+  private handleEvent(event: AcpEvent): boolean | undefined {
     // 1. Check if this is a child/descendant session event
     const eventSessionId = getEventSessionId(event);
     if (eventSessionId && eventSessionId !== this.sessionId) {
@@ -137,11 +153,12 @@ export class OpenCodeBridge implements AcpBridge {
       case 'permission.asked':   this.handlePermissionAsked(event); break;
       case 'question.asked':     this.handleQuestionAsked(event); break;
       case 'session.updated':    this.handleSessionUpdated(event); break;
-      case 'session.idle':       this.handleSessionIdle(); break;
+      case 'session.idle':       return this.handleSessionIdle();
       case 'session.diff':       this.handleSessionDiff(event); break;
       case 'session.status':     break; // log only
       default:                   break;
     }
+    return false;
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -150,55 +167,117 @@ export class OpenCodeBridge implements AcpBridge {
 
   private handlePartDelta(event: AcpPartDeltaEvent): void {
     if (!event.delta) return;
-    const kind = this.partKinds.get(event.partId);
-    if (kind === 'reasoning') {
-      this.sss.push(new ReasoningSSP({ partId: event.partId, delta: event.delta }));
-    } else {
-      this.sss.push(new AssistantTextSSP({ partId: event.partId, delta: event.delta }));
-    }
+    this.renderDeltaToTarget(event, this.sss);
   }
 
   private handlePartUpdated(event: AcpPartUpdatedEvent): void {
+    this.handlePartUpdatedForTarget(event, this.sss, true);
+  }
+
+  private handlePartUpdatedForTarget(
+    event: AcpPartUpdatedEvent,
+    target: SessionStreamNode,
+    captureRootUserMessage: boolean,
+  ): void {
     const part = event.part;
+    const nodeState = this.getNodeState(target);
     switch (part.type) {
       case 'text': {
-        // User echo detection: first text part's messageId = user message
-        if (this.userMessageId === null && part.messageId) {
-          this.userMessageId = part.messageId;
+        // User echo detection: before assistant output starts, the first text
+        // message belongs to the user. Restored or user-echo-less streams may
+        // begin directly with assistant text, so do not claim that id then.
+        const hasInitialText = (part.text ?? '').length > 0;
+        if (!nodeState.assistantStarted && nodeState.userMessageId === null && part.messageId && hasInitialText) {
+          nodeState.userMessageId = part.messageId;
+          if (captureRootUserMessage) {
+            this.userMessageId = part.messageId;
+          }
         }
-        if (part.messageId && part.messageId === this.userMessageId) {
-          this.partKinds.set(part.id, 'text');
+        if (!nodeState.assistantStarted && hasInitialText && part.messageId && part.messageId === nodeState.userMessageId) {
+          nodeState.partRoutes.set(part.id, 'ignored');
+          this.partTargets.set(part.id, target);
           return; // Skip user echo
         }
-        this.sss.push(new AssistantTextSSP({ partId: part.id, delta: part.text ?? '' }));
-        this.partKinds.set(part.id, 'text');
+        nodeState.assistantStarted = true;
+        target.push(new AssistantTextSSP({ partId: part.id, delta: part.text ?? '' }));
+        nodeState.partRoutes.set(part.id, 'text');
+        this.partTargets.set(part.id, target);
         break;
       }
       case 'reasoning':
-        this.sss.push(new ReasoningSSP({ partId: part.id, delta: part.text ?? '' }));
-        this.partKinds.set(part.id, 'reasoning');
+        nodeState.assistantStarted = true;
+        target.push(new ReasoningSSP({ partId: part.id, delta: part.text ?? '' }));
+        nodeState.partRoutes.set(part.id, 'reasoning');
+        this.partTargets.set(part.id, target);
         break;
       case 'tool':
-        this.handleToolState(part);
+        this.handleToolState(part, target);
         break;
       case 'step-start':
+        nodeState.assistantStarted = true;
+        break;
       case 'step-finish':
         break; // No rendering needed
     }
+  }
+
+  private renderDeltaToTarget(event: AcpPartDeltaEvent, fallbackTarget: SessionStreamNode): void {
+    const target = this.partTargets.get(event.partId) ?? fallbackTarget;
+    const targetState = this.getNodeState(target);
+    const kind = targetState.partRoutes.get(event.partId);
+    if (kind === 'reasoning') {
+      target.push(new ReasoningSSP({ partId: event.partId, delta: event.delta }));
+    } else if (kind === 'text') {
+      target.push(new AssistantTextSSP({ partId: event.partId, delta: event.delta }));
+    }
+  }
+
+  private getNodeState(target: SessionStreamNode): StreamNodeState {
+    let state = this.nodeStates.get(target);
+    if (!state) {
+      state = {
+        userMessageId: null,
+        assistantStarted: false,
+        partRoutes: new Map(),
+        externalEditCallIds: new Set(),
+        externalEditParts: new Map(),
+        toolCallIds: new Set(),
+      };
+      this.nodeStates.set(target, state);
+    }
+    return state;
   }
 
   // ════════════════════════════════════════════════════════════════════════
   // Mutable: tool lifecycle → push (pending) / update (running/completed)
   // ════════════════════════════════════════════════════════════════════════
 
-  private handleToolState(part: AcpToolPart): void {
+  private handleToolState(part: AcpToolPart, target: SessionStreamNode): void {
     const key = part.callId ?? part.id;
     const state = part.state;
     if (!state) return;
 
     const status = state.status;
+    const targetState = this.getNodeState(target);
+    const isExternalEdit = targetState.externalEditCallIds.has(key);
+    const eventScope = part.sessionId && part.sessionId !== this.sessionId
+      ? this.findScopeForSession(part.sessionId)
+      : undefined;
+    const fallbackScope = eventScope ?? (part.sessionId ? undefined : this.getActiveSubagentScope());
+    if (fallbackScope && !this.subagents.getScope(key) && part.toolName !== 'task' && part.toolName !== 'subagent') {
+      this.handleSubagentToolPart(fallbackScope, part);
+      return;
+    }
+
+    if (isExternalEdit && this.isWriteEditTool(part.toolName)) {
+      if (status === 'completed' || status === 'error') {
+        this.completeExternalEdit(key, state, target);
+      }
+      return;
+    }
 
     if (status === 'pending') {
+      targetState.toolCallIds.add(key);
       // Task/subagent → start scope
       if (part.toolName === 'task' || part.toolName === 'subagent') {
         const scope = this.subagents.startSubagent(key, {
@@ -206,7 +285,7 @@ export class OpenCodeBridge implements AcpBridge {
           title: state.title ?? '',
           input: state.input,
         });
-        this.sss.push(new ToolInvocationSSP({
+        target.push(new ToolInvocationSSP({
           partId: part.id,
           toolName: part.toolName,
           callId: key,
@@ -214,7 +293,7 @@ export class OpenCodeBridge implements AcpBridge {
           subAgentInvocationId: scope.subAgentInvocationId,
         }));
       } else {
-        this.sss.push(new ToolInvocationSSP({
+        target.push(new ToolInvocationSSP({
           partId: part.id,
           toolName: part.toolName,
           callId: key,
@@ -222,8 +301,25 @@ export class OpenCodeBridge implements AcpBridge {
         }));
       }
     } else {
-      // Update existing tool
-      this.sss.update(key, { state });
+      if (!targetState.toolCallIds.has(key)) {
+        targetState.toolCallIds.add(key);
+        const scope = (part.toolName === 'task' || part.toolName === 'subagent')
+          ? this.subagents.startSubagent(key, {
+              toolName: part.toolName,
+              title: state.title ?? '',
+              input: state.input,
+            })
+          : undefined;
+        target.push(new ToolInvocationSSP({
+          partId: part.id,
+          toolName: part.toolName,
+          callId: key,
+          state,
+          subAgentInvocationId: scope?.subAgentInvocationId,
+        }));
+      } else {
+        target.update(key, { state });
+      }
 
       // Task/subagent completion
       if ((part.toolName === 'task' || part.toolName === 'subagent') &&
@@ -231,13 +327,20 @@ export class OpenCodeBridge implements AcpBridge {
         this.hadSubagentTasks = true;
         const scope = this.subagents.getScope(key);
         if (scope) {
+          const childSessionId = this.getToolSessionId(state);
+          if (childSessionId) {
+            this.subagents.setChildSession(key, childSessionId);
+            this.recordAncestorDescendantSessions(scope, childSessionId);
+          }
           this.subagents.completeSubagent(key, state.output);
         }
       }
 
       // Write/edit completion → complete ExternalEditSSP
       if ((status === 'completed' || status === 'error') && this.isWriteEditTool(part.toolName)) {
-        this.sss.update(key, { status: 'completed' });
+        if (targetState.externalEditCallIds.has(key)) {
+          this.completeExternalEdit(key, state, target);
+        }
       }
     }
   }
@@ -246,7 +349,31 @@ export class OpenCodeBridge implements AcpBridge {
   // Permission → ExternalEditSSP with callbacks
   // ════════════════════════════════════════════════════════════════════════
 
+  private completeExternalEdit(
+    callId: string,
+    state: AcpToolState,
+    target: SessionStreamNode,
+  ): void {
+    const targetState = this.getNodeState(target);
+    const externalEdit = targetState.externalEditParts.get(callId);
+    if (externalEdit) {
+      target.update(externalEdit.id, { status: 'completed' });
+    }
+    if (targetState.toolCallIds.has(callId) && target.has(callId)) {
+      target.update(callId, {
+        state: {
+          ...state,
+          metadata: { ...state.metadata, externalEdit: true, presentation: 'hidden' },
+        },
+      });
+    }
+  }
+
   private handlePermissionAsked(event: AcpPermissionRequestEvent): void {
+    this.startExternalEdit(event, this.sss);
+  }
+
+  private startExternalEdit(event: AcpPermissionRequestEvent, target: SessionStreamNode): void {
     const callId = event.tool?.callId;
     const filepath = event.metadata?.filepath as string | undefined;
 
@@ -257,8 +384,10 @@ export class OpenCodeBridge implements AcpBridge {
     }
 
     const uri = createExternalEditUri(filepath, this.directory);
+    const targetState = this.getNodeState(target);
+    targetState.externalEditCallIds.add(callId);
 
-    this.sss.push(new ExternalEditSSP(
+    const externalEdit = new ExternalEditSSP(
       {
         toolCallId: callId,
         editId: '',
@@ -280,7 +409,9 @@ export class OpenCodeBridge implements AcpBridge {
           this.sss.serializeSnapshot(snapshot);
         },
       },
-    ));
+    );
+    targetState.externalEditParts.set(callId, externalEdit);
+    target.push(externalEdit);
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -288,9 +419,13 @@ export class OpenCodeBridge implements AcpBridge {
   // ════════════════════════════════════════════════════════════════════════
 
   private handleQuestionAsked(event: AcpQuestionRequestEvent): void {
+    this.startQuestion(event, this.sss);
+  }
+
+  private startQuestion(event: AcpQuestionRequestEvent, target: SessionStreamNode): void {
     const questions = event.questions;
 
-    this.sss.push(new QuestionSSP(
+    target.push(new QuestionSSP(
       {
         questionId: event.questionId,
         questions: questions as unknown[],
@@ -305,7 +440,7 @@ export class OpenCodeBridge implements AcpBridge {
             answers,
             this.directory,
           );
-          this.sss.update(event.questionId, { status: 'replied' });
+          target.update(event.questionId, { status: 'replied' });
         },
         onSkip: () => {
           this.backend.questions.reject(
@@ -313,7 +448,7 @@ export class OpenCodeBridge implements AcpBridge {
             event.questionId,
             this.directory,
           );
-          this.sss.update(event.questionId, { status: 'skipped' });
+          target.update(event.questionId, { status: 'skipped' });
         },
       },
     ));
@@ -378,17 +513,18 @@ export class OpenCodeBridge implements AcpBridge {
   // Session idle + deferred idle (wait for subagents)
   // ════════════════════════════════════════════════════════════════════════
 
-  private handleSessionIdle(): void {
+  private handleSessionIdle(): boolean {
     this.sss.writeMeta({ status: 'completed' });
 
     if (this.subagents.hasBusyDescendant()) {
       this.deferredIdle = true;
       this.startDeferredIdleTimer();
       this.logTag('idle', 'deferred — waiting for subagent sessions to complete');
-      return;
+      return false;
     }
     // No busy subagents — clean up and let loop end
     this.subagents.clear();
+    return true;
   }
 
   private startDeferredIdleTimer(): void {
@@ -448,16 +584,48 @@ export class OpenCodeBridge implements AcpBridge {
       return;
     }
 
+    const target = this.getSubsessionStream(scope.subAgentInvocationId!);
+
+    if (event.type === 'permission.asked') {
+      this.startExternalEdit(event, target);
+      return;
+    }
+
+    if (event.type === 'question.asked') {
+      this.startQuestion(event, target);
+      return;
+    }
+
+    if (event.type === 'session.updated') {
+      const e = event as { title?: string };
+      if (e.title) {
+        target.writeMeta({ title: e.title, titleSource: 'backend' });
+      }
+      return;
+    }
+
+    if (event.type === 'session.diff') {
+      const e = event as { diffs?: unknown[] };
+      if (e.diffs) {
+        target.writeMeta({ changeSummary: { files: e.diffs.length } });
+      }
+      return;
+    }
+
+    if (event.type === 'session.status') {
+      const e = event as { status?: unknown };
+      target.writeMeta({ status: e.status });
+      return;
+    }
+
     // Handle idle from child
     if (event.type === 'session.idle') {
       scope.descendantSessionIds.add(eventSessionId);
+      this.recordAncestorDescendantSessions(scope, eventSessionId);
       if (scope.childSessionId === eventSessionId && !scope.childIdle) {
         scope.childIdle = true;
         scope.timeEnd = Date.now();
-        // Update parent task tool card as completed
-        this.sss.update(scope.callId, {
-          state: { status: 'completed', output: scope.output ?? '' },
-        });
+        this.updateScopeTool(scope, { status: 'completed', output: scope.output ?? '' });
       }
       this.checkDeferredIdleResolution();
       return;
@@ -468,36 +636,7 @@ export class OpenCodeBridge implements AcpBridge {
       const part = (event as { part?: { type?: string } }).part;
       if (part?.type === 'tool') {
         const toolPart = (event as { part: AcpToolPart }).part;
-        const childCallId = toolPart.callId ?? toolPart.id;
-        const childStatus = toolPart.state?.status ?? 'running';
-
-        const sub = this.sss.subsession(scope.subAgentInvocationId!);
-
-        if (childStatus === 'pending') {
-          sub.push(new ToolInvocationSSP({
-            partId: `subagent-child-${childCallId}`,
-            toolName: toolPart.toolName,
-            callId: childCallId,
-            state: toolPart.state!,
-            subAgentInvocationId: scope.subAgentInvocationId,
-          }));
-        } else {
-          sub.update(childCallId, { state: toolPart.state });
-
-          if (childStatus === 'completed' || childStatus === 'error') {
-            // Record for progress
-            this.subagents.recordChildToolCall(scope.callId, {
-              name: toolPart.toolName,
-              title: toolPart.state?.title,
-              status: childStatus,
-            });
-
-            // Update parent card progress
-            this.sss.update(scope.callId, {
-              state: { title: formatSubagentProgress(scope) },
-            });
-          }
-        }
+        this.handleSubagentToolPart(scope, toolPart);
         return;
       }
 
@@ -506,6 +645,13 @@ export class OpenCodeBridge implements AcpBridge {
         const text = (event as { part?: { text?: string } }).part?.text;
         if (text && text.trim()) scope.lastText = text;
       }
+      this.handlePartUpdatedForTarget(event as AcpPartUpdatedEvent, target, false);
+      return;
+    }
+
+    if (event.type === 'part.delta') {
+      this.renderDeltaToTarget(event as AcpPartDeltaEvent, target);
+      return;
     }
   }
 
@@ -514,9 +660,155 @@ export class OpenCodeBridge implements AcpBridge {
     if (!scopes) return undefined;
     for (const scope of scopes.values()) {
       if (scope.childSessionId === sessionId) return scope;
+    }
+    for (const scope of scopes.values()) {
       if (scope.descendantSessionIds.has(sessionId)) return scope;
     }
     return undefined;
+  }
+
+  private getActiveSubagentScope(): SubagentScope | undefined {
+    const scopes = this.subagents['scopes'] as Map<string, SubagentScope> | undefined;
+    if (!scopes) return undefined;
+    return [...scopes.values()]
+      .filter(scope => !scope.childIdle && !scope.completed)
+      .sort((a, b) => this.getScopeDepth(b) - this.getScopeDepth(a))[0];
+  }
+
+  private getScopeDepth(scope: SubagentScope): number {
+    const scopes = this.subagents['scopes'] as Map<string, SubagentScope> | undefined;
+    let depth = 0;
+    let current = scope;
+    while (current.parentSubAgentInvocationId) {
+      const parent = this.findScopeBySubAgentInvocationId(current.parentSubAgentInvocationId, scopes);
+      if (!parent) break;
+      depth += 1;
+      current = parent;
+    }
+    return depth;
+  }
+
+  private handleSubagentToolPart(scope: SubagentScope, toolPart: AcpToolPart): void {
+    const childCallId = toolPart.callId ?? toolPart.id;
+    const childStatus = toolPart.state?.status ?? 'running';
+    const sub = this.getSubsessionStream(scope.subAgentInvocationId!);
+    const subState = this.getNodeState(sub);
+    const isExternalEdit = subState.externalEditCallIds.has(childCallId) && this.isWriteEditTool(toolPart.toolName);
+    if (isExternalEdit) {
+      if (childStatus === 'completed' || childStatus === 'error') {
+        this.completeExternalEdit(childCallId, toolPart.state!, sub);
+        this.subagents.recordChildToolCall(scope.callId, {
+          name: toolPart.toolName,
+          title: toolPart.state?.title,
+          status: childStatus,
+        });
+        this.updateScopeTool(scope, { title: formatSubagentProgress(scope) });
+      }
+      return;
+    }
+    let nestedScope: SubagentScope | undefined;
+    if (toolPart.toolName === 'task' || toolPart.toolName === 'subagent') {
+      nestedScope = this.subagents.getScope(childCallId);
+      if (!nestedScope) {
+        nestedScope = this.subagents.startSubagent(
+          childCallId,
+          {
+            toolName: toolPart.toolName,
+            title: toolPart.state?.title ?? '',
+            input: toolPart.state?.input ?? {},
+          },
+          scope.subAgentInvocationId,
+        );
+      }
+      const childSessionId = this.getToolSessionId(toolPart.state);
+      if (childSessionId) {
+        this.subagents.setChildSession(childCallId, childSessionId);
+        this.recordAncestorDescendantSessions(nestedScope, childSessionId);
+      }
+    }
+    const payload = {
+      partId: `subagent-child-${childCallId}`,
+      toolName: toolPart.toolName,
+      callId: childCallId,
+      state: toolPart.state!,
+      subAgentInvocationId: nestedScope?.subAgentInvocationId ?? scope.subAgentInvocationId,
+    };
+
+    if (childStatus === 'pending' || !sub.has(childCallId)) {
+      subState.toolCallIds.add(childCallId);
+      sub.push(new ToolInvocationSSP(payload));
+    } else {
+      sub.update(childCallId, { state: toolPart.state });
+    }
+
+    if (childStatus === 'completed' || childStatus === 'error') {
+      if (subState.externalEditCallIds.has(childCallId) && this.isWriteEditTool(toolPart.toolName)) {
+        this.completeExternalEdit(childCallId, toolPart.state!, sub);
+      }
+      if (nestedScope) {
+        this.subagents.completeSubagent(childCallId, toolPart.state?.output);
+      }
+      this.subagents.recordChildToolCall(scope.callId, {
+        name: toolPart.toolName,
+        title: toolPart.state?.title,
+        status: childStatus,
+      });
+      this.updateScopeTool(scope, { title: formatSubagentProgress(scope) });
+    }
+  }
+
+  private updateScopeTool(scope: SubagentScope, state: Partial<AcpToolState>): void {
+    const target = scope.parentSubAgentInvocationId
+      ? this.getSubsessionStream(scope.parentSubAgentInvocationId)
+      : this.sss;
+    target.update(scope.callId, { state });
+  }
+
+  private recordAncestorDescendantSessions(scope: SubagentScope | undefined, sessionId: string): void {
+    const scopes = this.subagents['scopes'] as Map<string, SubagentScope> | undefined;
+    let current = scope;
+    while (current?.parentSubAgentInvocationId) {
+      const parent = this.findScopeBySubAgentInvocationId(current.parentSubAgentInvocationId, scopes);
+      if (!parent) return;
+      this.subagents.addDescendantSession(parent.callId, sessionId);
+      current = parent;
+    }
+  }
+
+  private getSubsessionStream(subAgentInvocationId: string): SubsessionStream {
+    const scopes = this.subagents['scopes'] as Map<string, SubagentScope> | undefined;
+    const scope = this.findScopeBySubAgentInvocationId(subAgentInvocationId, scopes);
+    const chain: string[] = [];
+    let current: SubagentScope | undefined = scope;
+
+    while (current) {
+      if (current.subAgentInvocationId) {
+        chain.unshift(current.subAgentInvocationId);
+      }
+      current = current.parentSubAgentInvocationId
+        ? this.findScopeBySubAgentInvocationId(current.parentSubAgentInvocationId, scopes)
+        : undefined;
+    }
+
+    const ids = chain.length > 0 ? chain : [subAgentInvocationId];
+    let sub = this.sss.subsession(ids[0]);
+    for (const id of ids.slice(1)) {
+      sub = sub.subsession(id);
+    }
+    return sub;
+  }
+
+  private findScopeBySubAgentInvocationId(
+    subAgentInvocationId: string,
+    scopes = this.subagents['scopes'] as Map<string, SubagentScope> | undefined,
+  ): SubagentScope | undefined {
+    if (!scopes) return undefined;
+    return [...scopes.values()].find(scope => scope.subAgentInvocationId === subAgentInvocationId);
+  }
+
+  private getToolSessionId(state: AcpToolState | undefined): string | undefined {
+    const raw = state?.metadata?.sessionId ?? state?.metadata?.sessionID;
+    return typeof raw === 'string' && raw.length > 0 ? raw : undefined;
   }
 
   // ════════════════════════════════════════════════════════════════════════

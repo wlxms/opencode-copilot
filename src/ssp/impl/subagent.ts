@@ -16,6 +16,7 @@ export interface SubagentScope {
   childSessionId?: string;
   childIdle?: boolean;
   subAgentInvocationId?: string;
+  parentSubAgentInvocationId?: string;
   toolMeta?: {
     toolName: string;
     title: string;
@@ -55,9 +56,18 @@ export function formatSubagentProgress(scope: SubagentScope): string {
 export class SubagentManager {
   private scopes = new Map<string, SubagentScope>();
 
-  startSubagent(callId: string, toolMeta: SubagentScope['toolMeta']): SubagentScope {
+  startSubagent(
+    callId: string,
+    toolMeta: SubagentScope['toolMeta'],
+    parentSubAgentInvocationId?: string,
+  ): SubagentScope {
     const scope: SubagentScope = {
-      callId, toolCalls: [], completed: false, descendantSessionIds: new Set(),
+      callId,
+      toolCalls: [],
+      completed: false,
+      descendantSessionIds: new Set(),
+      subAgentInvocationId: this.generateSubAgentInvocationId(callId),
+      parentSubAgentInvocationId,
       ...toolMeta ? { toolMeta } : {},
     };
     this.scopes.set(callId, scope);
@@ -83,6 +93,11 @@ export class SubagentManager {
   setChildSession(callId: string, childSessionId: string): void {
     const scope = this.scopes.get(callId);
     if (scope) { scope.childSessionId = childSessionId; scope.descendantSessionIds.add(childSessionId); }
+  }
+
+  addDescendantSession(callId: string, sessionId: string): void {
+    const scope = this.scopes.get(callId);
+    if (scope) { scope.descendantSessionIds.add(sessionId); }
   }
 
   getScope(callId: string): SubagentScope | undefined { return this.scopes.get(callId); }

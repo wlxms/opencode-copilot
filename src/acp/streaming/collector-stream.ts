@@ -144,7 +144,8 @@ export class CollectorStream {
    * shape when available so proposed/extended response parts take VS Code's
    * session-provider restore path, then fall back for older test/runtime shims.
    */
-  buildTurn(): vscode.ChatResponseTurn | vscode.ChatResponseTurn2 {
+  buildTurn(metadata: Record<string, unknown> = {}): vscode.ChatResponseTurn | vscode.ChatResponseTurn2 {
+    const result: vscode.ChatResult = { metadata };
     const Turn2Ctor = (vscode as unknown as {
       ChatResponseTurn2?: new (
         r: readonly unknown[],
@@ -154,7 +155,7 @@ export class CollectorStream {
       ) => vscode.ChatResponseTurn2;
     }).ChatResponseTurn2;
     if (Turn2Ctor) {
-      return new Turn2Ctor(this._parts, { metadata: {} }, 'opencode-copilot.opencode');
+      return new Turn2Ctor(this._parts, result, 'opencode-copilot.opencode');
     }
 
     const TurnCtor = vscode.ChatResponseTurn as unknown as new (
@@ -163,7 +164,7 @@ export class CollectorStream {
       participant: string,
       command?: string,
     ) => vscode.ChatResponseTurn;
-    return new TurnCtor(this._parts, { metadata: {} }, 'opencode-copilot.opencode');
+    return new TurnCtor(this._parts, result, 'opencode-copilot.opencode');
   }
 
   /** Clear all captured parts. */

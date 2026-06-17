@@ -11,11 +11,19 @@ import * as path from 'node:path';
 import { SerializableSessionStream } from '../../acp/streaming/session-stream';
 import { materializeRecords, finalizeIncompleteStates } from '../../acp/streaming/deserialize';
 import { readAllStreamParts, readMetaIndex, createSSPFromRecord } from '../../acp/streaming/deserialize';
+import { readSubsessionRecords } from '../../acp/streaming/deserialize';
 import { AssistantTextSSP } from '../../ssp/impl/assistant-text';
 import { ReasoningSSP } from '../../ssp/impl/reasoning';
 import { ToolInvocationSSP } from '../../ssp/impl/tool-invocation';
 import { UserPromptSSP } from '../../ssp/impl/user-prompt';
-import type { StreamPartRecord, SerializableToolState } from '../../ssp/types';
+import { ExternalEditSSP } from '../../ssp/impl/external-edit';
+import type {
+  IMetadataProvider,
+  SerializableToolState,
+  StreamPartRecord,
+  SspStream,
+} from '../../ssp/types';
+import { SerializableStreamPart } from '../../ssp/types';
 import type { FileSnapshotRecord } from '../../acp/serializable/types';
 
 // ---------------------------------------------------------------------------
@@ -49,6 +57,18 @@ function toolState(overrides?: Partial<SerializableToolState>): SerializableTool
 
 function getSessionDir(tmpDir: string): string {
   return path.join(tmpDir, '.acpilot', 'test-backend', 'test-session');
+}
+
+class MetadataTestSSP
+  extends SerializableStreamPart<'rawAcpEvent', { event: unknown }>
+  implements IMetadataProvider {
+  readonly kind = 'rawAcpEvent' as const;
+  constructor(id: string, private readonly metadata: Record<string, unknown>) {
+    super({ event: { test: true } }, undefined, id);
+  }
+  get metaId(): string { return this.id; }
+  getMetadata(): Record<string, unknown> | undefined { return this.metadata; }
+  render(_stream: SspStream): void {}
 }
 
 async function readLines(filePath: string): Promise<string[]> {
@@ -208,6 +228,62 @@ describe('SerializableSessionStream', () => {
     expect(parts[0].kind).toBe('toolInvocation');
   });
 
+  it('subsession writes part metadata to its own meta.jsonl', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-sub-meta-'));
+    const sss = makeSSS(tmpDir);
+    await sss.initialize();
+
+    const sub = sss.subsession('sub-with-meta');
+    sub.push(new MetadataTestSSP('meta-part-1', { undoStopId: 'undo-sub-1' }));
+    await sss.drain();
+
+    const sessionDir = getSessionDir(tmpDir);
+    const subMetaPath = path.join(sessionDir, 'subsessions', 'sub-with-meta', 'meta.jsonl');
+    const metaIndex = await readMetaIndex(subMetaPath);
+    expect(metaIndex.get('meta-part-1')?.undoStopId).toBe('undo-sub-1');
+
+    const subsessions = await readSubsessionRecords(sessionDir);
+    const restored = subsessions.find(subsession => subsession.subAgentInvocationId === 'sub-with-meta');
+    expect(restored?.metaIndex.get('meta-part-1')?.undoStopId).toBe('undo-sub-1');
+  });
+
+  it('drain waits for async ExternalEditSSP metadata in subsessions', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-sub-async-meta-'));
+    const stream = {
+      ...mockStream(),
+      externalEdit: vi.fn(async (_target: unknown, callback: () => PromiseLike<unknown>) => {
+        await callback();
+        return 'undo-sub-async';
+      }),
+    };
+    const sss = new SerializableSessionStream(stream as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test-backend',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'req-0',
+    });
+    await sss.initialize();
+
+    const sub = sss.subsession('sub-async-meta');
+    const edit = new ExternalEditSSP({
+      toolCallId: 'child-edit-call',
+      editId: '',
+      status: 'pending',
+      uri: 'child.txt',
+      uris: [{ fsPath: path.join(tmpDir, 'child.txt'), toString: () => 'file:///child.txt' }],
+    } as never);
+
+    sub.push(edit);
+    sub.update(edit.id, { status: 'completed' });
+    await sss.drain();
+
+    const sessionDir = getSessionDir(tmpDir);
+    const subMetaPath = path.join(sessionDir, 'subsessions', 'sub-async-meta', 'meta.jsonl');
+    const metaIndex = await readMetaIndex(subMetaPath);
+    expect(metaIndex.get(edit.id)?.undoStopId).toBe('undo-sub-async');
+  });
+
   // ── serializeSnapshot ──────────────────────────────────────────────────
 
   it('serializeSnapshot writes snapshot line to session.jsonl', async () => {
@@ -253,6 +329,77 @@ describe('SerializableSessionStream', () => {
     );
     expect(mainParts.length).toBeGreaterThanOrEqual(1);
     expect(subParts.length).toBe(1);
+  });
+
+  it('nested subsessions persist ancestry metadata and are read recursively', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-nested-sub-'));
+    const sss = makeSSS(tmpDir);
+    await sss.initialize();
+
+    const nested = sss.subsession('sub-parent').subsession('sub-child');
+    nested.push(new ToolInvocationSSP({
+      partId: 'nested-1',
+      toolName: 'read',
+      callId: 'nested-c1',
+      state: toolState({ status: 'completed', input: {}, output: 'content' }),
+    }));
+
+    await sss.drain();
+
+    const sessionDir = getSessionDir(tmpDir);
+    const nestedPath = path.join(
+      sessionDir,
+      'subsessions',
+      'sub-parent',
+      'subsessions',
+      'sub-child',
+      'subsession.jsonl',
+    );
+    const nestedParts = await readAllStreamParts(nestedPath);
+    expect(nestedParts).toHaveLength(1);
+    expect(nestedParts[0].meta.subAgentInvocationId).toBe('sub-child');
+    expect(nestedParts[0].meta.parentSubAgentInvocationId).toBe('sub-parent');
+    expect(nestedParts[0].meta.subAgentPath).toEqual(['sub-parent', 'sub-child']);
+
+    const subsessions = await readSubsessionRecords(sessionDir);
+    const restored = subsessions.find(sub => sub.subAgentInvocationId === 'sub-child');
+    expect(restored?.subAgentPath).toEqual(['sub-parent', 'sub-child']);
+    expect(restored?.records[0].meta.subAgentPath).toEqual(['sub-parent', 'sub-child']);
+  });
+
+  it('keeps sequence local to root and each subsession stream', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-local-seq-'));
+    const sss = makeSSS(tmpDir);
+    await sss.initialize();
+
+    sss.push(new AssistantTextSSP({ partId: 'root-text', delta: 'root' }));
+    const firstSub = sss.subsession('sub-a');
+    firstSub.push(new ToolInvocationSSP({
+      partId: 'sub-a-tool',
+      toolName: 'read',
+      callId: 'shared-call-id',
+      state: toolState({ status: 'completed' }),
+    }));
+    const secondSub = sss.subsession('sub-b');
+    secondSub.push(new ToolInvocationSSP({
+      partId: 'sub-b-tool',
+      toolName: 'read',
+      callId: 'shared-call-id',
+      state: toolState({ status: 'completed' }),
+    }));
+
+    await sss.drain();
+
+    const sessionDir = getSessionDir(tmpDir);
+    const rootParts = await readAllStreamParts(path.join(sessionDir, 'session.jsonl'));
+    const subAParts = await readAllStreamParts(path.join(sessionDir, 'subsessions', 'sub-a', 'subsession.jsonl'));
+    const subBParts = await readAllStreamParts(path.join(sessionDir, 'subsessions', 'sub-b', 'subsession.jsonl'));
+
+    expect(rootParts[0].meta.sequence).toBe(0);
+    expect(subAParts[0].meta.sequence).toBe(0);
+    expect(subBParts[0].meta.sequence).toBe(0);
+    expect(subAParts[0].meta.subAgentPath).toEqual(['sub-a']);
+    expect(subBParts[0].meta.subAgentPath).toEqual(['sub-b']);
   });
 });
 
@@ -385,5 +532,34 @@ describe('createSSPFromRecord', () => {
     const ssp = createSSPFromRecord(record, metaIndex);
     expect(ssp.kind).toBe('externalEdit');
     expect((ssp.payload as { undoStopId?: string }).undoStopId).toBe('undo-xxx');
+  });
+
+  it('reads external edit metadata from the current stream node meta index only', () => {
+    const rootRecord: StreamPartRecord = {
+      kind: 'externalEdit', version: 1, id: 'shared-edit-id',
+      payload: { toolCallId: 'root-call', editId: '', status: 'completed' },
+      meta: { turnIndex: 0, requestId: '', sequence: 0, createdAt: '', source: 'restore' },
+    };
+    const subRecord: StreamPartRecord = {
+      kind: 'externalEdit', version: 1, id: 'shared-edit-id',
+      payload: { toolCallId: 'sub-call', editId: '', status: 'completed' },
+      meta: {
+        turnIndex: 0,
+        requestId: '',
+        sequence: 0,
+        createdAt: '',
+        source: 'restore',
+        subAgentInvocationId: 'sub-a',
+        subAgentPath: ['sub-a'],
+      },
+    };
+    const rootMetaIndex = new Map([['shared-edit-id', { undoStopId: 'undo-root' }]]);
+    const subMetaIndex = new Map([['shared-edit-id', { undoStopId: 'undo-sub' }]]);
+
+    const rootSsp = createSSPFromRecord(rootRecord, rootMetaIndex);
+    const subSsp = createSSPFromRecord(subRecord, subMetaIndex);
+
+    expect((rootSsp.payload as { undoStopId?: string }).undoStopId).toBe('undo-root');
+    expect((subSsp.payload as { undoStopId?: string }).undoStopId).toBe('undo-sub');
   });
 });

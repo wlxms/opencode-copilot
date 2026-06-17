@@ -98,15 +98,15 @@ describe('CollectorStream', () => {
 
   // ── buildTurn ──────────────────────────────────────────────────────────
 
-  it('buildTurn should construct a ChatResponseTurn with captured parts', () => {
+  it('buildTurn should construct a response turn with captured parts and metadata', () => {
     stream.markdown('Hello');
     stream.push({ custom: true });
 
-    const turn = stream.buildTurn();
+    const turn = stream.buildTurn({ toolIdEditMap: { tool: 'undo' } });
 
-    expect(turn).toBeInstanceOf(vscode.ChatResponseTurn);
     // `responses` is the mock property name; the real VS Code API uses `response`
     expect((turn as any).responses).toHaveLength(2);
+    expect((turn as any).result?.metadata).toEqual({ toolIdEditMap: { tool: 'undo' } });
   });
 
   // ── reset ──────────────────────────────────────────────────────────────

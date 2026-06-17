@@ -8,12 +8,14 @@
  */
 
 import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import {
   type StreamPartRecord,
   type AnySerializableStreamPart,
   type SerializableToolState,
   isMutableKind,
 } from '../../ssp/types';
+import type { FileSnapshotRecord } from '../serializable/types';
 import { parseLine } from '../serializable/serializer';
 import { AssistantTextSSP } from '../../ssp/impl/assistant-text';
 import { ReasoningSSP } from '../../ssp/impl/reasoning';
@@ -47,6 +49,110 @@ export async function readAllStreamParts(filePath: string): Promise<StreamPartRe
 }
 
 /** Read meta.jsonl, group by id, last-write-wins → Map<id, data> */
+/** Read all snapshot lines from a JSONL file. */
+export async function readAllSnapshots(filePath: string): Promise<FileSnapshotRecord[]> {
+  let content: string;
+  try {
+    content = await fs.readFile(filePath, 'utf-8');
+  } catch {
+    return [];
+  }
+
+  const snapshots: FileSnapshotRecord[] = [];
+  for (const line of content.split('\n')) {
+    const parsed = parseLine(line);
+    if (parsed?.t === 'snapshot') {
+      snapshots.push(parsed.d as FileSnapshotRecord);
+    }
+  }
+  return snapshots;
+}
+
+export interface SubsessionRecordSet {
+  subAgentInvocationId: string;
+  parentSubAgentInvocationId?: string;
+  subAgentPath: string[];
+  filePath: string;
+  metaPath: string;
+  records: StreamPartRecord[];
+  snapshots: FileSnapshotRecord[];
+  metaIndex: Map<string, Record<string, unknown>>;
+}
+
+export async function readSubsessionRecords(sessionDir: string): Promise<SubsessionRecordSet[]> {
+  const root = path.join(sessionDir, 'subsessions');
+  const result: SubsessionRecordSet[] = [];
+
+  async function walk(dir: string): Promise<void> {
+    let entries: import('node:fs').Dirent[];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const entryPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(entryPath);
+        continue;
+      }
+      if (!entry.isFile() || entry.name !== 'subsession.jsonl') {
+        continue;
+      }
+
+      const rel = path.relative(root, path.dirname(entryPath));
+      const subAgentPath = rel.split(path.sep).filter(part => part && part !== 'subsessions');
+      const subAgentInvocationId = subAgentPath[subAgentPath.length - 1] ?? rel;
+      const parentSubAgentInvocationId = subAgentPath.length > 1
+        ? subAgentPath[subAgentPath.length - 2]
+        : undefined;
+      const metaPath = path.join(path.dirname(entryPath), 'meta.jsonl');
+      result.push({
+        subAgentInvocationId,
+        parentSubAgentInvocationId,
+        subAgentPath,
+        filePath: entryPath,
+        metaPath,
+        records: (await readAllStreamParts(entryPath)).map(record =>
+          withSubsessionMeta(record, subAgentInvocationId, parentSubAgentInvocationId, subAgentPath),
+        ),
+        snapshots: await readAllSnapshots(entryPath),
+        metaIndex: await readMetaIndex(metaPath),
+      });
+    }
+  }
+
+  await walk(root);
+  return result.sort((a, b) => a.filePath.localeCompare(b.filePath));
+}
+
+function withSubsessionMeta(
+  record: StreamPartRecord,
+  subAgentInvocationId: string,
+  parentSubAgentInvocationId: string | undefined,
+  subAgentPath: string[],
+): StreamPartRecord {
+  const payload = record.payload;
+  const nextPayload = payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? {
+        ...(payload as Record<string, unknown>),
+        subAgentInvocationId: (payload as Record<string, unknown>).subAgentInvocationId ?? subAgentInvocationId,
+      }
+    : payload;
+
+  return {
+    ...record,
+    payload: nextPayload,
+    meta: {
+      ...record.meta,
+      subAgentInvocationId: record.meta.subAgentInvocationId ?? subAgentInvocationId,
+      parentSubAgentInvocationId: record.meta.parentSubAgentInvocationId ?? parentSubAgentInvocationId,
+      subAgentPath: record.meta.subAgentPath ?? subAgentPath,
+    },
+  };
+}
+
 export async function readMetaIndex(
   filePath: string,
 ): Promise<Map<string, Record<string, unknown>>> {
@@ -191,10 +297,11 @@ export function finalizeIncompleteStates(
     if (record.kind === 'toolInvocation') {
       const status = (record.payload as { state?: { status?: string } })?.state?.status;
       if (status === 'pending' || status === 'running') {
+        const payload = record.payload as Record<string, unknown>;
         return {
           ...record,
           payload: {
-            ...record.payload,
+            ...payload,
             state: {
               ...(record.payload as { state?: Record<string, unknown> }).state,
               status: 'error',
@@ -208,9 +315,21 @@ export function finalizeIncompleteStates(
     if (record.kind === 'question') {
       const status = (record.payload as { status?: string })?.status;
       if (status === 'asked') {
+        const payload = record.payload as Record<string, unknown>;
         return {
           ...record,
-          payload: { ...record.payload, status: 'skipped' },
+          payload: { ...payload, status: 'skipped' },
+        };
+      }
+    }
+
+    if (record.kind === 'externalEdit') {
+      const status = (record.payload as { status?: string })?.status;
+      if (status === 'pending') {
+        const payload = record.payload as Record<string, unknown>;
+        return {
+          ...record,
+          payload: { ...payload, status: 'completed' },
         };
       }
     }
@@ -229,7 +348,7 @@ export function finalizeIncompleteStates(
  */
 export function createSSPFromRecord(
   record: StreamPartRecord,
-  metaIndex?: Map<string, Record<string, unknown>>,
+  metaIndex?: ReadonlyMap<string, Record<string, unknown>>,
 ): AnySerializableStreamPart {
   // For externalEdit, inject undoStopId from meta if available
   if (record.kind === 'externalEdit' && metaIndex) {
@@ -238,7 +357,7 @@ export function createSSPFromRecord(
     if (undoStopId) {
       record = {
         ...record,
-        payload: { ...record.payload, undoStopId, editId: undoStopId },
+        payload: { ...(record.payload as Record<string, unknown>), undoStopId, editId: undoStopId },
       };
     }
   }
@@ -247,41 +366,41 @@ export function createSSPFromRecord(
 
   switch (record.kind) {
     case 'userPrompt':
-      return new UserPromptSSP(payload as never);
+      return new UserPromptSSP(payload as never, record.meta, record.id);
 
     case 'assistantText': {
       const p = payload as { partId: string; text: string; messageId?: string };
-      return new AssistantTextSSP({ partId: p.partId, delta: p.text, messageId: p.messageId });
+      return new AssistantTextSSP({ partId: p.partId, delta: p.text, messageId: p.messageId }, record.meta, record.id);
     }
 
     case 'reasoning': {
       const p = payload as { partId: string; text: string; messageId?: string };
-      return new ReasoningSSP({ partId: p.partId, delta: p.text, messageId: p.messageId });
+      return new ReasoningSSP({ partId: p.partId, delta: p.text, messageId: p.messageId }, record.meta, record.id);
     }
 
     case 'toolInvocation':
-      return new ToolInvocationSSP(payload as never);
+      return new ToolInvocationSSP(payload as never, record.meta, record.id);
 
     case 'question':
-      return new QuestionSSP(payload as never);
+      return new QuestionSSP(payload as never, undefined, record.meta, record.id);
 
     case 'externalEdit':
       return new ExternalEditSSP(payload as never, {
         onBaselineCaptured: () => {},
         onSnapshot: () => {},
-      });
+      }, record.meta, record.id);
 
     case 'sessionLifecycle':
-      return new SessionLifecycleSSP(payload as never);
+      return new SessionLifecycleSSP(payload as never, record.meta, record.id);
 
     case 'sessionDiff':
-      return new SessionDiffSSP(payload as never);
+      return new SessionDiffSSP(payload as never, record.meta, record.id);
 
     case 'rawAcpEvent':
-      return new RawAcpEventSSP(payload as never);
+      return new RawAcpEventSSP(payload as never, record.meta, record.id);
 
     default:
       // Unknown kind → wrap payload as raw event
-      return new RawAcpEventSSP({ event: record.payload });
+      return new RawAcpEventSSP({ event: record.payload }, record.meta, record.id);
   }
 }

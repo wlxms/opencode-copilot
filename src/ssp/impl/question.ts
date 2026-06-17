@@ -17,7 +17,7 @@
  */
 
 import { SerializableStreamPart, IMutableStreamPart } from '../types';
-import type { SspStream, QuestionStreamPartPayload } from '../types';
+import type { SerializableStreamPartMeta, SspStream, QuestionStreamPartPayload } from '../types';
 
 export interface QuestionSSPCallbacks {
   /** Called with the RAW VS Code result — Bridge is responsible for format mapping */
@@ -37,8 +37,14 @@ export class QuestionSSP extends SerializableStreamPart<
   constructor(
     payload: QuestionStreamPartPayload,
     private readonly callbacks?: QuestionSSPCallbacks,
+    meta?: Partial<SerializableStreamPartMeta>,
+    id?: string,
   ) {
-    super(payload);
+    super(payload, {
+      ...meta,
+      sourcePartId: meta?.sourcePartId ?? payload.questionId,
+      toolCallId: meta?.toolCallId,
+    }, id ?? payload.questionId);
   }
 
   render(stream: SspStream): void {

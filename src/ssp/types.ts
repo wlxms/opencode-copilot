@@ -39,6 +39,9 @@ export interface SerializableStreamPartMeta {
   toolCallId?: string;
   editId?: string;
   uri?: string;
+  subAgentInvocationId?: string;
+  parentSubAgentInvocationId?: string;
+  subAgentPath?: string[];
 }
 
 export type SerializableStreamPartKind =
@@ -124,6 +127,7 @@ export interface SerializableToolState {
   title?: string;
   error?: string;
   metadata?: Record<string, unknown>;
+  originalToolName?: string;
   startTime?: number;
   endTime?: number;
 }
@@ -269,6 +273,9 @@ export abstract class SerializableStreamPart<
       toolCallId: meta?.toolCallId,
       editId: meta?.editId,
       uri: meta?.uri,
+      subAgentInvocationId: meta?.subAgentInvocationId,
+      parentSubAgentInvocationId: meta?.parentSubAgentInvocationId,
+      subAgentPath: meta?.subAgentPath,
     };
   }
 
@@ -386,7 +393,20 @@ export interface IMetadataProvider {
   getMetadata(): Record<string, unknown> | undefined;
 }
 
+export interface IAsyncMetadataProvider extends IMetadataProvider {
+  whenMetadataSettled(): Promise<void>;
+}
+
 /** Type guard: returns true if the part implements IMetadataProvider */
-export function isMetadataProvider(part: ISerializableStreamPart): part is IMetadataProvider {
-  return typeof (part as IMetadataProvider).getMetadata === 'function';
+export function isMetadataProvider(
+  part: ISerializableStreamPart,
+): part is ISerializableStreamPart & IMetadataProvider {
+  return typeof (part as unknown as IMetadataProvider).getMetadata === 'function';
+}
+
+export function isAsyncMetadataProvider(
+  part: ISerializableStreamPart,
+): part is ISerializableStreamPart & IAsyncMetadataProvider {
+  const candidate = part as unknown as IAsyncMetadataProvider;
+  return isMetadataProvider(part) && typeof candidate.whenMetadataSettled === 'function';
 }
