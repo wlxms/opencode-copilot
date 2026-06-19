@@ -125,7 +125,7 @@ export class SerializableStreamPartEventHandler {
 
     switch (event.part.type) {
       case 'text': {
-        const payload = textPayload(event.part);
+        const payload = textPayload(event.part, event.sessionId);
         const isFirstPrompt =
           !this.state.userPromptWritten &&
           !!this.options.prompt &&
@@ -136,6 +136,7 @@ export class SerializableStreamPartEventHandler {
             text: payload.text,
             partId: payload.partId,
             messageId: payload.messageId,
+            sessionId: payload.sessionId,
           }, event);
         }
 
@@ -146,6 +147,7 @@ export class SerializableStreamPartEventHandler {
           partId: event.part.id,
           text: event.part.text,
           messageId: event.part.messageId,
+          sessionId: event.sessionId ?? event.part.sessionId,
         }, event);
       case 'tool':
         return this.createPart('toolInvocation', {
@@ -154,7 +156,7 @@ export class SerializableStreamPartEventHandler {
           callId: event.part.callId,
           state: event.part.state,
           messageId: event.part.messageId,
-          sessionId: event.part.sessionId,
+          sessionId: event.sessionId ?? event.part.sessionId,
         }, event);
       default:
         return this.createRawAcpEventPart(event);
@@ -168,6 +170,7 @@ export class SerializableStreamPartEventHandler {
         partId: event.partId,
         delta: event.delta,
         field: event.field,
+        sessionId: event.sessionId,
       }, event);
     }
 
@@ -175,6 +178,7 @@ export class SerializableStreamPartEventHandler {
       partId: event.partId,
       delta: event.delta,
       field: event.field,
+      sessionId: event.sessionId,
     }, event);
   }
 
@@ -188,6 +192,7 @@ export class SerializableStreamPartEventHandler {
     return this.createPart('sessionLifecycle', {
       eventType: event.type,
       sessionId: 'sessionId' in event ? event.sessionId : undefined,
+      parentId: 'parentId' in event ? event.parentId : undefined,
       title: 'title' in event ? event.title : undefined,
       error: 'error' in event ? event.error : undefined,
       status: 'status' in event ? event.status : undefined,
@@ -283,6 +288,7 @@ export class SerializableStreamPartEventHandler {
       sourcePartId: eventPart?.id ?? (event?.type === 'part.delta' ? event.partId : undefined),
       toolCallId,
       uri: getEventUri(event),
+      sessionId: getEventSessionId(event),
       ...override,
     };
   }
@@ -296,11 +302,13 @@ export function projectStreamPartToAcpEvent(part: SerializableStreamPart): AcpEv
       const payload = part.payload as UserPromptStreamPartPayload;
       return {
         type: 'part.updated',
+        sessionId: payload.sessionId ?? part.meta.sessionId,
         part: {
           type: 'text',
           id: payload.partId ?? part.meta.sourcePartId ?? `user-${part.meta.requestId}`,
           text: payload.text,
           messageId: payload.messageId,
+          sessionId: payload.sessionId ?? part.meta.sessionId,
         },
       };
     }
@@ -308,11 +316,13 @@ export function projectStreamPartToAcpEvent(part: SerializableStreamPart): AcpEv
       const payload = part.payload as AssistantTextStreamPartPayload;
       return {
         type: 'part.updated',
+        sessionId: payload.sessionId ?? part.meta.sessionId,
         part: {
           type: 'text',
           id: payload.partId,
           text: payload.text,
           messageId: payload.messageId,
+          sessionId: payload.sessionId ?? part.meta.sessionId,
           synthetic: payload.synthetic,
         },
       };
@@ -321,6 +331,7 @@ export function projectStreamPartToAcpEvent(part: SerializableStreamPart): AcpEv
       const payload = part.payload as AssistantTextDeltaStreamPartPayload;
       return {
         type: 'part.delta',
+        sessionId: payload.sessionId ?? part.meta.sessionId,
         partId: payload.partId,
         delta: payload.delta,
         field: payload.field,
@@ -330,11 +341,13 @@ export function projectStreamPartToAcpEvent(part: SerializableStreamPart): AcpEv
       const payload = part.payload as ReasoningStreamPartPayload;
       return {
         type: 'part.updated',
+        sessionId: payload.sessionId ?? part.meta.sessionId,
         part: {
           type: 'reasoning',
           id: payload.partId,
           text: payload.text,
           messageId: payload.messageId,
+          sessionId: payload.sessionId ?? part.meta.sessionId,
         },
       };
     }
@@ -342,6 +355,7 @@ export function projectStreamPartToAcpEvent(part: SerializableStreamPart): AcpEv
       const payload = part.payload as ReasoningDeltaStreamPartPayload;
       return {
         type: 'part.delta',
+        sessionId: payload.sessionId ?? part.meta.sessionId,
         partId: payload.partId,
         delta: payload.delta,
         field: payload.field,
@@ -351,6 +365,7 @@ export function projectStreamPartToAcpEvent(part: SerializableStreamPart): AcpEv
       const payload = part.payload as ToolInvocationStreamPartPayload;
       return {
         type: 'part.updated',
+        sessionId: payload.sessionId ?? part.meta.sessionId,
         part: {
           type: 'tool',
           id: payload.partId,
@@ -358,7 +373,7 @@ export function projectStreamPartToAcpEvent(part: SerializableStreamPart): AcpEv
           callId: payload.callId,
           state: payload.state,
           messageId: payload.messageId,
-          sessionId: payload.sessionId,
+          sessionId: payload.sessionId ?? part.meta.sessionId,
         },
       };
     }
@@ -427,11 +442,12 @@ export function requestDetailsFromStreamParts(
   return [...byRequest.values()].sort((a, b) => (a.turnIndex ?? 0) - (b.turnIndex ?? 0));
 }
 
-function textPayload(part: AcpTextPart): AssistantTextStreamPartPayload {
+function textPayload(part: AcpTextPart, eventSessionId?: string): AssistantTextStreamPartPayload {
   return {
     partId: part.id,
     text: part.text,
     messageId: part.messageId,
+    sessionId: eventSessionId ?? part.sessionId,
     synthetic: part.synthetic,
   };
 }
@@ -445,6 +461,7 @@ function projectSessionLifecycle(payload: SessionLifecycleStreamPartPayload): Ac
       return {
         type: payload.eventType,
         sessionId: payload.sessionId ?? '',
+        parentId: payload.parentId,
         title: payload.title,
         error: payload.error,
       } as AcpSessionLifecycleEvent;
@@ -523,6 +540,19 @@ function getEventUri(event: AcpEvent | undefined): string | undefined {
   }
   if (event.type === 'part.updated' && event.part.type === 'tool') {
     return getToolInputPath(event.part);
+  }
+  return undefined;
+}
+
+function getEventSessionId(event: AcpEvent | undefined): string | undefined {
+  if (!event) {
+    return undefined;
+  }
+  if ('sessionId' in event && event.sessionId) {
+    return event.sessionId;
+  }
+  if (event.type === 'part.updated') {
+    return event.part.sessionId;
   }
   return undefined;
 }

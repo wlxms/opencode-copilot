@@ -62,7 +62,9 @@ implements SessionStreamNode {
     ssp.onStateChange((s) => {
       this.syncMetadata(s);
     });
-    ssp.render(this.stream);
+    if (this.shouldRender(ssp)) {
+      ssp.render(this.stream);
+    }
     this.appendStreamRecord(ssp.toJSON());
     this.syncMetadata(ssp);
   }
@@ -79,7 +81,9 @@ implements SessionStreamNode {
     }
 
     ssp.update(data);
-    ssp.render(this.stream);
+    if (this.shouldRender(ssp)) {
+      ssp.render(this.stream);
+    }
     this.appendStreamRecord(ssp.toJSON());
     this.syncMetadata(ssp);
   }
@@ -143,6 +147,10 @@ implements SessionStreamNode {
 
   protected beforeAppendStream(): Promise<void> | void {
     return undefined;
+  }
+
+  protected shouldRender(_ssp: AnySerializableStreamPart): boolean {
+    return true;
   }
 
   protected preparePart(ssp: AnySerializableStreamPart): void {

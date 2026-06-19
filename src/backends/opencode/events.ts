@@ -42,6 +42,21 @@ import type {
   StepFinishStreamPart,
 } from './sdk-events';
 
+function getRawEventSessionId(event: OpenCodeEvent): string | undefined {
+  switch (event.type) {
+    case 'message.part.updated':
+      return event.properties?.part?.sessionID;
+    case 'message.part.delta':
+      return (event.properties as { sessionID?: string }).sessionID;
+    case 'session.created':
+    case 'session.updated':
+    case 'session.deleted':
+      return (event.properties as { info?: { id?: string } }).info?.id;
+    default:
+      return (event.properties as { sessionID?: string } | undefined)?.sessionID;
+  }
+}
+
 // ===========================================================================
 // StreamPart → AcpStreamPart
 // ===========================================================================
@@ -273,6 +288,7 @@ export function normalizeEvent(event: OpenCodeEvent): AcpEvent[] {
       return [{
         type: event.type,
         sessionId: props?.info?.id ?? '',
+        parentId: props?.info?.parentID,
         title: props?.info?.title,
       }];
     }
@@ -308,9 +324,11 @@ export function normalizeEvent(event: OpenCodeEvent): AcpEvent[] {
 
     // ---- Message parts ----
     case 'message.part.updated': {
+      const part = normalizeStreamPart(event.properties.part);
       const updated: AcpPartUpdatedEvent = {
         type: 'part.updated',
-        part: normalizeStreamPart(event.properties.part),
+        sessionId: getRawEventSessionId(event),
+        part,
         delta: event.properties.delta,
       };
       return [updated];
@@ -322,6 +340,7 @@ export function normalizeEvent(event: OpenCodeEvent): AcpEvent[] {
         partId: event.properties.partID,
         delta: event.properties.delta,
         field: event.properties.field,
+        sessionId: getRawEventSessionId(event),
       };
       return [delta];
     }

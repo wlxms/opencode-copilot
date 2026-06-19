@@ -247,6 +247,33 @@ describe('SerializableSessionStream', () => {
     expect(restored?.metaIndex.get('meta-part-1')?.undoStopId).toBe('undo-sub-1');
   });
 
+  it('subsession persists assistant text and reasoning without rendering them to the root stream', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-sub-text-'));
+    const stream = mockStream();
+    const sss = new SerializableSessionStream(stream as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test-backend',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'req-0',
+    });
+    await sss.initialize();
+
+    const sub = sss.subsession('sub-text');
+    sub.push(new ReasoningSSP({ partId: 'child-reasoning', delta: 'child thought' }));
+    sub.push(new AssistantTextSSP({ partId: 'child-text', delta: 'child answer' }));
+    await sss.drain();
+
+    expect(stream.thinkingProgress).not.toHaveBeenCalled();
+    expect(stream.markdown).not.toHaveBeenCalled();
+
+    const subPath = path.join(getSessionDir(tmpDir), 'subsessions', 'sub-text', 'subsession.jsonl');
+    const parts = await readAllStreamParts(subPath);
+    expect(parts.map(part => part.kind)).toEqual(['reasoning', 'assistantText']);
+    expect(parts.map(part => (part.payload as { text?: string }).text)).toEqual(['child thought', 'child answer']);
+    expect(parts.every(part => part.meta.subAgentInvocationId === 'sub-text')).toBe(true);
+  });
+
   it('drain waits for async ExternalEditSSP metadata in subsessions', async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-sub-async-meta-'));
     const stream = {

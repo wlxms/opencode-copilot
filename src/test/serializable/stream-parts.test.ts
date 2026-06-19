@@ -79,6 +79,60 @@ describe('SerializableStreamPartEventHandler', () => {
     });
   });
 
+  it('preserves event-level sessionId through text, reasoning, and delta records', () => {
+    const handler = new SerializableStreamPartEventHandler({
+      turnIndex: 1,
+      requestId: 'request-session',
+      prompt: 'Question',
+    });
+
+    const reasoning = handler.serializeEvent({
+      type: 'part.updated',
+      sessionId: 'ses_child',
+      part: { type: 'reasoning', id: 'reasoning-1', text: '', messageId: 'msg-assistant' },
+    })[0];
+    const reasoningDelta = handler.serializeEvent({
+      type: 'part.delta',
+      sessionId: 'ses_child',
+      partId: 'reasoning-1',
+      delta: 'thinking',
+      field: 'text',
+    })[0];
+    const text = handler.serializeEvent({
+      type: 'part.updated',
+      sessionId: 'ses_child',
+      part: { type: 'text', id: 'text-1', text: '', messageId: 'msg-assistant' },
+    })[0];
+    const textDelta = handler.serializeEvent({
+      type: 'part.delta',
+      sessionId: 'ses_child',
+      partId: 'text-1',
+      delta: 'answer',
+      field: 'text',
+    })[0];
+
+    expect(reasoning.meta.sessionId).toBe('ses_child');
+    expect(text.meta.sessionId).toBe('ses_child');
+    expect(projectStreamPartToAcpEvent(reasoning)).toEqual(expect.objectContaining({
+      type: 'part.updated',
+      sessionId: 'ses_child',
+      part: expect.objectContaining({ sessionId: 'ses_child' }),
+    }));
+    expect(projectStreamPartToAcpEvent(reasoningDelta)).toEqual(expect.objectContaining({
+      type: 'part.delta',
+      sessionId: 'ses_child',
+    }));
+    expect(projectStreamPartToAcpEvent(text)).toEqual(expect.objectContaining({
+      type: 'part.updated',
+      sessionId: 'ses_child',
+      part: expect.objectContaining({ sessionId: 'ses_child' }),
+    }));
+    expect(projectStreamPartToAcpEvent(textDelta)).toEqual(expect.objectContaining({
+      type: 'part.delta',
+      sessionId: 'ses_child',
+    }));
+  });
+
   it('maps tool invocations and interaction requests to concept parts', () => {
     const handler = new SerializableStreamPartEventHandler({
       turnIndex: 0,

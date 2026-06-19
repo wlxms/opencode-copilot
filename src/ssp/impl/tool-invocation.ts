@@ -100,6 +100,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     const stableId = id ?? payload.callId ?? payload.partId;
     super(payload, {
       ...meta,
+      sessionId: meta?.sessionId ?? payload.sessionId,
       toolCallId: meta?.toolCallId ?? payload.callId ?? payload.partId,
       sourcePartId: meta?.sourcePartId ?? payload.partId,
     }, stableId);
@@ -128,31 +129,20 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     if (!effectiveCallId) return;
 
     const status = state.status;
-    const renderToolName = toolName === 'task' ? 'subagent' : toolName;
-    const renderState: SerializableToolState = renderToolName === toolName
-      ? state
-      : {
-          ...state,
-          originalToolName: state.originalToolName ?? toolName,
-          metadata: {
-            ...state.metadata,
-            originalToolName: toolName,
-          },
-        };
 
     // PENDING: call beginToolInvocation (NOT push) — matches trunk L1061-1065
     if (status === 'pending') {
       if (stream.beginToolInvocation) {
         const subAgentInvocationId = this.getEffectiveSubAgentInvocationId();
         if (subAgentInvocationId) {
-          stream.beginToolInvocation(effectiveCallId, renderToolName, {
+          stream.beginToolInvocation(effectiveCallId, toolName, {
             subagentInvocationId: subAgentInvocationId,
           } as any);
         } else {
-          stream.beginToolInvocation(effectiveCallId, renderToolName);
+          stream.beginToolInvocation(effectiveCallId, toolName);
         }
       } else {
-        stream.progress(`\u{1F527} ${renderToolName}...`);
+        stream.progress(`\u{1F527} ${toolName}...`);
       }
       return;
     }
@@ -161,9 +151,9 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     const isError = status === 'error';
     const ToolInvocationPartCtor = VS.ChatToolInvocationPart;
     if (ToolInvocationPartCtor) {
-      this.pushToolInvocation(stream, effectiveCallId, renderToolName, renderState, isError);
+      this.pushToolInvocation(stream, effectiveCallId, toolName, state, isError);
     } else {
-      this.renderFallback(stream, effectiveCallId, renderToolName, renderState, isError);
+      this.renderFallback(stream, effectiveCallId, toolName, state, isError);
     }
   }
 
@@ -209,9 +199,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
 
       // isComplete logic (trunk L1256-1259)
       const subAgentInvocationId = this.getEffectiveSubAgentInvocationId();
-      part.isComplete = !subAgentInvocationId
-        || state.status === 'completed'
-        || state.status === 'error';
+      part.isComplete = state.status === 'completed' || state.status === 'error';
       if (state.status === 'pending' || (state.status === 'running' && !this._progressivePushed)) {
         part.isComplete = false;
       }
@@ -279,11 +267,12 @@ export class ToolInvocationSSP extends SerializableStreamPart<
 
     if (state.status === 'pending') {
       try {
+        const subAgentInvocationId = this.getEffectiveSubAgentInvocationId();
         stream.beginToolInvocation(
           callId,
           toolName,
-          this.getEffectiveSubAgentInvocationId()
-            ? { subAgentInvocationId: this.getEffectiveSubAgentInvocationId() } as any
+          subAgentInvocationId
+            ? { subagentInvocationId: subAgentInvocationId } as any
             : undefined,
         );
       } catch { /* ignore */ }
@@ -370,8 +359,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       return `Todos`;
     } else if (toolName === 'task' || toolName === 'subagent') {
       const desc = (input.description as string) ?? title;
-      const agentTag = (input.subagent_type as string) ?? (input.agentName as string) ?? (input.agent_type as string) ?? 'Subagent';
-      return `${agentTag}: ${desc}`;
+      return desc || 'Run subagent';
     } else if (toolName === 'list' || toolName === 'grep') {
       const filePath = (input.filePath as string) ?? (input.path as string) ?? (input.pattern as string) ?? title;
       const short = filePath.length > 60 ? filePath.substring(0, 57) + '...' : filePath;
@@ -484,8 +472,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       }
     } else if (toolName === 'task' || toolName === 'subagent') {
       const desc = (input?.description as string) ?? title;
-      const agentTag = (input?.subagent_type as string) ?? (input?.agentName as string) ?? (input?.agent_type as string) ?? 'Subagent';
-      return `${agentTag}: ${desc}${duration}`;
+      return `${desc || 'Run subagent'}${duration}`;
     }
 
     const display = title || toolName;
@@ -584,19 +571,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
 
       case 'task':
       case 'subagent': {
-        const description = (input.description as string) ?? title;
-        const agentName = (input.subagent_type as string) ?? (input.agentName as string) ?? (input.agent_type as string) ?? (input.agentType as string) ?? title ?? toolName;
-        const prompt = (input.prompt as string) ?? formatInput(input, '');
-        const result = truncate(output, 4000);
-        // CRITICAL: kind:'subagent' is required for VSCode to recognize this as a subagent card
-        // and extract agentName/description/prompt for the ChatSubagentContentPart UI.
-        // See VSCode ChatSubagentContentPart.extractSubagentInfo().
-        if (VS.ChatSubagentToolInvocationData) {
-          const data = new VS.ChatSubagentToolInvocationData(description, agentName, prompt, result);
-          (data as any).kind = 'subagent';
-          return data;
-        }
-        return { kind: 'subagent', description, agentName, prompt, result } as ChatSubagentToolInvocationData & { kind: 'subagent' };
+        return this.buildSubagentToolSpecificData(input, output, title);
       }
 
       default:
@@ -609,11 +584,45 @@ export class ToolInvocationSSP extends SerializableStreamPart<
         return undefined;
     }
   }
+
+  private buildSubagentToolSpecificData(
+    input: Record<string, unknown>,
+    output: string,
+    title: string,
+  ): ChatSubagentToolInvocationData {
+    const truncate = (s: string, max: number): string =>
+      s.length > max ? s.substring(0, max) + '...' : s;
+    const description = (input.description as string) ?? title;
+    const agentName = (input.subagent_type as string)
+      ?? (input.agentName as string)
+      ?? (input.agent_type as string)
+      ?? (input.agentType as string)
+      ?? title
+      ?? 'Subagent';
+    const prompt = (input.prompt as string) ?? formatSubagentInput(input);
+    const result = truncate(output, 4000);
+
+    if (VS.ChatSubagentToolInvocationData) {
+      return new VS.ChatSubagentToolInvocationData(description, agentName, prompt, result);
+    }
+    return { description, agentName, prompt, result };
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Module-level helpers (trunk L2132-2147)
 // ---------------------------------------------------------------------------
+
+function formatSubagentInput(input: Record<string, unknown>): string {
+  const entries = Object.entries(input);
+  if (entries.length === 0) return '';
+  return entries
+    .map(([key, value]) => {
+      const rendered = typeof value === 'string' ? value : JSON.stringify(value);
+      return `${key}: ${rendered}`;
+    })
+    .join('\n');
+}
 
 function stateOutputHasExitCode(output: string): boolean {
   return /exitCode:\s*-?\d+/.test(output);

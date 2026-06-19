@@ -21,7 +21,7 @@ export class UserPromptSSP extends SerializableStreamPart<
   readonly kind = 'userPrompt' as const;
 
   constructor(
-    payload: { text: string; partId?: string; command?: string; messageId?: string },
+    payload: { text: string; partId?: string; command?: string; messageId?: string; sessionId?: string },
     meta?: Partial<SerializableStreamPartMeta>,
     id?: string,
   ) {
@@ -29,9 +29,11 @@ export class UserPromptSSP extends SerializableStreamPart<
       text: payload.text,
       partId: payload.partId,
       messageId: payload.messageId,
+      sessionId: payload.sessionId,
       command: payload.command,
     }, {
       ...meta,
+      sessionId: meta?.sessionId ?? payload.sessionId,
       sourcePartId: meta?.sourcePartId ?? payload.partId,
     }, id);
   }

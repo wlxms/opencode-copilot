@@ -295,16 +295,65 @@ describe('ToolInvocationSSP', () => {
         partId: 'p1', toolName: 'task', callId: 'c1',
         state: toolState({
           status: 'completed',
-          input: { description: 'review code', agentName: 'reviewer', prompt: 'review src/' },
+          input: { description: 'review code', subagent_type: 'reviewer', prompt: 'review src/' },
           output: 'LGTM',
         }),
       });
       ssp.render(stream);
+      const part = lastPushedPart(stream);
+      expect(part.invocationMessage).toBeUndefined();
+      expect(part.pastTenseMessage).toBe('review code');
       const data = lastPushedPart(stream).toolSpecificData;
       expect(data).toBeDefined();
       expect(data.description).toBe('review code');
       expect(data.agentName).toBe('reviewer');
+      expect(data.prompt).toBe('review src/');
       expect(data.result).toBe('LGTM');
+    });
+
+    it('parent task pending starts VS Code task stream without subagent metadata', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'p1',
+        toolName: 'task',
+        callId: 'c1',
+        state: toolState({
+          status: 'pending',
+          input: {
+            description: 'Search docs',
+            subagent_type: 'librarian',
+            prompt: 'Search VS Code docs for ACP architecture.',
+          },
+        }),
+      });
+
+      ssp.render(stream);
+
+      expect(stream.beginToolInvocation).toHaveBeenCalledWith('c1', 'task');
+    });
+
+    it('child task pending starts VS Code task stream with parent subagent metadata', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'p1',
+        toolName: 'task',
+        callId: 'c1',
+        state: toolState({
+          status: 'pending',
+          input: {
+            description: 'Nested search',
+            subagent_type: 'librarian',
+            prompt: 'Search inside the parent subagent.',
+          },
+        }),
+        subAgentInvocationId: 'parent-call',
+      });
+
+      ssp.render(stream);
+
+      expect(stream.beginToolInvocation).toHaveBeenCalledWith('c1', 'task', {
+        subagentInvocationId: 'parent-call',
+      });
     });
   });
 

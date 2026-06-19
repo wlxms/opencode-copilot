@@ -288,14 +288,20 @@ describe('OpenCodeBridge', () => {
   it('should push task tool as ChatSubagentToolInvocationData', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({
-      tools: toolEvents({ toolName: 'task', callId: 'call_tsk', input: { description: 'subtask', prompt: 'do X' }, output: 'done', title: 'Subtask' }),
+      tools: toolEvents({ toolName: 'task', callId: 'call_tsk', input: { description: 'subtask', prompt: 'do X', subagent_type: 'librarian' }, output: 'done', title: 'Subtask' }),
     }));
     await runBridge(bridge,events, stream, mockToken());
-    expect(stream.beginToolInvocation).toHaveBeenCalledWith(
-      'call_tsk',
-      'subagent',
-      expect.objectContaining({ subagentInvocationId: expect.any(String) }),
-    );
+    const subagentPart = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; invocationMessage?: string; toolSpecificData?: Record<string, unknown> })
+      .find(part => part.toolName === 'task' && part.toolCallId === 'call_tsk');
+
+    expect(subagentPart).toBeDefined();
+    expect(subagentPart?.invocationMessage).toBe('subtask');
+    expect(subagentPart?.toolSpecificData).toEqual(expect.objectContaining({
+      description: 'subtask',
+      agentName: 'librarian',
+      prompt: 'do X',
+    }));
   });
 
   // --- Subagent event filtering ---
@@ -336,19 +342,17 @@ describe('OpenCodeBridge', () => {
     ]);
     await runBridge(bridge,events, stream, mockToken());
 
-    // Task tool should be invoked (begin + running push)
-    expect(stream.beginToolInvocation).toHaveBeenCalledWith(
-      taskCallId,
-      'subagent',
-      expect.objectContaining({ subagentInvocationId: expect.any(String) }),
-    );
-
     // The final card should be pushed when child session goes idle
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
+    const runningTaskPart = pushed
+      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; subAgentInvocationId?: string })
+      .find(part => part.toolName === 'task' && part.toolCallId === taskCallId);
+    expect(runningTaskPart?.subAgentInvocationId).toBeUndefined();
+
     // Should have the task's final completed part pushed (from child session.idle)
     const taskPart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean };
-      return p?.toolName === 'subagent' && p?.toolCallId === taskCallId && p?.isComplete === true;
+      return p?.toolName === 'task' && p?.toolCallId === taskCallId && p?.isComplete === true;
     });
     expect(taskPart).toBeDefined();
 
@@ -362,7 +366,7 @@ describe('OpenCodeBridge', () => {
     expect(readPart).toBeDefined();
     // Child tools should carry the subAgentInvocationId for grouping
     const readObj = readPart![0];
-    expect(readObj.subAgentInvocationId).toBeDefined();
+    expect(readObj.subAgentInvocationId).toBe(taskCallId);
 
     const bashPart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; subAgentInvocationId?: string };
@@ -370,7 +374,7 @@ describe('OpenCodeBridge', () => {
     });
     expect(bashPart).toBeDefined();
     const bashObj = bashPart![0];
-    expect(bashObj.subAgentInvocationId).toBeDefined();
+    expect(bashObj.subAgentInvocationId).toBe(taskCallId);
 
     // AI text should still be rendered
     expect(stream.markdown).toHaveBeenCalledWith('Done');
@@ -466,20 +470,18 @@ describe('OpenCodeBridge', () => {
 
     await runBridge(bridge, events, stream, mockToken());
 
-    const parentBegin = (stream.beginToolInvocation as ReturnType<typeof vi.fn>).mock.calls
-      .find((call: unknown[]) => call[0] === parentCallId);
-    const nestedTaskPart = (stream.push as ReturnType<typeof vi.fn>).mock.calls
-      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; subAgentInvocationId?: string })
-      .find(part => part.toolName === 'subagent' && part.toolCallId === nestedCallId);
-    const nestedReadPart = (stream.push as ReturnType<typeof vi.fn>).mock.calls
-      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; subAgentInvocationId?: string })
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; subAgentInvocationId?: string });
+    const parentTaskPart = pushed
+      .find(part => part.toolName === 'task' && part.toolCallId === parentCallId);
+    const nestedTaskPart = pushed
+      .find(part => part.toolName === 'task' && part.toolCallId === nestedCallId);
+    const nestedReadPart = pushed
       .find(part => part.toolName === 'read' && part.toolCallId === 'call_nested_read');
 
-    const parentSubAgentInvocationId = (parentBegin?.[2] as { subagentInvocationId?: string } | undefined)?.subagentInvocationId;
-    expect(parentSubAgentInvocationId).toBeDefined();
-    expect(nestedTaskPart?.subAgentInvocationId).toBeDefined();
-    expect(nestedTaskPart?.subAgentInvocationId).not.toBe(parentSubAgentInvocationId);
-    expect(nestedReadPart?.subAgentInvocationId).toBe(nestedTaskPart?.subAgentInvocationId);
+    expect(parentTaskPart?.subAgentInvocationId).toBeUndefined();
+    expect(nestedTaskPart?.subAgentInvocationId).toBe(parentCallId);
+    expect(nestedReadPart?.subAgentInvocationId).toBe(nestedCallId);
   });
 
   it('routes child session text and reasoning through the child subsession flow', async () => {
@@ -530,12 +532,12 @@ describe('OpenCodeBridge', () => {
         type: 'part.updated',
         part: { type: 'reasoning', text: '', messageId: 'child_assistant', id: childReasoningId, sessionId: childSessionId },
       },
-      { type: 'part.delta', partId: childReasoningId, delta: 'child thought', field: 'text' },
+      { type: 'part.delta', sessionId: childSessionId, partId: childReasoningId, delta: 'child thought', field: 'text' },
       {
         type: 'part.updated',
         part: { type: 'text', text: '', messageId: 'child_assistant', id: childTextId, sessionId: childSessionId },
       },
-      { type: 'part.delta', partId: childTextId, delta: 'child answer', field: 'text' },
+      { type: 'part.delta', sessionId: childSessionId, partId: childTextId, delta: 'child answer', field: 'text' },
       idleEventFor(childSessionId),
       idleEvent(),
     ]);
@@ -543,8 +545,192 @@ describe('OpenCodeBridge', () => {
     await runBridge(bridge, events, stream, mockToken());
 
     expect(stream.markdown).not.toHaveBeenCalledWith('child user echo');
-    expect(stream.thinkingProgress).toHaveBeenCalledWith({ text: 'child thought', id: childReasoningId });
-    expect(stream.markdown).toHaveBeenCalledWith('child answer');
+    expect(stream.thinkingProgress).not.toHaveBeenCalledWith({ text: 'child thought', id: childReasoningId });
+    expect(stream.markdown).not.toHaveBeenCalledWith('child answer');
+
+    const subagentPart = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as {
+        toolName?: string;
+        toolCallId?: string;
+        isComplete?: boolean;
+        toolSpecificData?: { result?: string };
+      })
+      .find(part => part.toolName === 'task' && part.toolCallId === taskCallId && part.isComplete === true);
+    expect(subagentPart?.toolSpecificData?.result).toBe('child answer');
+  });
+
+  it('buffers child session deltas until their child text part is routed to SubSSS', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_child_delta_task';
+    const childSessionId = 'ses_child_delta';
+    const childTextId = 'prt_child_delta_text';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'spawn child', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_child_delta_task',
+          callId: taskCallId,
+          state: {
+            status: 'running',
+            input: {
+              description: 'Inspect SSP types',
+              prompt: 'Read src/ssp/types.ts',
+              subagent_type: 'explore',
+            },
+            title: 'Inspect SSP types',
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      },
+      {
+        type: 'session.created',
+        sessionId: childSessionId,
+        parentId: 'test-session',
+        title: 'Inspect SSP types (@explore subagent)',
+      },
+      { type: 'part.delta', sessionId: childSessionId, partId: childTextId, delta: 'child ', field: 'text' },
+      { type: 'part.delta', sessionId: childSessionId, partId: childTextId, delta: 'answer', field: 'text' },
+      {
+        type: 'part.updated',
+        part: { type: 'text', text: 'child answer', messageId: 'child_assistant', id: childTextId, sessionId: childSessionId },
+      },
+      idleEventFor(childSessionId),
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_child_delta_task',
+          callId: taskCallId,
+          state: {
+            status: 'completed',
+            input: {
+              description: 'Inspect SSP types',
+              prompt: 'Read src/ssp/types.ts',
+              subagent_type: 'explore',
+            },
+            output: '<task_result>child answer</task_result>',
+            title: 'Inspect SSP types',
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      },
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    expect(stream.markdown).not.toHaveBeenCalledWith('child ');
+    expect(stream.markdown).not.toHaveBeenCalledWith('answer');
+    expect(stream.markdown).not.toHaveBeenCalledWith('child answer');
+
+    const subagentPart = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as {
+        toolName?: string;
+        toolCallId?: string;
+        isComplete?: boolean;
+        toolSpecificData?: { agentName?: string; description?: string; prompt?: string; result?: string };
+      })
+      .find(part => part.toolName === 'task' && part.toolCallId === taskCallId && part.isComplete === true);
+
+    expect(subagentPart?.toolSpecificData).toEqual(expect.objectContaining({
+      agentName: 'explore',
+      description: 'Inspect SSP types',
+      prompt: 'Read src/ssp/types.ts',
+      result: 'child answer',
+    }));
+  });
+
+  it('routes child part.updated events by event-level sessionId when the part lacks sessionId', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_event_session_task';
+    const childSessionId = 'ses_event_session_child';
+    const childTextId = 'prt_event_session_text';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'spawn child', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_event_session_task',
+          callId: taskCallId,
+          state: {
+            status: 'running',
+            input: { description: 'event session', prompt: 'answer in child', subagent_type: 'explore' },
+            title: 'event session',
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      },
+      { type: 'session.created', sessionId: childSessionId, parentId: 'test-session', title: 'event session child' },
+      {
+        type: 'part.updated',
+        sessionId: childSessionId,
+        part: { type: 'text', text: '', messageId: 'child_assistant', id: childTextId },
+      },
+      { type: 'part.delta', sessionId: childSessionId, partId: childTextId, delta: 'child only', field: 'text' },
+      {
+        type: 'part.updated',
+        sessionId: childSessionId,
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_event_session_read',
+          callId: 'call_event_session_read',
+          state: {
+            status: 'completed',
+            input: { filePath: '/child.ts' },
+            output: 'content',
+            title: 'child.ts',
+          },
+        },
+      },
+      idleEventFor(childSessionId),
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_event_session_task',
+          callId: taskCallId,
+          state: {
+            status: 'completed',
+            input: { description: 'event session', prompt: 'answer in child', subagent_type: 'explore' },
+            output: '<task_result>child only</task_result>',
+            title: 'event session',
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      },
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    expect(stream.markdown).not.toHaveBeenCalledWith('child only');
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as {
+        toolName?: string;
+        toolCallId?: string;
+        subAgentInvocationId?: string;
+        isComplete?: boolean;
+        toolSpecificData?: { result?: string };
+      });
+    const childReadPart = pushed
+      .find(part => part.toolName === 'read' && part.toolCallId === 'call_event_session_read');
+    const subagentPart = pushed
+      .find(part => part.toolName === 'task' && part.toolCallId === taskCallId && part.isComplete === true);
+
+    expect(childReadPart?.subAgentInvocationId).toBe(taskCallId);
+    expect(subagentPart?.toolSpecificData?.result).toBe('child only');
   });
 
   it('mock vscode full chain persists child session flow through bridge, SSS, SubSSS, and SSP', async () => {
@@ -642,12 +828,12 @@ describe('OpenCodeBridge', () => {
           type: 'part.updated',
           part: { type: 'reasoning', text: '', messageId: 'child_assistant', id: childReasoningId, sessionId: childSessionId },
         },
-        { type: 'part.delta', partId: childReasoningId, delta: 'child thought', field: 'text' },
+        { type: 'part.delta', sessionId: childSessionId, partId: childReasoningId, delta: 'child thought', field: 'text' },
         {
           type: 'part.updated',
           part: { type: 'text', text: '', messageId: 'child_assistant', id: childTextId, sessionId: childSessionId },
         },
-        { type: 'part.delta', partId: childTextId, delta: 'child answer', field: 'text' },
+        { type: 'part.delta', sessionId: childSessionId, partId: childTextId, delta: 'child answer', field: 'text' },
         permissionAskedEvent({
           sessionId: childSessionId,
           permissionId: 'perm_child_full_chain_write',
@@ -692,8 +878,8 @@ describe('OpenCodeBridge', () => {
       await sss.flush();
 
       expect(stream.markdown).not.toHaveBeenCalledWith('child user echo');
-      expect(stream.thinkingProgress).toHaveBeenCalledWith({ text: 'child thought', id: childReasoningId });
-      expect(stream.markdown).toHaveBeenCalledWith('child answer');
+      expect(stream.thinkingProgress).not.toHaveBeenCalledWith({ text: 'child thought', id: childReasoningId });
+      expect(stream.markdown).not.toHaveBeenCalledWith('child answer');
       expect(stream.externalEdit).toHaveBeenCalledTimes(1);
       expect(permissions.reply).toHaveBeenCalledWith(childSessionId, 'perm_child_full_chain_write', 'once', tmpDir);
 
@@ -715,6 +901,14 @@ describe('OpenCodeBridge', () => {
         'assistantText',
         'externalEdit',
       ]));
+      expect(rawSubRecords.some(record =>
+        record.kind === 'reasoning' &&
+        (record.payload as { text?: string }).text === 'child thought',
+      )).toBe(true);
+      expect(rawSubRecords.some(record =>
+        record.kind === 'assistantText' &&
+        (record.payload as { text?: string }).text === 'child answer',
+      )).toBe(true);
       expect(rawSubRecords.every(record => record.meta.subAgentInvocationId === sub.subAgentInvocationId)).toBe(true);
       expect(rawSubRecords[0]?.meta.sequence).toBe(0);
       expect(rootRecords[0]?.meta.sequence).toBe(0);
@@ -839,19 +1033,175 @@ describe('OpenCodeBridge', () => {
 
     await runBridge(bridge, events, stream, mockToken());
 
-    const beginCalls = (stream.beginToolInvocation as ReturnType<typeof vi.fn>).mock.calls;
-    const firstScopeId = (beginCalls.find((call: unknown[]) => call[0] === firstCallId)?.[2] as { subagentInvocationId?: string } | undefined)
-      ?.subagentInvocationId;
-    const secondScopeId = (beginCalls.find((call: unknown[]) => call[0] === secondCallId)?.[2] as { subagentInvocationId?: string } | undefined)
-      ?.subagentInvocationId;
-    const secondReadPart = (stream.push as ReturnType<typeof vi.fn>).mock.calls
-      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; subAgentInvocationId?: string })
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; subAgentInvocationId?: string });
+    const firstScopeId = pushed
+      .find(part => part.toolName === 'task' && part.toolCallId === firstCallId)
+      ?.toolCallId;
+    const secondScopeId = pushed
+      .find(part => part.toolName === 'task' && part.toolCallId === secondCallId)
+      ?.toolCallId;
+    const secondReadPart = pushed
       .find(part => part.toolName === 'read' && part.toolCallId === 'call_parallel_read_b');
 
     expect(firstScopeId).toBeDefined();
     expect(secondScopeId).toBeDefined();
     expect(secondScopeId).not.toBe(firstScopeId);
     expect(secondReadPart?.subAgentInvocationId).toBe(secondScopeId);
+  });
+
+  it('buffers real child session events until parent task metadata binds the matching scope', async () => {
+    const stream = mockStream();
+    const firstCallId = 'call_real_parallel_a';
+    const secondCallId = 'call_real_parallel_b';
+    const firstSessionId = 'ses_real_parallel_a';
+    const secondSessionId = 'ses_real_parallel_b';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'parallel real flow', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_real_parallel_a',
+          callId: firstCallId,
+          state: {
+            status: 'running',
+            input: { description: 'first', prompt: 'read a', subagent_type: 'explore' },
+            title: 'first',
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_real_parallel_b',
+          callId: secondCallId,
+          state: {
+            status: 'running',
+            input: { description: 'second', prompt: 'read b', subagent_type: 'explore' },
+            title: 'second',
+          },
+        },
+      },
+      { type: 'session.created', sessionId: secondSessionId, parentId: 'test-session', title: 'second child' },
+      { type: 'session.created', sessionId: firstSessionId, parentId: 'test-session', title: 'first child' },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_real_parallel_read_b',
+          callId: 'call_real_parallel_read_b',
+          sessionId: secondSessionId,
+          state: {
+            status: 'completed',
+            input: { filePath: '/b.ts' },
+            output: 'b',
+            title: 'b.ts',
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_real_parallel_b',
+          callId: secondCallId,
+          state: {
+            status: 'running',
+            input: { description: 'second', prompt: 'read b', subagent_type: 'explore' },
+            title: 'second',
+            metadata: { parentSessionId: 'test-session', sessionId: secondSessionId },
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_real_parallel_a',
+          callId: firstCallId,
+          state: {
+            status: 'running',
+            input: { description: 'first', prompt: 'read a', subagent_type: 'explore' },
+            title: 'first',
+            metadata: { parentSessionId: 'test-session', sessionId: firstSessionId },
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_real_parallel_read_a',
+          callId: 'call_real_parallel_read_a',
+          sessionId: firstSessionId,
+          state: {
+            status: 'completed',
+            input: { filePath: '/a.ts' },
+            output: 'a',
+            title: 'a.ts',
+          },
+        },
+      },
+      idleEventFor(firstSessionId),
+      idleEventFor(secondSessionId),
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_real_parallel_a',
+          callId: firstCallId,
+          state: {
+            status: 'completed',
+            input: { description: 'first', prompt: 'read a', subagent_type: 'explore' },
+            output: 'first done',
+            title: 'first',
+            metadata: { parentSessionId: 'test-session', sessionId: firstSessionId },
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_real_parallel_b',
+          callId: secondCallId,
+          state: {
+            status: 'completed',
+            input: { description: 'second', prompt: 'read b', subagent_type: 'explore' },
+            output: 'second done',
+            title: 'second',
+            metadata: { parentSessionId: 'test-session', sessionId: secondSessionId },
+          },
+        },
+      },
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; subAgentInvocationId?: string });
+    const firstTaskPart = pushed.find(part => part.toolName === 'task' && part.toolCallId === firstCallId);
+    const secondTaskPart = pushed.find(part => part.toolName === 'task' && part.toolCallId === secondCallId);
+    const firstReadPart = pushed.find(part => part.toolName === 'read' && part.toolCallId === 'call_real_parallel_read_a');
+    const secondReadPart = pushed.find(part => part.toolName === 'read' && part.toolCallId === 'call_real_parallel_read_b');
+
+    expect(firstTaskPart?.subAgentInvocationId).toBeUndefined();
+    expect(secondTaskPart?.subAgentInvocationId).toBeUndefined();
+    expect(firstReadPart?.subAgentInvocationId).toBe(firstCallId);
+    expect(secondReadPart?.subAgentInvocationId).toBe(secondCallId);
   });
 
   it('should not filter events when no subagent is active', async () => {
@@ -890,7 +1240,7 @@ describe('OpenCodeBridge', () => {
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
     const errorPart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; isComplete?: boolean };
-      return p?.toolName === 'subagent' && p?.isComplete === true;
+      return p?.toolName === 'task' && p?.isComplete === true;
     });
     expect(errorPart).toBeDefined();
   });
@@ -928,7 +1278,7 @@ describe('OpenCodeBridge', () => {
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
     const taskPart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean };
-      return p?.toolName === 'subagent' && p?.isComplete === true;
+      return p?.toolName === 'task' && p?.isComplete === true;
     });
     expect(taskPart).toBeDefined();
   });

@@ -39,6 +39,7 @@ export interface SerializableStreamPartMeta {
   toolCallId?: string;
   editId?: string;
   uri?: string;
+  sessionId?: string;
   subAgentInvocationId?: string;
   parentSubAgentInvocationId?: string;
   subAgentPath?: string[];
@@ -92,6 +93,7 @@ export interface UserPromptStreamPartPayload {
   text: string;
   partId?: string;
   messageId?: string;
+  sessionId?: string;
   command?: string;
 }
 
@@ -99,6 +101,7 @@ export interface AssistantTextStreamPartPayload {
   partId: string;
   text: string;
   messageId?: string;
+  sessionId?: string;
   synthetic?: boolean;
 }
 
@@ -106,18 +109,21 @@ export interface AssistantTextDeltaStreamPartPayload {
   partId: string;
   delta: string;
   field?: string;
+  sessionId?: string;
 }
 
 export interface ReasoningStreamPartPayload {
   partId: string;
   text: string;
   messageId?: string;
+  sessionId?: string;
 }
 
 export interface ReasoningDeltaStreamPartPayload {
   partId: string;
   delta: string;
   field?: string;
+  sessionId?: string;
 }
 
 export interface SerializableToolState {
@@ -152,6 +158,7 @@ export interface QuestionStreamPartPayload {
 export interface SessionLifecycleStreamPartPayload {
   eventType: 'session.created' | 'session.updated' | 'session.deleted' | 'session.error' | 'session.idle' | 'session.status' | 'server.connected' | 'server.heartbeat';
   sessionId?: string;
+  parentId?: string;
   title?: string;
   error?: string;
   status?: unknown;
@@ -273,6 +280,7 @@ export abstract class SerializableStreamPart<
       toolCallId: meta?.toolCallId,
       editId: meta?.editId,
       uri: meta?.uri,
+      sessionId: meta?.sessionId,
       subAgentInvocationId: meta?.subAgentInvocationId,
       parentSubAgentInvocationId: meta?.parentSubAgentInvocationId,
       subAgentPath: meta?.subAgentPath,

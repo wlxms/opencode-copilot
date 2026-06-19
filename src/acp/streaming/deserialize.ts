@@ -369,13 +369,23 @@ export function createSSPFromRecord(
       return new UserPromptSSP(payload as never, record.meta, record.id);
 
     case 'assistantText': {
-      const p = payload as { partId: string; text: string; messageId?: string };
-      return new AssistantTextSSP({ partId: p.partId, delta: p.text, messageId: p.messageId }, record.meta, record.id);
+      const p = payload as { partId: string; text: string; messageId?: string; sessionId?: string };
+      return new AssistantTextSSP({
+        partId: p.partId,
+        delta: p.text,
+        messageId: p.messageId,
+        sessionId: p.sessionId ?? record.meta.sessionId,
+      }, record.meta, record.id);
     }
 
     case 'reasoning': {
-      const p = payload as { partId: string; text: string; messageId?: string };
-      return new ReasoningSSP({ partId: p.partId, delta: p.text, messageId: p.messageId }, record.meta, record.id);
+      const p = payload as { partId: string; text: string; messageId?: string; sessionId?: string };
+      return new ReasoningSSP({
+        partId: p.partId,
+        delta: p.text,
+        messageId: p.messageId,
+        sessionId: p.sessionId ?? record.meta.sessionId,
+      }, record.meta, record.id);
     }
 
     case 'toolInvocation':

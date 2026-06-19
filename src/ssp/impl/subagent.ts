@@ -102,6 +102,22 @@ export class SubagentManager {
 
   getScope(callId: string): SubagentScope | undefined { return this.scopes.get(callId); }
 
+  listScopes(): SubagentScope[] { return [...this.scopes.values()]; }
+
+  findScopeBySubAgentInvocationId(subAgentInvocationId: string): SubagentScope | undefined {
+    return this.listScopes().find(scope => scope.subAgentInvocationId === subAgentInvocationId);
+  }
+
+  findScopeForSession(sessionId: string): SubagentScope | undefined {
+    for (const scope of this.scopes.values()) {
+      if (scope.childSessionId === sessionId) return scope;
+    }
+    for (const scope of this.scopes.values()) {
+      if (scope.descendantSessionIds.has(sessionId)) return scope;
+    }
+    return undefined;
+  }
+
   hasBusyDescendant(): boolean {
     for (const scope of this.scopes.values()) {
       if (!scope.completed || !scope.childIdle) { return true; }
@@ -110,7 +126,7 @@ export class SubagentManager {
   }
 
   generateSubAgentInvocationId(callId: string): string {
-    return `subagent-${callId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    return callId;
   }
 
   getProgressSummary(callId: string): string {

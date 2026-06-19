@@ -7,7 +7,7 @@
 
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import type { SspStream } from '../../ssp/types';
+import type { AnySerializableStreamPart, SspStream } from '../../ssp/types';
 import { SessionStreamNodeBase } from './session-stream-node';
 import type { SessionStreamNodeConfig } from './session-stream-node';
 
@@ -69,6 +69,10 @@ export class SubsessionStream extends SessionStreamNodeBase<SubsessionStream> {
     if (this.subDir) {
       await fs.mkdir(this.subDir, { recursive: true });
     }
+  }
+
+  protected override shouldRender(ssp: AnySerializableStreamPart): boolean {
+    return ssp.kind !== 'assistantText' && ssp.kind !== 'reasoning';
   }
 
   protected override appendMeta(data: Record<string, unknown>): void {
