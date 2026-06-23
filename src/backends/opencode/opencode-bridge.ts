@@ -66,14 +66,36 @@ function isSubagentProgressTitleUpdate(state: Partial<AcpToolState>): boolean {
   return keys.length === 1 && keys[0] === 'title' && typeof state.title === 'string';
 }
 
-function isIgnoredTextPart(part: AcpTextPart): boolean {
-  return part.ignored === true || isOpenCodeInternalUserNotice(part.text);
+interface SystemNotice {
+  title: string;
+  output: string;
 }
 
-function isOpenCodeInternalUserNotice(text: string | undefined): boolean {
-  const value = text?.trim();
-  if (!value) return false;
-  return value.includes('[ALL BACKGROUND TASKS COMPLETE]');
+function getSystemNotice(part: AcpTextPart): SystemNotice | undefined {
+  return getSystemNoticeFromText(part.text);
+}
+
+function getSystemNoticeFromText(text: string | undefined): SystemNotice | undefined {
+  const value = text ?? '';
+  if (!value || !hasClosedSystemReminder(value)) return undefined;
+  return {
+    title: extractBracketTitle(value) ?? 'SYSTEM REMINDER',
+    output: value,
+  };
+}
+
+function hasClosedSystemReminder(text: string): boolean {
+  return /<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/i.test(text);
+}
+
+function hasOpenSystemReminder(text: string | undefined): boolean {
+  return /<system-reminder\b[^>]*>/i.test(text ?? '');
+}
+
+function extractBracketTitle(text: string): string | undefined {
+  const match = text.match(/\[([^\]\r\n]+)\]/);
+  const title = match?.[1]?.trim();
+  return title || undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +104,7 @@ function isOpenCodeInternalUserNotice(text: string | undefined): boolean {
 
 interface BridgeLogger { appendLine(message: string): void; }
 
-type PartRouteKind = 'text' | 'reasoning' | 'ignored';
+type PartRouteKind = 'text' | 'reasoning' | 'ignored' | 'pendingSystemNotice' | 'systemNotice';
 type StreamablePartKind = 'text' | 'reasoning';
 
 interface StreamNodeState {
@@ -211,9 +233,23 @@ export class OpenCodeBridge implements AcpBridge {
       case 'text': {
         // Skip if already routed — part.updated fires again at completion
         // with the full accumulated text; deltas already rendered the content.
-        if (nodeState.partRoutes.has(part.id)) {
+        const existingRoute = nodeState.partRoutes.get(part.id);
+        if (existingRoute) {
           this.partTargets.set(part.id, target);
           this.logTag('route', `part.updated duplicate text partID=${part.id} target=${this.describeTarget(target)} action=keep-existing-route`);
+          if (existingRoute === 'pendingSystemNotice') {
+            const systemNotice = getSystemNotice(part);
+            if (systemNotice) {
+              nodeState.partRoutes.set(part.id, 'systemNotice');
+              nodeState.pendingDeltas.delete(part.id);
+              this.pushSystemNoticeTool(target, part, systemNotice, event.sessionId);
+              this.logTag('route', `text system notice completed partID=${part.id} title="${systemNotice.title}" target=${this.describeTarget(target)}`);
+            }
+            return;
+          }
+          if (existingRoute === 'ignored' || existingRoute === 'systemNotice') {
+            return;
+          }
           this.renderAssistantText(target, {
             partId: part.id,
             text: '',
@@ -223,11 +259,27 @@ export class OpenCodeBridge implements AcpBridge {
           }, `text complete partID=${part.id}`);
           return;
         }
-        if (isIgnoredTextPart(part)) {
+        const systemNotice = getSystemNotice(part);
+        if (systemNotice) {
+          nodeState.partRoutes.set(part.id, 'systemNotice');
+          this.partTargets.set(part.id, target);
+          nodeState.pendingDeltas.delete(part.id);
+          this.pushSystemNoticeTool(target, part, systemNotice, event.sessionId);
+          this.logTag('route', `text system notice partID=${part.id} title="${systemNotice.title}" target=${this.describeTarget(target)}`);
+          return;
+        }
+        if (hasOpenSystemReminder(part.text)) {
+          nodeState.partRoutes.set(part.id, 'pendingSystemNotice');
+          this.partTargets.set(part.id, target);
+          nodeState.pendingDeltas.delete(part.id);
+          this.logTag('route', `text pending system notice partID=${part.id} target=${this.describeTarget(target)}`);
+          return;
+        }
+        if (part.ignored === true) {
           nodeState.partRoutes.set(part.id, 'ignored');
           this.partTargets.set(part.id, target);
           nodeState.pendingDeltas.delete(part.id);
-          this.logTag('route', `text ignored internal partID=${part.id} messageID=${part.messageId ?? '<none>'} target=${this.describeTarget(target)}`);
+          this.logTag('route', `text ignored partID=${part.id} messageID=${part.messageId ?? '<none>'} target=${this.describeTarget(target)}`);
           return;
         }
         // User echo detection: before assistant output starts, the first text
@@ -335,8 +387,8 @@ export class OpenCodeBridge implements AcpBridge {
         sessionId: event.sessionId,
       }, `text delta partID=${event.partId}`);
       this.logTag('route', `delta rendered text partID=${event.partId} target=${this.describeTarget(target)}`);
-    } else if (kind === 'ignored') {
-      this.logTag('route', `delta ignored partID=${event.partId} target=${this.describeTarget(target)}`);
+    } else if (kind === 'ignored' || kind === 'pendingSystemNotice' || kind === 'systemNotice') {
+      this.logTag('route', `delta ignored kind=${kind} partID=${event.partId} target=${this.describeTarget(target)}`);
     } else if (event.sessionId) {
       const pending = targetState.pendingDeltas.get(event.partId) ?? [];
       pending.push(event);
@@ -389,6 +441,32 @@ export class OpenCodeBridge implements AcpBridge {
       }));
     }
     this.appendDeltaText(target, data.partId, data.text);
+  }
+
+  private pushSystemNoticeTool(
+    target: SessionStreamNode,
+    part: AcpTextPart,
+    notice: SystemNotice,
+    eventSessionId: string | undefined,
+  ): void {
+    const callId = `system-${part.id}`;
+    target.push(new ToolInvocationSSP({
+      partId: part.id,
+      toolName: 'system',
+      callId,
+      messageId: part.messageId,
+      sessionId: eventSessionId ?? part.sessionId,
+      state: {
+        status: 'completed',
+        input: { title: notice.title },
+        output: notice.output,
+        title: notice.title,
+        metadata: {
+          presentation: 'system',
+          source: 'opencode-system-reminder',
+        },
+      },
+    }));
   }
 
   private pushReasoning(

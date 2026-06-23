@@ -230,8 +230,9 @@ describe('OpenCodeBridge', () => {
     expect(stream.markdown).toHaveBeenCalledWith('assistant text');
   });
 
-  it('does not render OpenCode internal background-complete notices as root markdown', async () => {
+  it('renders closed OpenCode system reminders as standalone system tool cards', async () => {
     const stream = mockStream();
+    const noticeText = '<system-reminder>\n\n[ALL BACKGROUND TASKS COMPLETE]\n\nCompleted:\n\nbg_123: repo scan\n</system-reminder>\n\n<!-- OMO_INTERNAL_INITIATOR -->';
     const events = eventStream([
       { type: 'part.updated', part: { type: 'text', text: 'user echo', messageId: 'msg_u1', id: 'prt_u1' } },
       { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
@@ -243,7 +244,7 @@ describe('OpenCodeBridge', () => {
           type: 'text',
           id: 'prt_notice',
           messageId: 'msg_user_notice',
-          text: '[ALL BACKGROUND TASKS COMPLETE]\n\nCompleted:\n\nbg_123: repo scan',
+          text: noticeText,
           ignored: true,
         },
       },
@@ -258,9 +259,25 @@ describe('OpenCodeBridge', () => {
     expect(stream.markdown).toHaveBeenCalledWith(' still root');
     expect(stream.markdown).not.toHaveBeenCalledWith(expect.stringContaining('BACKGROUND TASKS COMPLETE'));
     expect(stream.markdown).not.toHaveBeenCalledWith('\nshould not render');
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as {
+        toolName?: string;
+        toolCallId?: string;
+        isComplete?: boolean;
+        pastTenseMessage?: string;
+        toolSpecificData?: { input?: string; output?: string };
+      });
+    const systemPart = pushed.find(part => part.toolName === 'system' && part.toolCallId === 'system-prt_notice');
+    expect(systemPart).toBeDefined();
+    expect(systemPart?.isComplete).toBe(true);
+    expect(systemPart?.pastTenseMessage).toBe('ALL BACKGROUND TASKS COMPLETE');
+    expect(systemPart?.toolSpecificData).toEqual({
+      input: 'ALL BACKGROUND TASKS COMPLETE',
+      output: noticeText,
+    });
   });
 
-  it('recognizes background-complete notices even without the ignored flag', async () => {
+  it('does not treat incomplete system-reminder text as a system tool card', async () => {
     const stream = mockStream();
     const events = eventStream([
       { type: 'part.updated', part: { type: 'text', text: 'user echo', messageId: 'msg_u1', id: 'prt_u1' } },
@@ -273,7 +290,7 @@ describe('OpenCodeBridge', () => {
           type: 'text',
           id: 'prt_notice',
           messageId: 'msg_user_notice',
-          text: '[ALL BACKGROUND TASKS COMPLETE]\n\nCompleted:\n\nbg_123: repo scan',
+          text: '<system-reminder>\n\n[ALL BACKGROUND TASKS COMPLETE]',
         },
       },
       idleEvent(),
@@ -282,7 +299,44 @@ describe('OpenCodeBridge', () => {
     await runBridge(bridge, events, stream, mockToken());
 
     expect(stream.markdown).toHaveBeenCalledWith('root answer');
-    expect(stream.markdown).not.toHaveBeenCalledWith(expect.stringContaining('BACKGROUND TASKS COMPLETE'));
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as { toolName?: string });
+    expect(pushed.some(part => part.toolName === 'system')).toBe(false);
+  });
+
+  it('renders any closed system-reminder title from the first bracketed heading', async () => {
+    const stream = mockStream();
+    const noticeText = '<system-reminder>\n\n[NEEDS USER REVIEW]\n\nCheck the background result.\n</system-reminder>';
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'user echo', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'text',
+          id: 'prt_notice_review',
+          messageId: 'msg_user_notice',
+          text: noticeText,
+        },
+      },
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    expect(stream.markdown).not.toHaveBeenCalledWith(expect.stringContaining('NEEDS USER REVIEW'));
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as {
+        toolName?: string;
+        pastTenseMessage?: string;
+        toolSpecificData?: { input?: string; output?: string };
+      });
+    const systemPart = pushed.find(part => part.toolName === 'system');
+    expect(systemPart?.pastTenseMessage).toBe('NEEDS USER REVIEW');
+    expect(systemPart?.toolSpecificData).toEqual({
+      input: 'NEEDS USER REVIEW',
+      output: noticeText,
+    });
   });
 
   it('should push read tool as ChatSimpleToolResultData', async () => {
