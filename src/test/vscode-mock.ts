@@ -419,6 +419,7 @@ export class ChatToolInvocationPart {
     subAgentInvocationId?: string;
     presentation?: 'hidden' | 'hiddenAfterComplete';
     enablePartialUpdate?: boolean;
+    isAttachedToThinking?: boolean;
 
     constructor(toolName: string, toolCallId: string, errorMessage?: string) {
         this.toolName = toolName;

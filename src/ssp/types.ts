@@ -39,7 +39,9 @@ export interface SerializableStreamPartMeta {
   toolCallId?: string;
   editId?: string;
   uri?: string;
+  subAgentId?: string;
   sessionId?: string;
+  parentSessionId?: string;
   subAgentInvocationId?: string;
   parentSubAgentInvocationId?: string;
   subAgentPath?: string[];
@@ -103,6 +105,7 @@ export interface AssistantTextStreamPartPayload {
   messageId?: string;
   sessionId?: string;
   synthetic?: boolean;
+  isComplete?: boolean;
 }
 
 export interface AssistantTextDeltaStreamPartPayload {
@@ -117,6 +120,9 @@ export interface ReasoningStreamPartPayload {
   text: string;
   messageId?: string;
   sessionId?: string;
+  thinkingId?: string;
+  metadata?: Record<string, unknown>;
+  isComplete?: boolean;
 }
 
 export interface ReasoningDeltaStreamPartPayload {
@@ -124,6 +130,8 @@ export interface ReasoningDeltaStreamPartPayload {
   delta: string;
   field?: string;
   sessionId?: string;
+  thinkingId?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface SerializableToolState {
@@ -145,6 +153,7 @@ export interface ToolInvocationStreamPartPayload {
   state: SerializableToolState;
   messageId?: string;
   sessionId?: string;
+  subAgentId?: string;
   subAgentInvocationId?: string;
 }
 
@@ -199,6 +208,8 @@ export interface ExternalEditStreamPartPayload {
   status?: 'pending' | 'completed' | 'error';
   undoStopId?: string;
   onDidComplete?: unknown;
+  subAgentId?: string;
+  subAgentInvocationId?: string;
 }
 
 export type KnownSerializableStreamPart =
@@ -237,7 +248,7 @@ export interface SspStream {
   markdown(value: string | MarkdownStringValue): void;
   progress(value: string): void;
   push(part: unknown): void;
-  thinkingProgress?(value: { text: string; id?: string } | string): void;
+  thinkingProgress?(value: { text: string; id?: string; metadata?: Record<string, unknown> } | string): void;
   beginToolInvocation?(toolCallId: string, toolName: string, streamData?: unknown): void;
   updateToolInvocation?(toolCallId: string, streamData: unknown): void;
   externalEdit?(target: unknown, callback: () => PromiseLike<unknown>): PromiseLike<string>;
@@ -280,7 +291,9 @@ export abstract class SerializableStreamPart<
       toolCallId: meta?.toolCallId,
       editId: meta?.editId,
       uri: meta?.uri,
+      subAgentId: meta?.subAgentId,
       sessionId: meta?.sessionId,
+      parentSessionId: meta?.parentSessionId,
       subAgentInvocationId: meta?.subAgentInvocationId,
       parentSubAgentInvocationId: meta?.parentSubAgentInvocationId,
       subAgentPath: meta?.subAgentPath,

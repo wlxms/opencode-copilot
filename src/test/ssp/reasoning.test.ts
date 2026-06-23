@@ -20,7 +20,14 @@ describe('ReasoningSSP', () => {
     it('should initialize with partId and delta as text', () => {
       const ssp = new ReasoningSSP({ partId: 'r1', delta: 'thinking...' });
       expect(ssp.kind).toBe('reasoning');
-      expect(ssp.payload).toEqual({ partId: 'r1', text: 'thinking...', messageId: undefined });
+      expect(ssp.payload).toEqual({
+        partId: 'r1',
+        text: 'thinking...',
+        messageId: undefined,
+        sessionId: undefined,
+        thinkingId: undefined,
+        metadata: undefined,
+      });
     });
   });
 
@@ -30,6 +37,43 @@ describe('ReasoningSSP', () => {
       const ssp = new ReasoningSSP({ partId: 'r1', delta: 'thinking...' });
       ssp.render(stream);
       expect(stream.thinkingProgress).toHaveBeenCalledWith({ text: 'thinking...', id: 'r1' });
+    });
+
+    it('should prefer thinkingId over backend partId when provided', () => {
+      const stream = mockStream();
+      const ssp = new ReasoningSSP({
+        partId: 'r1',
+        delta: 'thinking...',
+        thinkingId: 'thinking-1',
+      });
+      ssp.render(stream);
+      expect(stream.thinkingProgress).toHaveBeenCalledWith({ text: 'thinking...', id: 'thinking-1' });
+    });
+
+    it('should pass subagent metadata through thinkingProgress', () => {
+      const stream = mockStream();
+      const ssp = new ReasoningSSP(
+        { partId: 'r1', delta: 'thinking...', thinkingId: 'thinking-1' },
+        {
+          sessionId: 'ses-child',
+          parentSessionId: 'ses-parent',
+          subAgentInvocationId: 'call-subagent',
+          parentSubAgentInvocationId: 'call-parent',
+          subAgentPath: ['call-parent', 'call-subagent'],
+        },
+      );
+      ssp.render(stream);
+      expect(stream.thinkingProgress).toHaveBeenCalledWith({
+        text: 'thinking...',
+        id: 'thinking-1',
+        metadata: {
+          sessionId: 'ses-child',
+          parentSessionId: 'ses-parent',
+          subAgentInvocationId: 'call-subagent',
+          parentSubAgentInvocationId: 'call-parent',
+          subAgentPath: ['call-parent', 'call-subagent'],
+        },
+      });
     });
 
     it('should silently skip when thinkingProgress is unavailable', () => {

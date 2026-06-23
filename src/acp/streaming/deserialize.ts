@@ -379,12 +379,21 @@ export function createSSPFromRecord(
     }
 
     case 'reasoning': {
-      const p = payload as { partId: string; text: string; messageId?: string; sessionId?: string };
+      const p = payload as {
+        partId: string;
+        text: string;
+        messageId?: string;
+        sessionId?: string;
+        thinkingId?: string;
+        metadata?: Record<string, unknown>;
+      };
       return new ReasoningSSP({
         partId: p.partId,
         delta: p.text,
         messageId: p.messageId,
         sessionId: p.sessionId ?? record.meta.sessionId,
+        thinkingId: p.thinkingId,
+        metadata: p.metadata,
       }, record.meta, record.id);
     }
 

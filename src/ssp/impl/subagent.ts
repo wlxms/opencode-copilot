@@ -27,6 +27,8 @@ export interface SubagentScope {
   timeEnd?: number;
   descendantSessionIds: Set<string>;
   lastText?: string;
+  lastAssistantText?: string;
+  lastReasoningText?: string;
 }
 
 // ===========================================================================

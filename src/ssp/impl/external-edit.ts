@@ -68,6 +68,8 @@ export class ExternalEditSSP extends SerializableStreamPart<
   ) {
     super(payload, {
       ...meta,
+      subAgentId: meta?.subAgentId ?? payload.subAgentId,
+      subAgentInvocationId: meta?.subAgentInvocationId ?? payload.subAgentInvocationId,
       toolCallId: meta?.toolCallId ?? payload.toolCallId,
       editId: meta?.editId ?? payload.editId,
       uri: meta?.uri ?? payload.uri,

@@ -83,6 +83,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
 
   /** Progressive push idempotency (contract C3). */
   private _progressivePushed = false;
+  private nextRenderMode: 'updateOnly' | undefined;
 
   /** Whether this SSP has pushed a progressive (isComplete=false) part. */
   get isProgressivePushed(): boolean {
@@ -100,6 +101,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     const stableId = id ?? payload.callId ?? payload.partId;
     super(payload, {
       ...meta,
+      subAgentId: meta?.subAgentId ?? payload.subAgentId,
       sessionId: meta?.sessionId ?? payload.sessionId,
       toolCallId: meta?.toolCallId ?? payload.callId ?? payload.partId,
       sourcePartId: meta?.sourcePartId ?? payload.partId,
@@ -109,6 +111,9 @@ export class ToolInvocationSSP extends SerializableStreamPart<
 
   /** IMutableStreamPart.update — merge only, no emitStateChange */
   update(data: Partial<ToolInvocationStreamPartPayload>): void {
+    this.nextRenderMode = (
+      data as Partial<ToolInvocationStreamPartPayload> & { renderMode?: 'updateOnly' }
+    ).renderMode;
     if (data.state) {
       this.payload.state = { ...this.payload.state, ...data.state };
     }
@@ -134,13 +139,11 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     if (status === 'pending') {
       if (stream.beginToolInvocation) {
         const subAgentInvocationId = this.getEffectiveSubAgentInvocationId();
-        if (subAgentInvocationId) {
-          stream.beginToolInvocation(effectiveCallId, toolName, {
-            subagentInvocationId: subAgentInvocationId,
-          } as any);
-        } else {
-          stream.beginToolInvocation(effectiveCallId, toolName);
-        }
+        stream.beginToolInvocation(
+          effectiveCallId,
+          toolName,
+          buildAttachedToolStreamData(subAgentInvocationId),
+        );
       } else {
         stream.progress(`\u{1F527} ${toolName}...`);
       }
@@ -182,11 +185,15 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     // ★ Contract C3: subsequent running → updateToolInvocation (progressive update).
     // First running pushes a new part (isComplete=false); later running only
     // updates the invocationMessage via the streaming API — no redundant push.
+    if (this.nextRenderMode === 'updateOnly' && stream.updateToolInvocation) {
+      this.nextRenderMode = undefined;
+      this.updateToolInvocationMessage(stream, callId, toolName, state);
+      return;
+    }
+    this.nextRenderMode = undefined;
+
     if (state.status === 'running' && this._progressivePushed) {
-      const msg = this.formatInvocationMsg(toolName, input, title);
-      stream.updateToolInvocation?.(callId, {
-        invocationMessage: typeof msg === 'string' ? msg : msg.value,
-      } as any);
+      this.updateToolInvocationMessage(stream, callId, toolName, state);
       return;
     }
 
@@ -196,6 +203,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
         isError ? (state.error ?? 'Error') : undefined,
       );
       part.enablePartialUpdate = true;
+      part.isAttachedToThinking = true;
 
       // isComplete logic (trunk L1256-1259)
       const subAgentInvocationId = this.getEffectiveSubAgentInvocationId();
@@ -253,6 +261,32 @@ export class ToolInvocationSSP extends SerializableStreamPart<
   // Fallback rendering — trunk pushToolInvocationFallback L1302-1346
   // ════════════════════════════════════════════════════════════════════════
 
+  private updateToolInvocationMessage(
+    stream: SspStream,
+    callId: string,
+    toolName: string,
+    state: SerializableToolState,
+  ): void {
+    const input = state.input ?? {};
+    const title = state.title ?? '';
+    const msg = this.formatUpdateInvocationMsg(toolName, input, title);
+    stream.updateToolInvocation?.(callId, {
+      invocationMessage: typeof msg === 'string' ? msg : msg.value,
+      isAttachedToThinking: true,
+    } as any);
+  }
+
+  private formatUpdateInvocationMsg(
+    toolName: string,
+    input: Record<string, unknown>,
+    title: string,
+  ): string | vscode.MarkdownString {
+    if ((toolName === 'task' || toolName === 'subagent') && title) {
+      return title;
+    }
+    return this.formatInvocationMsg(toolName, input, title);
+  }
+
   private renderFallback(
     stream: SspStream,
     callId: string,
@@ -271,9 +305,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
         stream.beginToolInvocation(
           callId,
           toolName,
-          subAgentInvocationId
-            ? { subagentInvocationId: subAgentInvocationId } as any
-            : undefined,
+          buildAttachedToolStreamData(subAgentInvocationId),
         );
       } catch { /* ignore */ }
       return;
@@ -284,6 +316,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
         const msg = this.formatInvocationMsg(toolName, input, title);
         stream.updateToolInvocation?.(callId, {
           invocationMessage: typeof msg === 'string' ? msg : msg.value,
+          isAttachedToThinking: true,
         } as any);
       } catch { /* ignore */ }
       return;
@@ -299,6 +332,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
         stream.updateToolInvocation?.(callId, {
           pastTenseMessage: typeof pastMsg === 'string' ? pastMsg : pastMsg.value,
           invocationMessage: isError ? `✗ ${toolName}` : `✓ ${toolName}`,
+          isAttachedToThinking: true,
         } as any);
       } catch { /* ignore */ }
     }
@@ -635,4 +669,11 @@ function isTransientFileTool(toolName: string): boolean {
     || toolName === 'internal'
     || toolName === 'step-start'
     || toolName === 'step-finish';
+}
+
+function buildAttachedToolStreamData(subAgentInvocationId?: string): Record<string, unknown> {
+  return {
+    isAttachedToThinking: true,
+    ...(subAgentInvocationId ? { subagentInvocationId: subAgentInvocationId } : {}),
+  };
 }

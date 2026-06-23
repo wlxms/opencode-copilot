@@ -95,6 +95,7 @@ describe('ToolInvocationSSP', () => {
 
       const part = lastPushedPart(stream);
       expect(part).toBeDefined();
+      expect(part.isAttachedToThinking).toBe(true);
       expect(part.invocationMessage).toBeTruthy(); // has invocationMessage
       expect(String(part.invocationMessage)).toMatch(/Read.*main\.ts/i);
       // ★ CRITICAL: pastTenseMessage must NOT be set for read
@@ -118,6 +119,7 @@ describe('ToolInvocationSSP', () => {
       ssp.render(stream);
 
       const part = lastPushedPart(stream);
+      expect(part.isAttachedToThinking).toBe(true);
       expect(part.pastTenseMessage).toBeTruthy();
       expect(String(part.pastTenseMessage)).toMatch(/npm test/);
       expect(String(part.pastTenseMessage)).toMatch(/\(0\.5s\)/);
@@ -205,8 +207,37 @@ describe('ToolInvocationSSP', () => {
 
       const part = lastPushedPart(stream);
       expect(part).toBeDefined();
+      expect(part.isAttachedToThinking).toBe(true);
       expect(part.isComplete).toBe(true);
       expect(part.pastTenseMessage).toBeTruthy();
+    });
+
+    it('updateOnly should refresh an existing task without pushing a new part', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'p1',
+        toolName: 'task',
+        callId: 'c1',
+        state: toolState({
+          status: 'running',
+          input: { description: 'Fetch architecture' },
+          title: 'Fetch architecture',
+        }),
+      });
+      ssp.render(stream);
+      (stream.push as ReturnType<typeof vi.fn>).mockClear();
+
+      ssp.update({
+        state: { title: 'bash, webfetch' },
+        renderMode: 'updateOnly',
+      } as never);
+      ssp.render(stream);
+
+      expect(stream.push).not.toHaveBeenCalled();
+      expect(stream.updateToolInvocation).toHaveBeenCalledWith('c1', {
+        invocationMessage: 'bash, webfetch',
+        isAttachedToThinking: true,
+      });
     });
   });
 
@@ -301,6 +332,7 @@ describe('ToolInvocationSSP', () => {
       });
       ssp.render(stream);
       const part = lastPushedPart(stream);
+      expect(part.isAttachedToThinking).toBe(true);
       expect(part.invocationMessage).toBeUndefined();
       expect(part.pastTenseMessage).toBe('review code');
       const data = lastPushedPart(stream).toolSpecificData;
@@ -329,7 +361,9 @@ describe('ToolInvocationSSP', () => {
 
       ssp.render(stream);
 
-      expect(stream.beginToolInvocation).toHaveBeenCalledWith('c1', 'task');
+      expect(stream.beginToolInvocation).toHaveBeenCalledWith('c1', 'task', {
+        isAttachedToThinking: true,
+      });
     });
 
     it('child task pending starts VS Code task stream with parent subagent metadata', () => {
@@ -352,6 +386,7 @@ describe('ToolInvocationSSP', () => {
       ssp.render(stream);
 
       expect(stream.beginToolInvocation).toHaveBeenCalledWith('c1', 'task', {
+        isAttachedToThinking: true,
         subagentInvocationId: 'parent-call',
       });
     });
@@ -369,6 +404,7 @@ describe('ToolInvocationSSP', () => {
         state: toolState({ status: 'completed', input: { filePath: '/a.ts' }, output: '' }),
       });
       ssp.render(stream);
+      expect(lastPushedPart(stream).isAttachedToThinking).toBe(true);
       expect(lastPushedPart(stream).presentation).toBe('hiddenAfterComplete');
     });
 
@@ -379,6 +415,7 @@ describe('ToolInvocationSSP', () => {
         state: toolState({ status: 'completed', input: { command: 'ls' }, output: 'files' }),
       });
       ssp.render(stream);
+      expect(lastPushedPart(stream).isAttachedToThinking).toBe(true);
       expect(lastPushedPart(stream).presentation).toBeUndefined();
     });
   });
@@ -401,6 +438,7 @@ describe('ToolInvocationSSP', () => {
       });
       ssp.render(stream);
       const part = lastPushedPart(stream);
+      expect(part.isAttachedToThinking).toBe(true);
       expect(part.isError).toBe(true);
       expect(part.pastTenseMessage).toBeTruthy();
     });

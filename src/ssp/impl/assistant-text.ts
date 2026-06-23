@@ -19,7 +19,7 @@ export class AssistantTextSSP extends SerializableStreamPart<
   readonly kind = 'assistantText' as const;
 
   constructor(
-    payload: { partId: string; delta: string; messageId?: string; sessionId?: string },
+    payload: { partId: string; delta: string; messageId?: string; sessionId?: string; isComplete?: boolean },
     meta?: Partial<SerializableStreamPartMeta>,
     id?: string,
   ) {
@@ -28,6 +28,7 @@ export class AssistantTextSSP extends SerializableStreamPart<
       text: payload.delta,
       messageId: payload.messageId,
       sessionId: payload.sessionId,
+      isComplete: payload.isComplete,
     }, {
       ...meta,
       sessionId: meta?.sessionId ?? payload.sessionId,

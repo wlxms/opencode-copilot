@@ -112,10 +112,16 @@ export class CollectorStream {
   /**
    * Begin a tool invocation — creates a ChatToolInvocationPart and pushes it.
    */
-  beginToolInvocation(callId: string, toolName: string): void {
+  beginToolInvocation(callId: string, toolName: string, data?: { subagentInvocationId?: string; isAttachedToThinking?: boolean }): void {
     const ToolPart = (vscode as any).ChatToolInvocationPart;
     if (ToolPart) {
       const tp = new ToolPart(toolName, callId);
+      if (data?.subagentInvocationId) {
+        tp.subAgentInvocationId = data.subagentInvocationId;
+      }
+      if (data?.isAttachedToThinking !== undefined) {
+        tp.isAttachedToThinking = data.isAttachedToThinking;
+      }
       this.toolParts.set(callId, tp);
       // Use push() for deduplication by callId
       this.push(tp);
@@ -125,9 +131,12 @@ export class CollectorStream {
   /**
    * Update an active tool invocation — sets fields on the tracked part.
    */
-  updateToolInvocation(callId: string, data: { partialInput?: Record<string, unknown>; invocationMessage?: string }): void {
+  updateToolInvocation(callId: string, data: { partialInput?: Record<string, unknown>; invocationMessage?: string; isAttachedToThinking?: boolean }): void {
     const tp = this.toolParts.get(callId);
     if (tp) {
+      if (data.isAttachedToThinking !== undefined) {
+        tp.isAttachedToThinking = data.isAttachedToThinking;
+      }
       if (data.invocationMessage !== undefined) {
         tp.invocationMessage = data.invocationMessage;
         tp.isComplete = true;

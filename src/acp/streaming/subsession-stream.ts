@@ -9,13 +9,15 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import type { AnySerializableStreamPart, SspStream } from '../../ssp/types';
 import { SessionStreamNodeBase } from './session-stream-node';
-import type { SessionStreamNodeConfig } from './session-stream-node';
+import type { SessionStreamNodeConfig, SessionStreamScheduler } from './session-stream-node';
 
 export interface SubsessionStreamConfig {
   turnIndex: number;
   requestId: string;
+  parentSessionId?: string;
   parentSubAgentInvocationId?: string;
   subAgentPath?: string[];
+  scheduler?: SessionStreamScheduler;
 }
 
 export class SubsessionStream extends SessionStreamNodeBase<SubsessionStream> {
@@ -31,9 +33,11 @@ export class SubsessionStream extends SessionStreamNodeBase<SubsessionStream> {
     const nodeConfig: SessionStreamNodeConfig = {
       turnIndex: config.turnIndex,
       requestId: config.requestId,
+      parentSessionId: config.parentSessionId,
       subAgentInvocationId,
       parentSubAgentInvocationId: config.parentSubAgentInvocationId,
       subAgentPath,
+      scheduler: config.scheduler,
     };
     const subDir = parentDir ? path.join(parentDir, 'subsessions', subAgentInvocationId) : null;
     super(stream, nodeConfig, {
@@ -59,8 +63,10 @@ export class SubsessionStream extends SessionStreamNodeBase<SubsessionStream> {
       {
         turnIndex: this.config.turnIndex,
         requestId: this.config.requestId,
+        parentSessionId: this.config.parentSessionId,
         parentSubAgentInvocationId: this.subAgentInvocationId,
         subAgentPath: [...(this.config.subAgentPath ?? [this.subAgentInvocationId]), subAgentInvocationId],
+        scheduler: this.scheduler,
       },
     );
   }

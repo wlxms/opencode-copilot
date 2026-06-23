@@ -136,6 +136,8 @@ export class AcpRenderer {
   // Rendering state
   private userMessageId: string | null = null;
   private partKinds: Map<string, PartKind> = new Map();
+  private capturedSubagentPartKinds: Map<string, PartKind> = new Map();
+  private capturedSubagentPartText: Map<string, string> = new Map();
   private toolCallIds: Map<string, string> = new Map();
   private toolMetas: Map<string, ToolMeta> = new Map();
   private assistantPhaseStarted = false;
@@ -179,9 +181,12 @@ export class AcpRenderer {
 
     // Filter subagent-internal events: suppress rendering, capture for progress summary
     if (this.isSubagentInternalEvent(evt)) {
+      this.log(`route capture-subagent ${describeRendererEvent(evt)}`);
       this.captureSubagentEvent(evt, s);
       return { rendered: false, eventType: evt.type };
     }
+
+    this.log(`route root ${describeRendererEvent(evt)}`);
 
     switch (evt.type) {
       case 'part.updated':
@@ -265,6 +270,7 @@ export class AcpRenderer {
   private handlePartUpdated(evt: AcpPartUpdatedEvent, stream: Stream): boolean {
     const part = evt.part;
     if (!part) {return false;}
+    this.log(`part.updated handling ${describeRendererPart(part)} eventSession=${evt.sessionId ?? '<none>'}`);
 
     switch (part.type) {
       case 'text': {
@@ -283,6 +289,7 @@ export class AcpRenderer {
         // Register assistant text parts
         if (msgId !== this.userMessageId || !this.userMessageId) {
           this.partKinds.set(textPart.id, 'text');
+          this.log(`text registered partID=${textPart.id} messageID=${msgId ?? '<none>'}`);
         }
         return false;
       }
@@ -291,6 +298,7 @@ export class AcpRenderer {
         this.assistantPhaseStarted = true;
         const reasoningPart = part;
         this.partKinds.set(reasoningPart.id, 'reasoning');
+        this.log(`reasoning registered partID=${reasoningPart.id} messageID=${reasoningPart.messageId ?? '<none>'} sessionID=${reasoningPart.sessionId ?? evt.sessionId ?? '<none>'}`);
         return false;
       }
 
@@ -298,6 +306,7 @@ export class AcpRenderer {
         this.assistantPhaseStarted = true;
         const toolPart = part;
         this.partKinds.set(toolPart.id, 'tool');
+        this.log(`tool registered partID=${toolPart.id} callID=${toolPart.callId ?? toolPart.id} tool=${toolPart.toolName} status=${toolPart.state?.status ?? '<none>'}`);
         return this.handleToolState(toolPart, stream);
       }
 
@@ -323,14 +332,17 @@ export class AcpRenderer {
     const delta = evt.delta;
     if (!delta) {return false;}
     const kind = this.partKinds.get(partID);
+    this.log(`delta handling partID=${partID} kind=${kind ?? '<unrouted>'} sessionID=${evt.sessionId ?? '<none>'} text="${previewRendererText(delta)}"`);
 
     if (kind === 'reasoning') {
       if (this._hasThinking && stream.thinkingProgress) {
         stream.thinkingProgress({ text: delta, id: partID });
+        this.log(`delta rendered thinkingProgress partID=${partID}`);
         return true;
       }
     } else if (kind === 'text') {
       stream.markdown(delta);
+      this.log(`delta rendered markdown partID=${partID}`);
       return true;
     }
 
@@ -396,7 +408,7 @@ export class AcpRenderer {
     });
 
     if (this._hasToolUI && stream.beginToolInvocation) {
-      stream.beginToolInvocation(callID, toolName);
+      stream.beginToolInvocation(callID, toolName, buildAttachedToolStreamData());
     } else {
       stream.progress(`\u{1F527} ${toolName}...`);
     }
@@ -444,6 +456,7 @@ export class AcpRenderer {
 
     stream.updateToolInvocation(callID, {
       partialInput: state.input ?? {},
+      isAttachedToThinking: true,
     });
 
     // Progressive push: show a "tool running" spinner in the UI.
@@ -461,6 +474,7 @@ export class AcpRenderer {
           part.isComplete = false;
           part.isError = false;
           part.enablePartialUpdate = true;
+          part.isAttachedToThinking = true;
           const input = state.input ?? {};
           const title = getToolTitle(state) ?? toolName;
           part.invocationMessage = title;
@@ -527,7 +541,9 @@ export class AcpRenderer {
           const title = (input.description as string) ?? getToolTitle(state) ?? toolName;
           stream.updateToolInvocation(callID, {
             invocationMessage: `Running ${title}...`,
+            isAttachedToThinking: true,
           });
+          this.log(`subagent running update callID=${callID} title="${previewRendererText(title)}"`);
         } catch { /* best-effort */ }
       }
     } else {
@@ -599,6 +615,7 @@ export class AcpRenderer {
       const timeEnd = state.endTime ?? meta?.timeEnd;
 
       const part = new Ctor(toolName, callID);
+      part.isAttachedToThinking = true;
 
       if (isError) {
         part.isError = true;
@@ -673,15 +690,29 @@ export class AcpRenderer {
       const part = evt.part;
       if (!part) {return false;}
       // Structural parent parts are never subagent-internal
-      if (part.type === 'reasoning' ||
-          part.type === 'step-start' || part.type === 'step-finish') {
+      if (part.type === 'step-start' || part.type === 'step-finish') {
         return false;
+      }
+      // Reasoning from a child session should be captured into the subagent
+      // card, not emitted as a root thinkingProgress sequence.
+      if (part.type === 'reasoning') {
+        const captured = !!part.sessionId && this.findSubagentScopeForSession(part.sessionId) !== undefined;
+        if (captured) {
+          this.capturedSubagentPartKinds.set(part.id, 'reasoning');
+        }
+        this.log(`route decision reasoning partID=${part.id} sessionID=${part.sessionId ?? '<none>'} captured=${captured}`);
+        return captured;
       }
       // Text: subagent-internal if not already tracked as a parent part.
       // This prevents subagent LLM text from being rendered inline;
-      // instead it's collected as scope.lastText for the completion summary.
+      // instead it's collected as scope.lastAssistantText for the final result.
       if (part.type === 'text') {
-        return !this.partKinds.has(part.id);
+        const captured = !this.partKinds.has(part.id);
+        if (captured) {
+          this.capturedSubagentPartKinds.set(part.id, 'text');
+        }
+        this.log(`route decision text partID=${part.id} sessionID=${part.sessionId ?? '<none>'} captured=${captured}`);
+        return captured;
       }
       // Parent-level task/subagent tool invocations are NOT subagent-internal.
       // Without this, a second parallel task tool would be captured instead of rendered.
@@ -690,13 +721,20 @@ export class AcpRenderer {
         if (toolName === 'task' || toolName === 'subagent') {return false;}
       }
       if (this.partKinds.has(part.id)) {return false;}
+      this.log(`route decision tool/internal partID=${part.id} type=${part.type} sessionID=${part.sessionId ?? '<none>'} captured=true`);
       return true;
     }
 
     if (evt.type === 'part.delta') {
+      if (evt.sessionId && this.findSubagentScopeForSession(evt.sessionId)) {
+        this.log(`route decision delta partID=${evt.partId} sessionID=${evt.sessionId} captured=true reason=session-scope`);
+        return true;
+      }
       const partId = evt.partId;
       if (partId && this.partKinds.has(partId)) {return false;}
-      return !!partId;
+      const captured = !!partId;
+      this.log(`route decision delta partID=${partId ?? '<none>'} sessionID=${evt.sessionId ?? '<none>'} captured=${captured} reason=${partId ? 'untracked-part' : 'no-part'}`);
+      return captured;
     }
 
     return false;
@@ -716,8 +754,9 @@ export class AcpRenderer {
     const timeStart = meta?.timeStart;
     const timeEnd = scope.timeEnd;
     const progress = formatSubagentProgress(scope);
-    // Use lastText as summary if available, otherwise fall back to progress + output
-    const lastText = scope.lastText?.trim();
+    // Use the last assistant markdown text as the subagent result. Reasoning is
+    // captured separately so it cannot overwrite the visible answer.
+    const lastText = scope.lastAssistantText?.trim();
     const result = lastText
       ? lastText
       : (progress ? [progress, output].filter(Boolean).join('\n') : output);
@@ -728,7 +767,10 @@ export class AcpRenderer {
       let msg = `Subagent finished — ${completedCount} tool${completedCount !== 1 ? 's' : ''}`;
       if (progress) {msg += ` (${progress})`;}
       try {
-        stream.updateToolInvocation(scope.callId, { invocationMessage: msg });
+        stream.updateToolInvocation(scope.callId, {
+          invocationMessage: msg,
+          isAttachedToThinking: true,
+        });
       } catch { /* best-effort */ }
     }
 
@@ -740,6 +782,7 @@ export class AcpRenderer {
           const part = new Ctor(toolName, scope.callId);
           part.enablePartialUpdate = true;
           part.isComplete = true;
+          part.isAttachedToThinking = true;
           // Parent subagent card must NOT have subAgentInvocationId.
           // VSCode groups child tools under the parent by matching
           // child.subAgentInvocationId === parent.toolCallId (= scope.callId).
@@ -790,16 +833,24 @@ export class AcpRenderer {
     if (evt.type === 'part.delta') {
       const delta = evt.delta;
       if (delta) {
-        for (const scope of this.activeSubagentScopes.values()) {
-          const currentText = (scope.lastText ?? '') + delta;
+        const scopes = evt.sessionId
+          ? this.matchingSubagentScopesForSession(evt.sessionId)
+          : [...this.activeSubagentScopes.values()];
+        const currentText = evt.partId
+          ? (this.capturedSubagentPartText.get(evt.partId) ?? '') + delta
+          : delta;
+        if (evt.partId) {
+          this.capturedSubagentPartText.set(evt.partId, currentText);
+        }
+        const kind = evt.partId ? this.capturedSubagentPartKinds.get(evt.partId) : undefined;
+        for (const scope of scopes) {
           scope.lastText = currentText;
-          if (stream && this._hasToolUI && stream.updateToolInvocation) {
-            try {
-              stream.updateToolInvocation(scope.callId, {
-                invocationMessage: truncate(currentText, 200),
-              });
-            } catch { /* best-effort */ }
+          if (kind === 'text') {
+            scope.lastAssistantText = currentText;
+          } else if (kind === 'reasoning') {
+            scope.lastReasoningText = currentText;
           }
+          this.log(`subagent captured delta callID=${scope.callId} sessionID=${evt.sessionId ?? '<none>'} text="${previewRendererText(currentText)}"`);
         }
       }
       return;
@@ -809,19 +860,23 @@ export class AcpRenderer {
     const part = evt.part;
     if (!part) {return;}
 
-    // Collect text output from subagent and push to subagent card
-    if (part.type === 'text') {
+    // Collect text/reasoning output from subagent and push to subagent card
+    if (part.type === 'text' || part.type === 'reasoning') {
+      this.capturedSubagentPartKinds.set(part.id, part.type);
       const text = part.text;
       if (text && text.trim().length > 0) {
-        for (const scope of this.activeSubagentScopes.values()) {
+        this.capturedSubagentPartText.set(part.id, text);
+        const scopes = part.sessionId
+          ? this.matchingSubagentScopesForSession(part.sessionId)
+          : [...this.activeSubagentScopes.values()];
+        for (const scope of scopes) {
           scope.lastText = text;
-          if (stream && this._hasToolUI && stream.updateToolInvocation) {
-            try {
-              stream.updateToolInvocation(scope.callId, {
-                invocationMessage: truncate(text, 200),
-              });
-            } catch { /* best-effort */ }
+          if (part.type === 'text') {
+            scope.lastAssistantText = text;
+          } else {
+            scope.lastReasoningText = text;
           }
+          this.log(`subagent captured ${part.type} callID=${scope.callId} sessionID=${part.sessionId ?? '<none>'} text="${previewRendererText(text)}"`);
         }
       }
       return;
@@ -873,7 +928,10 @@ export class AcpRenderer {
       const label = title ?? toolName;
       const verb = state.status === 'completed' ? '✓' : state.status === 'error' ? '✗' : '⋯';
       try {
-        stream.updateToolInvocation(matchedScope.callId, { invocationMessage: `${verb} ${toolName}: ${label}` });
+        stream.updateToolInvocation(matchedScope.callId, {
+          invocationMessage: `${verb} ${toolName}: ${label}`,
+          isAttachedToThinking: true,
+        });
       } catch { /* best-effort */ }
     }
 
@@ -891,6 +949,7 @@ export class AcpRenderer {
             if (stream.beginToolInvocation) {
               stream.beginToolInvocation(childCallId, toolName, {
                 subagentInvocationId: matchedScope.subAgentInvocationId,
+                isAttachedToThinking: true,
               } as any);
             }
             // Use pushToolInvocation for proper toolSpecificData
@@ -907,6 +966,7 @@ export class AcpRenderer {
           try {
             stream.beginToolInvocation(childCallId, toolName, {
               subagentInvocationId: matchedScope.subAgentInvocationId,
+              isAttachedToThinking: true,
             } as any);
           } catch { /* best-effort */ }
         }
@@ -925,6 +985,16 @@ export class AcpRenderer {
 
   private log(message: string): void {
     this.logger?.appendLine(`[acp-renderer] ${message}`);
+  }
+
+  private findSubagentScopeForSession(sessionId: string): SubagentScope | undefined {
+    return this.matchingSubagentScopesForSession(sessionId)[0];
+  }
+
+  private matchingSubagentScopesForSession(sessionId: string): SubagentScope[] {
+    return [...this.activeSubagentScopes.values()].filter(scope =>
+      scope.childSessionId === sessionId || scope.descendantSessionIds.has(sessionId),
+    );
   }
 }
 
@@ -1447,6 +1517,55 @@ function getToolTitle(state: AcpToolState): string | undefined {
 
 function getToolOutput(state: AcpToolState): string | undefined {
   return 'output' in state ? state.output : undefined;
+}
+
+function buildAttachedToolStreamData(subAgentInvocationId?: string): ChatToolInvocationStreamData {
+  return {
+    isAttachedToThinking: true,
+    ...(subAgentInvocationId ? { subagentInvocationId: subAgentInvocationId } : {}),
+  } as ChatToolInvocationStreamData;
+}
+
+function describeRendererEvent(event: AcpEvent): string {
+  switch (event.type) {
+    case 'part.updated':
+      return `type=part.updated eventSession=${event.sessionId ?? '<none>'} ${describeRendererPart(event.part)}`;
+    case 'part.delta':
+      return `type=part.delta sessionID=${event.sessionId ?? '<none>'} partID=${event.partId} field=${event.field ?? '<none>'} text="${previewRendererText(event.delta)}"`;
+    case 'session.created':
+    case 'session.updated':
+    case 'session.deleted':
+    case 'session.error':
+      return `type=${event.type} sessionID=${event.sessionId} parentID=${event.parentId ?? '<none>'} title="${previewRendererText(event.title)}"`;
+    case 'session.idle':
+      return `type=session.idle sessionID=${event.sessionId ?? '<none>'}`;
+    case 'session.status':
+      return `type=session.status sessionID=${event.sessionId} status=${JSON.stringify(event.status)}`;
+    case 'session.diff':
+      return `type=session.diff sessionID=${event.sessionId} files=${event.diffs.length}`;
+    case 'permission.asked':
+      return `type=permission.asked sessionID=${event.sessionId} permissionID=${event.permissionId} toolCallID=${event.tool?.callId ?? '<none>'}`;
+    case 'question.asked':
+      return `type=question.asked sessionID=${event.sessionId} questionID=${event.questionId}`;
+    default:
+      return `type=${event.type}`;
+  }
+}
+
+function describeRendererPart(part: AcpStreamPart): string {
+  if (part.type === 'tool') {
+    return `partType=tool partID=${part.id} callID=${part.callId ?? part.id} tool=${part.toolName} status=${part.state?.status ?? '<none>'} partSession=${part.sessionId ?? '<none>'} title="${previewRendererText(part.state?.title)}"`;
+  }
+  if (part.type === 'text' || part.type === 'reasoning') {
+    return `partType=${part.type} partID=${part.id} messageID=${part.messageId ?? '<none>'} partSession=${part.sessionId ?? '<none>'} text="${previewRendererText(part.text)}"`;
+  }
+  return `partType=${part.type} partID=${part.id} messageID=${part.messageId ?? '<none>'} partSession=${part.sessionId ?? '<none>'}`;
+}
+
+function previewRendererText(text: unknown, maxLen = 80): string {
+  if (text === undefined || text === null) return '';
+  const normalized = String(text).replace(/\s+/g, ' ').trim();
+  return normalized.length > maxLen ? normalized.slice(0, maxLen - 3) + '...' : normalized;
 }
 
 function getToolTime(

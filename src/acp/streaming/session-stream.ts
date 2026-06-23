@@ -12,6 +12,7 @@ import { buildLine } from '../serializable/serializer';
 import { ensureSessionDir } from './workspace-setup';
 import { SubsessionStream } from './subsession-stream';
 import { SessionStreamNodeBase } from './session-stream-node';
+import type { SessionStreamSchedulingMode } from './session-stream-node';
 import type { FileSnapshotRecord } from '../serializable/types';
 import type { SspStream } from '../../ssp/types';
 
@@ -21,6 +22,7 @@ export interface SSSConfig {
   sessionId: string;
   turnIndex: number;
   requestId: string;
+  schedulingMode?: SessionStreamSchedulingMode;
 }
 
 export class SerializableSessionStream extends SessionStreamNodeBase<SubsessionStream> {
@@ -29,16 +31,18 @@ export class SerializableSessionStream extends SessionStreamNodeBase<SubsessionS
   private headerWritten = false;
 
   constructor(stream: vscode.ChatResponseStream, config: SSSConfig) {
+    const schedulingMode = config.schedulingMode ?? getConfiguredSchedulingMode();
     super(stream as unknown as SspStream, {
       turnIndex: config.turnIndex,
       requestId: config.requestId,
+      schedulingMode,
     }, {
       dir: null,
       streamPath: null,
       metaPath: null,
     }, '[SerializableSessionStream]');
     this.rootStream = stream;
-    this.rootConfig = config;
+    this.rootConfig = { ...config, schedulingMode };
   }
 
   protected createSubsession(subAgentInvocationId: string): SubsessionStream {
@@ -49,7 +53,9 @@ export class SerializableSessionStream extends SessionStreamNodeBase<SubsessionS
       {
         turnIndex: this.rootConfig.turnIndex,
         requestId: this.rootConfig.requestId,
+        parentSessionId: this.rootConfig.sessionId,
         subAgentPath: [subAgentInvocationId],
+        scheduler: this.scheduler,
       },
     );
   }
@@ -104,6 +110,7 @@ export class SerializableSessionStream extends SessionStreamNodeBase<SubsessionS
 
   close(): void {
     if (!this.isActive) return;
+    this.flushScheduled('close');
     this.deactivate();
     this.appendStreamLine(buildLine('turn-end', {
       turnIndex: this.rootConfig.turnIndex,
@@ -139,4 +146,19 @@ async function fileHasContent(filePath: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function getConfiguredSchedulingMode(): SessionStreamSchedulingMode {
+  try {
+    const raw = vscode.workspace
+      .getConfiguration('opencode')
+      .get<string>('experimental.streamSchedulingMode', 'tool-first');
+    return isSchedulingMode(raw) ? raw : 'tool-first';
+  } catch {
+    return 'tool-first';
+  }
+}
+
+function isSchedulingMode(value: unknown): value is SessionStreamSchedulingMode {
+  return value === 'immediate' || value === 'continuous' || value === 'tool-first';
 }

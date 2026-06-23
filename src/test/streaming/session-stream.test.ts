@@ -156,6 +156,177 @@ describe('SerializableSessionStream', () => {
     expect(parts.some(p => p.kind === 'userPrompt')).toBe(true);
   });
 
+  it('immediate scheduling renders every scheduled part as it arrives', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-schedule-immediate-'));
+    const stream = mockStream();
+    const sss = new SerializableSessionStream(stream as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test-backend',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'req-0',
+      schedulingMode: 'immediate',
+    });
+    await sss.initialize();
+
+    sss.push(new AssistantTextSSP({ partId: 'm1', delta: 'markdown' }));
+    sss.push(new ToolInvocationSSP({
+      partId: 'task-1', toolName: 'task', callId: 'task-1',
+      state: toolState({ status: 'running', input: { description: 'child' } }),
+      subAgentId: 'task-1',
+    }));
+
+    const markdownOrder = stream.markdown.mock.invocationCallOrder[0];
+    const toolOrder = stream.push.mock.invocationCallOrder[0];
+    expect(markdownOrder).toBeLessThan(toolOrder);
+  });
+
+  it('continuous scheduling keeps root markdown continuous before queued subagent tools', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-schedule-continuous-'));
+    const stream = mockStream();
+    const sss = new SerializableSessionStream(stream as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test-backend',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'req-0',
+      schedulingMode: 'continuous',
+    });
+    await sss.initialize();
+
+    sss.push(new AssistantTextSSP({ partId: 'm1', delta: 'one' }));
+    sss.push(new ToolInvocationSSP({
+      partId: 'task-1', toolName: 'task', callId: 'task-1',
+      state: toolState({ status: 'running', input: { description: 'child' } }),
+      subAgentId: 'task-1',
+    }));
+    sss.push(new AssistantTextSSP({ partId: 'm1', delta: ' two' }));
+    sss.push(new ToolInvocationSSP({
+      partId: 'read-1', toolName: 'read', callId: 'read-1',
+      state: toolState({ status: 'running', input: { filePath: '/tmp/a.ts' } }),
+    }));
+
+    const secondMarkdownOrder = stream.markdown.mock.invocationCallOrder[1];
+    const taskOrder = stream.push.mock.invocationCallOrder.find((_: number, index: number) => {
+      const part = stream.push.mock.calls[index][0] as { toolCallId?: string };
+      return part.toolCallId === 'task-1';
+    });
+    const readOrder = stream.push.mock.invocationCallOrder.find((_: number, index: number) => {
+      const part = stream.push.mock.calls[index][0] as { toolCallId?: string };
+      return part.toolCallId === 'read-1';
+    });
+
+    expect(secondMarkdownOrder).toBeLessThan(taskOrder!);
+    expect(taskOrder).toBeLessThan(readOrder!);
+  });
+
+  it('tool-first scheduling renders append parts immediately while no subagent is active', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-schedule-tool-first-'));
+    const stream = mockStream();
+    const sss = new SerializableSessionStream(stream as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test-backend',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'req-0',
+      schedulingMode: 'tool-first',
+    });
+    await sss.initialize();
+
+    sss.push(new ReasoningSSP({ partId: 'r1', delta: 'thinking' }));
+    sss.push(new ToolInvocationSSP({
+      partId: 'read-1', toolName: 'read', callId: 'read-1',
+      state: toolState({ status: 'completed', input: { filePath: '/tmp/a.ts' } }),
+    }));
+
+    expect(stream.push).toHaveBeenCalledTimes(1);
+    expect(stream.thinkingProgress).toHaveBeenCalledWith(expect.objectContaining({ text: 'thinking' }));
+    expect(stream.thinkingProgress.mock.invocationCallOrder[0])
+      .toBeLessThan(stream.push.mock.invocationCallOrder[0]);
+  });
+
+  it('tool-first scheduling delays append parts only while a subagent is active', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-schedule-tool-first-active-subagent-'));
+    const stream = mockStream();
+    const sss = new SerializableSessionStream(stream as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test-backend',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'req-0',
+      schedulingMode: 'tool-first',
+    });
+    await sss.initialize();
+
+    sss.push(new ToolInvocationSSP({
+      partId: 'task-1', toolName: 'task', callId: 'task-1',
+      state: toolState({ status: 'running', input: { description: 'child' } }),
+      subAgentId: 'task-1',
+    }));
+    sss.push(new ReasoningSSP({ partId: 'r1', delta: 'thinking' }));
+
+    expect(stream.push).toHaveBeenCalledTimes(1);
+    expect(stream.thinkingProgress).not.toHaveBeenCalled();
+
+    sss.push(new ReasoningSSP({ partId: 'r1', delta: '', isComplete: true }));
+
+    expect(stream.thinkingProgress).toHaveBeenCalledWith(expect.objectContaining({ text: 'thinking' }));
+    expect(stream.push.mock.invocationCallOrder[0])
+      .toBeLessThan(stream.thinkingProgress.mock.invocationCallOrder[0]);
+  });
+
+  it('tool-first scheduling returns to immediate after the active subagent completes', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-schedule-tool-first-subagent-complete-'));
+    const stream = mockStream();
+    const sss = new SerializableSessionStream(stream as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test-backend',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'req-0',
+      schedulingMode: 'tool-first',
+    });
+    await sss.initialize();
+
+    const task = new ToolInvocationSSP({
+      partId: 'task-1', toolName: 'task', callId: 'task-1',
+      state: toolState({ status: 'running', input: { description: 'child' } }),
+      subAgentId: 'task-1',
+    });
+    sss.push(task);
+    sss.update(task.id, { state: toolState({ status: 'completed', input: {}, output: 'done' }) });
+    sss.push(new ReasoningSSP({ partId: 'r-after', delta: 'after' }));
+
+    const completedTaskOrder = stream.push.mock.invocationCallOrder[1];
+    const reasoningOrder = stream.thinkingProgress.mock.invocationCallOrder[0];
+    expect(stream.thinkingProgress).toHaveBeenCalledWith(expect.objectContaining({ text: 'after' }));
+    expect(completedTaskOrder).toBeLessThan(reasoningOrder);
+  });
+
+  it('defaults to tool-first scheduling without delaying append parts before subagents are active', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-schedule-default-tool-first-'));
+    const stream = mockStream();
+    const sss = new SerializableSessionStream(stream as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test-backend',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'req-0',
+    });
+    await sss.initialize();
+
+    sss.push(new ReasoningSSP({ partId: 'r1', delta: 'thinking' }));
+    sss.push(new ToolInvocationSSP({
+      partId: 'read-1', toolName: 'read', callId: 'read-1',
+      state: toolState({ status: 'running', input: { filePath: '/tmp/a.ts' } }),
+    }));
+
+    expect(stream.push).toHaveBeenCalledTimes(1);
+    expect(stream.thinkingProgress).toHaveBeenCalledWith(expect.objectContaining({ text: 'thinking' }));
+    expect(stream.thinkingProgress.mock.invocationCallOrder[0])
+      .toBeLessThan(stream.push.mock.invocationCallOrder[0]);
+  });
+
   // ── update ─────────────────────────────────────────────────────────────
 
   it('update merges mutable part and appends', async () => {
@@ -247,7 +418,7 @@ describe('SerializableSessionStream', () => {
     expect(restored?.metaIndex.get('meta-part-1')?.undoStopId).toBe('undo-sub-1');
   });
 
-  it('subsession persists assistant text and reasoning without rendering them to the root stream', async () => {
+  it('subsession persists reasoning and assistant text without rendering them into the root stream', async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-sub-text-'));
     const stream = mockStream();
     const sss = new SerializableSessionStream(stream as any, {
@@ -536,6 +707,63 @@ describe('createSSPFromRecord', () => {
     const ssp = createSSPFromRecord(record);
     expect(ssp.kind).toBe('assistantText');
     expect((ssp.payload as { text: string }).text).toBe('hello');
+  });
+
+  it('restores ReasoningSSP with a persisted thinking id', () => {
+    const record: StreamPartRecord = {
+      kind: 'reasoning', version: 1, id: 'ssp-reasoning',
+      payload: { partId: 'backend-reasoning-1', text: 'thinking', thinkingId: 'thinking-1' },
+      meta: { turnIndex: 0, requestId: '', sequence: 0, createdAt: '', source: 'restore' },
+    };
+    const stream = mockStream();
+
+    const ssp = createSSPFromRecord(record);
+    ssp.render(stream as never);
+
+    expect(ssp.kind).toBe('reasoning');
+    expect((ssp.payload as { thinkingId?: string }).thinkingId).toBe('thinking-1');
+    expect(stream.thinkingProgress).toHaveBeenCalledWith({ text: 'thinking', id: 'thinking-1' });
+  });
+
+  it('restores ReasoningSSP with session and subagent metadata', () => {
+    const record: StreamPartRecord = {
+      kind: 'reasoning',
+      version: 1,
+      id: 'ssp-child-reasoning',
+      payload: {
+        partId: 'backend-child-reasoning',
+        text: 'child thinking',
+        thinkingId: 'thinking-2',
+      },
+      meta: {
+        turnIndex: 0,
+        requestId: '',
+        sequence: 0,
+        createdAt: '',
+        source: 'restore',
+        sessionId: 'ses-child',
+        parentSessionId: 'ses-parent',
+        subAgentInvocationId: 'call-child',
+        parentSubAgentInvocationId: 'call-parent',
+        subAgentPath: ['call-parent', 'call-child'],
+      },
+    };
+    const stream = mockStream();
+
+    const ssp = createSSPFromRecord(record);
+    ssp.render(stream as never);
+
+    expect(stream.thinkingProgress).toHaveBeenCalledWith({
+      text: 'child thinking',
+      id: 'thinking-2',
+      metadata: {
+        sessionId: 'ses-child',
+        parentSessionId: 'ses-parent',
+        subAgentInvocationId: 'call-child',
+        parentSubAgentInvocationId: 'call-parent',
+        subAgentPath: ['call-parent', 'call-child'],
+      },
+    });
   });
 
   it('creates ToolInvocationSSP from toolInvocation record', () => {
