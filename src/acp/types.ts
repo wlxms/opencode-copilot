@@ -122,6 +122,8 @@ export interface AcpTextPart extends AcpBasePart {
   type: 'text';
   text: string;
   synthetic?: boolean;
+  ignored?: boolean;
+  metadata?: Record<string, unknown>;
 }
 
 export interface AcpReasoningPart extends AcpBasePart {

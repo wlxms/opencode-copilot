@@ -324,6 +324,7 @@ export function projectStreamPartToAcpEvent(part: SerializableStreamPart): AcpEv
           messageId: payload.messageId,
           sessionId: payload.sessionId ?? part.meta.sessionId,
           synthetic: payload.synthetic,
+          metadata: payload.metadata,
         },
       };
     }
@@ -449,6 +450,7 @@ function textPayload(part: AcpTextPart, eventSessionId?: string): AssistantTextS
     messageId: part.messageId,
     sessionId: eventSessionId ?? part.sessionId,
     synthetic: part.synthetic,
+    metadata: part.metadata,
   };
 }
 

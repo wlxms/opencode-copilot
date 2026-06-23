@@ -18,6 +18,7 @@ import type {
   AcpPermissionRequestEvent,
   AcpQuestionRequestEvent,
   AcpQuestionInfo,
+  AcpTextPart,
   AcpToolPart,
   AcpToolState,
 } from '../../acp/types';
@@ -63,6 +64,16 @@ function createExternalEditUri(filePath: string, directory?: string): unknown {
 function isSubagentProgressTitleUpdate(state: Partial<AcpToolState>): boolean {
   const keys = Object.keys(state);
   return keys.length === 1 && keys[0] === 'title' && typeof state.title === 'string';
+}
+
+function isIgnoredTextPart(part: AcpTextPart): boolean {
+  return part.ignored === true || isOpenCodeInternalUserNotice(part.text);
+}
+
+function isOpenCodeInternalUserNotice(text: string | undefined): boolean {
+  const value = text?.trim();
+  if (!value) return false;
+  return value.includes('[ALL BACKGROUND TASKS COMPLETE]');
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +223,13 @@ export class OpenCodeBridge implements AcpBridge {
           }, `text complete partID=${part.id}`);
           return;
         }
+        if (isIgnoredTextPart(part)) {
+          nodeState.partRoutes.set(part.id, 'ignored');
+          this.partTargets.set(part.id, target);
+          nodeState.pendingDeltas.delete(part.id);
+          this.logTag('route', `text ignored internal partID=${part.id} messageID=${part.messageId ?? '<none>'} target=${this.describeTarget(target)}`);
+          return;
+        }
         // User echo detection: before assistant output starts, the first text
         // message belongs to the user. Restored or user-echo-less streams may
         // begin directly with assistant text, so do not claim that id then.
@@ -317,6 +335,8 @@ export class OpenCodeBridge implements AcpBridge {
         sessionId: event.sessionId,
       }, `text delta partID=${event.partId}`);
       this.logTag('route', `delta rendered text partID=${event.partId} target=${this.describeTarget(target)}`);
+    } else if (kind === 'ignored') {
+      this.logTag('route', `delta ignored partID=${event.partId} target=${this.describeTarget(target)}`);
     } else if (event.sessionId) {
       const pending = targetState.pendingDeltas.get(event.partId) ?? [];
       pending.push(event);

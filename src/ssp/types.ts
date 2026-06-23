@@ -106,6 +106,7 @@ export interface AssistantTextStreamPartPayload {
   sessionId?: string;
   synthetic?: boolean;
   isComplete?: boolean;
+  metadata?: Record<string, unknown>;
 }
 
 export interface AssistantTextDeltaStreamPartPayload {

@@ -230,6 +230,61 @@ describe('OpenCodeBridge', () => {
     expect(stream.markdown).toHaveBeenCalledWith('assistant text');
   });
 
+  it('does not render OpenCode internal background-complete notices as root markdown', async () => {
+    const stream = mockStream();
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'user echo', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
+      deltaEvent('root answer', 'prt_ai1'),
+      {
+        type: 'part.updated',
+        part: {
+          type: 'text',
+          id: 'prt_notice',
+          messageId: 'msg_user_notice',
+          text: '[ALL BACKGROUND TASKS COMPLETE]\n\nCompleted:\n\nbg_123: repo scan',
+          ignored: true,
+        },
+      },
+      deltaEvent('\nshould not render', 'prt_notice'),
+      deltaEvent(' still root', 'prt_ai1'),
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    expect(stream.markdown).toHaveBeenCalledWith('root answer');
+    expect(stream.markdown).toHaveBeenCalledWith(' still root');
+    expect(stream.markdown).not.toHaveBeenCalledWith(expect.stringContaining('BACKGROUND TASKS COMPLETE'));
+    expect(stream.markdown).not.toHaveBeenCalledWith('\nshould not render');
+  });
+
+  it('recognizes background-complete notices even without the ignored flag', async () => {
+    const stream = mockStream();
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'user echo', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
+      deltaEvent('root answer', 'prt_ai1'),
+      {
+        type: 'part.updated',
+        part: {
+          type: 'text',
+          id: 'prt_notice',
+          messageId: 'msg_user_notice',
+          text: '[ALL BACKGROUND TASKS COMPLETE]\n\nCompleted:\n\nbg_123: repo scan',
+        },
+      },
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    expect(stream.markdown).toHaveBeenCalledWith('root answer');
+    expect(stream.markdown).not.toHaveBeenCalledWith(expect.stringContaining('BACKGROUND TASKS COMPLETE'));
+  });
+
   it('should push read tool as ChatSimpleToolResultData', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({

@@ -114,6 +114,8 @@ function normalizeStreamPart(part: StreamPart): AcpStreamPart {
         type: 'text',
         text: part.text,
         synthetic: (part).synthetic,
+        ignored: (part).ignored,
+        metadata: (part).metadata,
       };
       return text;
     }
