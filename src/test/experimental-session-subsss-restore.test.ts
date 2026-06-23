@@ -151,6 +151,136 @@ function streamRecord(
 }
 
 describe('SubSSS externalEdit restore', () => {
+  it('does not restore subagent assistant text or reasoning as root response parts', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'subsss-text-restore-'));
+    try {
+      const sessionDir = path.join(tmpDir, '.acpilot', 'opencode', 'ses_restore');
+      const childSubId = 'subagent-child-text-restore';
+      const childReadCallId = 'call-child-read-restore';
+
+      const rootRecords = [
+        streamRecord(
+          'userPrompt',
+          'userPrompt:0',
+          { text: 'restore child text' },
+          { sequence: 0, sourceType: 'part.updated', sourcePartId: 'user' },
+        ),
+        streamRecord(
+          'toolInvocation',
+          'call-root-task',
+          {
+            partId: 'part-root-task',
+            toolName: 'task',
+            callId: 'call-root-task',
+            state: {
+              status: 'completed',
+              input: { prompt: 'child text' },
+              output: 'done',
+              title: 'child agent',
+            },
+            subAgentInvocationId: childSubId,
+          },
+          { sequence: 1, sourceType: 'part.updated', sourcePartId: 'part-root-task' },
+        ),
+        streamRecord(
+          'assistantText',
+          'root-text',
+          { partId: 'root-text', text: 'root answer' },
+          { sequence: 2, sourceType: 'part.updated', sourcePartId: 'root-text' },
+        ),
+      ];
+      writeJsonl(path.join(sessionDir, 'session.jsonl'), [
+        buildLine('version', '2.0'),
+        buildLine('turn-start', { turnIndex: 0, timestamp: '2026-06-17T00:00:00.000Z' }),
+        ...rootRecords.map(record => buildLine('stream-part', record)),
+        buildLine('turn-end', { turnIndex: 0, timestamp: '2026-06-17T00:00:03.000Z' }),
+      ]);
+
+      const childDir = path.join(sessionDir, 'subsessions', childSubId);
+      const childRecords = [
+        streamRecord(
+          'reasoning',
+          'child-reasoning',
+          { partId: 'child-reasoning', text: 'child private reasoning', thinkingId: 'thinking-child' },
+          {
+            sequence: 0,
+            sourceType: 'part.updated',
+            sourcePartId: 'child-reasoning',
+            subAgentInvocationId: childSubId,
+            subAgentPath: [childSubId],
+          },
+        ),
+        streamRecord(
+          'assistantText',
+          'child-text',
+          { partId: 'child-text', text: 'child markdown answer' },
+          {
+            sequence: 1,
+            sourceType: 'part.updated',
+            sourcePartId: 'child-text',
+            subAgentInvocationId: childSubId,
+            subAgentPath: [childSubId],
+          },
+        ),
+        streamRecord(
+          'toolInvocation',
+          childReadCallId,
+          {
+            partId: 'part-child-read',
+            toolName: 'read',
+            callId: childReadCallId,
+            state: {
+              status: 'completed',
+              input: { filePath: path.join(tmpDir, 'child.ts') },
+              output: 'content',
+              title: 'child.ts',
+            },
+            subAgentInvocationId: childSubId,
+          },
+          {
+            sequence: 2,
+            sourceType: 'part.updated',
+            sourcePartId: 'part-child-read',
+            subAgentInvocationId: childSubId,
+            subAgentPath: [childSubId],
+          },
+        ),
+      ];
+      writeJsonl(path.join(childDir, 'subsession.jsonl'), [
+        buildLine('version', '2.0'),
+        ...childRecords.map(record => buildLine('stream-part', record)),
+      ]);
+
+      (vscode.workspace as { workspaceFolders?: Array<{ uri: vscode.Uri; name: string; index: number }> }).workspaceFolders = [
+        { uri: vscode.Uri.file(tmpDir), name: 'test', index: 0 },
+      ];
+      const state = makeState(sessionDir);
+      const { provider } = createSessionContentProvider(
+        state,
+        { subscriptions: [] } as unknown as vscode.ExtensionContext,
+      );
+
+      const session = await provider.provideChatSessionContent(
+        vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+        { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+        { inputState: {} as vscode.ChatSessionInputState },
+      );
+
+      const parts = getFirstResponseParts(session);
+      expect(parts).toEqual(expect.arrayContaining([
+        expect.objectContaining({ value: expect.objectContaining({ value: 'root answer' }) }),
+        expect.objectContaining({ toolName: 'task', toolCallId: 'call-root-task' }),
+        expect.objectContaining({ toolName: 'read', toolCallId: childReadCallId, subAgentInvocationId: childSubId }),
+      ]));
+      expect(parts).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ value: expect.objectContaining({ value: 'child markdown answer' }) }),
+        expect.objectContaining({ value: 'child private reasoning' }),
+      ]));
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('restores root externalEdit bubbles with response metadata when there is no subagent', async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'root-external-edit-restore-'));
     try {

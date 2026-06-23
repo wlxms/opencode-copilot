@@ -154,6 +154,7 @@ interface RestoredRequestId {
 interface StreamRecordEntry {
   record: StreamPartRecord;
   metaIndex: ReadonlyMap<string, Record<string, unknown>>;
+  streamNode: 'root' | 'subsession';
 }
 
 interface SessionListEntry {
@@ -1641,11 +1642,12 @@ export function createSessionContentProvider(
     records: readonly StreamPartRecord[],
     metaIndex: ReadonlyMap<string, Record<string, unknown>>,
     sessionStatus: string,
+    streamNode: StreamRecordEntry['streamNode'],
   ): StreamRecordEntry[] {
     return finalizeIncompleteStates(
       materializeRecords(sortStreamRecordsWithinNode(records).filter(record => record.kind !== 'userPrompt')),
       sessionStatus,
-    ).map(record => ({ record, metaIndex }));
+    ).map(record => ({ record, metaIndex, streamNode }));
   }
 
   function expandStreamRecordsByTree(
@@ -1681,7 +1683,7 @@ export function createSessionContentProvider(
       }
 
       const subSessionStatus = getNodeSessionStatus(rootSessionStatus, sub.metaIndex);
-      for (const entry of materializeStreamNodeEntries(sub.records, sub.metaIndex, subSessionStatus)) {
+      for (const entry of materializeStreamNodeEntries(sub.records, sub.metaIndex, subSessionStatus, 'subsession')) {
         output.push(entry);
         const { record } = entry;
         const triggered = getRecordSubAgentInvocationId(record);
@@ -1707,7 +1709,7 @@ export function createSessionContentProvider(
     }
 
     const output: StreamRecordEntry[] = [];
-    for (const entry of materializeStreamNodeEntries(mainRecords, rootMetaIndex, rootSessionStatus)) {
+    for (const entry of materializeStreamNodeEntries(mainRecords, rootMetaIndex, rootSessionStatus, 'root')) {
       output.push(entry);
       const { record } = entry;
       const triggered = getRecordSubAgentInvocationId(record);
@@ -1743,6 +1745,13 @@ export function createSessionContentProvider(
 
   function flattenEntryRecords(entries: readonly StreamRecordEntry[]): StreamPartRecord[] {
     return entries.map(entry => entry.record);
+  }
+
+  function shouldRenderRestoredEntry(entry: StreamRecordEntry): boolean {
+    if (entry.streamNode !== 'subsession') {
+      return true;
+    }
+    return entry.record.kind !== 'assistantText' && entry.record.kind !== 'reasoning';
   }
 
   function groupPromptsByTurn(records: readonly StreamPartRecord[]): Map<number, StreamPartRecord[]> {
@@ -2043,7 +2052,9 @@ export function createSessionContentProvider(
 
         for (const entry of entriesForResponse) {
           if (token.isCancellationRequested) break;
-          createSSPFromRecord(entry.record, entry.metaIndex).render(collector as never);
+          if (shouldRenderRestoredEntry(entry)) {
+            createSSPFromRecord(entry.record, entry.metaIndex).render(collector as never);
+          }
           const restoredEditCallId = getRestoredEditSnapshotCallId(entry.record);
           if (restoredEditCallId && pushedRestoredEditCallIds.has(restoredEditCallId)) {
             continue;
