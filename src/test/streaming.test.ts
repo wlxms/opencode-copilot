@@ -230,7 +230,7 @@ describe('OpenCodeBridge', () => {
     expect(stream.markdown).toHaveBeenCalledWith('assistant text');
   });
 
-  it('renders closed OpenCode system reminders as standalone system tool cards', async () => {
+  it('renders closed OpenCode system reminders as standalone tool cards', async () => {
     const stream = mockStream();
     const noticeText = '<system-reminder>\n\n[ALL BACKGROUND TASKS COMPLETE]\n\nCompleted:\n\nbg_123: repo scan\n</system-reminder>\n\n<!-- OMO_INTERNAL_INITIATOR -->';
     const events = eventStream([
@@ -267,7 +267,7 @@ describe('OpenCodeBridge', () => {
         pastTenseMessage?: string;
         toolSpecificData?: { input?: string; output?: string };
       });
-    const systemPart = pushed.find(part => part.toolName === 'system' && part.toolCallId === 'system-prt_notice');
+    const systemPart = pushed.find(part => part.toolName === 'ALL BACKGROUND TASKS COMPLETE' && part.toolCallId === 'system-prt_notice');
     expect(systemPart).toBeDefined();
     expect(systemPart?.isComplete).toBe(true);
     expect(systemPart?.pastTenseMessage).toBe('ALL BACKGROUND TASKS COMPLETE');
@@ -301,7 +301,7 @@ describe('OpenCodeBridge', () => {
     expect(stream.markdown).toHaveBeenCalledWith('root answer');
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
       .map((call: unknown[]) => call[0] as { toolName?: string });
-    expect(pushed.some(part => part.toolName === 'system')).toBe(false);
+    expect(pushed.some(part => part.toolName === 'ALL BACKGROUND TASKS COMPLETE')).toBe(false);
   });
 
   it('renders any closed system-reminder title from the first bracketed heading', async () => {
@@ -331,7 +331,7 @@ describe('OpenCodeBridge', () => {
         pastTenseMessage?: string;
         toolSpecificData?: { input?: string; output?: string };
       });
-    const systemPart = pushed.find(part => part.toolName === 'system');
+    const systemPart = pushed.find(part => part.toolName === 'NEEDS USER REVIEW');
     expect(systemPart?.pastTenseMessage).toBe('NEEDS USER REVIEW');
     expect(systemPart?.toolSpecificData).toEqual({
       input: 'NEEDS USER REVIEW',

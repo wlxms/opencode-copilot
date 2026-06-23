@@ -408,8 +408,6 @@ export class ToolInvocationSSP extends SerializableStreamPart<
         const short = query.length > 80 ? query.substring(0, 77) + '...' : query;
         return new vscode.MarkdownString(`Web Searching \`${short}\``);
       }
-    } else if (toolName === 'system') {
-      return `${title || input.title || 'SYSTEM REMINDER'}`;
     }
 
     const display = title || toolName;
@@ -509,8 +507,6 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     } else if (toolName === 'task' || toolName === 'subagent') {
       const desc = (input?.description as string) ?? title;
       return `${desc || 'Run subagent'}${duration}`;
-    } else if (toolName === 'system') {
-      return `${title || input?.title || 'SYSTEM REMINDER'}${duration}`;
     }
 
     const display = title || toolName;
@@ -579,13 +575,6 @@ export class ToolInvocationSSP extends SerializableStreamPart<
         return {
           input: formatInput(input, title),
           output: truncate(output, 2000),
-        } satisfies ChatSimpleToolResultData;
-      }
-
-      case 'system': {
-        return {
-          input: title || (input.title as string | undefined) || 'SYSTEM REMINDER',
-          output,
         } satisfies ChatSimpleToolResultData;
       }
 

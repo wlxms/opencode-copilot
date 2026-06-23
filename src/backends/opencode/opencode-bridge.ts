@@ -26,6 +26,7 @@ import type { AcpBridge } from '../../acp/backend';
 import type { SerializableSessionStream } from '../../acp/streaming/session-stream';
 import type { SubsessionStream } from '../../acp/streaming/subsession-stream';
 import type { SessionStreamNode } from '../../acp/streaming/session-stream-node';
+import type { SspStream } from '../../ssp/types';
 import { SubagentManager, formatSubagentProgress, type SubagentScope } from '../../ssp/impl/subagent';
 import { AssistantTextSSP } from '../../ssp/impl/assistant-text';
 import { ReasoningSSP } from '../../ssp/impl/reasoning';
@@ -33,7 +34,12 @@ import { ToolInvocationSSP } from '../../ssp/impl/tool-invocation';
 import { ExternalEditSSP } from '../../ssp/impl/external-edit';
 import { QuestionSSP } from '../../ssp/impl/question';
 import { SessionLifecycleSSP } from '../../ssp/impl/session-lifecycle';
-import { ChatQuestion, ChatQuestionType } from '../../types/vscode-proposed-additions';
+import {
+  ChatQuestion,
+  ChatQuestionType,
+  type ChatSimpleToolResultData,
+  type ChatToolInvocationPart,
+} from '../../types/vscode-proposed-additions';
 import type { AcpBackend } from '../../acp/backend';
 import path from 'node:path';
 import * as vscode from 'vscode';
@@ -69,6 +75,46 @@ function isSubagentProgressTitleUpdate(state: Partial<AcpToolState>): boolean {
 interface SystemNotice {
   title: string;
   output: string;
+}
+
+type ProposedOpenCodeVscode = typeof vscode & {
+  ChatToolInvocationPart?: new (
+    toolName: string,
+    toolCallId: string,
+    errorMessage?: string,
+  ) => ChatToolInvocationPart;
+};
+
+const OpenCodeVS = vscode as ProposedOpenCodeVscode;
+
+class OpenCodeSystemNoticeToolSSP extends ToolInvocationSSP {
+  override render(stream: SspStream): void {
+    const callId = this.payload.callId ?? this.payload.partId;
+    const title = this.payload.state.title ?? this.payload.toolName;
+    const output = this.payload.state.output ?? '';
+    const ToolInvocationPartCtor = OpenCodeVS.ChatToolInvocationPart;
+
+    if (ToolInvocationPartCtor && stream.push) {
+      const part = new ToolInvocationPartCtor(title, callId);
+      part.enablePartialUpdate = true;
+      part.isAttachedToThinking = true;
+      part.isComplete = true;
+      part.pastTenseMessage = title;
+      part.toolSpecificData = {
+        input: title,
+        output,
+      } satisfies ChatSimpleToolResultData;
+      stream.push(part);
+      return;
+    }
+
+    stream.beginToolInvocation?.(callId, title, { isAttachedToThinking: true });
+    stream.updateToolInvocation?.(callId, {
+      pastTenseMessage: title,
+      invocationMessage: title,
+      isAttachedToThinking: true,
+    });
+  }
 }
 
 function getSystemNotice(part: AcpTextPart): SystemNotice | undefined {
@@ -450,15 +496,15 @@ export class OpenCodeBridge implements AcpBridge {
     eventSessionId: string | undefined,
   ): void {
     const callId = `system-${part.id}`;
-    target.push(new ToolInvocationSSP({
+    target.push(new OpenCodeSystemNoticeToolSSP({
       partId: part.id,
-      toolName: 'system',
+      toolName: notice.title,
       callId,
       messageId: part.messageId,
       sessionId: eventSessionId ?? part.sessionId,
       state: {
         status: 'completed',
-        input: { title: notice.title },
+        input: {},
         output: notice.output,
         title: notice.title,
         metadata: {
