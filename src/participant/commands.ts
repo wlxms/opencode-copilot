@@ -12,7 +12,31 @@ import type {
 import { ChatQuestion, ChatQuestionType } from '../types/vscode-proposed-additions';
 import { ErrorMessages } from './errors';
 import { ensureServer } from './handler';
-import { ExternalEditTracker } from './external-edit-tracker';
+
+// Minimal inline tracker for diagnostic commands (replaces deleted ExternalEditTracker)
+class DiagnosticEditTracker {
+  private _edits = new Map<string, { resolve: () => void; onDidComplete: Thenable<string> }>();
+  hasEdit(key: string) { return this._edits.has(key); }
+  isTrackingAny(_uris: unknown[]) { return this._edits.size > 0; }
+  trackEdit(key: string, uris: vscode.Uri[], stream: unknown): Promise<void> {
+    const s = stream as { externalEdit?: (t: unknown, cb: () => Thenable<unknown>) => Thenable<string> };
+    if (!s.externalEdit) return Promise.resolve();
+    return new Promise(resolve => {
+      let r: () => void = () => {};
+      const deferred = new Promise<void>(res => { r = res; });
+      const cb = async () => { resolve(); await deferred; };
+      this._edits.set(key, { resolve: r, onDidComplete: s.externalEdit!(uris, cb) });
+    });
+  }
+  completeEdit(key: string): Thenable<string> | undefined {
+    const e = this._edits.get(key);
+    if (!e) return undefined;
+    this._edits.delete(key);
+    e.resolve();
+    return e.onDidComplete;
+  }
+  dispose() { for (const e of this._edits.values()) e.resolve(); this._edits.clear(); }
+}
 
 export async function routeCommand(
   command: string,
@@ -166,7 +190,7 @@ async function handleTestExternalEditCommand(
     return;
   }
 
-  const tracker = new ExternalEditTracker();
+  const tracker = new DiagnosticEditTracker();
   const editKey = `test-${Date.now()}`;
   const tmpPath = vscode.Uri.joinPath(
     workspaceFolders[0].uri,
@@ -184,7 +208,7 @@ async function handleTestExternalEditCommand(
     // 2. Push the externalEdit bubble
     stream.markdown('📤 Starting `stream.externalEdit` tracking...\n\n');
 
-    const trackPromise = tracker.trackEdit(editKey, [tmpPath], stream, token);
+    const trackPromise = tracker.trackEdit(editKey, [tmpPath], stream);
     await trackPromise;
 
     stream.markdown('✅ `trackEdit` resolved — baseline captured by VSCode.\n\n');
@@ -328,7 +352,7 @@ async function handleTestExternalEditRealCommand(
     roundStream: vscode.ChatResponseStream,
     writeMethod: 'fs' | 'cmd' | 'powershell' | 'async' = 'fs',
   ): Promise<void> {
-    const tracker = new ExternalEditTracker();
+    const tracker = new DiagnosticEditTracker();
     const editKey = `round-${Date.now()}`;
     const tag = `${writeMethod}-d${delayMs}`;
     const uri = tmpFileUri(tag);
@@ -354,7 +378,7 @@ async function handleTestExternalEditRealCommand(
       // 2. Push externalEdit bubble
       roundStream.markdown('2️⃣ Starting `stream.externalEdit` tracking...\n\n');
 
-      const trackPromise = tracker.trackEdit(editKey, [uri], roundStream, token);
+      const trackPromise = tracker.trackEdit(editKey, [uri], roundStream);
       await trackPromise;
       roundStream.markdown('   ✅ `trackEdit` resolved — baseline captured.\n\n');
 
@@ -576,7 +600,7 @@ async function handleTestExternalEditE2ECommand(
     return;
   }
 
-  const tracker = new ExternalEditTracker();
+  const tracker = new DiagnosticEditTracker();
   const editKey = `ask-${Date.now()}`;
   let baselineCaptured = false;
   let editComplete = false;
@@ -633,7 +657,7 @@ async function handleTestExternalEditE2ECommand(
           editCallID = callID;
           stream.markdown(`     🎯 Matched target file — parallel trackEdit + "once"\n`);
           await Promise.all([
-            tracker.trackEdit(editKey, [tmpUri], stream, token).then(() => {
+            tracker.trackEdit(editKey, [tmpUri], stream).then(() => {
               baselineCaptured = true;
               stream.markdown(`     ✅ trackEdit resolved — baseline captured\n`);
             }).catch((err: unknown) => {

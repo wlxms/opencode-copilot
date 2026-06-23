@@ -31,6 +31,12 @@ import type {
 export interface ChatToolInvocationStreamData {
   readonly partialInput?: unknown;
   readonly invocationMessage?: string | MarkdownString;
+  readonly subagentInvocationId?: string;
+  /**
+   * Internal VS Code runtime hint used experimentally to keep tool cards
+   * attached to the current thinking block.
+   */
+  readonly isAttachedToThinking?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +182,11 @@ export class ChatToolInvocationPart {
   subAgentInvocationId?: string;
   presentation?: 'hidden' | 'hiddenAfterComplete' | undefined;
   enablePartialUpdate?: boolean;
+  /**
+   * Internal VS Code runtime hint used experimentally to keep tool cards
+   * attached to the current thinking block.
+   */
+  isAttachedToThinking?: boolean;
 
   constructor(
     toolName: string,

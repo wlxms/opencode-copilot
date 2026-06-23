@@ -8,6 +8,8 @@
 
 ## 架构
 
+当前代码库采用 **SSP-first / SSS-owned-stream** 分层架构（v4），彻底解耦协议语义、序列化与平台渲染：
+
 ```
 ┌─────────────────────────────────────────────────────┐
 │ VSCode Copilot Chat UI                              │
@@ -16,23 +18,39 @@
                       │ ChatRequestHandler
 ┌─────────────────────▼───────────────────────────────┐
 │ src/participant/handler.ts                          │
-│  • 斜杠命令路由                                       │
-│  • 懒加载服务器启动                                    │
-│  • 会话管理                                          │
-│  • 事件桥接                                          │
+│  • 斜杠命令路由 / 会话解析（create/reuse/rewind）      │
+│  • 模型 & agent 解析（AcpModels ⇄ SelectionStore）    │
+│  • Checkpoint 包裹（ChatResponseExternalEditPart）    │
 └─────────────────────┬───────────────────────────────┘
-                      │ StreamBridge
+                      │ backend.sessions.prompt + AsyncIterable<AcpEvent>
 ┌─────────────────────▼───────────────────────────────┐
-│ src/participant/streaming.ts                        │
-│  • reasoning → thinkingProgress() 实时思考流          │
-│  • tool → beginToolInvocation() + ChatToolInvocationPart │
-│  • text → markdown() token-by-token 流式输出          │
+│ src/backends/opencode/opencode-bridge.ts            │
+│  • 薄路由（~825 行）：ACP 事件 → SSS push/update      │
+│  • SubagentManager 协调子会话                         │
+│  • 不含渲染、不含状态机                                │
 └─────────────────────┬───────────────────────────────┘
-                      │ SSE events
+                      │ push(ssp) / update(id, data)
 ┌─────────────────────▼───────────────────────────────┐
-│ src/opencode/server.ts                              │
+│ src/acp/streaming/session-stream.ts (SSS)           │
+│  • SerializableSessionStream 拥有 vscode 流           │
+│  • push(ssp) → 渲染 + 追加 session.jsonl             │
+│  • update(id) → 合并 + 渲染 + 追加                    │
+│  • SubsessionStream 子代理独立文件                     │
+└─────────────────────┬───────────────────────────────┘
+                      │ ssp.render(stream) + append JSONL
+┌─────────────────────▼───────────────────────────────┐
+│ src/ssp/impl/* (SSP 自洽层)                          │
+│  • AssistantTextSSP → stream.markdown()              │
+│  • ReasoningSSP → stream.thinkingProgress()          │
+│  • ToolInvocationSSP → ChatToolInvocationPart        │
+│  • ExternalEditSSP → stream.externalEdit()           │
+│  • QuestionSSP → question carousel                   │
+└─────────────────────┬───────────────────────────────┘
+                      │ SSE events (SDK)
+┌─────────────────────▼───────────────────────────────┐
+│ src/opencode/server.ts + client.ts                  │
 │  createOpencode({ port: 0 }) → server + client       │
-│  @opencode-ai/sdk v1.15.10 (v1 client, v2 available)                          │
+│  @opencode-ai/sdk ^1.16.0                            │
 └─────────────────────┬───────────────────────────────┘
                       │ HTTP + SSE
 ┌─────────────────────▼───────────────────────────────┐
@@ -44,29 +62,60 @@
 
 ```
 src/
-├── extension.ts          # activate/deactivate, 注册 ChatParticipant
-├── opencode/
-│   └── server.ts         # OpenCodeServerManager (SDK 封装)
-├── participant/
-│   ├── handler.ts        # ChatRequestHandler 主流程
-│   ├── streaming.ts      # StreamBridge (SSE→Chat UI)
-│   ├── commands.ts       # /new, /help, /model, /test-question 路由
-│   └── errors.ts         # 错误常量 + 空提示检测
-├── types/
-│   ├── index.ts          # ExtensionState, SessionInfo
-│   └── events.ts         # SSE 事件类型 + 常量
-└── test/
-    ├── vscode-mock.ts    # Vitest 的 VSCode API 模拟
-    ├── streaming.test.ts # 16 个流式渲染测试
-    ├── handler.test.ts   # 12 个处理器测试
-    ├── commands.test.ts  # 11 个命令测试
-    ├── server.test.ts    # 12 个服务器测试
-    ├── client.test.ts    # 15 个客户端测试
-    ├── extension.test.ts # 1 个激活测试
-    └── integration/
-        ├── helpers/live-opencode.ts
-        ├── opencode-backend.integration.test.ts
-        └── question-flow.integration.test.ts  # question 端到端测试 (3 tests)
+├── extension.ts              # activate/deactivate, 注册 ChatParticipant
+├── statusbar.ts              # 状态栏管理
+├── acp/                      # ACP 协议语义层（零 vscode/SDK 依赖）
+│   ├── backend.ts            #   AcpBackend / AcpBridge 核心接口
+│   ├── types.ts              #   AcpEvent / AcpStreamPart 类型定义
+│   ├── backend-registry.ts   #   后端工厂注册（插件式）
+│   ├── app-event-bus.ts      #   类型化事件总线
+│   ├── selection-store.ts    #   agent/model 选择状态
+│   ├── session-manager.ts    #   VSCode ⇄ backend 会话映射
+│   ├── streaming/            #   SSS 可序列化会话流
+│   │   ├── session-stream.ts #     SerializableSessionStream（拥有 vscode 流）
+│   │   ├── subsession-stream.ts  # SubsessionStream（子代理）
+│   │   ├── session-store.ts  #     文件系统持久化
+│   │   └── deserialize.ts    #     读时合并 + 中断修复
+│   ├── serializable/         #   JSONL 序列化器
+│   └── checkpoint/           #   Checkpoint 审批状态
+├── ssp/                      # 可序列化流部件层（自洽状态 + 渲染）
+│   ├── types.ts              #   SerializableStreamPart 基类
+│   └── impl/                 #   10+ 具体 SSP
+│       ├── assistant-text.ts #     AssistantTextSSP (append-only)
+│       ├── reasoning.ts      #     ReasoningSSP (append-only)
+│       ├── tool-invocation.ts#     ToolInvocationSSP (mutable 生命周期)
+│       ├── external-edit.ts  #     ExternalEditSSP (合并了旧 Tracker)
+│       ├── question.ts       #     QuestionSSP (mutable + 回调)
+│       ├── subagent.ts       #     SubagentManager 子会话协调
+│       └── ...
+├── backends/opencode/        # OpenCode 后端实现
+│   ├── adapter.ts            #   OpenCodeBackend (implements AcpBackend)
+│   ├── opencode-bridge.ts    #   OpenCodeBridge (薄路由 ~825 行)
+│   ├── event-broker.ts       #   GlobalEventBroker (SSE 多路复用)
+│   └── events.ts             #   normalizeStreamEvent (ACP 归一化)
+├── acpmodels/                # Copilot ⇄ ACP 模型双向同步
+├── surfaces/vscode/          # VS Code surfaces
+│   ├── acp-renderer.ts       #   ACP 事件 → Chat UI 渲染
+│   ├── capabilities.ts       #   运行时能力检测
+│   ├── stable-participant.ts #   稳定 surface（仅 markdown）
+│   └── experimental-session.ts # 实验 ChatSessionContentProvider
+├── participant/              # ChatRequestHandler 编排层
+│   ├── handler.ts            #   主流程（会话/模型/agent/checkpoint 编排）
+│   ├── commands.ts           #   斜杠命令路由
+│   ├── checkpoint.ts         #   CheckpointManager
+│   └── ...
+├── settings/                 # Webview 设置面板
+├── opencode/                 # SDK 封装
+│   ├── server.ts             #   OpenCodeServerManager (生命周期)
+│   └── client.ts             #   OpenCodeClient (HTTP 客户端)
+├── types/                    # 共享类型
+│   ├── index.ts              #   ExtensionState, SessionState
+│   └── vscode-proposed-additions.ts # vscode proposed API 类型声明
+└── test/                     # vitest 测试（350+ 用例）
+    ├── vscode-mock.ts        #   VSCode API 模拟
+    ├── *.test.ts             #   各模块单元测试
+    ├── streaming/            #   SSS/序列化集成测试
+    └── integration/          #   端到端测试
 ```
 
 ---
@@ -134,21 +183,25 @@ class ChatToolInvocationPart {
   pastTenseMessage?: string;  // 完成后消息 (Read file.ts 0.5s)
   enablePartialUpdate?: bool; // 支持流式更新
   toolSpecificData?:          // 工具特定数据（决定 UI 渲染方式）
-    | TerminalToolData        // → 终端命令行样式
-    | SimpleToolResultData    // → 可折叠 Input/Output
-    | ToolResourcesData       // → 文件引用列表
-    | SubagentToolData;       // → 子代理展开
+    | ChatTerminalToolInvocationData  // → 终端命令行样式
+    | ChatSimpleToolResultData        // → 可折叠 Input/Output
+    | ChatToolResourcesInvocationData // → 文件引用列表
+    | ChatSubagentToolInvocationData; // → 子代理展开
 }
 ```
 
 ### 4. 工具特定数据类型
 
+工具数据使用 VS Code `chatParticipantAdditions` proposal API 类型，声明在 `src/types/vscode-proposed-additions.ts`：
+
 | 类型 | 场景 | 字段 | UI 效果 |
 |------|------|------|---------|
-| `TerminalToolData` | bash/shell | `commandLine`, `language`, `output`, `state` | 终端样式 + 退出码 + 耗时 |
-| `SimpleToolResultData` | read/list/grep | `input`, `output` | 可折叠的输入/输出块 |
-| `ToolResourcesData` | write/edit | `values: [{path, line?}]` | 文件引用列表（可点击跳转） |
-| `SubagentToolData` | task/subagent | `agentName`, `prompt`, `result` | 点击展开子代理完整对话 |
+| `ChatTerminalToolInvocationData` | bash/shell | `commandLine`, `language`, `output`, `state` | 终端样式 + 退出码 + 耗时 |
+| `ChatSimpleToolResultData` | read/list/grep | `input`, `output` | 可折叠的输入/输出块 |
+| `ChatToolResourcesInvocationData` | write/edit | `values: Uri[]` | 文件引用列表（可点击跳转） |
+| `ChatSubagentToolInvocationData` (class) | task/subagent | `description`, `agentName`, `prompt`, `result` | 点击展开子代理完整对话 |
+
+`ChatSubagentToolInvocationData` 是有构造函数的 class，运行时通过 `new VS.ChatSubagentToolInvocationData(...)` 实例化（带 fallback 到普通对象）。其余三个是 interface，用 `satisfies` 确保类型安全。`buildToolSpecificData()` 存在两处实现：`surfaces/vscode/acp-renderer.ts`（导出函数）和 `ssp/impl/tool-invocation.ts`（SSP 私有方法）。
 
 ### 5. OpenCode SDK 集成
 
@@ -187,31 +240,39 @@ await promise;  // 最后才 await
 
 ## 事件流详解
 
-### SSE 事件类型
+### SSE 事件 → ACP 归一化 → SSP 路由
 
-每个对话回合的事件顺序：
-
-```
-1. message.part.updated  type=text        → 用户回显（跳过）
-2. message.part.updated  type=step-start  → 步骤开始
-3. message.part.updated  type=reasoning   → 思考部分创建
-4. message.part.delta    field=text       → 思考 token 流 → thinkingProgress()
-5. message.part.updated  type=tool        → 工具调用 (pending→running→completed)
-6. message.part.updated  type=text        → AI 文本部分创建
-7. message.part.delta    field=text       → AI token 流 → markdown()
-8. message.part.updated  type=step-finish → 步骤结束
-9. session.idle                           → 回合完成 → break
-```
-
-### 工具调用状态机
+SDK 原始事件经 `normalizeStreamEvent()` 归一化为 `AcpEvent`，再由 `OpenCodeBridge` 路由到 SSS：
 
 ```
-pending ──→ beginToolInvocation(callId, toolName)
+SDK SSE event                AcpEvent                  SSS 操作
+─────────────────────────────────────────────────────────────────
+message.part.updated (text)  → part.updated(text)      → sss.push(AssistantTextSSP)
+message.part.updated (reasoning) → part.updated(reasoning) → sss.push(ReasoningSSP)
+message.part.delta (reasoning) → part.delta(text)       → sss.push(ReasoningSSP, delta)
+message.part.updated (tool)  → part.updated(tool)       → sss.push/update(ToolInvocationSSP)
+message.part.delta (text)    → part.delta(text)         → sss.push(AssistantTextSSP, delta)
+permission.asked (edit)      → permission.asked         → sss.push(ExternalEditSSP) + 自动回复
+question.asked               → (ACP 扩展)               → sss.push(QuestionSSP) + 回调
+session.idle                 → session.idle             → 延迟空闲检查 → sss.drain()
+session.diff                 → session.diff             → sss.writeMeta()
+子会话事件                    → (路由到 SubsessionStream)  → 子 SSS 独立 push/update
+```
+
+### 工具调用状态机（ToolInvocationSSP）
+
+SSP 自治管理生命周期状态，SSS 只负责 push/update：
+
+```
+pending ──→ sss.push(ToolInvocationSSP { state: 'pending' })
+  │           └── SSP.render() → stream.beginToolInvocation()
   │
-  ├─ running ──→ updateToolInvocation(callId, { partialInput })
+  ├─ running ──→ sss.update(callId, { state: 'running', input, title })
+  │              └── SSP.render() → stream.updateToolInvocation()
   │
-  └─ completed ──→ stream.push(new ChatToolInvocationPart(...))
-                   └── toolSpecificData = buildToolSpecificData(toolName, ...)
+  └─ completed ──→ sss.update(callId, { state: 'completed', output, time })
+                   └── SSP.render() → stream.push(ChatToolInvocationPart)
+                       └── toolSpecificData = buildToolSpecificData(toolName, ...)
 ```
 
 ### 工具名 → 数据类型映射
@@ -220,15 +281,20 @@ pending ──→ beginToolInvocation(callId, toolName)
 function buildToolSpecificData(toolName, input, output, ...) {
   switch (toolName) {
     case 'bash':
-    case 'shell':  return TerminalToolData { commandLine, language, output, state };
+    case 'shell':  return { commandLine, language, output, state }
+                        satisfies ChatTerminalToolInvocationData;
     case 'read':
     case 'list':
-    case 'grep':   return SimpleToolResultData { input, output };
+    case 'grep':   return { input, output }
+                        satisfies ChatSimpleToolResultData;
     case 'write':
-    case 'edit':   return ToolResourcesData { values: [{ path }] };
+    case 'edit':   return { values: [vscode.Uri.file(filePath)] }
+                        satisfies ChatToolResourcesInvocationData;
     case 'task':
-    case 'subagent': return SubagentToolData { agentName, prompt, result };
-    default:       return SimpleToolResultData { input, output };  // 降级
+    case 'subagent': return new VS.ChatSubagentToolInvocationData(
+                        description, agentName, prompt, result);
+    default:       return { input, output }
+                        satisfies ChatSimpleToolResultData;  // 降级
   }
 }
 ```
@@ -241,11 +307,11 @@ function buildToolSpecificData(toolName, input, output, ...) {
 
 ```json
 {
-  "engines": { "vscode": "^1.95.0" },
+  "engines": { "vscode": "^1.118.0" },
   "enabledApiProposals": ["chatParticipantAdditions"],
   "main": "./out/extension.js",
   "activationEvents": ["onStartupFinished"],
-  "dependencies": { "@opencode-ai/sdk": "^1.14.41" }
+  "dependencies": { "@opencode-ai/sdk": "^1.16.0" }
 }
 ```
 
@@ -268,7 +334,7 @@ resolve: {
 }
 ```
 
-- 67 个单元测试，全部通过
+- 350+ 单元测试
 - 通过 `paths` 别名将 `vscode` 映射到 mock 模块
 - SDK 调用全部被 mock（不依赖真实 OpenCode 服务）
 - 通过真机终端 E2E 测试验证了完整的 SSE 事件流
@@ -286,9 +352,13 @@ resolve: {
 | `createOpencode({ port: 0 })` 而非子进程 | SDK 管理完整的服务器生命周期 |
 | 不设置 `OPENCODE_SERVER_PASSWORD` | 导致 401；SDK 无需密码即可运行 |
 | prompt fire-and-forget + 并行事件消费 | `await prompt()` 会阻塞事件流，导致所有事件丢失 |
-| `thinkingProgress()` 实时流式传输推理内容 | 推理内容不缓冲；每个增量立即显示 |
-| 工具调用采用流式生命周期 (begin→update→push) | 原生 spinner → 实时参数更新 → 完成卡片 |
-| `toolSpecificData` 按工具名自动选择 | 根据工具类型触发不同的 VSCode UI 渲染 |
+| **SSP 自洽：每个 SSP 拥有自身状态 + 渲染 + 序列化** | 消除 Bridge 2201 行巨型状态机，状态归属各部件 |
+| **SSS 拥有 vscode 流（push/update API）** | Bridge 永不直接触达 UI，单一变更入口 |
+| **Bridge 薄路由（~825 行）** | 只做 ACP 事件 → SSP 映射，不含渲染/持久化 |
+| **3 文件 append-only 持久化** | 中断安全；读时合并（materializeRecords）；子代理独立文件 |
+| **ExternalEditSSP 合并了旧 Tracker** | 编辑同步闭环在单个 SSP 内，消除跨文件状态碎片 |
+| **Checkpoint 包裹 prompt+bridge** | baseline 在 prompt 前捕获，编辑进入 VS Code undo 体系 |
+| 工具数据用 VS Code proposal 类型（`satisfies` + `new`） | 原生 UI 渲染；类型安全；`ChatSubagentToolInvocationData` 运行时构造 |
 | esbuild 打包，`--external:vscode` | VSCode 扩展的标准构建方式 |
 | vitest + mock vscode 模块 | 无需 VSCode 扩展主机即可运行测试 |
 
@@ -298,11 +368,11 @@ resolve: {
 
 | 包 | 版本 | 用途 |
 |---|------|------|
-| `@opencode-ai/sdk` | ^1.14.41 | OpenCode 服务器和客户端管理 |
+| `@opencode-ai/sdk` | ^1.16.0 | OpenCode 服务器和客户端管理 |
 | `@types/vscode` | ^1.118.0 | VSCode API 类型（稳定部分） |
 | `@types/node` | ^20.19.40 | Node.js 类型 |
 | `esbuild` | ^0.24.2 | ESM→CJS 打包 |
 | `typescript` | ^5.9.3 | 类型检查 |
 | `vitest` | ^4.1.5 | 单元测试 |
-| VSCode | ≥1.119.0 | 运行环境（支持 chatParticipantAdditions） |
-| OpenCode CLI | 1.14.41 | 本地 AI 服务器 |
+| VSCode | ≥1.118.0 | 运行环境（支持 chatParticipantAdditions） |
+| OpenCode CLI | 1.16.0 | 本地 AI 服务器 |

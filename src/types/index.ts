@@ -2,31 +2,6 @@ import type * as vscode from 'vscode';
 import type { AcpBackend } from '../acp/backend';
 import type { StatusBarManager } from '../statusbar';
 
-// ===========================================================================
-// Re-export SDK types from their new location for backward compatibility
-// during migration. TODO: remove these re-exports once all consumers
-// import directly from backends/opencode/sdk-types.
-// ===========================================================================
-
-export type {
-  SdkResponse,
-  SdkSessionData,
-  SdkProviderModel,
-  SdkProvider,
-  SdkAgentData,
-  SdkConfigData,
-  SdkUserMessage,
-  SdkAssistantMessage,
-  SdkMessage,
-  SdkTextPart,
-  SdkReasoningPart,
-  SdkToolPart,
-  SdkSubtaskPart,
-  SdkPart,
-  OpenCodeClient,
-  OpenCodeServerController,
-} from '../backends/opencode/sdk-types';
-
 /** Info about a conversation session extracted from SDK response */
 export interface SessionInfo {
   id: string;

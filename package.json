@@ -69,6 +69,21 @@
           "type": "boolean",
           "default": true,
           "description": "Replay restored session file checkpoints through VS Code chat external edits when available, preserving ordinary workspace edits on conflicts."
+        },
+        "opencode.experimental.streamSchedulingMode": {
+          "type": "string",
+          "default": "tool-first",
+          "enum": [
+            "immediate",
+            "continuous",
+            "tool-first"
+          ],
+          "enumDescriptions": [
+            "Disable scheduling and render stream parts as they arrive.",
+            "Keep root reasoning, markdown, and root tools continuous; render subagent tools at main-flow boundaries.",
+            "Render tools immediately and buffer root reasoning or markdown until their part is complete."
+          ],
+          "description": "Controls how ACP stream parts are scheduled before rendering to VS Code chat."
         }
       }
     },

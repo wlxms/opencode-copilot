@@ -1,2089 +1,905 @@
 /**
- * OpenCodeBridge — bridges ACP events to a VS Code ChatResponseStream.
+ * OpenCodeBridge — translates ACP events to SSS push/update calls.
  *
- * Implements the AcpBridge interface for both live streaming and session
- * restore (replay). The same bridge handles both paths:
+ * Architecture (v2):
+ * - Bridge does NOT touch the VS Code stream directly — SSS owns it
+ * - Bridge only calls sss.push(ssp) / sss.update(id, data)
+ * - SubagentManager stays in bridge for scope tracking
+ * - Child session events route to sss.subsession(id)
+ * - Permission/Question handled via SSP callback injection
  *
- * == Live path ==
- *   Call setStream(stream), setTracker(tracker), setCallbacks(callbacks),
- *   then await run(events, token). After each processed event the bridge
- *   invokes callbacks.onEvent(event) so the caller can persist events.
- *
- * == Replay path ==
- *   Call setStream(collectorStream), then processEvent(event) for each
- *   persisted event. The collector stream captures rendered parts.
- *
- * Uses VSCode's proposed API (chatParticipantAdditions) for native rendering:
- * - stream.thinkingProgress()           → real-time thinking display
- * - stream.beginToolInvocation()        → streaming tool spinner
- * - ChatToolInvocationPart + toolSpecificData → rich expandable tool cards
- * - stream.markdown()                   → AI text token streaming
- *
- * toolSpecificData mapping (OpenCode tool → VSCode type):
- *   read          → ChatToolResourcesInvocationData (clickable file reference)
- *   bash          → ChatTerminalToolInvocationData (terminal UI with exit code)
- *   write         → ChatToolResourcesInvocationData (clickable file reference)
- *   edit          → ChatToolResourcesInvocationData (clickable file reference)
- *   list / grep   → ChatSimpleToolResultData (collapsible listing)
- *   task          → ChatSubagentToolInvocationData (click to expand subagent)
- *   (other)       → ChatSimpleToolResultData (generic fallback)
+ * Replaces the old 1763-line bridge that directly called stream APIs.
  */
 
-import * as vscode from 'vscode';
-import * as path from 'node:path';
 import type {
   AcpEvent,
-  AcpResult,
-  AcpStreamPart,
-  AcpTextPart,
-  AcpReasoningPart,
-  AcpToolPart,
-  AcpStepPart,
-  AcpToolState,
   AcpPartUpdatedEvent,
   AcpPartDeltaEvent,
-  AcpSessionIdleEvent,
-  AcpSessionDiffEvent,
-  AcpFileDiff,
   AcpPermissionRequestEvent,
   AcpQuestionRequestEvent,
-  AcpSessionLifecycleEvent,
-  AcpSessionStatus,
-  AcpChildSessionInfo,
+  AcpQuestionInfo,
+  AcpTextPart,
+  AcpToolPart,
+  AcpToolState,
 } from '../../acp/types';
-import type {
-  ChatTerminalToolInvocationData,
-  ChatSimpleToolResultData,
-  ChatToolResourcesInvocationData,
-  ChatSubagentToolInvocationData,
-  ChatTodoToolInvocationData,
-  ChatToolSpecificData,
-  ChatToolInvocationPart,
-  ChatToolInvocationStreamData,
-  ChatWorkspaceFileEdit,
-  ChatResponseWorkspaceEditPart,
+import type { AcpBridge } from '../../acp/backend';
+import type { SerializableSessionStream } from '../../acp/streaming/session-stream';
+import type { SubsessionStream } from '../../acp/streaming/subsession-stream';
+import type { SessionStreamNode } from '../../acp/streaming/session-stream-node';
+import type { SspStream } from '../../ssp/types';
+import { SubagentManager, formatSubagentProgress, type SubagentScope } from '../../ssp/impl/subagent';
+import { AssistantTextSSP } from '../../ssp/impl/assistant-text';
+import { ReasoningSSP } from '../../ssp/impl/reasoning';
+import { ToolInvocationSSP } from '../../ssp/impl/tool-invocation';
+import { ExternalEditSSP } from '../../ssp/impl/external-edit';
+import { QuestionSSP } from '../../ssp/impl/question';
+import { SessionLifecycleSSP } from '../../ssp/impl/session-lifecycle';
+import {
+  ChatQuestion,
+  ChatQuestionType,
+  type ChatSimpleToolResultData,
+  type ChatToolInvocationPart,
 } from '../../types/vscode-proposed-additions';
-import { ChatTodoStatus, ChatQuestion, ChatQuestionType } from '../../types/vscode-proposed-additions';
-import { type ExternalEditTracker } from '../../participant/external-edit-tracker';
-import type { AcpEventStream } from '../../acp/backend';
-import type {
-  AcpBridge,
-  AcpSessionOperations,
-  AcpPermissionOperations,
-  AcpQuestionOperations,
-  StreamingBridgeCallbacks,
-} from '../../acp/backend';
-import { type SubagentScope, formatSubagentProgress } from '../../participant/subagent';
+import type { AcpBackend } from '../../acp/backend';
+import path from 'node:path';
+import * as vscode from 'vscode';
 
-/** Extended stream with proposed API methods */
-type Stream = vscode.ChatResponseStream & {
-  thinkingProgress?(delta: { text?: string | string[]; id?: string; metadata?: { readonly [key: string]: unknown } }): void;
-  beginToolInvocation?(callId: string, name: string, data?: ChatToolInvocationStreamData): void;
-  updateToolInvocation?(callId: string, data: ChatToolInvocationStreamData): void;
-  questionCarousel?(questions: ChatQuestion[], allowSkip?: boolean): Thenable<Record<string, unknown> | undefined>;
-  /** Proposed API: push a ChatResponsePart directly to the stream */
-  push?(part: unknown): void;
-};
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-type ProposedVscode = typeof vscode & {
+function getEventSessionId(event: AcpEvent): string | undefined {
+  const e = event as unknown as Record<string, unknown>;
+  return (e.sessionId as string | undefined) ??
+    (e.part as { sessionId?: string } | undefined)?.sessionId;
+}
+
+function createExternalEditUri(filePath: string, directory?: string): unknown {
+  const resolvedPath = path.isAbsolute(filePath)
+    ? filePath
+    : path.resolve(directory ?? '', filePath);
+  const rawUri = vscode.Uri.file(resolvedPath);
+  const normalizedPath = /^\/[a-zA-Z]:(?=\/)/.test(rawUri.path)
+    ? rawUri.path.toLowerCase()
+    : rawUri.path;
+  return rawUri.path !== normalizedPath
+    ? rawUri.with({ path: normalizedPath })
+    : rawUri;
+}
+
+function isSubagentProgressTitleUpdate(state: Partial<AcpToolState>): boolean {
+  const keys = Object.keys(state);
+  return keys.length === 1 && keys[0] === 'title' && typeof state.title === 'string';
+}
+
+interface SystemNotice {
+  title: string;
+  output: string;
+}
+
+type ProposedOpenCodeVscode = typeof vscode & {
   ChatToolInvocationPart?: new (
     toolName: string,
     toolCallId: string,
     errorMessage?: string,
   ) => ChatToolInvocationPart;
-  ChatSubagentToolInvocationData?: new (
-    description?: string,
-    agentName?: string,
-    prompt?: string,
-    result?: string,
-  ) => ChatSubagentToolInvocationData;
-  ChatResponseWorkspaceEditPart?: new (
-    edits: readonly ChatWorkspaceFileEdit[],
-  ) => ChatResponseWorkspaceEditPart;
 };
 
-// Runtime access to proposed classes (may not exist)
-const VS = vscode as ProposedVscode;
+const OpenCodeVS = vscode as ProposedOpenCodeVscode;
 
-interface StreamBridgeLogger {
-  appendLine(message: string): void;
+class OpenCodeSystemNoticeToolSSP extends ToolInvocationSSP {
+  override render(stream: SspStream): void {
+    const callId = this.payload.callId ?? this.payload.partId;
+    const title = this.payload.state.title ?? this.payload.toolName;
+    const output = this.payload.state.output ?? '';
+    const ToolInvocationPartCtor = OpenCodeVS.ChatToolInvocationPart;
+
+    if (ToolInvocationPartCtor && stream.push) {
+      const part = new ToolInvocationPartCtor(title, callId);
+      part.enablePartialUpdate = true;
+      part.isAttachedToThinking = true;
+      part.isComplete = true;
+      part.pastTenseMessage = title;
+      part.toolSpecificData = {
+        input: title,
+        output,
+      } satisfies ChatSimpleToolResultData;
+      stream.push(part);
+      return;
+    }
+
+    stream.beginToolInvocation?.(callId, title, { isAttachedToThinking: true });
+    stream.updateToolInvocation?.(callId, {
+      pastTenseMessage: title,
+      invocationMessage: title,
+      isAttachedToThinking: true,
+    });
+  }
 }
 
-// =======================================================================
-// OpenCodeBridge
-// =======================================================================
+function getSystemNotice(part: AcpTextPart): SystemNotice | undefined {
+  return getSystemNoticeFromText(part.text);
+}
 
-/**
- * Bridges OpenCode ACP events to a VSCode ChatResponseStream.
- *
- * Implements {@link AcpBridge} for both live streaming and session replay.
- * Backend sub-interfaces (`sessions`, `permissions`, `questions`) are
- * injected directly rather than wrapped in callback options.
- */
+function getSystemNoticeFromText(text: string | undefined): SystemNotice | undefined {
+  const value = text ?? '';
+  if (!value || !hasClosedSystemReminder(value)) return undefined;
+  return {
+    title: extractBracketTitle(value) ?? 'SYSTEM REMINDER',
+    output: value,
+  };
+}
+
+function hasClosedSystemReminder(text: string): boolean {
+  return /<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/i.test(text);
+}
+
+function hasOpenSystemReminder(text: string | undefined): boolean {
+  return /<system-reminder\b[^>]*>/i.test(text ?? '');
+}
+
+function extractBracketTitle(text: string): string | undefined {
+  const match = text.match(/\[([^\]\r\n]+)\]/);
+  const title = match?.[1]?.trim();
+  return title || undefined;
+}
+
+// ---------------------------------------------------------------------------
+// OpenCodeBridge
+// ---------------------------------------------------------------------------
+
+interface BridgeLogger { appendLine(message: string): void; }
+
+type PartRouteKind = 'text' | 'reasoning' | 'ignored' | 'pendingSystemNotice' | 'systemNotice';
+type StreamablePartKind = 'text' | 'reasoning';
+
+interface StreamNodeState {
+  userMessageId: string | null;
+  assistantStarted: boolean;
+  partRoutes: Map<string, PartRouteKind>;
+  pendingDeltas: Map<string, AcpPartDeltaEvent[]>;
+  deltaText: Map<string, string>;
+}
+
 export class OpenCodeBridge implements AcpBridge {
-  private stream?: Stream;
-  private callbacks?: StreamingBridgeCallbacks;
-  private tracker?: ExternalEditTracker;
+  private sss!: SerializableSessionStream;
+  private logger: BridgeLogger = { appendLine: () => {} };
+  private readonly sessionId: string;
+
+  // Event state
   private userMessageId: string | null = null;
-  private partKinds: Map<string, PartKind> = new Map();
-  /** partID → toolCallID */
-  private toolCallIds: Map<string, string> = new Map();
-  /** callID → tool metadata accumulated during streaming */
-  private toolMetas: Map<string, ToolMeta> = new Map();
-  private hasThinking: boolean = false;
-  private hasToolUI: boolean = false;
-  private assistantPhaseStarted: boolean = false;
-  /** Tracks which tool callIDs have received a progressive push (isComplete=false) part */
-  private progressivePushed: Set<string> = new Set();
-  /** Tool callIDs represented by VS Code ExternalEditPart instead of tool cards. */
-  private externalEditCallIds: Set<string> = new Set();
-  /** externalEdit completion promises that persist after snapshots with undoStopId. */
-  private externalEditCompletions: Promise<unknown>[] = [];
-  /** Timestamp of last processed delta (for inter-delta gap measurement) */
-  private lastDeltaTime: number = 0;
-  /** Active subagent scopes — filters child events from rendering as independent cards */
-  private activeSubagentScopes: Map<string, SubagentScope> = new Map();
-  /** Whether at least one subagent (task) tool completed during this bridge session */
-  /** Backend-generated session title captured from session.updated events */
+  private partTargets = new Map<string, SessionStreamNode>();
+  private nodeStates = new WeakMap<SessionStreamNode, StreamNodeState>();
   private sessionTitle: string | undefined;
   private hadSubagentTasks = false;
-  /** Whether a session.idle event was received (and deferred due to active subagents) */
+  private pendingChildEvents = new Map<string, AcpEvent[]>();
+  private childSessionHints = new Map<string, string>();
+  private targetLabels = new WeakMap<SessionStreamNode, string>();
+  private externalEditIds = new Set<string>();
+
+  // Subagent management
+  private subagents = new SubagentManager();
+
+  // Deferred idle
   private deferredIdle = false;
-  /** Safety timer: after deferred idle, stop waiting after this many ms of no events */
   private static readonly DEFERRED_IDLE_TIMEOUT_MS = 120_000;
-  /** Timer handle for the deferred-idle safety timeout */
   private deferredIdleTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Resolves when forceStop is triggered (deferred-idle timeout or external abort) */
-  private forceStopResolve: (() => void) | null = null;
-  private readonly log: (message: string) => void;
-  private sessionId?: string;
-  /** URIs of files that existed before the turn started (proactive baseline) */
-  private knownFileUris: Set<string>;
-  private readonly directory?: string;
 
   constructor(
-    private readonly sessions?: AcpSessionOperations,
-    private readonly permissions?: AcpPermissionOperations,
-    private readonly questions?: AcpQuestionOperations,
-    options?: {
-      logger?: StreamBridgeLogger;
-      sessionId?: string;
-      /** URIs of files known to exist at the start of the turn */
-      knownFileUris?: Set<string>;
-      /** Workspace directory for API calls */
-      directory?: string;
-    },
+    private readonly backend: AcpBackend,
+    sessionId: string,
+    private readonly directory?: string,
+    options?: { sessionId?: string },
   ) {
-    this.sessionId = options?.sessionId;
-    this.knownFileUris = options?.knownFileUris ?? new Set();
-    this.directory = options?.directory;
-    this.log = options?.logger
-      ? (msg: string) => options.logger!.appendLine(`[streaming] ${msg}`)
-      : () => {};
+    this.sessionId = options?.sessionId ?? sessionId;
   }
 
-  /** Tagged log — prefixes message with [tag] for filtering (e.g. [tool], [delta], [subagent]). */
-  private logTag(tag: string, message: string): void {
-    this.log(`[${tag}] ${message}`);
+  setSSS(sss: unknown): void {
+    this.sss = sss as SerializableSessionStream;
+    this.targetLabels.set(this.sss, `root sessionID=${this.sessionId}`);
   }
 
-  // -------------------------------------------------------------------
-  // AcpBridge interface
-  // -------------------------------------------------------------------
-
-  /** @inheritdoc */
-  setStream(stream: unknown): void {
-    this.stream = stream as Stream;
-    this.hasThinking = typeof (stream as Stream).thinkingProgress === 'function';
-    this.hasToolUI = typeof (stream as Stream).beginToolInvocation === 'function';
+  setLogger(logger: BridgeLogger): void {
+    this.logger = logger;
+    this.log = (msg: string) => logger.appendLine(`[bridge] ${msg}`);
   }
 
-  /** @inheritdoc */
-  setCallbacks(callbacks: StreamingBridgeCallbacks): void {
-    this.callbacks = callbacks;
-  }
+  private log: (msg: string) => void = () => {};
+  private logTag(tag: string, msg: string): void { this.log(`[${tag}] ${msg}`); }
 
-  /** @inheritdoc */
-  setTracker(tracker: unknown): void {
-    this.tracker = tracker as ExternalEditTracker;
-  }
+  // ════════════════════════════════════════════════════════════════════════
+  // Event loop
+  // ════════════════════════════════════════════════════════════════════════
 
-  /** Set the session ID after construction */
-  setSessionId(sessionId: string): void {
-    this.sessionId = sessionId;
-  }
-
-  /** Set the workspace directory after construction */
-  setDirectory(directory: string): void {
-    (this as unknown as { directory?: string }).directory = directory;
-  }
-
-  /** Set the known file URIs after construction */
-  setKnownFileUris(knownFileUris: Set<string>): void {
-    this.knownFileUris = knownFileUris;
-  }
-
-  /** @inheritdoc */
-  processEvent(event: AcpEvent): void {
-    const stream = this.stream;
-    if (!stream) return;
-    // Probe stream capabilities for replay (same check as run())
-    this.hasThinking = typeof (stream as any).thinkingProgress === 'function';
-    this.hasToolUI = typeof (stream as any).beginToolInvocation === 'function';
-    this.dispatchEvent(event, stream as Stream);
-  }
-
-  /** @inheritdoc */
-  getUserMessageId(): string | null {
-    return this.userMessageId;
-  }
-
-  /** @inheritdoc */
-  getSessionTitle(): string | null {
-    return this.sessionTitle ?? null;
-  }
-
-  // -------------------------------------------------------------------
-  // Backward compat (tests still use this path)
-  // -------------------------------------------------------------------
-
-  /** Whether at least one subagent (task) tool completed during this session.
-   *  Set to true after a background task finishes; used by the handler to decide
-   *  whether to send a continuation prompt after bridge stop. */
-  getHadSubagentTasks(): boolean {
-    return this.hadSubagentTasks;
-  }
-
-  // -------------------------------------------------------------------
-  // run() — live event loop
-  // -------------------------------------------------------------------
-
-  /**
-   * Primary bridge method: consume ACP events directly from the backend
-   * and render them to the stream that was set via {@link setStream}.
-   *
-   * @param events Async iterable of AcpEvent from the backend
-   * @param token Cancellation token
-   * @returns true if the stream completed without cancellation
-   */
-  async run(
-    events: AsyncIterable<AcpEvent>,
-    token: vscode.CancellationToken,
-  ): Promise<boolean> {
-    const stream = this.stream as Stream;
-    if (!stream) {
-      this.log('bridge error: no stream set (call setStream first)');
-      return false;
-    }
-    this.hasThinking = typeof stream.thinkingProgress === 'function';
-    this.hasToolUI = typeof stream.beginToolInvocation === 'function';
-    this.lastDeltaTime = 0;
-    this.log(
-      `bridge start: hasThinking=${this.hasThinking}, hasToolUI=${this.hasToolUI}, ` +
-      `tokenCancelled=${token.isCancellationRequested}, targetSession=${this.sessionId ?? 'any'}`,
-    );
-
-    // Set up a force-stop mechanism for the deferred-idle safety timeout.
-    // When the timer fires, it resolves this promise, which breaks the
-    // for-await loop via Promise.race.
-    let forceStopResolve: (() => void) | null = null;
-    const forceStopPromise = new Promise<void>((resolve) => { forceStopResolve = resolve; });
-    this.forceStopResolve = () => forceStopResolve?.();
-
-    const iter = events[Symbol.asyncIterator]();
-
+  async run(events: AsyncIterable<AcpEvent>, token: { isCancellationRequested: boolean }): Promise<boolean> {
     try {
-      while (true) {
-        if (token.isCancellationRequested) {
-          const msg = 'Operation cancelled';
-          this.log('bridge stop: cancellation requested');
-          stream.markdown(`\n⚠️ ${msg}\n`);
-          break;
-        }
-
-        // Race between next event and force-stop signal
-        this.log('[lifecycle] waiting for next event...');
-        const nextP = iter.next();
-        const result = await Promise.race([
-          nextP.then((r) => ({ event: r, stopped: false })),
-          forceStopPromise.then(() => ({ event: null, stopped: true })),
-        ]);
-
-        if (result.stopped) {
-          this.log('bridge stop: deferred idle timeout');
-          break;
-        }
-
-        if (result.event) {
-          const { value: event, done } = result.event;
-          if (done) {
-            this.log('[lifecycle] iterator returned done=true, exiting bridge loop');
-            break;
-          }
-          if (!event) {
-            this.log('[lifecycle] iterator returned null event, exiting bridge loop');
-            break;
-          }
-
-          this.log(`[lifecycle] received event type=${event.type}`);
-
-          const tEnter = Date.now();
-          // Handle permission.asked as sync barrier (async, blocks loop until baseline captured + auto-reply)
-          if (event.type === 'permission.asked') {
-            await this.handlePermissionAsked(event, stream);
-            this.persistEvent(event);
-            this.logTag('timing', `permission.asked took ${Date.now() - tEnter}ms`);
-            continue;
-          }
-          // Handle question.asked as sync barrier (async, blocks loop until user answers)
-          if (event.type === 'question.asked') {
-            await this.handleQuestionAsked(event, stream);
-            this.persistEvent(event);
-            this.logTag('timing', `question.asked took ${Date.now() - tEnter}ms`);
-            this.log('[lifecycle] question.asked completed, continuing bridge loop to wait for next event');
-            continue;
-          }
-          const dispatched = this.dispatchEvent(event, stream);
-          // Persist via callbacks after processing
-          if (this.callbacks) {
-            this.callbacks.onEvent(event as AcpEvent);
-          } else {
-            console.log(`[OpenCodeBridge] no callbacks set — event ${event.type} not persisted`);
-          }
-
-          const tProcessed = Date.now();
-          this.logTag('timing', `processEvent: type=${event.type}, rendered=${dispatched.rendered}, took ${tProcessed - tEnter}ms`);
-          if (dispatched.rendered) {
-            await yieldToEventLoop();
-            this.logTag('timing', `yieldToEventLoop resolved, total=${Date.now() - tEnter}ms`);
-          }
-          if (dispatched.stop) {
-            if (this.activeSubagentScopes.size > 0) {
-              // Event stream ended while subagents were still active — log warning
-              // but don't continue looping (the stream is exhausted).
-              this.log(
-                `bridge stop with ${this.activeSubagentScopes.size} leaked subagent scope(s): ` +
-                [...this.activeSubagentScopes.keys()].join(', '),
-              );
-            } else {
-              this.log('bridge stop: session.idle received');
-            }
-            break;
-          }
-        }
+      for await (const event of events) {
+        if (token.isCancellationRequested) break;
+        if (await this.handleEvent(event)) break;
       }
-      this.logTag('lifecycle', 'bridge loop completed');
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Connection lost';
       this.log(`bridge error: ${msg}`);
-      stream.markdown(`\n⚠️ ${msg}\n`);
-    } finally {
-      await this.drainExternalEditCompletions();
-      this.log(
-        `bridge reset: userMessageId=${this.userMessageId ?? 'null'}, ` +
-        `partKinds=${this.partKinds.size}, toolMetas=${this.toolMetas.size}, ` +
-        `subagentScopes=${this.activeSubagentScopes.size}`,
-      );
-      this.reset();
     }
     return !token.isCancellationRequested;
   }
 
-  /**
-   * @deprecated Use run() instead. Kept for backward compatibility with tests.
-   */
-  async bridgeEventsToStream(
-    events: AcpEventStream,
-    stream: vscode.ChatResponseStream,
-    token: vscode.CancellationToken,
-  ): Promise<boolean> {
-    this.setStream(stream);
-    return this.run(events.stream, token);
-  }
-
-  private persistEvent(event: AcpEvent): void {
-    if (this.callbacks) {
-      this.callbacks.onEvent(event);
-    } else {
-      console.log(`[OpenCodeBridge] no callbacks set - event ${event.type} not persisted`);
-    }
-  }
-
-  // -------------------------------------------------------------------
+  // ════════════════════════════════════════════════════════════════════════
   // Event dispatch
-  // -------------------------------------------------------------------
+  // ════════════════════════════════════════════════════════════════════════
 
-  private dispatchEvent(event: AcpEvent, stream: Stream): EventDispatchResult {
-    this.logTag('event', `dispatchEvent: type=${event.type}`);
-
-    if (!this.shouldProcessEvent(event)) {
-      const eventSessionId = getEventSessionId(event);
-      this.logTag('event', `skip: type=${event.type}, sessionID=${eventSessionId ?? 'unknown'}, target=${this.sessionId ?? 'any'}`);
-      return { stop: false, rendered: false };
-    }
-
-    // Handle forwarded child/descendant session events
+  private async handleEvent(event: AcpEvent): Promise<boolean | undefined> {
+    // 1. Check if this is a child/descendant session event
     const eventSessionId = getEventSessionId(event);
-    if (eventSessionId && this.sessionId && eventSessionId !== this.sessionId) {
-      // This event is from a child or descendant session (forwarded by event-broker)
-
-      // Find which subagent scope owns this session (direct child or descendant)
-      const owningScope = this.findScopeForSession(eventSessionId);
-
-      if (event.type === 'session.idle') {
-        // A descendant session went idle.
-        // Track it in the scope's descendant set.
-        if (owningScope) {
-          owningScope.descendantSessionIds.add(eventSessionId);
-        }
-
-        // Check if this is the direct child session going idle
-        if (owningScope?.childSessionId === eventSessionId && !owningScope.childIdle) {
-          // The direct child is idle, but its descendants may still be running.
-          // Only mark as truly complete if ALL descendant sessions are idle.
-          // For now, record the event and check completion below.
-          this.logTag('subagent', `direct child session idle: childSessionId=${eventSessionId}, callID=${owningScope.callId}`);
-        } else {
-          this.logTag('subagent', `descendant session idle: sessionId=${eventSessionId}, scope=${owningScope?.callId ?? 'none'}`);
-        }
-
-        // Check if the owning scope's entire session tree is idle
-        if (owningScope) {
-          // If the direct child session hasn't gone idle yet, don't complete the scope
-          if (owningScope.childSessionId === eventSessionId || owningScope.childIdle) {
-            // Direct child is idle (or this IS the direct child going idle) —
-            // check if all known descendants are accounted for.
-            // A scope is complete when its direct child has gone idle.
-            // For nested subagents, the child session will only go idle
-            // after ALL its own descendants complete (the event-broker
-            // forwards descendant idle events, but the child session.idle
-            // itself only fires when the SDK session is truly done).
-            if (owningScope.childSessionId === eventSessionId && !owningScope.childIdle) {
-              owningScope.childIdle = true;
-              owningScope.timeEnd = Date.now();
-              // Push final completed subagent card
-              this.pushFinalSubagentUpdate(stream, owningScope);
-              // If we were in deferred idle, check if ALL children are now idle
-              if (this.deferredIdle) {
-                const allChildrenIdle = [...this.activeSubagentScopes.values()]
-                  .filter(s => s.childSessionId)
-                  .every(s => s.childIdle);
-                if (allChildrenIdle) {
-                  this.deferredIdle = false;
-                  this.clearDeferredIdleTimer();
-                  // Clean up child scopes to avoid "leaked scope" warning
-                  for (const [callId, s] of this.activeSubagentScopes) {
-                    if (s.childIdle) {this.activeSubagentScopes.delete(callId);}
-                  }
-                  this.logTag('subagent', 'all child sessions idle — waiting for parent orchestrator to continue');
-                  return { stop: false, rendered: false };
-                }
-              }
-            }
-          }
-        }
-      } else if (event.type === 'session.status') {
-        // Child/descendant session status update — log but don't stop
-        const statusEvent = event as any;
-        this.logTag('subagent', `descendant session status: sessionId=${eventSessionId}, status=${statusEvent.status?.type}`);
-      } else if (event.type === 'part.updated') {
-        if (event.part?.type === 'tool') {
-          // Capture child/descendant tool call for subagent progress display.
-          const childToolName = (event.part as any).toolName ?? 'unknown';
-          const childPartId = (event.part as any).id ?? '';
-          const childCallId = (event.part as any).callId ?? childPartId;
-          const childState = (event.part as any).state;
-          const childStatus = childState?.status ?? 'running';
-          const childTitle = childState?.title;
-
-          let matchingScope = owningScope;
-          if (!matchingScope) {
-            // Lazy bind: first scope without a childSessionId gets this session
-            matchingScope = [...this.activeSubagentScopes.values()]
-              .find(s => !s.childSessionId);
-            if (matchingScope) {
-              matchingScope.childSessionId = eventSessionId;
-              this.logTag('subagent', `lazy-bound childSessionId=${eventSessionId} to callID=${matchingScope.callId}`);
-            }
-          }
-          if (matchingScope) {
-            matchingScope.descendantSessionIds.add(eventSessionId);
-            matchingScope.toolCalls.push({
-              name: childToolName,
-              title: childTitle ?? undefined,
-              status: childStatus,
-            });
-            // Update parent task tool card in real-time so subagent activity
-            // appears inside the subagent card in VSCode chat.
-            this.updateSubagentCard(stream, matchingScope, childToolName, childTitle, childStatus);
-            // Forward child tool invocation to VSCode with subAgentInvocationId
-            // so VSCode groups it under the parent subagent card.
-            // Uses pushToolInvocation() for full toolSpecificData rendering.
-            if (matchingScope.subAgentInvocationId) {
-              if (childStatus === 'completed' || childStatus === 'error') {
-                if (this.hasToolUI && VS.ChatToolInvocationPart && typeof stream.push === 'function') {
-                  try {
-                    if (stream.beginToolInvocation) {
-                      stream.beginToolInvocation(childCallId, childToolName, {
-                        subagentInvocationId: matchingScope.subAgentInvocationId,
-                      } as any);
-                    }
-                    this.pushToolInvocation(
-                      stream, childCallId, childToolName, childState as AcpToolState,
-                      childStatus === 'error',
-                      matchingScope.subAgentInvocationId,
-                    );
-                  } catch { /* best-effort */ }
-                }
-              } else {
-                if (this.hasToolUI && stream.beginToolInvocation) {
-                  try {
-                    stream.beginToolInvocation(childCallId, childToolName, {
-                      subagentInvocationId: matchingScope.subAgentInvocationId,
-                    } as any);
-                  } catch { /* best-effort */ }
-                }
-              }
-            }
-          } else {
-            this.logTag('subagent',
-              `descendant tool event with no matching scope: sessionID=${eventSessionId}, ` +
-              `tool=${childToolName}, activeScopes=[${[...this.activeSubagentScopes.values()]
-                .map(s => s.childSessionId ?? '?').join(', ')}]`,
-            );
-          }
-        } else if (event.part?.type === 'text') {
-          // Collect text output from child/descendant sessions
-          if (owningScope) {
-            const text = (event.part as any).text;
-            if (text && text.trim().length > 0) {
-              owningScope.lastText = text;
-            }
-          }
-        }
-      }
-      // Don't render child session events as parent events
-      return { stop: false, rendered: false };
+    if (eventSessionId && eventSessionId !== this.sessionId) {
+      this.logTag('route', `child -> ${this.describeEvent(event)}`);
+      this.handleChildSessionEvent(event, eventSessionId);
+      return;
     }
 
-    // Pre-register part IDs before subagent filtering so that parent-level
-    // parts (e.g. AI response text arriving after subagent completion)
-    // are not incorrectly classified as subagent-internal.
-    if (event.type === 'part.updated' && event.part) {
-      const p = event.part as { type?: string; id?: string };
-      if (p.type === 'text' && p.id && !this.partKinds.has(p.id)) {
-        // Tentatively register — handlePartUpdated may refine later
-        this.partKinds.set(p.id, 'text');
-      }
-    }
-
-    // Filter subagent-internal events: suppress rendering, capture for progress summary
-    if (this.isSubagentInternalEvent(event)) {
-      // Any subagent-internal event means the subagent is still active — reset safety timer
-      if (this.deferredIdle) {
-        this.resetDeferredIdleTimer();
-      }
-      this.captureSubagentEvent(event, stream);
-      return { stop: false, rendered: false };
-    }
-
+    // 2. Parent session events
+    this.logTag('route', `root -> ${this.describeEvent(event)}`);
     switch (event.type) {
-      case 'part.updated':
-        return { stop: false, rendered: this.handlePartUpdated(event, stream) };
-      case 'part.delta':
-        return { stop: false, rendered: this.handlePartDelta(event, stream) };
-      case 'session.idle':
-        // Don't stop while subagents are active — their completion events
-        // haven't arrived yet and a premature break would lose them.
-        if (this.activeSubagentScopes.size > 0) {
-          const hasUncompleted = [...this.activeSubagentScopes.values()].some(s => !s.completed);
-          if (!hasUncompleted) {
-            // All subagent scopes are completed (parent dispatched all tasks).
-            // But background child sessions may still be running — poll them.
-            this.checkChildSessionsAndMaybeStop();
-            return { stop: false, rendered: false };
-          }
-          // At least one subagent is still running — defer idle
-          this.deferredIdle = true;
-          this.startDeferredIdleTimer();
-          this.log(
-            `session.idle deferred: ${this.activeSubagentScopes.size} subagent(s), ` +
-            `${[...this.activeSubagentScopes.values()].filter(s => !s.completed).length} still running, ` +
-            `timeout=${OpenCodeBridge.DEFERRED_IDLE_TIMEOUT_MS / 1000}s`,
-          );
-          return { stop: false, rendered: false };
-        }
-        return { stop: true, rendered: false };
-      case 'session.updated': {
-        // Backend may auto-generate a meaningful title and broadcast it via
-        // session.updated. Capture it so the handler can update the session list.
-        const lifecycle = event as AcpSessionLifecycleEvent;
-        const rawTitle = lifecycle.title;
-        const trimmedTitle = rawTitle?.trim();
-        this.logTag(
-          'title',
-          `session.updated: sessionId=${lifecycle.sessionId}, rawTitle=${JSON.stringify(rawTitle)}, trimmed=${JSON.stringify(trimmedTitle)}`,
-        );
-        if (trimmedTitle) {
-          this.sessionTitle = trimmedTitle;
-        }
-        return { stop: false, rendered: false };
-      }
-      case 'session.diff':
-        return { stop: false, rendered: this.handleSessionDiff(event, stream) };
-      case 'session.error': {
-        const message = 'error' in event && typeof event.error === 'string'
-          ? (event as any).error
-          : 'Session error';
-        this.log(`session.error: ${message}`);
-        stream.markdown(`\n⚠️ ${message}\n`);
-        return { stop: false, rendered: true };
-      }
-      default:
-        return { stop: false, rendered: false };
-    }
-  }
-
-  /** Check if event should be processed by this bridge (filters by target session). */
-  private shouldProcessEvent(evt: AcpEvent): boolean {
-    if (!this.sessionId) {return true;}
-
-    switch (evt.type) {
-      case 'part.updated':
-      case 'part.delta': {
-        const eventSessionId = getEventSessionId(evt);
-        // Allow parent session events and all child session events.
-        // Child routing block (dispatchEvent) handles matching/scoping;
-        // filtering here would drop child tool events that arrive before
-        // task:completed (when childSessionId is not yet on the scope).
-        if (!eventSessionId || eventSessionId === this.sessionId) {return true;}
-        return true;
-      }
-      // session.idle and session.status from child sessions should be processed
-      // (they're forwarded by the broker for completion detection)
-      case 'session.idle':
-      case 'session.status':
-        return true;
-      default:
-        return true;
-    }
-  }
-
-  // -------------------------------------------------------------------
-  // permission.asked — sync barrier for per-edit externalEdit
-  // -------------------------------------------------------------------
-
-  private async handlePermissionAsked(event: AcpPermissionRequestEvent, stream: vscode.ChatResponseStream): Promise<boolean> {
-    const callID = event.tool?.callId;
-    const filepath = event.metadata?.filepath as string | undefined;
-    const sessionId = event.sessionId;
-    const permissionId = event.permissionId;
-
-    this.log(
-      `permission.asked: id=${permissionId}, callID=${callID ?? 'none'}, ` +
-      `filepath=${filepath ?? 'none'}, sessionID=${sessionId ?? 'none'}`,
-    );
-
-    // If we have a tracker and this is an edit-related permission with a file path, track it
-    if (this.tracker && callID && filepath) {
-      // Normalize Windows file URIs to match VS Code's internal path comparisons.
-      const fileUri = createExternalEditUri(filepath, this.directory);
-
-      // Skip if this callID is already tracked, or if the file already has an active
-      // ExternalEditPart (VSCode only supports one per file at a time).
-      if (this.tracker.hasEdit(callID)) {
-        this.externalEditCallIds.add(callID);
-        this.logTag('edit', `trackEdit skipped — callID=${callID} already tracked`);
-      } else if (this.tracker.isTrackingAny([fileUri])) {
-        this.logTag('edit', `trackEdit skipped — file ${filepath} already has an active edit, callID=${callID}`);
-      } else {
-        try {
-          await this.tracker.trackEdit(callID, [fileUri], stream);
-          this.externalEditCallIds.add(callID);
-          this.hideProgressiveExternalEditTool(stream, callID);
-          this.logTag('edit', `tracked edit callID=${callID}, file=${filepath}`);
-        } catch (err) {
-          this.logTag('edit', `trackEdit error for callID=${callID}: ${err}`);
-        }
-      }
-    }
-
-    // Auto-reply: once (do-edit) for write/permission events
-    if (sessionId && permissionId && this.permissions) {
-      try {
-        await this.permissions.reply(sessionId, permissionId, 'once', this.directory);
-        this.logTag('permission', `auto-replied to permission ${permissionId} (once)`);
-      } catch (err) {
-        this.logTag('permission', `auto-reply failed for permission ${permissionId}: ${err}`);
-      }
+      case 'part.updated':       this.handlePartUpdated(event); break;
+      case 'part.delta':         this.handlePartDelta(event); break;
+      case 'permission.asked':   this.handlePermissionAsked(event); break;
+      case 'question.asked':     this.handleQuestionAsked(event); break;
+      case 'session.updated':    this.handleSessionUpdated(event); break;
+      case 'session.created':    this.handleSessionCreated(event); break;
+      case 'session.idle':       return this.handleSessionIdle();
+      case 'session.diff':       this.handleSessionDiff(event); break;
+      case 'session.status':     break; // log only
+      default:                   break;
     }
     return false;
   }
 
-  // -------------------------------------------------------------------
-  // question.asked — sync barrier for user input
-  // -------------------------------------------------------------------
+  // ════════════════════════════════════════════════════════════════════════
+  // Append-only: text / reasoning deltas → always push
+  // ════════════════════════════════════════════════════════════════════════
 
-  private async handleQuestionAsked(event: AcpQuestionRequestEvent, stream: Stream): Promise<boolean> {
-    const questionId = event.questionId;
-    const sessionId = event.sessionId;
-    const questions = event.questions;
-
-    this.log(
-      `question.asked: id=${questionId}, sessionID=${sessionId}, questions=${questions.length}`,
-    );
-
-    // Try VSCode proposed API questionCarousel first
-    if (typeof stream.questionCarousel === 'function') {
-      try {
-        // Map OpenCode QuestionInfo → VSCode ChatQuestion
-        const vscodeQuestions: ChatQuestion[] = questions.map((q, i) => {
-          const hasOptions = q.options && q.options.length > 0;
-          const isMultiple = q.multiple ?? false;
-          const isCustom = q.custom ?? false;
-
-          const chatQuestion = new ChatQuestion(
-            `q_${i}`,
-            !hasOptions
-              ? ChatQuestionType.Text
-              : isMultiple
-                ? ChatQuestionType.MultiSelect
-                : ChatQuestionType.SingleSelect,
-            q.header ?? q.question,
-            {
-              message: q.question,
-              options: q.options?.map((o, j) => ({
-                id: `opt_${j}`,
-                label: o.label,
-                value: o.label,
-                detail: o.description,
-              })),
-            },
-          );
-
-          // Allow freeform input if custom=true
-          if (isCustom && hasOptions) {
-            chatQuestion.placeholder = 'Type your own answer...';
-          }
-
-          return chatQuestion;
-        });
-
-        this.log(`question.asked: showing questionCarousel with ${vscodeQuestions.length} questions`);
-        const result = await stream.questionCarousel(vscodeQuestions, true);
-        this.log(`question.asked: questionCarousel resolved, result=${JSON.stringify(result)}`);
-
-        if (result === undefined) {
-          // User skipped / cancelled
-          if (this.questions && sessionId && questionId) {
-            try {
-              await this.questions.reject(sessionId, questionId, this.directory);
-              this.logTag('question', `rejected question ${questionId} (user skipped)`);
-            } catch (err) {
-              this.logTag('question', `reject failed for question ${questionId}: ${err}`);
-            }
-          }
-        } else {
-          // User answered — map VSCode answers back to OpenCode format
-          // VSCode questionCarousel returns Record<string, IChatQuestionAnswerValue>:
-          //   - Text: string (direct value)
-          //   - SingleSelect: { selectedValue: unknown, freeformValue?: string }
-          //   - MultiSelect: { selectedValues: unknown[], freeformValue?: string }
-          const answers: Array<Array<string>> = questions.map((q, i) => {
-            const key = `q_${i}`;
-            const answer = result[key];
-
-            if (answer === undefined || answer === null) {
-              return [];
-            }
-
-            // Text answer — direct string
-            if (typeof answer === 'string') {
-              return [answer];
-            }
-
-            if (typeof answer === 'object' && answer !== null) {
-              const obj = answer as Record<string, unknown>;
-
-              // SingleSelect: { selectedValue: unknown, freeformValue?: string }
-              if ('selectedValue' in obj) {
-                // Prefer freeformValue if user typed a custom answer
-                if (obj.freeformValue && typeof obj.freeformValue === 'string') {
-                  return [obj.freeformValue];
-                }
-                const val = obj.selectedValue;
-                if (val !== undefined && val !== null) {
-                  return [String(val)];
-                }
-                return [];
-              }
-
-              // MultiSelect: { selectedValues: unknown[], freeformValue?: string }
-              if ('selectedValues' in obj && Array.isArray(obj.selectedValues)) {
-                const selected = (obj.selectedValues as unknown[]).map(v =>
-                  v !== undefined && v !== null ? String(v) : '',
-                ).filter(v => v !== '');
-                // Also include freeformValue if present
-                if (obj.freeformValue && typeof obj.freeformValue === 'string') {
-                  selected.push(obj.freeformValue);
-                }
-                return selected;
-              }
-            }
-
-            return [];
-          });
-
-          if (this.questions && sessionId && questionId) {
-            try {
-              this.logTag('question', `sending reply to question ${questionId}: sessionId=${sessionId}, answers=${JSON.stringify(answers)}, directory=${this.directory ?? 'none'}`);
-              await this.questions.reply(sessionId, questionId, answers, this.directory);
-              this.logTag('question', `replied to question ${questionId} successfully, answers=${JSON.stringify(answers)}`);
-            } catch (err) {
-              this.logTag('question', `reply FAILED for question ${questionId}: ${err}`);
-            }
-          } else {
-            this.logTag('question', `WARNING: cannot reply — questions=${!!this.questions}, sessionId=${sessionId}, questionId=${questionId}`);
-          }
-        }
-
-        return false; // questionCarousel handles its own UI
-      } catch (err) {
-        this.logTag('question', `questionCarousel error: ${err}`);
-        // Fall through to fallback
-      }
-    }
-
-    // Fallback: use vscode.window.showQuickPick for single-question scenarios
-    if (questions.length > 0) {
-      try {
-        const q = questions[0];
-        if (q.options && q.options.length > 0) {
-          const picks = q.options.map(o => ({
-            label: o.label,
-            description: o.description,
-          }));
-          const selected = await vscode.window.showQuickPick(picks, {
-            placeHolder: q.question,
-            canPickMany: q.multiple ?? false,
-          });
-
-          if (selected) {
-            const answers: Array<Array<string>> = [];
-            if (Array.isArray(selected)) {
-              answers.push(selected.map(s => s.label));
-            } else {
-              answers.push([selected.label]);
-            }
-
-            if (this.questions && sessionId && questionId) {
-              await this.questions.reply(sessionId, questionId, answers, this.directory);
-            }
-          } else {
-            if (this.questions && sessionId && questionId) {
-              await this.questions.reject(sessionId, questionId, this.directory);
-            }
-          }
-        } else {
-          // Text input question
-          const answer = await vscode.window.showInputBox({
-            prompt: q.question,
-            placeHolder: q.header,
-          });
-
-          if (answer !== undefined) {
-            const answers: Array<Array<string>> = [[answer]];
-            if (this.questions && sessionId && questionId) {
-              await this.questions.reply(sessionId, questionId, answers, this.directory);
-            }
-          } else {
-            if (this.questions && sessionId && questionId) {
-              await this.questions.reject(sessionId, questionId, this.directory);
-            }
-          }
-        }
-      } catch (err) {
-        this.logTag('question', `fallback UI error: ${err}`);
-        // Last resort: reject the question so the server doesn't hang
-        if (this.questions && sessionId && questionId) {
-          try {
-            await this.questions.reject(sessionId, questionId, this.directory);
-          } catch { /* ignore */ }
-        }
-      }
-    }
-
-    return false;
+  private handlePartDelta(event: AcpPartDeltaEvent): void {
+    if (!event.delta) return;
+    this.renderDeltaToTarget(event, this.sss);
   }
 
-  // -------------------------------------------------------------------
-  // part.updated
-  // -------------------------------------------------------------------
+  private handlePartUpdated(event: AcpPartUpdatedEvent): void {
+    this.handlePartUpdatedForTarget(event, this.sss, true);
+  }
 
-  private handlePartUpdated(event: AcpPartUpdatedEvent, stream: Stream): boolean {
+  private handlePartUpdatedForTarget(
+    event: AcpPartUpdatedEvent,
+    target: SessionStreamNode,
+    captureRootUserMessage: boolean,
+  ): void {
     const part = event.part;
-    if (!part) {return false;}
-
+    const nodeState = this.getNodeState(target);
+    this.logTag('route', `part.updated target=${this.describeTarget(target)} captureRootUser=${captureRootUserMessage} part=${this.describePart(part)} eventSession=${event.sessionId ?? '<none>'}`);
     switch (part.type) {
       case 'text': {
-        const textPart = part;
-        const msgId = textPart.messageId;
-        if (!this.assistantPhaseStarted && !this.userMessageId && textPart.text && textPart.text.length > 0 && msgId) {
-          this.userMessageId = msgId;
-          this.log(`captured userMessageId=${msgId}`);
-          return false;
-        }
-        if (msgId !== this.userMessageId || !this.userMessageId) {
-          this.partKinds.set(textPart.id, 'text');
-          this.log(`registered text part id=${textPart.id}, messageId=${msgId ?? 'none'}`);
-        }
-        return false;
-      }
-      case 'reasoning': {
-        this.assistantPhaseStarted = true;
-        const reasoningPart = part;
-        this.partKinds.set(reasoningPart.id, 'reasoning');
-        return false;
-      }
-      case 'tool': {
-        this.assistantPhaseStarted = true;
-        const toolPart = part;
-        this.partKinds.set(toolPart.id, 'tool');
-        return this.handleToolState(toolPart, stream);
-      }
-      case 'step-start':
-      case 'step-finish': {
-        this.assistantPhaseStarted = true;
-        return false;
-      }
-    }
-
-    return false;
-  }
-
-  // -------------------------------------------------------------------
-  // part.delta
-  // -------------------------------------------------------------------
-
-  private handlePartDelta(
-    event: AcpPartDeltaEvent,
-    stream: Stream,
-  ): boolean {
-    if (!event.delta) {return false;}
-
-    const partID = event.partId;
-    const delta = event.delta;
-    const kind = this.partKinds.get(partID);
-    const now = Date.now();
-    const gap = this.lastDeltaTime ? now - this.lastDeltaTime : 0;
-    this.lastDeltaTime = now;
-    this.logTag('delta', `partID=${partID}, kind=${kind ?? 'unknown'}, len=${delta.length}, gap=${gap}ms`);
-
-    if (kind === 'reasoning') {
-      if (this.hasThinking && stream.thinkingProgress) {
-        stream.thinkingProgress({ text: delta, id: partID });
-        return true;
-      }
-    } else if (kind === 'text') {
-      stream.markdown(delta);
-      return true;
-    }
-
-    return false;
-  }
-
-  // -------------------------------------------------------------------
-  // session.diff is used for persisted/session-list changes, not chat UI.
-  // -------------------------------------------------------------------
-
-  private handleSessionDiff(_event: AcpSessionDiffEvent, _stream: Stream): boolean {
-    return false;
-  }
-
-  // -------------------------------------------------------------------
-  // Tool call state machine: pending → running → completed
-  // -------------------------------------------------------------------
-
-  private handleToolState(part: AcpToolPart, stream: Stream): boolean {
-    const state = part.state;
-    if (!state) {return false;}
-
-    const toolName = part.toolName ?? 'unknown';
-    const callID = part.callId ?? part.id;
-    const status = state.status;
-    this.logTag('tool', `tool=${toolName}, callID=${callID}, status=${status}`);
-
-    if (status === 'pending') {
-      // --- TOOL STARTED ---
-      this.toolCallIds.set(part.id, callID);
-      this.toolMetas.set(callID, {
-        name: toolName,
-        input: undefined,
-        output: undefined,
-        title: undefined,
-        timeStart: undefined,
-        timeEnd: undefined,
-      });
-
-      if (this.isExternalEditToolCall(toolName, callID)) {
-        this.logTag('edit', `suppressing ${toolName}:pending tool card for externalEdit callID=${callID}`);
-        return true;
-      }
-
-      if (this.hasToolUI && stream.beginToolInvocation) {
-        stream.beginToolInvocation(callID, toolName);
-      } else {
-        stream.progress(`🔧 ${toolName}...`);
-      }
-      return true;
-    }
-
-    if (status === 'running') {
-      // --- TOOL RUNNING (has input) ---
-      const meta = this.toolMetas.get(callID);
-      if (meta) {
-        meta.input = state.input ?? {};
-        meta.title = getToolTitle(state);
-        meta.timeStart = getToolTime(state)?.start;
-      }
-
-      // Track subagent scope for "task" / "subagent" tools
-      if (toolName === 'task' || toolName === 'subagent') {
-        if (!this.activeSubagentScopes.has(callID)) {
-          // Generate a subAgentInvocationId for grouping child tools under this card.
-          const subAgentInvocationId = `subagent-${callID}-${Date.now()}`;
-          this.activeSubagentScopes.set(callID, {
-            callId: callID,
-            childSessionId: undefined,
-            descendantSessionIds: new Set(),
-            childIdle: false,
-            completed: false,
-            timeStart: Date.now(),
-            timeEnd: undefined,
-            toolCalls: [],
-            output: undefined,
-            lastText: undefined,
-            subAgentInvocationId,
-          } as SubagentScope);
-          this.logTag('subagent', `scope created: callID=${callID}, subAgentInvocationId=${subAgentInvocationId}`);
-        }
-      }
-
-      // Build invocation message for the tool card
-      const meta2 = this.toolMetas.get(callID);
-      const title = getToolTitle(state) ?? meta2?.title ?? toolName;
-      const invocationMsg = this.formatInvocationMsg(toolName, state.input ?? {}, title);
-      this.logTag('tool', `running: callID=${callID}, toolName=${toolName}, hasToolUI=${this.hasToolUI}`);
-
-      if (this.isExternalEditToolCall(toolName, callID)) {
-        this.logTag('edit', `suppressing ${toolName}:running tool card for externalEdit callID=${callID}`);
-        return true;
-      }
-
-      // Full toolSpecificData rendering via pushToolInvocation
-      // or legacy updateToolInvocation for backward compatibility.
-      if (this.progressivePushed.has(callID)) {
-        // Already pushed a progressive part — update only.
-        if (stream.updateToolInvocation) {
-          try {
-            stream.updateToolInvocation(callID, {
-              invocationMessage: typeof invocationMsg === 'string'
-                ? invocationMsg
-                : invocationMsg.value,
-            });
-          } catch { /* best-effort */ }
-        }
-      } else {
-        this.pushToolInvocation(stream, callID, toolName, state, false, undefined);
-        this.progressivePushed.add(callID);
-      }
-      return true;
-    }
-
-    if (status === 'completed' || status === 'error') {
-      // --- TOOL COMPLETED / ERROR ---
-      const meta = this.toolMetas.get(callID);
-      if (meta) {
-        meta.output = getToolOutput(state) ?? '';
-        meta.timeEnd = getToolTime(state)?.end;
-        meta.title = getToolTitle(state) ?? meta.title;
-      }
-
-      // For subagent tools: the subagent was just created and starts running.
-      // At task:completed, pushToolInvocation creates the subagent card with
-      // ChatSubagentToolInvocationData. The card shows task tool duration.
-      // At child session.idle, pushFinalSubagentUpdate updates with full duration.
-      const subagentScope = this.activeSubagentScopes.get(callID);
-      if ((toolName === 'task' || toolName === 'subagent') && subagentScope) {
-        // Extract child session ID from tool metadata (OpenCode task tool puts it there)
-        // Note: childSessionId may already be set via lazy binding if child events arrived first
-        const childSessionId = (state.metadata?.sessionId ??
-          (typeof state.output === 'string' ? state.output.match(/task_id:\s*(\S+)/)?.[1] : undefined)) as string | undefined;
-        if (childSessionId && !subagentScope.childSessionId) {
-          subagentScope.childSessionId = childSessionId;
-          this.logTag('subagent', `child session ID captured: callID=${callID}, childSessionId=${childSessionId}`);
-        }
-        // subAgentInvocationId was already generated at task:running (scope creation)
-        // so child tool events arriving before task:completed have it available.
-
-        // Save output for the final card push at child session.idle.
-        // NOTE: timeEnd is NOT set here — it will be set to Date.now() when the
-        // child session goes idle, giving the true creation→completion duration.
-        subagentScope.output = getToolOutput(state) ?? '';
-        subagentScope.completed = true;
-        this.hadSubagentTasks = true;
-
-        this.logTag('subagent', `scope activated (subagent spawned): callID=${callID}, childSessionId=${childSessionId || subagentScope.childSessionId}, subAgentInvocationId=${subagentScope.subAgentInvocationId}`);
-        // DON'T push completed card — the subagent is still running!
-        // Just update the running card to show it's active.
-        // The final completed card will be pushed at child session.idle.
-        if (stream.updateToolInvocation) {
-          try {
-            const input = state.input ?? {};
-            const description = (input.description as string) ?? getToolTitle(state) ?? toolName;
-            stream.updateToolInvocation(callID, {
-              invocationMessage: `Subagent started: ${description}`,
-            });
-          } catch { /* best-effort */ }
-        }
-        return true;
-      }
-
-      const externalEditTool = this.isExternalEditToolCall(toolName, callID);
-
-      // Complete tracker edit if this is a tracked tool
-      if (this.tracker && typeof this.tracker.completeEdit === 'function') {
-        try {
-          const completion = this.tracker.completeEdit(callID);
-          if (completion) {
-            this.externalEditCompletions.push(
-              Promise.resolve(completion)
-                .then((undoStopId) => {
-                  if (undoStopId) {
-                    this.callbacks?.onExternalEdit?.(callID, undoStopId);
-                    this.logTag('edit', `externalEdit completed callID=${callID}, undoStopId=${undoStopId}`);
-                  } else {
-                    this.logTag('edit', `externalEdit completed callID=${callID} without undoStopId`);
-                  }
-                })
-                .catch((err: unknown) => {
-                  this.logTag('edit', `externalEdit completion failed for callID=${callID}: ${
-                    err instanceof Error ? err.message : String(err)
-                  }`);
-                }),
-            );
+        // Skip if already routed — part.updated fires again at completion
+        // with the full accumulated text; deltas already rendered the content.
+        const existingRoute = nodeState.partRoutes.get(part.id);
+        if (existingRoute) {
+          this.partTargets.set(part.id, target);
+          this.logTag('route', `part.updated duplicate text partID=${part.id} target=${this.describeTarget(target)} action=keep-existing-route`);
+          if (existingRoute === 'pendingSystemNotice') {
+            const systemNotice = getSystemNotice(part);
+            if (systemNotice) {
+              nodeState.partRoutes.set(part.id, 'systemNotice');
+              nodeState.pendingDeltas.delete(part.id);
+              this.pushSystemNoticeTool(target, part, systemNotice, event.sessionId);
+              this.logTag('route', `text system notice completed partID=${part.id} title="${systemNotice.title}" target=${this.describeTarget(target)}`);
+            }
+            return;
           }
-        } catch { /* best-effort */ }
-      }
-
-      if (externalEditTool) {
-        this.externalEditCallIds.delete(callID);
-        this.toolMetas.delete(callID);
-        this.toolCallIds.delete(part.id);
-        this.logTag('edit', `suppressing ${toolName}:${status} tool card for externalEdit callID=${callID}`);
-        return true;
-      }
-
-      // Non-subagent tool completion: push the final tool invocation part
-      this.pushToolInvocation(stream, callID, toolName, state, status === 'error', undefined);
-      return true;
-    }
-
-    return false;
-  }
-
-  private hideProgressiveExternalEditTool(stream: Stream, callID: string): void {
-    if (!this.progressivePushed.has(callID) || !VS.ChatToolInvocationPart || !stream.push) {
-      return;
-    }
-
-    try {
-      const toolName = this.toolMetas.get(callID)?.name ?? 'edit';
-      const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callID);
-      part.enablePartialUpdate = true;
-      part.isComplete = true;
-      part.presentation = 'hidden';
-      stream.push(part as unknown as vscode.ChatResponsePart);
-      this.logTag('edit', `hid progressive edit tool card for externalEdit callID=${callID}`);
-    } catch { /* best-effort */ }
-  }
-
-  // -------------------------------------------------------------------
-  // External edit handling (file snapshot before write)
-  // -------------------------------------------------------------------
-
-  private async handleEditSnapshot(
-    data: { callId: string; filepath?: string; sessionId?: string },
-  ): Promise<void> {
-    // Snapshot was already taken during permission.asked via tracker.trackEdit.
-    // This is a no-op now since permission.asked already emits the snapshot.
-  }
-
-  private isExternalEditToolCall(toolName: string, callID: string): boolean {
-    return isEditTool(toolName) && this.externalEditCallIds.has(callID);
-  }
-
-  // -------------------------------------------------------------------
-  // Tool card rendering
-  // -------------------------------------------------------------------
-
-  /**
-   * Push a full tool invocation part to the stream.
-   * Used for both progressive (in-flight) and completed tool states.
-   */
-  private pushToolInvocation(
-    stream: Stream,
-    callID: string,
-    toolName: string,
-    state: AcpToolState,
-    isError: boolean,
-    subAgentInvocationId?: string,
-  ): void {
-    if (!VS.ChatToolInvocationPart || !stream.push) {
-      // Fallback: no ChatToolInvocationPart support — just update tool state
-      this.pushToolInvocationFallback(stream, callID, toolName, state, isError, subAgentInvocationId);
-      return;
-    }
-
-    try {
-      const input = state.input ?? {};
-      const output = state.output ?? '';
-      const title = state.title ?? '';
-
-      // Create ChatToolInvocationPart
-      const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callID, isError ? (state.error ?? 'Error') : undefined);
-      part.enablePartialUpdate = true;
-      part.isComplete = !subAgentInvocationId || state.status === 'completed' || state.status === 'error';
-      if (state.status === 'pending' || (state.status === 'running' && !this.progressivePushed.has(callID))) {
-        part.isComplete = false;
-      }
-
-      // invocationMessage: short one-liner for the collapsed card
-      // pastTenseMessage: shown when the tool completes (expanded state)
-      if (state.status === 'running' || state.status === 'pending') {
-        const msg = this.formatInvocationMsg(toolName, input, title);
-        part.invocationMessage = typeof msg === 'string' ? msg : msg.value;
-      } else if (state.status === 'completed' || state.status === 'error') {
-        if (toolName === 'read') {
-          const msg = this.formatInvocationMsg(toolName, input, title);
-          part.invocationMessage = typeof msg === 'string' ? msg : msg.value;
-        } else {
-          const pastMsg = this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input);
-          part.pastTenseMessage = typeof pastMsg === 'string' ? pastMsg : pastMsg.value;
+          if (existingRoute === 'ignored' || existingRoute === 'systemNotice') {
+            return;
+          }
+          this.renderAssistantText(target, {
+            partId: part.id,
+            text: '',
+            messageId: part.messageId,
+            sessionId: event.sessionId ?? part.sessionId,
+            isComplete: true,
+          }, `text complete partID=${part.id}`);
+          return;
         }
+        const systemNotice = getSystemNotice(part);
+        if (systemNotice) {
+          nodeState.partRoutes.set(part.id, 'systemNotice');
+          this.partTargets.set(part.id, target);
+          nodeState.pendingDeltas.delete(part.id);
+          this.pushSystemNoticeTool(target, part, systemNotice, event.sessionId);
+          this.logTag('route', `text system notice partID=${part.id} title="${systemNotice.title}" target=${this.describeTarget(target)}`);
+          return;
+        }
+        if (hasOpenSystemReminder(part.text)) {
+          nodeState.partRoutes.set(part.id, 'pendingSystemNotice');
+          this.partTargets.set(part.id, target);
+          nodeState.pendingDeltas.delete(part.id);
+          this.logTag('route', `text pending system notice partID=${part.id} target=${this.describeTarget(target)}`);
+          return;
+        }
+        if (part.ignored === true) {
+          nodeState.partRoutes.set(part.id, 'ignored');
+          this.partTargets.set(part.id, target);
+          nodeState.pendingDeltas.delete(part.id);
+          this.logTag('route', `text ignored partID=${part.id} messageID=${part.messageId ?? '<none>'} target=${this.describeTarget(target)}`);
+          return;
+        }
+        // User echo detection: before assistant output starts, the first text
+        // message belongs to the user. Restored or user-echo-less streams may
+        // begin directly with assistant text, so do not claim that id then.
+        const hasInitialText = (part.text ?? '').length > 0;
+        const hasBufferedDeltas = (nodeState.pendingDeltas.get(part.id)?.length ?? 0) > 0;
+        if (!nodeState.assistantStarted && nodeState.userMessageId === null && part.messageId && hasInitialText && !hasBufferedDeltas) {
+          nodeState.userMessageId = part.messageId;
+          if (captureRootUserMessage) {
+            this.userMessageId = part.messageId;
+          }
+          this.logTag('route', `text user candidate partID=${part.id} messageID=${part.messageId} target=${this.describeTarget(target)} captureRootUser=${captureRootUserMessage}`);
+        }
+        if (!nodeState.assistantStarted && hasInitialText && !hasBufferedDeltas && part.messageId && part.messageId === nodeState.userMessageId) {
+          nodeState.partRoutes.set(part.id, 'ignored');
+          this.partTargets.set(part.id, target);
+          this.logTag('route', `text ignored user echo partID=${part.id} messageID=${part.messageId} target=${this.describeTarget(target)}`);
+          return; // Skip user echo
+        }
+        nodeState.assistantStarted = true;
+        nodeState.partRoutes.set(part.id, 'text');
+        this.partTargets.set(part.id, target);
+        const hadBufferedDelta = this.flushPendingDeltas(part.id, target);
+        this.logTag('route', `text routed partID=${part.id} target=${this.describeTarget(target)} hadBufferedDelta=${hadBufferedDelta}`);
+        if (!hadBufferedDelta) {
+          this.renderAssistantText(target, {
+            partId: part.id,
+            text: part.text ?? '',
+            messageId: part.messageId,
+            sessionId: event.sessionId ?? part.sessionId,
+          }, `text partID=${part.id}`);
+        }
+        break;
       }
-
-      // toolSpecificData: rich type-specific rendering
-      const specific = this.buildToolSpecificData(toolName, input, output, title);
-      if (specific) {
-        part.toolSpecificData = specific as ChatToolSpecificData;
-      }
-
-      if (isTransientFileTool(toolName)) {
-        part.presentation = 'hiddenAfterComplete';
-      }
-
-      // subAgentInvocationId: group child tools under a subagent card
-      if (subAgentInvocationId) {
-        part.subAgentInvocationId = subAgentInvocationId;
-      }
-
-      stream.push(part as unknown as vscode.ChatResponsePart);
-      this.logTag('tool', `pushed ChatToolInvocationPart: callID=${callID}, toolName=${toolName}, isComplete=${part.isComplete}, hasToolSpecific=${!!specific}`);
-    } catch {
-      this.pushToolInvocationFallback(stream, callID, toolName, state, isError, subAgentInvocationId);
+      case 'reasoning':
+        // Skip if already routed — same dedup as text (see above)
+        if (nodeState.partRoutes.has(part.id)) {
+          this.partTargets.set(part.id, target);
+          this.logTag('route', `part.updated duplicate reasoning partID=${part.id} target=${this.describeTarget(target)} action=keep-existing-route`);
+          this.pushReasoning(target, {
+            partId: part.id,
+            text: '',
+            messageId: part.messageId,
+            sessionId: event.sessionId ?? part.sessionId,
+            isComplete: true,
+          });
+          return;
+        }
+        nodeState.assistantStarted = true;
+        nodeState.partRoutes.set(part.id, 'reasoning');
+        this.partTargets.set(part.id, target);
+        const hadBufferedDelta = this.flushPendingDeltas(part.id, target);
+        this.logTag('route', `reasoning routed partID=${part.id} target=${this.describeTarget(target)} hadBufferedDelta=${hadBufferedDelta}`);
+        const initialDelta = part.text ?? '';
+        if (!hadBufferedDelta && initialDelta) {
+          const sessionId = event.sessionId ?? part.sessionId;
+          this.pushReasoning(target, {
+            partId: part.id,
+            text: initialDelta,
+            messageId: part.messageId,
+            sessionId,
+          });
+          this.appendDeltaText(target, part.id, initialDelta);
+        } else if (!hadBufferedDelta) {
+          this.logTag('route', `reasoning initial empty skipped partID=${part.id} target=${this.describeTarget(target)}`);
+        }
+        break;
+      case 'tool':
+        this.logTag('route', `tool routed partID=${part.id} callID=${part.callId ?? part.id} tool=${part.toolName} status=${part.state?.status ?? '<none>'} target=${this.describeTarget(target)}`);
+        if (part.toolName === 'task' || part.toolName === 'subagent') {
+          this.ensureRootSubagentScope(part, event.sessionId);
+        }
+        this.handleToolState(part, target, event.sessionId);
+        break;
+      case 'step-start':
+        nodeState.assistantStarted = true;
+        this.logTag('route', `step-start target=${this.describeTarget(target)} partID=${part.id}`);
+        break;
+      case 'step-finish':
+        this.logTag('route', `step-finish target=${this.describeTarget(target)} partID=${part.id}`);
+        break; // No rendering needed
     }
   }
 
-  /**
-   * Fallback tool rendering when ChatToolInvocationPart is not available.
-   * Uses stream.beginToolInvocation / updateToolInvocation.
-   */
-  private pushToolInvocationFallback(
-    stream: Stream,
-    callID: string,
-    toolName: string,
-    state: AcpToolState,
-    isError: boolean,
-    subAgentInvocationId?: string,
+  private renderDeltaToTarget(event: AcpPartDeltaEvent, fallbackTarget: SessionStreamNode): void {
+    if (!event.delta) return;
+
+    const target = this.partTargets.get(event.partId) ?? fallbackTarget;
+    const targetState = this.getNodeState(target);
+    const kind = targetState.partRoutes.get(event.partId);
+    this.logTag('route', `delta partID=${event.partId} sessionID=${event.sessionId ?? '<none>'} kind=${kind ?? '<unrouted>'} target=${this.describeTarget(target)} fallback=${this.describeTarget(fallbackTarget)} text="${previewText(event.delta)}"`);
+    if (kind === 'reasoning') {
+      this.pushReasoning(target, {
+        partId: event.partId,
+        text: event.delta,
+        sessionId: event.sessionId,
+      });
+      this.logTag('route', `delta rendered reasoning partID=${event.partId} target=${this.describeTarget(target)}`);
+      this.appendDeltaText(target, event.partId, event.delta);
+    } else if (kind === 'text') {
+      this.renderAssistantText(target, {
+        partId: event.partId,
+        text: event.delta,
+        sessionId: event.sessionId,
+      }, `text delta partID=${event.partId}`);
+      this.logTag('route', `delta rendered text partID=${event.partId} target=${this.describeTarget(target)}`);
+    } else if (kind === 'ignored' || kind === 'pendingSystemNotice' || kind === 'systemNotice') {
+      this.logTag('route', `delta ignored kind=${kind} partID=${event.partId} target=${this.describeTarget(target)}`);
+    } else if (event.sessionId) {
+      const pending = targetState.pendingDeltas.get(event.partId) ?? [];
+      pending.push(event);
+      targetState.pendingDeltas.set(event.partId, pending);
+      this.logTag('route', `delta buffered partID=${event.partId} sessionID=${event.sessionId} target=${this.describeTarget(target)} pending=${pending.length}`);
+    } else {
+      this.logTag('route', `delta dropped unrouted partID=${event.partId} no event sessionID target=${this.describeTarget(target)}`);
+    }
+  }
+
+  private flushPendingDeltas(partId: string, target: SessionStreamNode): boolean {
+    const targetState = this.getNodeState(target);
+    const pending = targetState.pendingDeltas.get(partId);
+    if (!pending || pending.length === 0) return false;
+    targetState.pendingDeltas.delete(partId);
+    this.logTag('route', `flush pending deltas partID=${partId} count=${pending.length} target=${this.describeTarget(target)}`);
+    for (const event of pending) {
+      this.renderDeltaToTarget(event, target);
+    }
+    return true;
+  }
+
+  private appendDeltaText(target: SessionStreamNode, partId: string, delta: string): void {
+    if (!delta) return;
+    const targetState = this.getNodeState(target);
+    targetState.deltaText.set(partId, (targetState.deltaText.get(partId) ?? '') + delta);
+  }
+
+  private renderAssistantText(
+    target: SessionStreamNode,
+    data: { partId: string; text: string; messageId?: string; sessionId?: string; isComplete?: boolean },
+    label: string,
   ): void {
-    if (!this.hasToolUI) {
+    if (!data.text && !data.isComplete) return;
+    if (this.isRootTarget(target)) {
+      target.push(new AssistantTextSSP({
+        partId: data.partId,
+        delta: data.text,
+        messageId: data.messageId,
+        sessionId: data.sessionId,
+        isComplete: data.isComplete,
+      }));
+    } else {
+      target.push(new AssistantTextSSP({
+        partId: data.partId,
+        delta: data.text,
+        messageId: data.messageId,
+        sessionId: data.sessionId,
+        isComplete: data.isComplete,
+      }));
+    }
+    this.appendDeltaText(target, data.partId, data.text);
+  }
+
+  private pushSystemNoticeTool(
+    target: SessionStreamNode,
+    part: AcpTextPart,
+    notice: SystemNotice,
+    eventSessionId: string | undefined,
+  ): void {
+    const callId = `system-${part.id}`;
+    target.push(new OpenCodeSystemNoticeToolSSP({
+      partId: part.id,
+      toolName: notice.title,
+      callId,
+      messageId: part.messageId,
+      sessionId: eventSessionId ?? part.sessionId,
+      state: {
+        status: 'completed',
+        input: {},
+        output: notice.output,
+        title: notice.title,
+        metadata: {
+          presentation: 'system',
+          source: 'opencode-system-reminder',
+        },
+      },
+    }));
+  }
+
+  private pushReasoning(
+    target: SessionStreamNode,
+    data: { partId: string; text: string; messageId?: string; sessionId?: string; thinkingId?: string; isComplete?: boolean },
+  ): void {
+    if (!data.text && !data.isComplete) return;
+    target.push(new ReasoningSSP({
+      partId: data.partId,
+      delta: data.text,
+      messageId: data.messageId,
+      sessionId: data.sessionId,
+      thinkingId: data.thinkingId,
+      metadata: this.getReasoningMetadata(data.sessionId),
+      isComplete: data.isComplete,
+    }, this.getReasoningMeta(data.sessionId)));
+  }
+
+  private isRootTarget(target: SessionStreamNode): boolean {
+    return target === this.sss;
+  }
+
+  private getReasoningMetadata(sessionId: string | undefined): Record<string, unknown> | undefined {
+    if (!sessionId) return undefined;
+    const metadata: Record<string, unknown> = { sessionId };
+    const parentSessionId = this.getParentSessionId(sessionId);
+    if (parentSessionId) {
+      metadata.parentSessionId = parentSessionId;
+    }
+    return metadata;
+  }
+
+  private getReasoningMeta(sessionId: string | undefined): { parentSessionId?: string } | undefined {
+    const parentSessionId = this.getParentSessionId(sessionId);
+    return parentSessionId ? { parentSessionId } : undefined;
+  }
+
+  private getParentSessionId(sessionId: string | undefined): string | undefined {
+    if (!sessionId || sessionId === this.sessionId) return undefined;
+    return this.childSessionHints.get(sessionId) ?? this.sessionId;
+  }
+
+  private getDeltaText(target: SessionStreamNode, partId: string): string | undefined {
+    return this.getNodeState(target).deltaText.get(partId);
+  }
+
+  private isAssistantTextPart(target: SessionStreamNode, partId: string | undefined): boolean {
+    if (!partId) return false;
+    return this.getNodeState(target).partRoutes.get(partId) === 'text';
+  }
+
+  private isReasoningPart(target: SessionStreamNode, partId: string | undefined): boolean {
+    if (!partId) return false;
+    return this.getNodeState(target).partRoutes.get(partId) === 'reasoning';
+  }
+
+  private updateScopeSummary(scope: SubagentScope, kind: StreamablePartKind, text: string | undefined): void {
+    if (!text || !text.trim()) return;
+    scope.lastText = text;
+    if (kind === 'text') {
+      scope.lastAssistantText = text;
+    } else {
+      scope.lastReasoningText = text;
+    }
+    this.logTag('subagent', `summary captured kind=${kind} scope=${this.describeScope(scope)} text="${previewText(text)}"`);
+  }
+
+  private ensureRootSubagentScope(part: AcpToolPart, sessionId: string | undefined): SubagentScope | undefined {
+    if (part.toolName !== 'task' && part.toolName !== 'subagent') return undefined;
+    const key = part.callId ?? part.id;
+    let scope = this.subagents.getScope(key);
+    if (!scope) {
+      scope = this.subagents.startSubagent(key, {
+        toolName: part.toolName,
+        title: part.state?.title ?? '',
+        input: part.state?.input ?? {},
+      });
+      this.logTag('subagent', `scope started ${this.describeScope(scope)} from ${part.state?.status ?? '<none>'} tool=${part.toolName} sessionID=${sessionId ?? '<none>'}`);
+    }
+    const childSessionId = this.getToolSessionId(part.state);
+    if (childSessionId) {
+      this.logTag('subagent', `task state has childSessionId=${childSessionId} scope=${this.describeScope(scope)}`);
+      this.bindScopeToChildSession(scope, childSessionId);
+    }
+    return scope;
+  }
+
+  private getNodeState(target: SessionStreamNode): StreamNodeState {
+    let state = this.nodeStates.get(target);
+    if (!state) {
+      state = {
+        userMessageId: null,
+        assistantStarted: false,
+        partRoutes: new Map(),
+        pendingDeltas: new Map(),
+        deltaText: new Map(),
+      };
+      this.nodeStates.set(target, state);
+    }
+    return state;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // Mutable: tool lifecycle → push (pending) / update (running/completed)
+  // ════════════════════════════════════════════════════════════════════════
+
+  private handleToolState(
+    part: AcpToolPart,
+    target: SessionStreamNode,
+    eventSessionId = part.sessionId,
+  ): void {
+    const key = part.callId ?? part.id;
+    const state = part.state;
+    if (!state) return;
+
+    const status = state.status;
+    const sessionId = eventSessionId ?? part.sessionId;
+    const eventScope = sessionId && sessionId !== this.sessionId
+      ? this.findScopeForSession(sessionId)
+      : undefined;
+    const isKnownRootTool = target.has(key);
+    const fallbackScope = eventScope ?? (!sessionId && !isKnownRootTool ? this.getActiveSubagentScope() : undefined);
+    if (fallbackScope && !this.subagents.getScope(key) && part.toolName !== 'task' && part.toolName !== 'subagent') {
+      this.handleSubagentToolPart(fallbackScope, part, sessionId);
       return;
     }
 
-    const title = state.title ?? toolName;
-    const input = state.input ?? {};
-
-    if (state.status === 'pending') {
-      try {
-        stream.beginToolInvocation?.(callID, toolName, subAgentInvocationId ? { subAgentInvocationId } as any : undefined);
-      } catch { /* ignore */ }
-      return;
-    }
-
-    if (state.status === 'running') {
-      try {
-        const msg = this.formatInvocationMsg(toolName, input, title);
-        stream.updateToolInvocation?.(callID, {
-          invocationMessage: typeof msg === 'string' ? msg : msg.value,
-        } as any);
-      } catch { /* ignore */ }
-      return;
-    }
-
-    if (state.status === 'completed' || state.status === 'error') {
-      if (toolName === 'read') {
+    // Write/edit tools: defer SSP creation until permission.asked creates ExternalEditSSP.
+    // If permission never comes (auto-approve), create ToolInvocationSSP at completion.
+    if (this.isWriteEditTool(part.toolName)) {
+      if (this.hasExternalEdit(key, target)) {
+        // ExternalEditSSP exists → external edit path
+        if (status === 'completed' || status === 'error') {
+          this.completeExternalEdit(key, target);
+        }
         return;
       }
-      const pastMsg = this.formatPastTenseMsg(toolName, title, state.startTime, state.endTime, input);
-      try {
-        stream.updateToolInvocation?.(callID, {
-          pastTenseMessage: typeof pastMsg === 'string' ? pastMsg : pastMsg.value,
-          invocationMessage: isError ? `✗ ${toolName}` : `✓ ${toolName}`,
-        } as any);
-      } catch { /* ignore */ }
+      // No ExternalEditSSP yet — keep deferring at pending/running
+      if (status === 'pending' || status === 'running') return;
+      // completed/error without permission → fall through to normal tool handling
     }
-  }
 
-  /**
-   * Build tool-specific data for the ChatToolInvocationPart.
-   * Returns appropriate data based on the tool name and its input/output.
-   */
-  private buildToolSpecificData(
-    toolName: string,
-    input: Record<string, unknown>,
-    output: string,
-    title: string,
-  ): ChatTerminalToolInvocationData | ChatSimpleToolResultData | ChatToolResourcesInvocationData | ChatSubagentToolInvocationData | ChatTodoToolInvocationData | undefined {
-    const formatInput = (data: Record<string, unknown>, fallbackTitle: string): string => {
-      const keys = Object.keys(data);
-      if (keys.length === 0) {return fallbackTitle;}
-      const parts = keys.map((k) => {
-        const val = typeof data[k] === 'string'
-          ? (data[k] as string).substring(0, 100)
-          : JSON.stringify(data[k]).substring(0, 100);
-        return `${k}: ${val}`;
-      });
-      return parts.join('\n');
-    };
-
-    const truncate = (s: string, max: number): string =>
-      s.length > max ? s.substring(0, max) + '...' : s;
-
-    switch (toolName) {
-      case 'read':
-        return undefined;
-
-      case 'write':
-      case 'edit':
-        return undefined;
-
-      case 'bash': {
-        const command = (input.command as string) ?? (input.script as string) ?? formatInput(input, title);
-        const exitCode = ((): number | undefined => {
-          if (stateOutputHasExitCode(output)) {
-            const match = output.match(/exitCode:\s*(-?\d+)/);
-            return match ? parseInt(match[1], 10) : undefined;
-          }
-          return undefined;
-        })();
-        return {
-          commandLine: { original: command },
-          language: (input.language as string) ?? 'bash',
-          output: output ? { text: truncate(output, 2000) } : undefined,
-          state: exitCode != null ? { exitCode } : undefined,
-        } satisfies ChatTerminalToolInvocationData;
-      }
-
-      case 'list':
-      case 'grep':
-      case 'glob':
-      case 'websearch':
-      case 'websearch_web_search_exa':
-      case 'read_url':
-      case 'readUrl':
-      case 'fetch':
-      case 'context': {
-        return {
-          input: formatInput(input, title),
-          output: truncate(output, 2000),
-        } satisfies ChatSimpleToolResultData;
-      }
-
-      case 'todo': {
-        const todos = input.todos as Array<{ content: string; status: string }> | undefined;
-        if (todos) {
-          // Subagent: use simple result format
-          const check = (s: string) =>
-            s === 'completed' ? '✓' : s === 'in_progress' ? '⟳' : '○';
-          const formatted = todos.map((item, idx) => {
-            return `[${check(item.status)}] ${idx + 1}. ${item.content}`;
-          }).join('\n');
-          return {
-            input: formatted,
-            output: truncate(output, 2000),
-          } satisfies ChatSimpleToolResultData;
-        }
-        // Root session: use proper ChatTodoToolInvocationData
-        const todoList = (todos ?? []).map((item: { content: string; status: string }, idx: number) => ({
-          id: idx,
-          title: item.content,
-          status: item.status === 'completed'
-            ? ChatTodoStatus.Completed
-            : item.status === 'in_progress'
-              ? ChatTodoStatus.InProgress
-              : ChatTodoStatus.NotStarted,
+    if (!target.has(key)) {
+      // Task/subagent → start scope
+      if (part.toolName === 'task' || part.toolName === 'subagent') {
+        this.ensureRootSubagentScope(part, sessionId);
+        target.push(new ToolInvocationSSP({
+          partId: part.id,
+          toolName: part.toolName,
+          callId: key,
+          state,
+          messageId: part.messageId,
+          sessionId,
+          subAgentId: key,
         }));
-        return { todoList } satisfies ChatTodoToolInvocationData;
-      }
-
-      case 'task':
-      case 'subagent': {
-        const description = (input.description as string) ?? title;
-        const agentName = (input.agentName as string) ?? (input.agent_type as string) ?? title ?? toolName;
-        const prompt = (input.prompt as string) ?? formatInput(input, '');
-        const result = truncate(output, 4000);
-        // Use ChatSubagentToolInvocationData constructor if available at runtime
-        if (VS.ChatSubagentToolInvocationData) {
-          return new VS.ChatSubagentToolInvocationData(
-            description,
-            agentName,
-            prompt,
-            result,
-          ) satisfies ChatSubagentToolInvocationData;
-        }
-        return {
-          description,
-          agentName,
-          prompt,
-          result,
-        } satisfies ChatSubagentToolInvocationData;
-      }
-
-      default:
-        // Generic fallback
-        if (Object.keys(input).length > 0 || output) {
-          return {
-            input: formatInput(input, title),
-            output: truncate(output, 2000),
-          } satisfies ChatSimpleToolResultData;
-        }
-        return undefined;
-    }
-  }
-
-  // -------------------------------------------------------------------
-  // Message formatting
-  // -------------------------------------------------------------------
-
-  private formatInvocationMsg(
-    toolName: string,
-    input: Record<string, unknown>,
-    title: string,
-  ): string | vscode.MarkdownString {
-    const formatFileBubbleMessage = (
-      verb: 'Read' | 'Editing' | 'Writing',
-      filePath: string,
-      offset?: number,
-      limit?: number,
-    ): vscode.MarkdownString => {
-      const uri = vscode.Uri.file(filePath).toString().toLowerCase();
-      const range = offset != null || limit != null
-        ? (() => {
-            const start = offset ?? 1;
-            const end = limit != null ? start + limit - 1 : start;
-            return `#${start}-${end}`;
-          })()
-        : '';
-      return new vscode.MarkdownString(`${verb} [](${uri}${range})`);
-    };
-
-    if (toolName === 'read') {
-      const filePath = input?.filePath as string | undefined;
-      if (filePath) {
-        const offset = input?.offset as number | undefined;
-        const limit = input?.limit as number | undefined;
-        return formatFileBubbleMessage('Read', filePath, offset, limit);
-      }
-    } else if (toolName === 'edit') {
-      const filePath = input?.filePath as string | undefined;
-      if (filePath) {
-        return formatFileBubbleMessage('Editing', filePath);
-      }
-    } else if (toolName === 'write') {
-      const filePath = input?.filePath as string | undefined;
-      if (filePath) {
-        return formatFileBubbleMessage('Writing', filePath);
-      }
-    } else if (toolName === 'bash') {
-      const command = (input.command as string) ?? (input.script as string) ?? title;
-      const short = command.length > 80 ? command.substring(0, 77) + '...' : command;
-      return `\`${short}\``;
-    } else if (toolName === 'todo') {
-      return `Todos`;
-    } else if (toolName === 'task' || toolName === 'subagent') {
-      const desc = (input.description as string) ?? title;
-      return `Subagent: ${desc}`;
-    } else if (toolName === 'list' || toolName === 'grep') {
-      const filePath = (input.filePath as string) ?? (input.path as string) ?? (input.pattern as string) ?? title;
-      const short = filePath.length > 60 ? filePath.substring(0, 57) + '...' : filePath;
-      return `${toolName === 'list' ? 'List' : 'Search'} \`${short}\``;
-    } else if (toolName === 'glob') {
-      const pattern = (input.pattern as string) ?? title;
-      const short = pattern.length > 60 ? pattern.substring(0, 57) + '...' : pattern;
-      return `Glob \`${short}\``;
-    } else if (toolName === 'websearch' || toolName === 'websearch_web_search_exa') {
-      const query = (input.query as string) ?? title;
-      if (query) {
-        const short = query.length > 80 ? query.substring(0, 77) + '...' : query;
-        return new vscode.MarkdownString(`Web Searching \`${short}\``);
-      }
-    }
-
-    const display = title || toolName;
-    if (!input || Object.keys(input).length === 0) {
-      return `Running ${display}`;
-    }
-    const firstKey = Object.keys(input)[0];
-    const firstVal = input[firstKey];
-    const short = typeof firstVal === 'string'
-      ? firstVal.length > 60 ? firstVal.substring(0, 57) + '...' : firstVal
-      : JSON.stringify(firstVal);
-    return `Running ${display} (${firstKey}: ${short})`;
-  }
-
-  private formatPastTenseMsg(
-    toolName: string,
-    title: string,
-    timeStart?: number,
-    timeEnd?: number,
-    input?: Record<string, unknown>,
-  ): string | vscode.MarkdownString {
-    const duration = (timeStart != null && timeEnd != null)
-      ? ` (${((timeEnd - timeStart) / 1000).toFixed(1)}s)`
-      : '';
-
-    const formatFileBubbleMessage = (
-      verb: 'Read' | 'Edited' | 'Wrote',
-      filePath: string,
-      offset?: number,
-      limit?: number,
-      suffix = '',
-    ): vscode.MarkdownString => {
-      const uri = vscode.Uri.file(filePath).toString().toLowerCase();
-      const range = offset != null || limit != null
-        ? (() => {
-            const start = offset ?? 1;
-            const end = limit != null ? start + limit - 1 : start;
-            return `#${start}-${end}`;
-          })()
-        : '';
-      let lineInfo = '';
-      if (offset != null || limit != null) {
-        const start = offset ?? 1;
-        const end = limit != null ? start + limit - 1 : undefined;
-        lineInfo = end != null ? ` line ${start}-${end}` : ` line ${start}`;
-      }
-      return new vscode.MarkdownString(`${verb} [](${uri}${range})${lineInfo}${suffix}${duration}`);
-    };
-
-    // --- read: keep official-style file bubble in completed state ---
-    // IMPORTANT: completed-state `pastTenseMessage` is the critical preservation point.
-    // If this returns plain text, the bubble may render briefly during the running state
-    // and then disappear as soon as the tool completes.
-    if (toolName === 'read') {
-      const filePath = input?.filePath as string | undefined;
-      if (filePath) {
-        const offset = input?.offset as number | undefined;
-        const limit = input?.limit as number | undefined;
-        return formatFileBubbleMessage('Read', filePath, offset, limit);
-      }
-    } else if (toolName === 'edit') {
-      const filePath = input?.filePath as string | undefined;
-      if (filePath) {
-        const offset = input?.offset as number | undefined;
-        const limit = input?.limit as number | undefined;
-        return formatFileBubbleMessage('Edited', filePath, offset, limit, '');
-      }
-    } else if (toolName === 'write') {
-      const filePath = input?.filePath as string | undefined;
-      if (filePath) {
-        return formatFileBubbleMessage('Wrote', filePath, undefined, undefined, '');
-      }
-    } else if (toolName === 'bash') {
-      const command = (input?.command as string) ?? (input?.script as string) ?? title;
-      const short = command.length > 60 ? command.substring(0, 57) + '...' : command;
-      return `\`${short}\`${duration}`;
-    } else if (toolName === 'list') {
-      const filePath = (input?.filePath as string) ?? (input?.path as string) ?? title;
-      const short = filePath.length > 60 ? filePath.substring(0, 57) + '...' : filePath;
-      return `Listed \`${short}\`${duration}`;
-    } else if (toolName === 'grep') {
-      const pattern = (input?.pattern as string) ?? title;
-      const short = pattern.length > 60 ? pattern.substring(0, 57) + '...' : pattern;
-      return `Searched \`${short}\`${duration}`;
-    } else if (toolName === 'glob') {
-      const pattern = (input?.pattern as string) ?? title;
-      const short = pattern.length > 60 ? pattern.substring(0, 57) + '...' : pattern;
-      return `Globbed \`${short}\`${duration}`;
-    } else if (toolName === 'todo') {
-      return `Updated todos${duration}`;
-    } else if (toolName === 'websearch' || toolName === 'websearch_web_search_exa') {
-      const query = (input?.query as string) ?? title;
-      if (query) {
-        const short = query.length > 80 ? query.substring(0, 77) + '...' : query;
-        return `Web Searched \`${short}\`${duration}`;
-      }
-    } else if (toolName === 'task' || toolName === 'subagent') {
-      const desc = (input?.description as string) ?? title;
-      return `Subagent: ${desc}${duration}`;
-    }
-
-    const display = title || toolName;
-    return `Completed ${display}${duration}`;
-  }
-
-  // -------------------------------------------------------------------
-  // Subagent card rendering
-  // -------------------------------------------------------------------
-
-  /** Push a completed subagent card with its tool call summary. */
-  private pushFinalSubagentUpdate(stream: Stream, scope: SubagentScope): void {
-    if (!VS.ChatToolInvocationPart || !stream.push) {
-      // Fallback: update invocation message only
-      if (stream.updateToolInvocation) {
-        try {
-          const progress = scope.toolCalls.length > 0
-            ? formatSubagentProgress(scope)
-            : undefined;
-          stream.updateToolInvocation(scope.callId, {
-            invocationMessage: progress ? `Completed: ${progress}` : 'Subagent finished',
-          });
-        } catch { /* ignore */ }
-      }
-      return;
-    }
-
-    let progress: string | undefined;
-    try {
-      progress = scope.toolCalls.length > 0
-        ? formatSubagentProgress(scope)
-        : undefined;
-      const description = scope.lastText
-        ? scope.lastText.substring(0, 200)
-        : (progress ?? 'Subagent task');
-      const agentName = 'subagent';
-      const prompt = scope.lastText ?? '';
-      const result = scope.output ?? scope.lastText ?? '';
-
-      const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart('subagent', scope.callId);
-      part.isComplete = true;
-      part.subAgentInvocationId = scope.subAgentInvocationId;
-      part.invocationMessage = progress
-        ? `Subagent: ${progress}`
-        : 'Subagent task';
-
-      const timeStart = (scope as any).timeStart as number | undefined;
-      const duration = timeStart != null && scope.timeEnd != null
-        ? ` (${((scope.timeEnd - timeStart) / 1000).toFixed(1)}s)`
-        : '';
-      part.pastTenseMessage = `Subagent completed${duration}`;
-
-      if (VS.ChatSubagentToolInvocationData) {
-        part.toolSpecificData = new VS.ChatSubagentToolInvocationData(
-          description,
-          agentName,
-          prompt,
-          truncate(result, 4000),
-        );
       } else {
-        part.toolSpecificData = {
-          description,
-          agentName,
-          prompt,
-          result: truncate(result, 4000),
-        } satisfies ChatSubagentToolInvocationData;
+        target.push(new ToolInvocationSSP({
+          partId: part.id,
+          toolName: part.toolName,
+          callId: key,
+          state,
+          messageId: part.messageId,
+          sessionId,
+        }));
+      }
+    } else {
+      if (part.toolName === 'task' || part.toolName === 'subagent') {
+        const renderState = status === 'completed' || status === 'error'
+          ? { ...state, status: 'running' as const }
+          : state;
+        target.update(key, { state: renderState });
+      } else {
+        target.update(key, { state });
       }
 
-      stream.push(part as unknown as vscode.ChatResponsePart);
-      this.logTag('subagent',
-        `final subagent card pushed: callID=${scope.callId}, toolCalls=${scope.toolCalls.length}, progress="${progress}"`,
-      );
-    } catch {
-      // Best-effort fallback: update invocationMessage only
-      if (stream.updateToolInvocation) {
-        try {
-          stream.updateToolInvocation(scope.callId, {
-            invocationMessage: progress ? `Completed: ${progress}` : `Subagent finished`,
-          });
-        } catch { /* ignore */ }
-      }
+    }
+    this.completeScopeFromToolPart(part, sessionId);
+  }
+
+  private completeScopeFromToolPart(part: AcpToolPart, sessionId: string | undefined): void {
+    if (part.toolName !== 'task' && part.toolName !== 'subagent') return;
+    const state = part.state;
+    if (!state || (state.status !== 'completed' && state.status !== 'error')) return;
+
+    const key = part.callId ?? part.id;
+    const scope = this.subagents.getScope(key);
+    if (!scope) return;
+
+    this.ensureRootSubagentScope(part, sessionId);
+    this.hadSubagentTasks = true;
+    this.subagents.completeSubagent(key, state.output);
+    this.logTag('subagent', `scope completed status=${state.status} ${this.describeScope(scope)} output="${previewText(state.output)}" childIdle=${!!scope.childIdle}`);
+    if (scope.childIdle || state.status === 'error') {
+      this.finalizeScopeTool(scope);
+      this.checkDeferredIdleResolution();
     }
   }
 
-  /**
-   * Capture a subagent-internal event for progress aggregation.
-   * Tool events are tracked (for the summary like "3 reads, 2 edits").
-   * Text events are collected (lastText) for the subagent summary.
-   * Also pushes real-time invocation message updates to the parent task tool card.
-   */
-  private captureSubagentEvent(event: AcpEvent, stream?: Stream): void {
-    // Handle text delta events from subagent — stream text into the subagent card
-    if (event.type === 'part.delta') {
-      const deltaEvent = event;
-      const delta = deltaEvent.delta;
-      if (delta) {
-        for (const scope of this.activeSubagentScopes.values()) {
-          const currentText = (scope.lastText ?? '') + delta;
-          scope.lastText = currentText;
-          if (stream && this.hasToolUI && stream.updateToolInvocation) {
-            try {
-              stream.updateToolInvocation(scope.callId, {
-                invocationMessage: truncate(currentText, 200),
-              });
-            } catch { /* best-effort */ }
-          }
-        }
-      }
+  // ════════════════════════════════════════════════════════════════════════
+  // Permission → ExternalEditSSP with callbacks
+  // ════════════════════════════════════════════════════════════════════════
+
+  private completeExternalEdit(callId: string, target: SessionStreamNode): void {
+    target.update(callId, { status: 'completed' });
+  }
+
+  private hasExternalEdit(callId: string, target: SessionStreamNode): boolean {
+    return this.externalEditIds.has(this.getExternalEditKey(callId, target));
+  }
+
+  private markExternalEdit(callId: string, target: SessionStreamNode): void {
+    this.externalEditIds.add(this.getExternalEditKey(callId, target));
+  }
+
+  private getExternalEditKey(callId: string, target: SessionStreamNode): string {
+    return `${this.describeTarget(target)}::${callId}`;
+  }
+
+  private handlePermissionAsked(event: AcpPermissionRequestEvent): void {
+    this.startExternalEdit(event, this.sss);
+  }
+
+  private startExternalEdit(event: AcpPermissionRequestEvent, target: SessionStreamNode): void {
+    const callId = event.tool?.callId;
+    const filepath = event.metadata?.filepath as string | undefined;
+
+    if (!callId || !filepath) {
+      // Non-file permission: auto-reply directly
+      this.backend.permissions.reply(event.sessionId, event.permissionId, 'once', this.directory);
       return;
     }
 
-    if (event.type !== 'part.updated' || !event.part) {return;}
+    const uri = createExternalEditUri(filepath, this.directory);
+    this.markExternalEdit(callId, target);
 
-    // Collect text output from subagent and push to subagent card
-    if (event.part.type === 'text') {
-      const text = (event.part as any).text;
-      if (text && text.trim().length > 0) {
-        for (const scope of this.activeSubagentScopes.values()) {
-          scope.lastText = text;
-          if (stream && this.hasToolUI && stream.updateToolInvocation) {
-            try {
-              stream.updateToolInvocation(scope.callId, {
-                invocationMessage: truncate(text, 200),
-              });
-            } catch { /* best-effort */ }
-          }
+    target.push(new ExternalEditSSP(
+      {
+        toolCallId: callId,
+        editId: '',
+        status: 'pending',
+        uri: filepath,
+        uris: [uri],
+      },
+      {
+        onBaselineCaptured: () => {
+          // Baseline captured → auto-reply permission
+          this.backend.permissions.reply(
+            event.sessionId,
+            event.permissionId,
+            'once',
+            this.directory,
+          );
+        },
+        onSnapshot: (snapshot) => {
+          this.sss.serializeSnapshot(snapshot);
+        },
+      },
+    ));
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // Question → QuestionSSP with callbacks
+  // ════════════════════════════════════════════════════════════════════════
+
+  private handleQuestionAsked(event: AcpQuestionRequestEvent): void {
+    this.startQuestion(event, this.sss);
+  }
+
+  private startQuestion(event: AcpQuestionRequestEvent, target: SessionStreamNode): void {
+    const questions = event.questions;
+
+    target.push(new QuestionSSP(
+      {
+        questionId: event.questionId,
+        questions: questions as unknown[],
+        status: 'asked',
+      },
+      {
+        onResult: (vscodeRawResult) => {
+          const answers = this.mapQuestionAnswers(vscodeRawResult, questions);
+          this.backend.questions.reply(
+            event.sessionId,
+            event.questionId,
+            answers,
+            this.directory,
+          );
+          target.update(event.questionId, { status: 'replied' });
+        },
+        onSkip: () => {
+          this.backend.questions.reject(
+            event.sessionId,
+            event.questionId,
+            this.directory,
+          );
+          target.update(event.questionId, { status: 'skipped' });
+        },
+      },
+    ));
+  }
+
+  /** Map VS Code questionCarousel result → OpenCode string[][] format */
+  private mapQuestionAnswers(
+    vscodeRaw: unknown,
+    questions: AcpQuestionInfo[],
+  ): string[][] {
+    const result = vscodeRaw as Record<string, unknown> | undefined;
+    if (!result) return questions.map(() => []);
+
+    return questions.map((_, i) => {
+      const key = `q_${i}`;
+      const answer = result[key];
+      if (answer === undefined || answer === null) return [];
+
+      if (typeof answer === 'string') return [answer];
+
+      if (typeof answer === 'object' && answer !== null) {
+        const obj = answer as Record<string, unknown>;
+        if ('selectedValue' in obj) {
+          if (obj.freeformValue && typeof obj.freeformValue === 'string') return [obj.freeformValue];
+          const val = obj.selectedValue;
+          return val !== undefined && val !== null ? [String(val)] : [];
+        }
+        if ('selectedValues' in obj && Array.isArray(obj.selectedValues)) {
+          const selected = (obj.selectedValues as unknown[])
+            .map(v => v != null ? String(v) : '')
+            .filter(v => v !== '');
+          if (obj.freeformValue && typeof obj.freeformValue === 'string') selected.push(obj.freeformValue);
+          return selected;
         }
       }
-      return;
+      return [];
+    });
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // Session lifecycle events → writeMeta
+  // ════════════════════════════════════════════════════════════════════════
+
+  private handleSessionUpdated(event: AcpEvent): void {
+    const e = event as { title?: string };
+    if (e.title) {
+      this.sessionTitle = e.title;
+      this.sss.writeMeta({ title: e.title, titleSource: 'backend' });
     }
+  }
 
-    if (event.part.type !== 'tool') {return;}
+  private handleSessionCreated(event: AcpEvent): void {
+    const e = event as { sessionId?: string; parentId?: string; title?: string };
+    if (e.sessionId && e.parentId) {
+      this.childSessionHints.set(e.sessionId, e.parentId);
+    }
+  }
 
-    const toolPart = event.part;
-    const state = toolPart.state;
-    if (!state) {return;}
-
-    const toolName = toolPart.toolName ?? 'unknown';
-    const title = state.title;
-    const callId = toolPart.callId ?? toolPart.id;
-    const status = state.status;
-
-    // Record into all active scopes (typically just one)
-    for (const scope of this.activeSubagentScopes.values()) {
-      const isNew = !scope.toolCalls.some(t => t.name === toolName);
-      scope.toolCalls.push({
-        name: toolName,
-        title: title ?? undefined,
-        status,
+  private handleSessionDiff(event: AcpEvent): void {
+    const e = event as { diffs?: unknown[] };
+    if (e.diffs) {
+      this.sss.writeMeta({
+        changeSummary: { files: e.diffs.length },
       });
-      // Update parent task tool card so subagent activity is visible in chat
-      if (stream) {
-        this.updateSubagentCard(stream, scope, toolName, title, status);
-      }
-      // Forward to VSCode with subAgentInvocationId so VSCode groups child tools
-      // under the parent subagent card (scope mechanism).
-      // Forward ALL first-seen child tools (not just 'pending') because child events
-      // often arrive already completed by the time the parent processes them.
-      if (isNew && scope.subAgentInvocationId && stream) {
-        // Tell VSCode this tool belongs to the subagent
-        if (this.hasToolUI && stream.beginToolInvocation) {
-          try {
-            stream.beginToolInvocation(callId, toolName, {
-              subagentInvocationId: scope.subAgentInvocationId,
-            } as any);
-          } catch { /* best-effort */ }
-        }
-        // If the tool is already done, push its completion state
-        if (status === 'completed' || status === 'error') {
-          if (this.hasToolUI && stream.push && VS.ChatToolInvocationPart) {
-            try {
-              const part: ChatToolInvocationPart = new VS.ChatToolInvocationPart(toolName, callId);
-              part.subAgentInvocationId = scope.subAgentInvocationId;
-              part.isComplete = true;
-              part.isError = status === 'error';
-              part.invocationMessage = status === 'error' ? `✗ ${toolName}` : `✓ ${toolName}: ${title ?? ''}`;
-              stream.push(part as unknown as vscode.ChatResponsePart);
-            } catch { /* best-effort */ }
-          }
-        }
-      }
     }
-
-    this.logTag('subagent',
-      `capture: tool=${toolName}, status=${state.status}, ` +
-      `activeScopes=${this.activeSubagentScopes.size}`,
-    );
   }
 
-  /** Update the nested invocation message inside a subagent card in real time. */
-  private updateSubagentCard(
-    stream: Stream,
-    scope: SubagentScope,
-    toolName: string,
-    title: string | null | undefined,
-    status: string,
-  ): void {
-    if (!this.hasToolUI) {return;}
-    try {
-      const progress = formatSubagentProgress(scope);
-      if (progress && stream.updateToolInvocation) {
-        stream.updateToolInvocation(scope.callId, {
-          invocationMessage: progress,
-        });
-      }
-    } catch { /* best-effort */ }
-  }
+  // ════════════════════════════════════════════════════════════════════════
+  // Session idle + deferred idle (wait for subagents)
+  // ════════════════════════════════════════════════════════════════════════
 
-  // -------------------------------------------------------------------
-  // Child session polling (deferred idle)
-  // -------------------------------------------------------------------
+  private handleSessionIdle(): boolean {
+    this.sss.writeMeta({ status: 'completed' });
 
-  /**
-   * Check whether any child sessions are still running (busy).
-   * Uses the sessions.status() + sessions.children() APIs to detect busy children.
-   */
-  private async checkChildSessionsRunning(): Promise<boolean> {
-    if (!this.sessions || !this.sessionId) return false;
-    try {
-      const statusResult = await this.sessions.status(this.directory);
-      if (statusResult.error || !statusResult.data) return false;
-      return await this.hasBusyDescendant(this.sessionId, new Set(), statusResult.data);
-    } catch {
+    if (this.subagents.hasBusyDescendant()) {
+      this.deferredIdle = true;
+      this.startDeferredIdleTimer();
+      this.logTag('idle', 'deferred — waiting for subagent sessions to complete');
       return false;
     }
+    // No busy subagents — clean up and let loop end
+    this.subagents.clear();
+    return true;
   }
 
-  /**
-   * Recursively check if any descendant session (child, grandchild, etc.)
-   * of `parentId` is still busy.
-   */
-  private async hasBusyDescendant(
-    parentId: string,
-    visited: Set<string>,
-    statuses: Record<string, AcpSessionStatus>,
-  ): Promise<boolean> {
-    if (visited.has(parentId)) return false;
-    visited.add(parentId);
-
-    const childrenResult = await this.sessions!.children(parentId, this.directory);
-    if (childrenResult.error || !childrenResult.data) return false;
-
-    for (const child of childrenResult.data) {
-      if (visited.has(child.id)) continue;
-      const status = statuses[child.id];
-      if (status?.type === 'busy') return true;
-      if (await this.hasBusyDescendant(child.id, visited, statuses)) return true;
-    }
-    return false;
-  }
-
-  /**
-   * Called when session.idle fires but subagent scopes are all completed.
-   * Polls child sessions to see if background tasks are still running.
-   * If yes, defers the idle signal; if no, stops the bridge.
-   */
-  private checkChildSessionsAndMaybeStop(): void {
-    if (!this.sessions || !this.sessionId) {
-      // No session operations available — push final subagent cards and stop
-      this.clearDeferredIdleTimer();
-      if (this.stream) {
-        for (const scope of this.activeSubagentScopes.values()) {
-          if (scope.completed) {
-            scope.timeEnd = Date.now();
-            this.pushFinalSubagentUpdate(this.stream, scope);
-          }
-        }
-      }
-      this.logTag('subagent', 'bridge stop: all subagents completed (no session operations)');
-      this.requestStop();
-      return;
-    }
-
-    this.deferredIdle = true;
-    this.startDeferredIdleTimer();
-    this.logTag('subagent', 'session.idle deferred: checking child sessions in 2s');
-
-    // Poll child sessions after a short delay
-    const pollTimer = setTimeout(async () => {
-      try {
-        const childrenRunning = await this.checkChildSessionsRunning();
-        if (!childrenRunning) {
-          this.deferredIdle = false;
-          this.clearDeferredIdleTimer();
-          this.logTag('subagent', 'all child sessions idle (via poll) — waiting for parent orchestrator to continue');
-        } else {
-          this.logTag('subagent', 'child sessions still running, polling again in 3s');
-          // Schedule another poll — replace the safety timer
-          this.checkChildSessionsAndMaybeStop();
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.logTag('subagent', `child session poll error: ${msg}, stopping bridge`);
-        this.clearDeferredIdleTimer();
-        this.requestStop();
-      }
-    }, 2000);
-
-    // Track timer so clearDeferredIdleTimer can cancel it
-    if (this.deferredIdleTimer !== null) {
-      clearTimeout(this.deferredIdleTimer);
-    }
-    this.deferredIdleTimer = pollTimer;
-  }
-
-  // -------------------------------------------------------------------
-  // Subagent scope helpers
-  // -------------------------------------------------------------------
-
-  /**
-   * Find which subagent scope owns a given session ID by walking
-   * the session hierarchy.
-   */
-  private findScopeForSession(sessionId: string): SubagentScope | undefined {
-    // 1. Direct match: this session is a known childSessionId
-    for (const scope of this.activeSubagentScopes.values()) {
-      if (scope.childSessionId === sessionId) {return scope;}
-    }
-
-    // 2. Descendant match: walk up parent chain to find which scope owns this session
-    if (this.sessions) {
-      const childSessionIds = new Set<string>();
-      for (const scope of this.activeSubagentScopes.values()) {
-        if (scope.childSessionId) {childSessionIds.add(scope.childSessionId);}
-      }
-      if (childSessionIds.size > 0) {
-        const ancestorId = this.sessions.findAncestor(sessionId, childSessionIds);
-        if (ancestorId) {
-          for (const scope of this.activeSubagentScopes.values()) {
-            if (scope.childSessionId === ancestorId) {return scope;}
-          }
-        }
-      }
-    }
-
-    return undefined;
-  }
-
-  /**
-   * Check whether an event belongs to an active subagent's internal stream.
-   *
-   * Strategy: `partKinds` acts as a whitelist of known parent parts. Any
-   * `part.updated` or `part.delta` referencing an unregistered partId while
-   * a subagent scope is active is treated as a subagent-internal event.
-   *
-   * Exception: top-level structural part types (text, reasoning, step-start,
-   * step-finish) are NEVER subagent-internal — they belong to the parent turn
-   * and may arrive after the subagent scope opens (e.g. a second step that
-   * starts while the subagent is still running).
-   */
-  private isSubagentInternalEvent(event: AcpEvent): boolean {
-    if (this.activeSubagentScopes.size === 0) {return false;}
-
-    if (event.type === 'part.updated') {
-      const part = event.part;
-      if (!part) {return false;}
-      // Structural parent parts are never subagent-internal
-      if (part.type === 'reasoning' ||
-          part.type === 'step-start' || part.type === 'step-finish') {
-        return false;
-      }
-      // Text: subagent-internal if not already tracked as a parent part.
-      // This prevents subagent LLM text from being rendered inline;
-      // instead it's collected as scope.lastText for the completion summary.
-      if (part.type === 'text') {
-        return !this.partKinds.has(part.id);
-      }
-      // Parent-level task/subagent tool invocations are NOT subagent-internal.
-      // Without this, a second parallel task tool would be captured instead of rendered.
-      if (part.type === 'tool') {
-        const toolName = (part).toolName;
-        if (toolName === 'task' || toolName === 'subagent') {
-          return false;
-        }
-        // Non-task tools: subagent-internal if partId is unknown.
-        return !this.partKinds.has(part.id);
-      }
-      return false;
-    }
-
-    if (event.type === 'part.delta') {
-      // Delta events for unknown part IDs are subagent-internal.
-      // But deltas for known parent parts must pass through.
-      if (event.partId && this.partKinds.has(event.partId)) {
-        return false;
-      }
-      // Without a known parent part, deltas are likely subagent-internal.
-      return this.activeSubagentScopes.size > 0;
-    }
-
-    return false;
-  }
-
-  // -------------------------------------------------------------------
-  // Reset
-  // -------------------------------------------------------------------
-
-  private reset(): void {
-    // userMessageId intentionally NOT reset — caller reads it after bridging
-    this.partKinds.clear();
-    this.toolCallIds.clear();
-    this.toolMetas.clear();
-    this.progressivePushed.clear();
-    this.externalEditCallIds.clear();
-    this.externalEditCompletions = [];
-    this.activeSubagentScopes.clear();
-    this.deferredIdle = false;
-    this.clearDeferredIdleTimer();
-    this.forceStopResolve = null;
-    this.assistantPhaseStarted = false;
-  }
-
-  private async drainExternalEditCompletions(): Promise<void> {
-    if (this.externalEditCompletions.length === 0) {
-      return;
-    }
-    const completions = this.externalEditCompletions.splice(0);
-    await Promise.allSettled(completions);
-  }
-
-  // -------------------------------------------------------------------
-  // Deferred idle safety timer
-  // -------------------------------------------------------------------
-
-  /**
-   * Start a safety timeout. If no subagent events arrive before it fires,
-   * the bridge stops to avoid hanging indefinitely.
-   */
   private startDeferredIdleTimer(): void {
     this.clearDeferredIdleTimer();
     this.deferredIdleTimer = setTimeout(() => {
-      this.log(
-        `deferred idle timeout fired (${OpenCodeBridge.DEFERRED_IDLE_TIMEOUT_MS / 1000}s) — ` +
-        `closing ${this.activeSubagentScopes.size} remaining subagent scope(s)`,
-      );
-      this.activeSubagentScopes.clear();
-      this.deferredIdleTimer = null;
-      // Break the while-loop in run() by resolving the force-stop promise
-      this.forceStopResolve?.();
+      this.logTag('idle', `deferred idle timeout (${OpenCodeBridge.DEFERRED_IDLE_TIMEOUT_MS / 1000}s) — stopping`);
+      this.deferredIdle = false;
+      this.subagents.clear();
     }, OpenCodeBridge.DEFERRED_IDLE_TIMEOUT_MS);
-  }
-
-  /** Reset the timer (called when a subagent-internal event arrives after deferred idle). */
-  private resetDeferredIdleTimer(): void {
-    if (this.deferredIdle && this.deferredIdleTimer) {
-      this.startDeferredIdleTimer();
-    }
   }
 
   private clearDeferredIdleTimer(): void {
@@ -2093,109 +909,468 @@ export class OpenCodeBridge implements AcpBridge {
     }
   }
 
-  /** Break the while-loop in run() by resolving the force-stop promise. */
-  private requestStop(): void {
-    if (this.forceStopResolve) {
-      this.forceStopResolve();
-      this.forceStopResolve = null;
+  /** Check if deferred idle can be resolved (all subagents done) */
+  private checkDeferredIdleResolution(): boolean {
+    if (!this.deferredIdle) return false;
+    if (!this.subagents.hasBusyDescendant()) {
+      this.deferredIdle = false;
+      this.clearDeferredIdleTimer();
+      // Clean up completed scopes
+      for (const scope of this.subagents.listScopes()) {
+        if (scope.completed) this.subagents.removeSubagent(scope.callId);
+      }
+      return true;
+    }
+    // Reset safety timer on any activity
+    this.startDeferredIdleTimer();
+    return false;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // Child session event routing → subsession
+  // ════════════════════════════════════════════════════════════════════════
+
+  private handleChildSessionEvent(event: AcpEvent, eventSessionId: string): void {
+    this.logTag('subagent', `child event start sessionID=${eventSessionId} ${this.describeEvent(event)}`);
+    if (event.type === 'session.created' || event.type === 'session.updated') {
+      const created = event as { parentId?: string };
+      if (created.parentId) {
+        this.childSessionHints.set(eventSessionId, created.parentId);
+        this.logTag('subagent', `child hint sessionID=${eventSessionId} parentID=${created.parentId}`);
+      }
+    }
+
+    // Find owning scope
+    let scope = this.findScopeForSession(eventSessionId);
+    if (scope) {
+      this.logTag('subagent', `scope matched directly sessionID=${eventSessionId} ${this.describeScope(scope)}`);
+    }
+
+    if (!scope) {
+      scope = this.findBindableScopeForChildSession(eventSessionId);
+      if (scope) {
+        this.logTag('subagent', `scope bindable sessionID=${eventSessionId} ${this.describeScope(scope)}`);
+        this.bindScopeToChildSession(scope, eventSessionId);
+        scope = this.findScopeForSession(eventSessionId) ?? scope;
+      }
+    }
+
+    if (!scope) {
+      this.bufferChildEvent(eventSessionId, event);
+      this.logTag('subagent', `buffered child event type=${event.type} for sessionID=${eventSessionId}`);
+      return;
+    }
+
+    if (event.type === 'session.created') {
+      const e = event as { title?: string };
+      if (e.title) {
+        const target = this.getSubsessionStream(scope.subAgentInvocationId!);
+        this.logTag('subagent', `child session.created write meta title="${e.title}" target=${this.describeTarget(target)} scope=${this.describeScope(scope)}`);
+        target.writeMeta({ title: e.title, titleSource: 'backend' });
+      }
+      return;
+    }
+
+    const target = this.getSubsessionStream(scope.subAgentInvocationId!);
+    this.logTag('subagent', `child event routed target=${this.describeTarget(target)} scope=${this.describeScope(scope)} ${this.describeEvent(event)}`);
+
+    if (event.type === 'permission.asked') {
+      this.logTag('subagent', `child permission routed to external edit target=${this.describeTarget(target)} permissionID=${event.permissionId}`);
+      this.startExternalEdit(event, target);
+      return;
+    }
+
+    if (event.type === 'question.asked') {
+      this.logTag('subagent', `child question routed target=${this.describeTarget(target)} questionID=${event.questionId}`);
+      this.startQuestion(event, target);
+      return;
+    }
+
+    if (event.type === 'session.updated') {
+      const e = event as { title?: string };
+      if (e.title) {
+        this.logTag('subagent', `child session.updated write meta title="${e.title}" target=${this.describeTarget(target)}`);
+        target.writeMeta({ title: e.title, titleSource: 'backend' });
+      }
+      return;
+    }
+
+    if (event.type === 'session.diff') {
+      const e = event as { diffs?: unknown[] };
+      if (e.diffs) {
+        this.logTag('subagent', `child session.diff write meta files=${e.diffs.length} target=${this.describeTarget(target)}`);
+        target.writeMeta({ changeSummary: { files: e.diffs.length } });
+      }
+      return;
+    }
+
+    if (event.type === 'session.status') {
+      const e = event as { status?: unknown };
+      this.logTag('subagent', `child session.status write meta status=${JSON.stringify(e.status)} target=${this.describeTarget(target)}`);
+      target.writeMeta({ status: e.status });
+      return;
+    }
+
+    // Handle idle from child
+    if (event.type === 'session.idle') {
+      scope.descendantSessionIds.add(eventSessionId);
+      this.recordAncestorDescendantSessions(scope, eventSessionId);
+      this.logTag('subagent', `child idle sessionID=${eventSessionId} scope=${this.describeScope(scope)} completed=${!!scope.completed} lastAssistantText="${previewText(scope.lastAssistantText)}" lastReasoningText="${previewText(scope.lastReasoningText)}"`);
+      if (scope.childSessionId === eventSessionId && !scope.childIdle) {
+        scope.childIdle = true;
+        scope.timeEnd = Date.now();
+        if (scope.completed) {
+          this.finalizeScopeTool(scope);
+        }
+      }
+      this.checkDeferredIdleResolution();
+      target.push(new SessionLifecycleSSP({
+        eventType: 'session.idle',
+        sessionId: eventSessionId,
+      }));
+      return;
+    }
+
+    // Handle tool events from child → route to subsession
+    if (event.type === 'part.updated') {
+      const part = (event as { part?: { type?: string } }).part;
+      if (part?.type === 'tool') {
+        const toolPart = (event as { part: AcpToolPart }).part;
+        this.logTag('subagent', `child tool captured tool=${toolPart.toolName} callID=${toolPart.callId ?? toolPart.id} status=${toolPart.state?.status ?? '<none>'} scope=${this.describeScope(scope)}`);
+        this.handleSubagentToolPart(scope, toolPart, eventSessionId);
+        return;
+      }
+
+      this.handlePartUpdatedForTarget(event as AcpPartUpdatedEvent, target, false);
+      // Capture child text/reasoning for the parent subagent card result.
+      if (part?.type === 'text' || part?.type === 'reasoning') {
+        const streamPart = (event as { part?: { id?: string; text?: string } }).part;
+        const isCapturedPart = part.type === 'text'
+          ? this.isAssistantTextPart(target, streamPart?.id)
+          : this.isReasoningPart(target, streamPart?.id);
+        if (isCapturedPart) {
+          const streamedText = streamPart?.id ? this.getDeltaText(target, streamPart.id) : undefined;
+          this.updateScopeSummary(scope, part.type, streamedText ?? streamPart?.text);
+        } else {
+          this.logTag('subagent', `child ${part.type} not captured partID=${streamPart?.id ?? '<none>'} route=${streamPart?.id ? this.getNodeState(target).partRoutes.get(streamPart.id) ?? '<none>' : '<none>'} target=${this.describeTarget(target)}`);
+        }
+      }
+      return;
+    }
+
+    if (event.type === 'part.delta') {
+      const deltaEvent = event as AcpPartDeltaEvent;
+      this.renderDeltaToTarget(deltaEvent, target);
+      const kind = this.isAssistantTextPart(target, deltaEvent.partId)
+        ? 'text'
+        : this.isReasoningPart(target, deltaEvent.partId)
+          ? 'reasoning'
+          : undefined;
+      const text = kind
+        ? this.getDeltaText(target, deltaEvent.partId)
+        : undefined;
+      if (kind) {
+        this.updateScopeSummary(scope, kind, text);
+      }
+      if (!text) {
+        this.logTag('subagent', `child delta no summary partID=${deltaEvent.partId} route=${this.getNodeState(target).partRoutes.get(deltaEvent.partId) ?? '<none>'} target=${this.describeTarget(target)}`);
+      }
+      return;
     }
   }
-}
 
-// =======================================================================
-// Helpers
-// =======================================================================
-
-type PartKind = 'reasoning' | 'text' | 'tool';
-
-interface EventDispatchResult {
-  stop: boolean;
-  rendered: boolean;
-}
-
-interface ToolMeta {
-  name: string;
-  input: Record<string, unknown> | undefined;
-  output: string | undefined;
-  title: string | undefined;
-  timeStart: number | undefined;
-  timeEnd: number | undefined;
-}
-
-const TRUNCATED_SUFFIX = '... (truncated)';
-
-function truncate(value: string, maxLength: number): string {
-  if (!value) {return value;}
-  return value.length <= maxLength ? value : value.substring(0, maxLength).replace(/\s+\S*$/, '') + TRUNCATED_SUFFIX;
-}
-
-function stateOutputHasExitCode(output: string): boolean {
-  return /exitCode:\s*-?\d+/.test(output);
-}
-
-function isTransientFileTool(toolName: string): boolean {
-  return toolName === 'read'
-    || toolName === 'write'
-    || toolName === 'edit'
-    || toolName === 'internal'
-    || toolName === 'step-start'
-    || toolName === 'step-finish';
-}
-
-function isEditTool(toolName: string): boolean {
-  return toolName === 'edit' || toolName === 'write';
-}
-
-function normalizeWindowsFileUriPath(uriPath: string): string {
-  return /^\/[a-zA-Z]:(?=\/)/.test(uriPath)
-    ? uriPath.toLowerCase()
-    : uriPath;
-}
-
-function createExternalEditUri(filepath: string, directory?: string): vscode.Uri {
-  const absolutePath = directory && !path.isAbsolute(filepath)
-    ? path.join(directory, filepath)
-    : filepath;
-  const rawUri = vscode.Uri.file(absolutePath);
-  const normalizedPath = normalizeWindowsFileUriPath(rawUri.path);
-  return rawUri.path !== normalizedPath
-    ? rawUri.with({ path: normalizedPath })
-    : rawUri;
-}
-
-function getToolTitle(state: AcpToolState): string | undefined {
-  return state.title;
-}
-
-function getToolOutput(state: AcpToolState): string | undefined {
-  return state.output;
-}
-
-function getToolTime(
-  state: AcpToolState,
-): { start?: number; end?: number } | undefined {
-  if (state.startTime != null || state.endTime != null) {
-    return { start: state.startTime, end: state.endTime };
+  private findScopeForSession(sessionId: string): SubagentScope | undefined {
+    return this.subagents.findScopeForSession(sessionId);
   }
-  return undefined;
-}
 
-function getEventSessionId(evt: AcpEvent): string | undefined {
-  switch (evt.type) {
-    case 'part.updated':
-      return evt.part?.sessionId;
-    case 'session.idle':
-    case 'session.status':
-      return evt.sessionId;
-    case 'session.created':
-    case 'session.updated':
-    case 'session.deleted':
-      return evt.sessionId;
-    default:
-      return undefined;
+  private findBindableScopeForChildSession(sessionId: string): SubagentScope | undefined {
+    const parentId = this.childSessionHints.get(sessionId);
+    const unbound = this.subagents.listScopes().filter(scope => !scope.childSessionId);
+    if (unbound.length === 0) return undefined;
+
+    let candidates = unbound;
+    if (parentId) {
+      const parentScope = this.findScopeForSession(parentId);
+      candidates = parentScope?.subAgentInvocationId
+        ? unbound.filter(scope => scope.parentSubAgentInvocationId === parentScope.subAgentInvocationId)
+        : parentId === this.sessionId
+          ? unbound.filter(scope => !scope.parentSubAgentInvocationId)
+          : [];
+    }
+
+    return candidates.length === 1 ? candidates[0] : undefined;
+  }
+
+  private bindScopeToChildSession(
+    scope: SubagentScope,
+    childSessionId: string,
+    drainPending = true,
+  ): void {
+    if (scope.childSessionId === childSessionId) return;
+    if (scope.childSessionId && scope.childSessionId !== childSessionId) {
+      this.logTag('subagent', `scope callID=${scope.callId} already bound to childSessionId=${scope.childSessionId}, ignoring ${childSessionId}`);
+      return;
+    }
+
+    this.subagents.setChildSession(scope.callId, childSessionId);
+    this.recordAncestorDescendantSessions(scope, childSessionId);
+    this.logTag('subagent', `bound childSessionId=${childSessionId} to callID=${scope.callId}`);
+    this.logTag('subagent', `bound scope now ${this.describeScope(scope)}`);
+
+    if (drainPending) {
+      this.drainPendingChildEvents(childSessionId);
+    }
+  }
+
+  private bufferChildEvent(sessionId: string, event: AcpEvent): void {
+    const existing = this.pendingChildEvents.get(sessionId) ?? [];
+    existing.push(event);
+    this.pendingChildEvents.set(sessionId, existing);
+    this.logTag('subagent', `pending child buffer sessionID=${sessionId} count=${existing.length} ${this.describeEvent(event)}`);
+  }
+
+  private drainPendingChildEvents(sessionId: string): void {
+    const pending = this.pendingChildEvents.get(sessionId);
+    if (!pending || pending.length === 0) return;
+    this.pendingChildEvents.delete(sessionId);
+    this.logTag('subagent', `draining pending child events sessionID=${sessionId} count=${pending.length}`);
+    for (const event of pending) {
+      this.handleChildSessionEvent(event, sessionId);
+    }
+  }
+
+  private getActiveSubagentScope(): SubagentScope | undefined {
+    return this.subagents.listScopes()
+      .filter(scope => !scope.childIdle && !scope.completed)
+      .sort((a, b) => this.getScopeDepth(b) - this.getScopeDepth(a))[0];
+  }
+
+  private getScopeDepth(scope: SubagentScope): number {
+    let depth = 0;
+    let current = scope;
+    while (current.parentSubAgentInvocationId) {
+      const parent = this.subagents.findScopeBySubAgentInvocationId(current.parentSubAgentInvocationId);
+      if (!parent) break;
+      depth += 1;
+      current = parent;
+    }
+    return depth;
+  }
+
+  private handleSubagentToolPart(
+    scope: SubagentScope,
+    toolPart: AcpToolPart,
+    eventSessionId = toolPart.sessionId,
+  ): void {
+    const childCallId = toolPart.callId ?? toolPart.id;
+    const childStatus = toolPart.state?.status ?? 'running';
+    const sub = this.getSubsessionStream(scope.subAgentInvocationId!);
+    this.logTag('subagent', `child tool route scope=${this.describeScope(scope)} target=${this.describeTarget(sub)} tool=${toolPart.toolName} callID=${childCallId} status=${childStatus} eventSession=${eventSessionId ?? '<none>'}`);
+
+    // Write/edit tools: defer until permission.asked creates ExternalEditSSP.
+    if (this.isWriteEditTool(toolPart.toolName)) {
+      if (this.hasExternalEdit(childCallId, sub)) {
+        if (childStatus === 'completed' || childStatus === 'error') {
+          this.completeExternalEdit(childCallId, sub);
+          this.subagents.recordChildToolCall(scope.callId, {
+            name: toolPart.toolName,
+            title: toolPart.state?.title,
+            status: childStatus,
+          });
+          this.updateScopeTool(scope, { title: formatSubagentProgress(scope) });
+        }
+        return;
+      }
+      // No ExternalEditSSP yet — keep deferring at pending/running
+      if (childStatus === 'pending' || childStatus === 'running') return;
+      // completed/error without permission → fall through to normal handling
+    }
+    let nestedScope: SubagentScope | undefined;
+    if (toolPart.toolName === 'task' || toolPart.toolName === 'subagent') {
+      nestedScope = this.subagents.getScope(childCallId);
+      if (!nestedScope) {
+        nestedScope = this.subagents.startSubagent(
+          childCallId,
+          {
+            toolName: toolPart.toolName,
+            title: toolPart.state?.title ?? '',
+            input: toolPart.state?.input ?? {},
+          },
+          scope.subAgentInvocationId,
+        );
+        this.logTag('subagent', `nested scope started ${this.describeScope(nestedScope)} parent=${this.describeScope(scope)}`);
+      }
+      const childSessionId = this.getToolSessionId(toolPart.state);
+      if (childSessionId) {
+        this.bindScopeToChildSession(nestedScope, childSessionId);
+      }
+    }
+    const payload = {
+      partId: `subagent-child-${childCallId}`,
+      toolName: toolPart.toolName,
+      callId: childCallId,
+      state: toolPart.state!,
+      messageId: toolPart.messageId,
+      sessionId: eventSessionId,
+      subAgentId: scope.subAgentInvocationId,
+      subAgentInvocationId: scope.subAgentInvocationId,
+    };
+
+    const isFirstChildToolEvent = !sub.has(childCallId);
+    if (isFirstChildToolEvent) {
+      sub.push(new ToolInvocationSSP(payload));
+      this.logTag('subagent', `child tool push callID=${childCallId} subAgentInvocationId=${scope.subAgentInvocationId ?? '<none>'}`);
+    } else {
+      sub.update(childCallId, { state: toolPart.state });
+      this.logTag('subagent', `child tool update callID=${childCallId} subAgentInvocationId=${scope.subAgentInvocationId ?? '<none>'}`);
+    }
+
+    if (childStatus === 'completed' || childStatus === 'error') {
+      if (nestedScope) {
+        this.subagents.completeSubagent(childCallId, toolPart.state?.output);
+      }
+      this.subagents.recordChildToolCall(scope.callId, {
+        name: toolPart.toolName,
+        title: toolPart.state?.title,
+        status: childStatus,
+      });
+      this.updateScopeTool(scope, { title: formatSubagentProgress(scope) });
+    }
+  }
+
+  private updateScopeTool(scope: SubagentScope, state: Partial<AcpToolState>): void {
+    const renderMode = isSubagentProgressTitleUpdate(state) ? 'updateOnly' : undefined;
+    const target = scope.parentSubAgentInvocationId
+      ? this.getSubsessionStream(scope.parentSubAgentInvocationId)
+      : this.sss;
+    this.logTag('subagent', `update scope tool callID=${scope.callId} target=${this.describeTarget(target)} state=${this.describeToolStatePatch(state)} scope=${this.describeScope(scope)}`);
+    target.update(scope.callId, { state, renderMode });
+  }
+
+  private finalizeScopeTool(scope: SubagentScope): void {
+    const output = scope.lastAssistantText?.trim() || scope.output || '';
+    this.logTag('subagent', `finalize scope ${this.describeScope(scope)} output="${previewText(output)}" progress="${formatSubagentProgress(scope)}"`);
+    this.updateScopeTool(scope, {
+      status: 'completed',
+      output,
+      title: formatSubagentProgress(scope) || scope.toolMeta?.title,
+    });
+  }
+
+  private recordAncestorDescendantSessions(scope: SubagentScope | undefined, sessionId: string): void {
+    let current = scope;
+    while (current?.parentSubAgentInvocationId) {
+      const parent = this.subagents.findScopeBySubAgentInvocationId(current.parentSubAgentInvocationId);
+      if (!parent) return;
+      this.subagents.addDescendantSession(parent.callId, sessionId);
+      current = parent;
+    }
+  }
+
+  private getSubsessionStream(subAgentInvocationId: string): SubsessionStream {
+    const scope = this.subagents.findScopeBySubAgentInvocationId(subAgentInvocationId);
+    const chain: string[] = [];
+    let current: SubagentScope | undefined = scope;
+
+    while (current) {
+      if (current.subAgentInvocationId) {
+        chain.unshift(current.subAgentInvocationId);
+      }
+      current = current.parentSubAgentInvocationId
+        ? this.subagents.findScopeBySubAgentInvocationId(current.parentSubAgentInvocationId)
+        : undefined;
+    }
+
+    const ids = chain.length > 0 ? chain : [subAgentInvocationId];
+    let sub = this.sss.subsession(ids[0]);
+    this.targetLabels.set(sub, `subsession path=${ids[0]}`);
+    for (const id of ids.slice(1)) {
+      sub = sub.subsession(id);
+      this.targetLabels.set(sub, `subsession path=${ids.join('/')}`);
+    }
+    return sub;
+  }
+
+  private getToolSessionId(state: AcpToolState | undefined): string | undefined {
+    const raw = state?.metadata?.sessionId ?? state?.metadata?.sessionID;
+    return typeof raw === 'string' && raw.length > 0 ? raw : undefined;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // Utility
+  // ════════════════════════════════════════════════════════════════════════
+
+  private isWriteEditTool(toolName: string): boolean {
+    return toolName === 'write' || toolName === 'edit';
+  }
+
+  getUserMessageId(): string | null { return this.userMessageId; }
+  getSessionTitle(): string | null { return this.sessionTitle ?? null; }
+  getHadSubagentTasks(): boolean { return this.hadSubagentTasks; }
+
+  private describeTarget(target: SessionStreamNode): string {
+    return this.targetLabels.get(target) ?? 'unknown-target';
+  }
+
+  private describeScope(scope: SubagentScope): string {
+    return [
+      `callID=${scope.callId}`,
+      `subAgentInvocationId=${scope.subAgentInvocationId ?? '<none>'}`,
+      `parentSubAgentInvocationId=${scope.parentSubAgentInvocationId ?? '<none>'}`,
+      `childSessionId=${scope.childSessionId ?? '<none>'}`,
+      `childIdle=${!!scope.childIdle}`,
+      `completed=${!!scope.completed}`,
+      `descendants=${scope.descendantSessionIds.size}`,
+    ].join(' ');
+  }
+
+  private describeEvent(event: AcpEvent): string {
+    switch (event.type) {
+      case 'part.updated':
+        return `type=part.updated eventSession=${event.sessionId ?? '<none>'} ${this.describePart(event.part)}`;
+      case 'part.delta':
+        return `type=part.delta sessionID=${event.sessionId ?? '<none>'} partID=${event.partId} field=${event.field ?? '<none>'} text="${previewText(event.delta)}"`;
+      case 'session.created':
+      case 'session.updated':
+      case 'session.deleted':
+      case 'session.error':
+        return `type=${event.type} sessionID=${event.sessionId} parentID=${event.parentId ?? '<none>'} title="${previewText(event.title)}"`;
+      case 'session.idle':
+        return `type=session.idle sessionID=${event.sessionId ?? '<none>'}`;
+      case 'session.status':
+        return `type=session.status sessionID=${event.sessionId} status=${JSON.stringify(event.status)}`;
+      case 'session.diff':
+        return `type=session.diff sessionID=${event.sessionId} files=${event.diffs.length}`;
+      case 'permission.asked':
+        return `type=permission.asked sessionID=${event.sessionId} permissionID=${event.permissionId} toolCallID=${event.tool?.callId ?? '<none>'}`;
+      case 'question.asked':
+        return `type=question.asked sessionID=${event.sessionId} questionID=${event.questionId}`;
+      default:
+        return `type=${event.type}`;
+    }
+  }
+
+  private describePart(part: AcpPartUpdatedEvent['part']): string {
+    if (part.type === 'tool') {
+      return `partType=tool partID=${part.id} callID=${part.callId ?? part.id} tool=${part.toolName} status=${part.state?.status ?? '<none>'} partSession=${part.sessionId ?? '<none>'} title="${previewText(part.state?.title)}"`;
+    }
+    if (part.type === 'text' || part.type === 'reasoning') {
+      return `partType=${part.type} partID=${part.id} messageID=${part.messageId ?? '<none>'} partSession=${part.sessionId ?? '<none>'} text="${previewText(part.text)}"`;
+    }
+    return `partType=${part.type} partID=${part.id} messageID=${part.messageId ?? '<none>'} partSession=${part.sessionId ?? '<none>'}`;
+  }
+
+  private describeToolStatePatch(state: Partial<AcpToolState>): string {
+    return [
+      state.status ? `status=${state.status}` : '',
+      state.title ? `title="${previewText(state.title)}"` : '',
+      state.output ? `output="${previewText(state.output)}"` : '',
+    ].filter(Boolean).join(' ') || JSON.stringify(state);
   }
 }
 
-async function yieldToEventLoop(): Promise<void> {
-  await new Promise<void>((resolve) => setImmediate(resolve));
+function previewText(text: unknown, maxLen = 80): string {
+  if (text === undefined || text === null) return '';
+  const normalized = String(text).replace(/\s+/g, ' ').trim();
+  return normalized.length > maxLen ? normalized.slice(0, maxLen - 3) + '...' : normalized;
 }

@@ -1,6 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { promises as fs } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { OpenCodeBridge } from '../backends/opencode/opencode-bridge';
+import { SerializableSessionStream } from '../acp/streaming/session-stream';
+import { UserPromptSSP } from '../ssp/impl/user-prompt';
+import {
+  readAllSnapshots,
+  readAllStreamParts,
+  readMetaIndex,
+  readSubsessionRecords,
+} from '../acp/streaming/deserialize';
 import type {
   AcpEvent,
   AcpPartDeltaEvent,
@@ -8,12 +19,38 @@ import type {
   AcpSessionDiffEvent,
   AcpPermissionRequestEvent,
 } from '../acp/types';
+import type { SessionStreamSchedulingMode } from '../acp/streaming/session-stream-node';
+
+// ---------------------------------------------------------------------------
+// Mock backend for bridge constructor
+// ---------------------------------------------------------------------------
+
+function mockBackend(overrides?: {
+  permissions?: { reply: ReturnType<typeof vi.fn> };
+  questions?: { reply: ReturnType<typeof vi.fn>; reject?: ReturnType<typeof vi.fn> };
+}) {
+  return {
+    name: 'test',
+    permissions: overrides?.permissions ?? { reply: vi.fn().mockResolvedValue(undefined) },
+    questions: overrides?.questions
+      ? { reject: vi.fn().mockResolvedValue(undefined), ...overrides.questions }
+      : { reply: vi.fn().mockResolvedValue(undefined), reject: vi.fn().mockResolvedValue(undefined) },
+    sessions: {},
+    config: {},
+    events: {},
+    auth: {},
+  } as any;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-type MockStream = vscode.ChatResponseStream & {
+type MockStream = Omit<vscode.ChatResponseStream, 'markdown' | 'progress' | 'push'> & {
+  markdown: ReturnType<typeof vi.fn>;
+  progress: ReturnType<typeof vi.fn>;
+  push: ReturnType<typeof vi.fn>;
+  externalEdit: ReturnType<typeof vi.fn>;
   thinkingProgress: ReturnType<typeof vi.fn>;
   beginToolInvocation: ReturnType<typeof vi.fn>;
   updateToolInvocation: ReturnType<typeof vi.fn>;
@@ -49,6 +86,32 @@ function eventStream(events: AcpEvent[]): { stream: AsyncIterable<AcpEvent> } {
     for (const e of events) {yield e;}
   }
   return { stream: gen() };
+}
+
+function getTestSessionDir(workspaceRoot: string): string {
+  return path.join(workspaceRoot, '.acpilot', 'test', 'test-session');
+}
+
+/** Compatibility helper: creates SSS with mock stream + runs events through bridge */
+async function runBridge(
+  bridge: OpenCodeBridge,
+  events: { stream: AsyncIterable<AcpEvent> },
+  stream: MockStream,
+  token: vscode.CancellationToken,
+  options?: { schedulingMode?: SessionStreamSchedulingMode },
+): Promise<boolean> {
+  const sss = new SerializableSessionStream(stream as any, {
+    workspaceRoot: '',
+    backendName: 'test',
+    sessionId: 'test-session',
+    turnIndex: 0,
+    requestId: 'test',
+    schedulingMode: options?.schedulingMode,
+  });
+  bridge.setSSS(sss);
+  const result = await bridge.run(events.stream, token);
+  await sss.flush();
+  return result;
 }
 
 function deltaEvent(delta: string, partId = 'prt_ai1'): AcpPartDeltaEvent {
@@ -121,13 +184,13 @@ describe('OpenCodeBridge', () => {
   let bridge: OpenCodeBridge;
 
   beforeEach(() => {
-    bridge = new OpenCodeBridge();
+    bridge = new OpenCodeBridge(mockBackend(), 'test-session');
   });
 
   it('should complete a full turn with tool + AI text', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({}));
-    const result = await bridge.bridgeEventsToStream(events, stream, mockToken());
+    const result = await runBridge(bridge,events, stream, mockToken());
     expect(result).toBe(true);
     expect(stream.markdown).toHaveBeenCalledWith('OK');
   });
@@ -141,7 +204,7 @@ describe('OpenCodeBridge', () => {
       idleEvent(),
     ]);
 
-    const result = await bridge.bridgeEventsToStream(events, stream, mockToken());
+    const result = await runBridge(bridge,events, stream, mockToken());
 
     expect(result).toBe(true);
     expect(stream.markdown).toHaveBeenCalledWith(' world');
@@ -150,13 +213,143 @@ describe('OpenCodeBridge', () => {
 
   // --- Tool: read → SimpleToolResultData ---
 
+  it('does not render deltas for a skipped user echo part', async () => {
+    const stream = mockStream();
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'user echo', messageId: 'msg_u1', id: 'prt_u1' } },
+      deltaEvent(' ignored user delta', 'prt_u1'),
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
+      deltaEvent('assistant text', 'prt_ai1'),
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    expect(stream.markdown).not.toHaveBeenCalledWith(' ignored user delta');
+    expect(stream.markdown).toHaveBeenCalledWith('assistant text');
+  });
+
+  it('renders closed OpenCode system reminders as standalone tool cards', async () => {
+    const stream = mockStream();
+    const noticeText = '<system-reminder>\n\n[ALL BACKGROUND TASKS COMPLETE]\n\nCompleted:\n\nbg_123: repo scan\n</system-reminder>\n\n<!-- OMO_INTERNAL_INITIATOR -->';
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'user echo', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
+      deltaEvent('root answer', 'prt_ai1'),
+      {
+        type: 'part.updated',
+        part: {
+          type: 'text',
+          id: 'prt_notice',
+          messageId: 'msg_user_notice',
+          text: noticeText,
+          ignored: true,
+        },
+      },
+      deltaEvent('\nshould not render', 'prt_notice'),
+      deltaEvent(' still root', 'prt_ai1'),
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    expect(stream.markdown).toHaveBeenCalledWith('root answer');
+    expect(stream.markdown).toHaveBeenCalledWith(' still root');
+    expect(stream.markdown).not.toHaveBeenCalledWith(expect.stringContaining('BACKGROUND TASKS COMPLETE'));
+    expect(stream.markdown).not.toHaveBeenCalledWith('\nshould not render');
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as {
+        toolName?: string;
+        toolCallId?: string;
+        isComplete?: boolean;
+        pastTenseMessage?: string;
+        toolSpecificData?: { input?: string; output?: string };
+      });
+    const systemPart = pushed.find(part => part.toolName === 'ALL BACKGROUND TASKS COMPLETE' && part.toolCallId === 'system-prt_notice');
+    expect(systemPart).toBeDefined();
+    expect(systemPart?.isComplete).toBe(true);
+    expect(systemPart?.pastTenseMessage).toBe('ALL BACKGROUND TASKS COMPLETE');
+    expect(systemPart?.toolSpecificData).toEqual({
+      input: 'ALL BACKGROUND TASKS COMPLETE',
+      output: noticeText,
+    });
+  });
+
+  it('does not treat incomplete system-reminder text as a system tool card', async () => {
+    const stream = mockStream();
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'user echo', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
+      deltaEvent('root answer', 'prt_ai1'),
+      {
+        type: 'part.updated',
+        part: {
+          type: 'text',
+          id: 'prt_notice',
+          messageId: 'msg_user_notice',
+          text: '<system-reminder>\n\n[ALL BACKGROUND TASKS COMPLETE]',
+        },
+      },
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    expect(stream.markdown).toHaveBeenCalledWith('root answer');
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as { toolName?: string });
+    expect(pushed.some(part => part.toolName === 'ALL BACKGROUND TASKS COMPLETE')).toBe(false);
+  });
+
+  it('renders any closed system-reminder title from the first bracketed heading', async () => {
+    const stream = mockStream();
+    const noticeText = '<system-reminder>\n\n[NEEDS USER REVIEW]\n\nCheck the background result.\n</system-reminder>';
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'user echo', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'text',
+          id: 'prt_notice_review',
+          messageId: 'msg_user_notice',
+          text: noticeText,
+        },
+      },
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    expect(stream.markdown).not.toHaveBeenCalledWith(expect.stringContaining('NEEDS USER REVIEW'));
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as {
+        toolName?: string;
+        pastTenseMessage?: string;
+        toolSpecificData?: { input?: string; output?: string };
+      });
+    const systemPart = pushed.find(part => part.toolName === 'NEEDS USER REVIEW');
+    expect(systemPart?.pastTenseMessage).toBe('NEEDS USER REVIEW');
+    expect(systemPart?.toolSpecificData).toEqual({
+      input: 'NEEDS USER REVIEW',
+      output: noticeText,
+    });
+  });
+
   it('should push read tool as ChatSimpleToolResultData', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({
       tools: toolEvents({ toolName: 'read', callId: 'call_rd', input: { filePath: '/src/main.ts' }, output: 'line1\nline2', title: 'main.ts', timeStart: 1000, timeEnd: 1500 }),
     }));
-    await bridge.bridgeEventsToStream(events, stream, mockToken());
-    expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_rd', 'read');
+    await runBridge(bridge,events, stream, mockToken());
+    expect(stream.beginToolInvocation).toHaveBeenCalledWith(
+      'call_rd',
+      'read',
+      expect.objectContaining({ isAttachedToThinking: true }),
+    );
     expect(stream.push).toHaveBeenCalled();
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
     const readPart = pushed.find((call: unknown[]) => {
@@ -170,7 +363,9 @@ describe('OpenCodeBridge', () => {
       presentation?: string;
       enablePartialUpdate?: boolean;
       toolSpecificData?: unknown;
+      isAttachedToThinking?: boolean;
     };
+    expect(part.isAttachedToThinking).toBe(true);
     expect(String(part.invocationMessage)).toMatch(/Read.*main\.ts/);
     expect(part.pastTenseMessage).toBeUndefined();
     expect(part.presentation).toBe('hiddenAfterComplete');
@@ -185,8 +380,12 @@ describe('OpenCodeBridge', () => {
     const events = eventStream(fullTurnEvents({
       tools: toolEvents({ toolName: 'bash', callId: 'call_sh', input: { command: 'ls -la' }, output: 'total 42', title: 'bash', timeStart: 1000, timeEnd: 3200 }),
     }));
-    await bridge.bridgeEventsToStream(events, stream, mockToken());
-    expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_sh', 'bash');
+    await runBridge(bridge,events, stream, mockToken());
+    expect(stream.beginToolInvocation).toHaveBeenCalledWith(
+      'call_sh',
+      'bash',
+      expect.objectContaining({ isAttachedToThinking: true }),
+    );
   });
 
   // --- Tool: write → ToolResourcesInvocationData ---
@@ -196,8 +395,9 @@ describe('OpenCodeBridge', () => {
     const events = eventStream(fullTurnEvents({
       tools: toolEvents({ toolName: 'write', callId: 'call_wr', input: { filePath: '/src/new.ts' }, output: 'written', title: 'new.ts' }),
     }));
-    await bridge.bridgeEventsToStream(events, stream, mockToken());
-    expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_wr', 'write');
+    await runBridge(bridge,events, stream, mockToken());
+    // Write tools without permission are deferred at pending/running;
+    // ToolInvocationSSP is created at completed state directly.
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
     const writePart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; isComplete?: boolean };
@@ -208,7 +408,9 @@ describe('OpenCodeBridge', () => {
       presentation?: string;
       enablePartialUpdate?: boolean;
       toolSpecificData?: unknown;
+      isAttachedToThinking?: boolean;
     };
+    expect(part.isAttachedToThinking).toBe(true);
     expect(part.presentation).toBe('hiddenAfterComplete');
     expect(part.enablePartialUpdate).toBe(true);
     expect(part.toolSpecificData).toBeUndefined();
@@ -219,10 +421,20 @@ describe('OpenCodeBridge', () => {
   it('should push task tool as ChatSubagentToolInvocationData', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({
-      tools: toolEvents({ toolName: 'task', callId: 'call_tsk', input: { description: 'subtask', prompt: 'do X' }, output: 'done', title: 'Subtask' }),
+      tools: toolEvents({ toolName: 'task', callId: 'call_tsk', input: { description: 'subtask', prompt: 'do X', subagent_type: 'librarian' }, output: 'done', title: 'Subtask' }),
     }));
-    await bridge.bridgeEventsToStream(events, stream, mockToken());
-    expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_tsk', 'task');
+    await runBridge(bridge,events, stream, mockToken());
+    const subagentPart = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; invocationMessage?: string; toolSpecificData?: Record<string, unknown> })
+      .find(part => part.toolName === 'task' && part.toolCallId === 'call_tsk');
+
+    expect(subagentPart).toBeDefined();
+    expect(subagentPart?.invocationMessage).toBe('subtask');
+    expect(subagentPart?.toolSpecificData).toEqual(expect.objectContaining({
+      description: 'subtask',
+      agentName: 'librarian',
+      prompt: 'do X',
+    }));
   });
 
   // --- Subagent event filtering ---
@@ -261,19 +473,23 @@ describe('OpenCodeBridge', () => {
       // Parent session idle → bridge stops
       idleEvent(),
     ]);
-    await bridge.bridgeEventsToStream(events, stream, mockToken());
-
-    // Task tool should be invoked (begin + running push)
-    expect(stream.beginToolInvocation).toHaveBeenCalledWith(taskCallId, 'task');
+    await runBridge(bridge,events, stream, mockToken());
 
     // The final card should be pushed when child session goes idle
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
+    const runningTaskPart = pushed
+      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; subAgentInvocationId?: string; isAttachedToThinking?: boolean })
+      .find(part => part.toolName === 'task' && part.toolCallId === taskCallId);
+    expect(runningTaskPart?.subAgentInvocationId).toBeUndefined();
+    expect(runningTaskPart?.isAttachedToThinking).toBe(true);
+
     // Should have the task's final completed part pushed (from child session.idle)
     const taskPart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean };
-      return p?.toolName === 'subagent' && p?.toolCallId === taskCallId && p?.isComplete === true;
+      return p?.toolName === 'task' && p?.toolCallId === taskCallId && p?.isComplete === true;
     });
     expect(taskPart).toBeDefined();
+    expect((taskPart![0] as { isAttachedToThinking?: boolean }).isAttachedToThinking).toBe(true);
 
     // Verify subagent internal tools were pushed as child tool cards
     // (with subAgentInvocationId for VSCode scope grouping), not as
@@ -285,7 +501,8 @@ describe('OpenCodeBridge', () => {
     expect(readPart).toBeDefined();
     // Child tools should carry the subAgentInvocationId for grouping
     const readObj = readPart![0];
-    expect(readObj.subAgentInvocationId).toBeDefined();
+    expect(readObj.subAgentInvocationId).toBe(taskCallId);
+    expect(readObj.isAttachedToThinking).toBe(true);
 
     const bashPart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; subAgentInvocationId?: string };
@@ -293,10 +510,1516 @@ describe('OpenCodeBridge', () => {
     });
     expect(bashPart).toBeDefined();
     const bashObj = bashPart![0];
-    expect(bashObj.subAgentInvocationId).toBeDefined();
+    expect(bashObj.subAgentInvocationId).toBe(taskCallId);
+    expect(bashObj.isAttachedToThinking).toBe(true);
 
     // AI text should still be rendered
     expect(stream.markdown).toHaveBeenCalledWith('Done');
+  });
+
+  it('updates parent subagent progress through updateToolInvocation between root tool completions', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_parent_task';
+    const childSessionId = 'ses_child_task';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'do it', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_task',
+          callId: taskCallId,
+          state: { status: 'pending', input: { description: 'background task' } },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_task',
+          callId: taskCallId,
+          state: {
+            status: 'completed',
+            input: { description: 'background task' },
+            output: 'launched',
+            title: 'background task',
+            metadata: { sessionId: childSessionId },
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'webfetch',
+          id: 'prt_root_fetch_a',
+          callId: 'call_root_fetch_a',
+          state: { status: 'pending', input: { url: 'https://example.test/a' } },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'webfetch',
+          id: 'prt_root_fetch_b',
+          callId: 'call_root_fetch_b',
+          state: { status: 'pending', input: { url: 'https://example.test/b' } },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'webfetch',
+          id: 'prt_root_fetch_a',
+          callId: 'call_root_fetch_a',
+          state: {
+            status: 'completed',
+            input: { url: 'https://example.test/a' },
+            title: 'a',
+            output: 'a',
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        sessionId: childSessionId,
+        part: {
+          type: 'tool',
+          toolName: 'bash',
+          id: 'prt_child_bash',
+          callId: 'call_child_bash',
+          sessionId: childSessionId,
+          state: {
+            status: 'completed',
+            input: { command: 'npm test' },
+            title: 'npm test',
+            output: 'ok',
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'webfetch',
+          id: 'prt_root_fetch_b',
+          callId: 'call_root_fetch_b',
+          state: {
+            status: 'completed',
+            input: { url: 'https://example.test/b' },
+            title: 'b',
+            output: 'b',
+          },
+        },
+      },
+      idleEventFor(childSessionId),
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken(), { schedulingMode: 'continuous' });
+
+    const pushedTaskParts = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string })
+      .filter(part => part.toolName === 'task' && part.toolCallId === taskCallId);
+    expect(pushedTaskParts).toHaveLength(2);
+    expect(stream.updateToolInvocation).toHaveBeenCalledWith(taskCallId, {
+      invocationMessage: 'bash',
+      isAttachedToThinking: true,
+    });
+  });
+
+  it('routes nested subagent session events to the nested subsession scope', async () => {
+    const stream = mockStream();
+    const parentCallId = 'call_parent_sub';
+    const parentSessionId = 'ses_parent_sub';
+    const nestedCallId = 'call_nested_sub';
+    const nestedSessionId = 'ses_nested_sub';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'do nested work', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_parent_task',
+          callId: parentCallId,
+          state: { status: 'pending', input: {} },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_parent_task',
+          callId: parentCallId,
+          state: {
+            status: 'running',
+            input: { description: 'parent task' },
+            title: 'parent',
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_nested_task',
+          callId: nestedCallId,
+          sessionId: parentSessionId,
+          state: {
+            status: 'completed',
+            input: { description: 'nested task' },
+            output: 'nested done',
+            title: 'nested',
+            metadata: { sessionId: nestedSessionId },
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_nested_read',
+          callId: 'call_nested_read',
+          sessionId: nestedSessionId,
+          state: {
+            status: 'completed',
+            input: { filePath: '/nested.ts' },
+            output: 'nested content',
+            title: 'nested.ts',
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_parent_task',
+          callId: parentCallId,
+          state: {
+            status: 'completed',
+            input: { description: 'parent task' },
+            output: 'parent done',
+            title: 'parent',
+            metadata: { sessionId: parentSessionId },
+          },
+        },
+      },
+      idleEventFor(nestedSessionId),
+      idleEventFor(parentSessionId),
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; subAgentInvocationId?: string });
+    const parentTaskPart = pushed
+      .find(part => part.toolName === 'task' && part.toolCallId === parentCallId);
+    const nestedTaskPart = pushed
+      .find(part => part.toolName === 'task' && part.toolCallId === nestedCallId);
+    const nestedReadPart = pushed
+      .find(part => part.toolName === 'read' && part.toolCallId === 'call_nested_read');
+
+    expect(parentTaskPart?.subAgentInvocationId).toBeUndefined();
+    expect(nestedTaskPart?.subAgentInvocationId).toBe(parentCallId);
+    expect(nestedReadPart?.subAgentInvocationId).toBe(nestedCallId);
+  });
+
+  it('routes child session text and reasoning through the child subsession flow', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_child_text_task';
+    const childSessionId = 'ses_child_text';
+    const childReasoningId = 'prt_child_reasoning';
+    const childTextId = 'prt_child_text';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'spawn child', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_child_text_task',
+          callId: taskCallId,
+          state: { status: 'pending', input: {} },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_child_text_task',
+          callId: taskCallId,
+          state: {
+            status: 'completed',
+            input: { description: 'child text' },
+            output: 'child done',
+            title: 'child',
+            metadata: { sessionId: childSessionId },
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: { type: 'text', text: 'child user echo', messageId: 'child_user', id: 'prt_child_user', sessionId: childSessionId },
+      },
+      {
+        type: 'part.updated',
+        part: { type: 'step-start', messageId: 'child_assistant', id: 'prt_child_step', sessionId: childSessionId },
+      },
+      {
+        type: 'part.updated',
+        part: { type: 'reasoning', text: '', messageId: 'child_assistant', id: childReasoningId, sessionId: childSessionId },
+      },
+      { type: 'part.delta', sessionId: childSessionId, partId: childReasoningId, delta: 'child thought', field: 'text' },
+      {
+        type: 'part.updated',
+        part: { type: 'text', text: '', messageId: 'child_assistant', id: childTextId, sessionId: childSessionId },
+      },
+      { type: 'part.delta', sessionId: childSessionId, partId: childTextId, delta: 'child answer', field: 'text' },
+      idleEventFor(childSessionId),
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken(), { schedulingMode: 'continuous' });
+
+    expect(stream.markdown).not.toHaveBeenCalledWith('child user echo');
+    expect(stream.thinkingProgress).not.toHaveBeenCalledWith(expect.objectContaining({ text: 'child thought' }));
+    expect(stream.markdown).not.toHaveBeenCalledWith('child answer');
+
+    const subagentPart = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as {
+        toolName?: string;
+        toolCallId?: string;
+        isComplete?: boolean;
+        toolSpecificData?: { result?: string };
+      })
+      .find(part => part.toolName === 'task' && part.toolCallId === taskCallId && part.isComplete === true);
+    expect(subagentPart?.toolSpecificData?.result).toBe('child answer');
+  });
+
+  it('keeps child reasoning inside the subagent card instead of root thinkingProgress', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_child_reasoning_scope';
+    const childSessionId = 'ses_child_reasoning_scope';
+    const rootReasoningId = 'prt_root_reasoning_scope';
+    const childReasoningId = 'prt_child_reasoning_scope';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'spawn child', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      { type: 'part.updated', part: { type: 'reasoning', text: '', messageId: 'msg_a1', id: rootReasoningId } },
+      { type: 'part.delta', partId: rootReasoningId, delta: 'root thought', field: 'text' },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_child_reasoning_task',
+          callId: taskCallId,
+          state: {
+            status: 'running',
+            input: { description: 'child reasoning', prompt: 'think', subagent_type: 'explore' },
+            title: 'child reasoning',
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      },
+      { type: 'session.created', sessionId: childSessionId, parentId: 'test-session', title: 'child reasoning' },
+      {
+        type: 'part.updated',
+        sessionId: childSessionId,
+        part: { type: 'reasoning', text: '', messageId: 'child_assistant', id: childReasoningId },
+      },
+      { type: 'part.delta', sessionId: childSessionId, partId: childReasoningId, delta: 'child thought', field: 'text' },
+      idleEventFor(childSessionId),
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_child_reasoning_task',
+          callId: taskCallId,
+          state: {
+            status: 'completed',
+            input: { description: 'child reasoning', prompt: 'think', subagent_type: 'explore' },
+            output: 'done',
+            title: 'child reasoning',
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      },
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken(), { schedulingMode: 'continuous' });
+
+    const thinkingCalls = stream.thinkingProgress.mock.calls
+      .map((call: unknown[]) => call[0] as {
+        text?: string;
+        id?: string;
+        metadata?: {
+          sessionId?: string;
+          parentSessionId?: string;
+          subAgentInvocationId?: string;
+          subAgentPath?: string[];
+        };
+      })
+      .filter(call => call.text);
+    const rootThought = thinkingCalls.find(call => call.text === 'root thought');
+    const childThought = thinkingCalls.find(call => call.text === 'child thought');
+
+    expect(rootThought?.id).toBeDefined();
+    expect(childThought).toBeUndefined();
+    expect(rootThought?.metadata?.subAgentInvocationId).toBeUndefined();
+
+    const parentCardUpdates = stream.updateToolInvocation.mock.calls
+      .filter((call: unknown[]) => call[0] === taskCallId)
+      .map((call: unknown[]) => call[1] as {
+        invocationMessage?: string;
+        pastTenseMessage?: string;
+      });
+    expect(parentCardUpdates).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ invocationMessage: expect.stringContaining('child thought') }),
+    ]));
+    expect(parentCardUpdates).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ pastTenseMessage: expect.stringContaining('child thought') }),
+    ]));
+
+    const subagentPart = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as {
+        toolName?: string;
+        toolCallId?: string;
+        isComplete?: boolean;
+        toolSpecificData?: { result?: string };
+      })
+      .find(part => part.toolName === 'task' && part.toolCallId === taskCallId && part.isComplete === true);
+    expect(subagentPart?.toolSpecificData?.result).toBe('done');
+  });
+
+  it('keeps consecutive root reasoning together and inserts subagent tools at the next main-flow boundary', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_hybrid_reasoning_boundary_task';
+    const reasoningId = 'prt_hybrid_reasoning_boundary';
+    const mainCallId = 'call_hybrid_reasoning_boundary_main';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'spawn child', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'reasoning', text: '', messageId: 'msg_a1', id: reasoningId } },
+      { type: 'part.delta', partId: reasoningId, delta: 'root r1', field: 'text' },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_hybrid_reasoning_boundary_task',
+          callId: taskCallId,
+          state: {
+            status: 'running',
+            input: { description: 'child work', prompt: 'read', subagent_type: 'explore' },
+            title: 'child work',
+          },
+        },
+      },
+      { type: 'part.delta', partId: reasoningId, delta: 'root r2', field: 'text' },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_hybrid_reasoning_boundary_main',
+          callId: mainCallId,
+          state: {
+            status: 'running',
+            input: { filePath: '/tmp/main.ts' },
+            title: 'main.ts',
+          },
+        },
+      },
+    ] satisfies AcpEvent[]);
+
+    await runBridge(bridge, events, stream, mockToken(), { schedulingMode: 'continuous' });
+
+    const r2Index = stream.thinkingProgress.mock.calls
+      .findIndex((call: unknown[]) => (call[0] as { text?: string }).text === 'root r2');
+    const taskPushIndex = stream.push.mock.calls
+      .findIndex((call: unknown[]) => {
+        const part = call[0] as { toolName?: string; toolCallId?: string };
+        return part.toolName === 'task' && part.toolCallId === taskCallId;
+      });
+    const mainPushIndex = stream.push.mock.calls
+      .findIndex((call: unknown[]) => {
+        const part = call[0] as { toolName?: string; toolCallId?: string };
+        return part.toolName === 'read' && part.toolCallId === mainCallId;
+      });
+
+    expect(r2Index).toBeGreaterThanOrEqual(0);
+    expect(taskPushIndex).toBeGreaterThanOrEqual(0);
+    expect(mainPushIndex).toBeGreaterThanOrEqual(0);
+    expect(stream.thinkingProgress.mock.invocationCallOrder[r2Index])
+      .toBeLessThan(stream.push.mock.invocationCallOrder[taskPushIndex]);
+    expect(stream.push.mock.invocationCallOrder[taskPushIndex])
+      .toBeLessThan(stream.push.mock.invocationCallOrder[mainPushIndex]);
+  });
+
+  it('keeps consecutive markdown together and inserts subagent tools before the next main-flow kind', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_hybrid_markdown_boundary_task';
+    const textId = 'prt_hybrid_markdown_boundary';
+    const mainCallId = 'call_hybrid_markdown_boundary_main';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'spawn child', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: textId } },
+      { type: 'part.delta', partId: textId, delta: 'Preparing search', field: 'text' },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_hybrid_markdown_boundary_task',
+          callId: taskCallId,
+          state: {
+            status: 'running',
+            input: { description: 'child work', prompt: 'read', subagent_type: 'explore' },
+            title: 'child work',
+          },
+        },
+      },
+      { type: 'part.delta', partId: textId, delta: '\n\n:', field: 'text' },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_hybrid_markdown_boundary_main',
+          callId: mainCallId,
+          state: {
+            status: 'running',
+            input: { filePath: '/tmp/main.ts' },
+            title: 'main.ts',
+          },
+        },
+      },
+    ] satisfies AcpEvent[]);
+
+    await runBridge(bridge, events, stream, mockToken(), { schedulingMode: 'continuous' });
+
+    const colonIndex = stream.markdown.mock.calls
+      .findIndex((call: unknown[]) => call[0] === '\n\n:');
+    const taskPushIndex = stream.push.mock.calls
+      .findIndex((call: unknown[]) => {
+        const part = call[0] as { toolName?: string; toolCallId?: string };
+        return part.toolName === 'task' && part.toolCallId === taskCallId;
+      });
+    const mainPushIndex = stream.push.mock.calls
+      .findIndex((call: unknown[]) => {
+        const part = call[0] as { toolName?: string; toolCallId?: string };
+        return part.toolName === 'read' && part.toolCallId === mainCallId;
+      });
+
+    expect(colonIndex).toBeGreaterThanOrEqual(0);
+    expect(taskPushIndex).toBeGreaterThanOrEqual(0);
+    expect(mainPushIndex).toBeGreaterThanOrEqual(0);
+    expect(stream.markdown.mock.invocationCallOrder[colonIndex])
+      .toBeLessThan(stream.push.mock.invocationCallOrder[taskPushIndex]);
+    expect(stream.push.mock.invocationCallOrder[taskPushIndex])
+      .toBeLessThan(stream.push.mock.invocationCallOrder[mainPushIndex]);
+  });
+
+  it('tool-first scheduling renders root tools immediately and delays reasoning while a subagent is active', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_tool_first_task';
+    const reasoningId = 'prt_tool_first_reasoning';
+    const readCallId = 'call_tool_first_read';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'inspect', messageId: 'msg_u1', id: 'prt_u1' } },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_tool_first_task',
+          callId: taskCallId,
+          state: {
+            status: 'running',
+            input: { description: 'child work', prompt: 'inspect', subagent_type: 'explore' },
+            title: 'child work',
+          },
+        },
+      },
+      { type: 'part.updated', part: { type: 'reasoning', text: '', messageId: 'msg_a1', id: reasoningId } },
+      { type: 'part.delta', partId: reasoningId, delta: 'root thought', field: 'text' },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_tool_first_read',
+          callId: readCallId,
+          state: {
+            status: 'running',
+            input: { filePath: '/tmp/main.ts' },
+            title: 'main.ts',
+          },
+        },
+      },
+      { type: 'part.updated', part: { type: 'reasoning', text: 'root thought', messageId: 'msg_a1', id: reasoningId } },
+    ] satisfies AcpEvent[]);
+
+    await runBridge(bridge, events, stream, mockToken(), { schedulingMode: 'tool-first' });
+
+    const readPushIndex = stream.push.mock.calls
+      .findIndex((call: unknown[]) => {
+        const part = call[0] as { toolName?: string; toolCallId?: string };
+        return part.toolName === 'read' && part.toolCallId === readCallId;
+      });
+    const reasoningIndex = stream.thinkingProgress.mock.calls
+      .findIndex((call: unknown[]) => (call[0] as { text?: string }).text === 'root thought');
+
+    expect(readPushIndex).toBeGreaterThanOrEqual(0);
+    expect(reasoningIndex).toBeGreaterThanOrEqual(0);
+    expect(stream.push.mock.invocationCallOrder[readPushIndex])
+      .toBeLessThan(stream.thinkingProgress.mock.invocationCallOrder[reasoningIndex]);
+  });
+
+  it('default tool-first scheduling streams reasoning immediately until a subagent is active', async () => {
+    const stream = mockStream();
+    const reasoningId = 'prt_default_tool_first_reasoning';
+    const readCallId = 'call_default_tool_first_read';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'inspect', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'reasoning', text: '', messageId: 'msg_a1', id: reasoningId } },
+      { type: 'part.delta', partId: reasoningId, delta: 'root thought', field: 'text' },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_default_tool_first_read',
+          callId: readCallId,
+          state: {
+            status: 'running',
+            input: { filePath: '/tmp/main.ts' },
+            title: 'main.ts',
+          },
+        },
+      },
+      { type: 'part.updated', part: { type: 'reasoning', text: 'root thought', messageId: 'msg_a1', id: reasoningId } },
+    ] satisfies AcpEvent[]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    const readPushIndex = stream.push.mock.calls
+      .findIndex((call: unknown[]) => {
+        const part = call[0] as { toolName?: string; toolCallId?: string };
+        return part.toolName === 'read' && part.toolCallId === readCallId;
+      });
+    const reasoningIndex = stream.thinkingProgress.mock.calls
+      .findIndex((call: unknown[]) => (call[0] as { text?: string }).text === 'root thought');
+
+    expect(readPushIndex).toBeGreaterThanOrEqual(0);
+    expect(reasoningIndex).toBeGreaterThanOrEqual(0);
+    expect(stream.thinkingProgress.mock.invocationCallOrder[reasoningIndex])
+      .toBeLessThan(stream.push.mock.invocationCallOrder[readPushIndex]);
+  });
+
+  it('flushes queued subagent tools before main session idle handling', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_hybrid_idle_task';
+    const textId = 'prt_hybrid_idle_text';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'spawn child', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: textId } },
+      { type: 'part.delta', partId: textId, delta: 'Working', field: 'text' },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_hybrid_idle_task',
+          callId: taskCallId,
+          state: {
+            status: 'running',
+            input: { description: 'child work', prompt: 'read', subagent_type: 'explore' },
+            title: 'child work',
+          },
+        },
+      },
+      idleEvent(),
+    ] satisfies AcpEvent[]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    const taskPushIndex = stream.push.mock.calls
+      .findIndex((call: unknown[]) => {
+        const part = call[0] as { toolName?: string; toolCallId?: string };
+        return part.toolName === 'task' && part.toolCallId === taskCallId;
+      });
+    expect(taskPushIndex).toBeGreaterThanOrEqual(0);
+  });
+
+  it('flushes every queued subagent tool when deferred main idle resolves', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_hybrid_deferred_idle_task';
+    const childSessionId = 'ses_hybrid_deferred_idle_child';
+    const childReadCallId = 'call_hybrid_deferred_idle_child_read';
+    const textId = 'prt_hybrid_deferred_idle_text';
+    let releaseStream!: () => void;
+    let childIdleHandled!: () => void;
+    const waitForRelease = new Promise<void>((resolve) => { releaseStream = resolve; });
+    const afterChildIdleHandled = new Promise<void>((resolve) => { childIdleHandled = resolve; });
+
+    const eventsBeforeChildIdle = [
+      { type: 'part.updated', part: { type: 'text', text: 'spawn child', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: textId } },
+      { type: 'part.delta', partId: textId, delta: 'Working', field: 'text' },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_hybrid_deferred_idle_task',
+          callId: taskCallId,
+          state: {
+            status: 'running',
+            input: { description: 'child work', prompt: 'read', subagent_type: 'explore' },
+            title: 'child work',
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      },
+      idleEvent(),
+      {
+        type: 'part.updated',
+        sessionId: childSessionId,
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_hybrid_deferred_idle_child_read',
+          callId: childReadCallId,
+          state: {
+            status: 'pending',
+            input: { filePath: '/tmp/child.ts' },
+            title: 'child.ts',
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        sessionId: childSessionId,
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_hybrid_deferred_idle_child_read',
+          callId: childReadCallId,
+          state: {
+            status: 'running',
+            input: { filePath: '/tmp/child.ts' },
+            title: 'child.ts',
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        sessionId: childSessionId,
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_hybrid_deferred_idle_child_read',
+          callId: childReadCallId,
+          state: {
+            status: 'completed',
+            input: { filePath: '/tmp/child.ts' },
+            output: 'child file',
+            title: 'child.ts',
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_hybrid_deferred_idle_task',
+          callId: taskCallId,
+          state: {
+            status: 'completed',
+            input: { description: 'child work', prompt: 'read', subagent_type: 'explore' },
+            output: 'child done',
+            title: 'child work',
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      },
+    ] satisfies AcpEvent[];
+
+    async function* controlledStream(): AsyncIterable<AcpEvent> {
+      for (const event of eventsBeforeChildIdle) {
+        yield event;
+      }
+      yield idleEventFor(childSessionId);
+      childIdleHandled();
+      await waitForRelease;
+    }
+
+    const runPromise = runBridge(bridge, { stream: controlledStream() }, stream, mockToken());
+    await afterChildIdleHandled;
+
+    const childBeginIndex = stream.beginToolInvocation.mock.calls
+      .findIndex((call: unknown[]) => call[0] === childReadCallId && call[1] === 'read');
+    const childReadPushes = stream.push.mock.calls
+      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean })
+      .filter(part => part.toolName === 'read' && part.toolCallId === childReadCallId);
+    const finalTaskIndex = stream.push.mock.calls
+      .findIndex((call: unknown[]) => {
+        const part = call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean };
+        return part.toolName === 'task' && part.toolCallId === taskCallId && part.isComplete === true;
+      });
+
+    expect(childBeginIndex).toBeGreaterThanOrEqual(0);
+    expect(childReadPushes.length).toBeGreaterThanOrEqual(2);
+    expect(finalTaskIndex).toBeGreaterThanOrEqual(0);
+
+    releaseStream();
+    await runPromise;
+  });
+
+  it('uses the last child assistant markdown text as the subagent result', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_child_text_result_scope';
+    const childSessionId = 'ses_child_text_result_scope';
+    const childTextId = 'prt_child_text_result_scope';
+    const childReasoningId = 'prt_child_late_reasoning_scope';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'spawn child', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_child_text_result_task',
+          callId: taskCallId,
+          state: {
+            status: 'running',
+            input: { description: 'child text result', prompt: 'answer', subagent_type: 'explore' },
+            title: 'child text result',
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      },
+      { type: 'session.created', sessionId: childSessionId, parentId: 'test-session', title: 'child text result' },
+      {
+        type: 'part.updated',
+        sessionId: childSessionId,
+        part: { type: 'text', text: '', messageId: 'child_assistant', id: childTextId },
+      },
+      { type: 'part.delta', sessionId: childSessionId, partId: childTextId, delta: 'final markdown answer', field: 'text' },
+      {
+        type: 'part.updated',
+        sessionId: childSessionId,
+        part: { type: 'reasoning', text: '', messageId: 'child_assistant', id: childReasoningId },
+      },
+      { type: 'part.delta', sessionId: childSessionId, partId: childReasoningId, delta: 'late private reasoning', field: 'text' },
+      idleEventFor(childSessionId),
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_child_text_result_task',
+          callId: taskCallId,
+          state: {
+            status: 'completed',
+            input: { description: 'child text result', prompt: 'answer', subagent_type: 'explore' },
+            output: 'fallback task output',
+            title: 'child text result',
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      },
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    expect(stream.markdown).not.toHaveBeenCalledWith('final markdown answer');
+    expect(stream.thinkingProgress).not.toHaveBeenCalledWith(expect.objectContaining({ text: 'late private reasoning' }));
+
+    const subagentPart = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as {
+        toolName?: string;
+        toolCallId?: string;
+        isComplete?: boolean;
+        toolSpecificData?: { result?: string };
+      })
+      .find(part => part.toolName === 'task' && part.toolCallId === taskCallId && part.isComplete === true);
+    expect(subagentPart?.toolSpecificData?.result).toBe('final markdown answer');
+  });
+
+  it('buffers child session deltas until their child text part is routed to SubSSS', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_child_delta_task';
+    const childSessionId = 'ses_child_delta';
+    const childTextId = 'prt_child_delta_text';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'spawn child', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_child_delta_task',
+          callId: taskCallId,
+          state: {
+            status: 'running',
+            input: {
+              description: 'Inspect SSP types',
+              prompt: 'Read src/ssp/types.ts',
+              subagent_type: 'explore',
+            },
+            title: 'Inspect SSP types',
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      },
+      {
+        type: 'session.created',
+        sessionId: childSessionId,
+        parentId: 'test-session',
+        title: 'Inspect SSP types (@explore subagent)',
+      },
+      { type: 'part.delta', sessionId: childSessionId, partId: childTextId, delta: 'child ', field: 'text' },
+      { type: 'part.delta', sessionId: childSessionId, partId: childTextId, delta: 'answer', field: 'text' },
+      {
+        type: 'part.updated',
+        part: { type: 'text', text: 'child answer', messageId: 'child_assistant', id: childTextId, sessionId: childSessionId },
+      },
+      idleEventFor(childSessionId),
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_child_delta_task',
+          callId: taskCallId,
+          state: {
+            status: 'completed',
+            input: {
+              description: 'Inspect SSP types',
+              prompt: 'Read src/ssp/types.ts',
+              subagent_type: 'explore',
+            },
+            output: '<task_result>child answer</task_result>',
+            title: 'Inspect SSP types',
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      },
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    expect(stream.markdown).not.toHaveBeenCalledWith('child ');
+    expect(stream.markdown).not.toHaveBeenCalledWith('answer');
+    expect(stream.markdown).not.toHaveBeenCalledWith('child answer');
+
+    const subagentPart = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as {
+        toolName?: string;
+        toolCallId?: string;
+        isComplete?: boolean;
+        toolSpecificData?: { agentName?: string; description?: string; prompt?: string; result?: string };
+      })
+      .find(part => part.toolName === 'task' && part.toolCallId === taskCallId && part.isComplete === true);
+
+    expect(subagentPart?.toolSpecificData).toEqual(expect.objectContaining({
+      agentName: 'explore',
+      description: 'Inspect SSP types',
+      prompt: 'Read src/ssp/types.ts',
+      result: 'child answer',
+    }));
+  });
+
+  it('routes child part.updated events by event-level sessionId when the part lacks sessionId', async () => {
+    const stream = mockStream();
+    const taskCallId = 'call_event_session_task';
+    const childSessionId = 'ses_event_session_child';
+    const childTextId = 'prt_event_session_text';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'spawn child', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_event_session_task',
+          callId: taskCallId,
+          state: {
+            status: 'running',
+            input: { description: 'event session', prompt: 'answer in child', subagent_type: 'explore' },
+            title: 'event session',
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      },
+      { type: 'session.created', sessionId: childSessionId, parentId: 'test-session', title: 'event session child' },
+      {
+        type: 'part.updated',
+        sessionId: childSessionId,
+        part: { type: 'text', text: '', messageId: 'child_assistant', id: childTextId },
+      },
+      { type: 'part.delta', sessionId: childSessionId, partId: childTextId, delta: 'child only', field: 'text' },
+      {
+        type: 'part.updated',
+        sessionId: childSessionId,
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_event_session_read',
+          callId: 'call_event_session_read',
+          state: {
+            status: 'completed',
+            input: { filePath: '/child.ts' },
+            output: 'content',
+            title: 'child.ts',
+          },
+        },
+      },
+      idleEventFor(childSessionId),
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_event_session_task',
+          callId: taskCallId,
+          state: {
+            status: 'completed',
+            input: { description: 'event session', prompt: 'answer in child', subagent_type: 'explore' },
+            output: '<task_result>child only</task_result>',
+            title: 'event session',
+            metadata: { parentSessionId: 'test-session', sessionId: childSessionId },
+          },
+        },
+      },
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    expect(stream.markdown).not.toHaveBeenCalledWith('child only');
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as {
+        toolName?: string;
+        toolCallId?: string;
+        subAgentInvocationId?: string;
+        isComplete?: boolean;
+        toolSpecificData?: { result?: string };
+      });
+    const childReadPart = pushed
+      .find(part => part.toolName === 'read' && part.toolCallId === 'call_event_session_read');
+    const subagentPart = pushed
+      .find(part => part.toolName === 'task' && part.toolCallId === taskCallId && part.isComplete === true);
+
+    expect(childReadPart?.subAgentInvocationId).toBe(taskCallId);
+    expect(subagentPart?.toolSpecificData?.result).toBe('child only');
+  });
+
+  it('mock vscode full chain persists child session flow through bridge, SSS, SubSSS, and SSP', async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-full-chain-'));
+    const childFilePath = path.join(tmpDir, 'child.txt');
+    await fs.writeFile(childFilePath, 'before\n', 'utf-8');
+
+    try {
+      const permissions = { reply: vi.fn(async () => ({ data: true, error: undefined })) };
+      const stream = mockStream();
+      stream.externalEdit = vi.fn(async (_target: vscode.Uri | vscode.Uri[], callback: () => Thenable<unknown>) => {
+        await callback();
+        await fs.writeFile(childFilePath, 'after\n', 'utf-8');
+        return 'undo-child-full-chain';
+      });
+
+      const sss = new SerializableSessionStream(stream as any, {
+        workspaceRoot: tmpDir,
+        backendName: 'test',
+        sessionId: 'test-session',
+        turnIndex: 0,
+        requestId: 'req-full-chain',
+      });
+      await sss.initialize();
+      sss.push(new UserPromptSSP({
+        text: 'spawn child and edit file',
+        partId: 'user-full-chain',
+      }));
+
+      const fullBridge = new OpenCodeBridge(
+        mockBackend({ permissions }),
+        'ses_root_full_chain',
+        tmpDir,
+        { sessionId: 'ses_root_full_chain' },
+      );
+      fullBridge.setSSS(sss);
+
+      const childSessionId = 'ses_child_full_chain';
+      const taskCallId = 'call_task_full_chain';
+      const writeCallId = 'call_child_write_full_chain';
+      const childReasoningId = 'prt_child_reasoning_full_chain';
+      const childTextId = 'prt_child_text_full_chain';
+
+      const events = eventStream([
+        { type: 'part.updated', part: { type: 'text', text: 'spawn child', messageId: 'msg_u1', id: 'prt_u1' } },
+        { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'task',
+            id: 'prt_child_full_chain_task',
+            callId: taskCallId,
+            state: { status: 'pending', input: { description: 'child full chain' } },
+          },
+        },
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'task',
+            id: 'prt_child_full_chain_task',
+            callId: taskCallId,
+            state: {
+              status: 'completed',
+              input: { description: 'child full chain' },
+              output: 'child spawned',
+              title: 'child full chain',
+              metadata: { sessionId: childSessionId },
+            },
+          },
+        },
+        { type: 'session.updated', sessionId: childSessionId, title: 'Child Full Chain' },
+        {
+          type: 'session.diff',
+          sessionId: childSessionId,
+          diffs: [{
+            file: childFilePath,
+            patch: '@@ -1 +1 @@\n-before\n+after\n',
+            additions: 1,
+            deletions: 1,
+            status: 'modified' as const,
+          }],
+        },
+        { type: 'session.status', sessionId: childSessionId, status: { type: 'busy' } },
+        {
+          type: 'part.updated',
+          part: { type: 'text', text: 'child user echo', messageId: 'child_user', id: 'prt_child_user', sessionId: childSessionId },
+        },
+        {
+          type: 'part.updated',
+          part: { type: 'step-start', messageId: 'child_assistant', id: 'prt_child_step', sessionId: childSessionId },
+        },
+        {
+          type: 'part.updated',
+          part: { type: 'reasoning', text: '', messageId: 'child_assistant', id: childReasoningId, sessionId: childSessionId },
+        },
+        { type: 'part.delta', sessionId: childSessionId, partId: childReasoningId, delta: 'child thought', field: 'text' },
+        {
+          type: 'part.updated',
+          part: { type: 'text', text: '', messageId: 'child_assistant', id: childTextId, sessionId: childSessionId },
+        },
+        { type: 'part.delta', sessionId: childSessionId, partId: childTextId, delta: 'child answer', field: 'text' },
+        permissionAskedEvent({
+          sessionId: childSessionId,
+          permissionId: 'perm_child_full_chain_write',
+          metadata: { filepath: 'child.txt' },
+          tool: { messageId: 'msg_child_tool', callId: writeCallId },
+        }),
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'write',
+            id: 'prt_child_write_full_chain',
+            callId: writeCallId,
+            sessionId: childSessionId,
+            state: { status: 'pending', input: { filePath: 'child.txt' } },
+          },
+        },
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'write',
+            id: 'prt_child_write_full_chain',
+            callId: writeCallId,
+            sessionId: childSessionId,
+            state: {
+              status: 'completed',
+              input: { filePath: 'child.txt' },
+              output: 'ok',
+              title: 'child.txt',
+            },
+          },
+        },
+        idleEventFor(childSessionId),
+        idleEvent(),
+      ] satisfies AcpEvent[]);
+
+      await fullBridge.run(events.stream, mockToken());
+      await sss.flush();
+      await sss.drain();
+      sss.close();
+      await sss.flush();
+
+      expect(stream.markdown).not.toHaveBeenCalledWith('child user echo');
+      expect(stream.thinkingProgress).not.toHaveBeenCalledWith(expect.objectContaining({ text: 'child thought' }));
+      expect(stream.markdown).not.toHaveBeenCalledWith('child answer');
+      expect(stream.externalEdit).toHaveBeenCalledTimes(1);
+      expect(permissions.reply).toHaveBeenCalledWith(childSessionId, 'perm_child_full_chain_write', 'once', tmpDir);
+
+      const sessionDir = getTestSessionDir(tmpDir);
+      const rootRecords = await readAllStreamParts(path.join(sessionDir, 'session.jsonl'));
+      expect(rootRecords.some(record => record.kind === 'userPrompt')).toBe(true);
+      expect(rootRecords.some(record =>
+        record.kind === 'toolInvocation' &&
+        (record.payload as { callId?: string }).callId === taskCallId,
+      )).toBe(true);
+
+      const subsessions = await readSubsessionRecords(sessionDir);
+      expect(subsessions).toHaveLength(1);
+      const sub = subsessions[0];
+      const rawSubRecords = await readAllStreamParts(sub.filePath);
+
+      expect(rawSubRecords.map(record => record.kind)).toEqual(expect.arrayContaining([
+        'reasoning',
+        'assistantText',
+        'externalEdit',
+      ]));
+      expect(rawSubRecords.some(record =>
+        record.kind === 'reasoning' &&
+        (record.payload as { text?: string }).text === 'child thought',
+      )).toBe(true);
+      expect(rawSubRecords.some(record =>
+        record.kind === 'assistantText' &&
+        (record.payload as { text?: string }).text === 'child answer',
+      )).toBe(true);
+      expect(rawSubRecords.every(record => record.meta.subAgentInvocationId === sub.subAgentInvocationId)).toBe(true);
+      expect(rawSubRecords[0]?.meta.sequence).toBe(0);
+      expect(rootRecords[0]?.meta.sequence).toBe(0);
+      expect(sub.records.some(record =>
+        record.kind === 'toolInvocation' &&
+        (record.payload as { callId?: string }).callId === writeCallId,
+      )).toBe(false);
+
+      const childSessionMeta = sub.metaIndex.get('session');
+      expect(childSessionMeta?.title).toBe('Child Full Chain');
+      expect(childSessionMeta?.changeSummary).toEqual({ files: 1 });
+      expect(childSessionMeta?.status).toEqual({ type: 'busy' });
+      expect(sub.metaIndex.get(writeCallId)?.undoStopId).toBe('undo-child-full-chain');
+
+      const rootMeta = await readMetaIndex(path.join(sessionDir, 'meta.jsonl'));
+      expect(rootMeta.get('session')?.title).not.toBe('Child Full Chain');
+      expect(rootMeta.get(writeCallId)).toBeUndefined();
+
+      const snapshots = await readAllSnapshots(path.join(sessionDir, 'session.jsonl'));
+      expect(snapshots).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          toolCallId: writeCallId,
+          phase: 'before',
+          content: 'before\n',
+          missing: false,
+        }),
+        expect.objectContaining({
+          toolCallId: writeCallId,
+          phase: 'after',
+          content: 'after\n',
+          undoStopId: 'undo-child-full-chain',
+          missing: false,
+        }),
+      ]));
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('routes parallel subagent session events by explicit sessionId', async () => {
+    const stream = mockStream();
+    const firstCallId = 'call_parallel_a';
+    const secondCallId = 'call_parallel_b';
+    const firstSessionId = 'ses_parallel_a';
+    const secondSessionId = 'ses_parallel_b';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'parallel', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_parallel_a',
+          callId: firstCallId,
+          state: { status: 'pending', input: {} },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_parallel_b',
+          callId: secondCallId,
+          state: { status: 'pending', input: {} },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_parallel_a',
+          callId: firstCallId,
+          state: {
+            status: 'completed',
+            input: { description: 'first' },
+            output: 'first done',
+            title: 'first',
+            metadata: { sessionId: firstSessionId },
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_parallel_b',
+          callId: secondCallId,
+          state: {
+            status: 'completed',
+            input: { description: 'second' },
+            output: 'second done',
+            title: 'second',
+            metadata: { sessionId: secondSessionId },
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_parallel_read_b',
+          callId: 'call_parallel_read_b',
+          sessionId: secondSessionId,
+          state: {
+            status: 'completed',
+            input: { filePath: '/b.ts' },
+            output: 'b',
+            title: 'b.ts',
+          },
+        },
+      },
+      idleEventFor(firstSessionId),
+      idleEventFor(secondSessionId),
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; subAgentInvocationId?: string });
+    const firstScopeId = pushed
+      .find(part => part.toolName === 'task' && part.toolCallId === firstCallId)
+      ?.toolCallId;
+    const secondScopeId = pushed
+      .find(part => part.toolName === 'task' && part.toolCallId === secondCallId)
+      ?.toolCallId;
+    const secondReadPart = pushed
+      .find(part => part.toolName === 'read' && part.toolCallId === 'call_parallel_read_b');
+
+    expect(firstScopeId).toBeDefined();
+    expect(secondScopeId).toBeDefined();
+    expect(secondScopeId).not.toBe(firstScopeId);
+    expect(secondReadPart?.subAgentInvocationId).toBe(secondScopeId);
+  });
+
+  it('buffers real child session events until parent task metadata binds the matching scope', async () => {
+    const stream = mockStream();
+    const firstCallId = 'call_real_parallel_a';
+    const secondCallId = 'call_real_parallel_b';
+    const firstSessionId = 'ses_real_parallel_a';
+    const secondSessionId = 'ses_real_parallel_b';
+
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'parallel real flow', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_real_parallel_a',
+          callId: firstCallId,
+          state: {
+            status: 'running',
+            input: { description: 'first', prompt: 'read a', subagent_type: 'explore' },
+            title: 'first',
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_real_parallel_b',
+          callId: secondCallId,
+          state: {
+            status: 'running',
+            input: { description: 'second', prompt: 'read b', subagent_type: 'explore' },
+            title: 'second',
+          },
+        },
+      },
+      { type: 'session.created', sessionId: secondSessionId, parentId: 'test-session', title: 'second child' },
+      { type: 'session.created', sessionId: firstSessionId, parentId: 'test-session', title: 'first child' },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_real_parallel_read_b',
+          callId: 'call_real_parallel_read_b',
+          sessionId: secondSessionId,
+          state: {
+            status: 'completed',
+            input: { filePath: '/b.ts' },
+            output: 'b',
+            title: 'b.ts',
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_real_parallel_b',
+          callId: secondCallId,
+          state: {
+            status: 'running',
+            input: { description: 'second', prompt: 'read b', subagent_type: 'explore' },
+            title: 'second',
+            metadata: { parentSessionId: 'test-session', sessionId: secondSessionId },
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_real_parallel_a',
+          callId: firstCallId,
+          state: {
+            status: 'running',
+            input: { description: 'first', prompt: 'read a', subagent_type: 'explore' },
+            title: 'first',
+            metadata: { parentSessionId: 'test-session', sessionId: firstSessionId },
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'read',
+          id: 'prt_real_parallel_read_a',
+          callId: 'call_real_parallel_read_a',
+          sessionId: firstSessionId,
+          state: {
+            status: 'completed',
+            input: { filePath: '/a.ts' },
+            output: 'a',
+            title: 'a.ts',
+          },
+        },
+      },
+      idleEventFor(firstSessionId),
+      idleEventFor(secondSessionId),
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_real_parallel_a',
+          callId: firstCallId,
+          state: {
+            status: 'completed',
+            input: { description: 'first', prompt: 'read a', subagent_type: 'explore' },
+            output: 'first done',
+            title: 'first',
+            metadata: { parentSessionId: 'test-session', sessionId: firstSessionId },
+          },
+        },
+      },
+      {
+        type: 'part.updated',
+        part: {
+          type: 'tool',
+          toolName: 'task',
+          id: 'prt_real_parallel_b',
+          callId: secondCallId,
+          state: {
+            status: 'completed',
+            input: { description: 'second', prompt: 'read b', subagent_type: 'explore' },
+            output: 'second done',
+            title: 'second',
+            metadata: { parentSessionId: 'test-session', sessionId: secondSessionId },
+          },
+        },
+      },
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge, events, stream, mockToken());
+
+    const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; subAgentInvocationId?: string });
+    const firstTaskPart = pushed.find(part => part.toolName === 'task' && part.toolCallId === firstCallId);
+    const secondTaskPart = pushed.find(part => part.toolName === 'task' && part.toolCallId === secondCallId);
+    const firstReadPart = pushed.find(part => part.toolName === 'read' && part.toolCallId === 'call_real_parallel_read_a');
+    const secondReadPart = pushed.find(part => part.toolName === 'read' && part.toolCallId === 'call_real_parallel_read_b');
+
+    expect(firstTaskPart?.subAgentInvocationId).toBeUndefined();
+    expect(secondTaskPart?.subAgentInvocationId).toBeUndefined();
+    expect(firstReadPart?.subAgentInvocationId).toBe(firstCallId);
+    expect(secondReadPart?.subAgentInvocationId).toBe(secondCallId);
   });
 
   it('should not filter events when no subagent is active', async () => {
@@ -304,7 +2027,7 @@ describe('OpenCodeBridge', () => {
     const events = eventStream(fullTurnEvents({
       tools: toolEvents({ toolName: 'read', callId: 'call_rd', input: { filePath: '/f.txt' }, output: 'hello', title: 'f.txt' }),
     }));
-    await bridge.bridgeEventsToStream(events, stream, mockToken());
+    await runBridge(bridge,events, stream, mockToken());
 
     // Read tool should be pushed normally
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
@@ -328,14 +2051,14 @@ describe('OpenCodeBridge', () => {
       { type: 'part.updated', part: { type: 'tool', toolName: 'task', id: taskId, callId: taskCallId, state: { status: 'error', input: { description: 'fail task' }, error: 'timeout' } } },
       idleEvent(),
     ]);
-    await bridge.bridgeEventsToStream(events, stream, mockToken());
+    await runBridge(bridge,events, stream, mockToken());
 
     // After error, scope should be cleaned — subsequent tools should not be filtered
     // Just verify no crash and error part was pushed
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
     const errorPart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; isComplete?: boolean };
-      return p?.toolName === 'subagent' && p?.isComplete === true;
+      return p?.toolName === 'task' && p?.isComplete === true;
     });
     expect(errorPart).toBeDefined();
   });
@@ -364,7 +2087,7 @@ describe('OpenCodeBridge', () => {
       // Final idle (no active subagents) → should stop
       idleEvent(),
     ]);
-    const result = await bridge.bridgeEventsToStream(events, stream, mockToken());
+    const result = await runBridge(bridge,events, stream, mockToken());
 
     // Bridge should complete successfully (not cancel)
     expect(result).toBe(true);
@@ -373,7 +2096,7 @@ describe('OpenCodeBridge', () => {
     const pushed = (stream.push as ReturnType<typeof vi.fn>).mock.calls;
     const taskPart = pushed.find((call: unknown[]) => {
       const p = call[0] as { toolName?: string; toolCallId?: string; isComplete?: boolean };
-      return p?.toolName === 'subagent' && p?.isComplete === true;
+      return p?.toolName === 'task' && p?.isComplete === true;
     });
     expect(taskPart).toBeDefined();
   });
@@ -385,8 +2108,12 @@ describe('OpenCodeBridge', () => {
     const events = eventStream(fullTurnEvents({
       tools: toolEvents({ toolName: 'custom', callId: 'call_cu', input: { x: 1 }, output: 'ok' }),
     }));
-    await bridge.bridgeEventsToStream(events, stream, mockToken());
-    expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_cu', 'custom');
+    await runBridge(bridge,events, stream, mockToken());
+    expect(stream.beginToolInvocation).toHaveBeenCalledWith(
+      'call_cu',
+      'custom',
+      expect.objectContaining({ isAttachedToThinking: true }),
+    );
   });
 
   // --- Reasoning ---
@@ -402,11 +2129,60 @@ describe('OpenCodeBridge', () => {
       deltaEvent('Yes'),
       idleEvent(),
     ]);
-    await bridge.bridgeEventsToStream(events, stream, mockToken());
+    await runBridge(bridge,events, stream, mockToken());
     expect(stream.thinkingProgress).toHaveBeenCalledWith(
       expect.objectContaining({ text: 'hmm...' }),
     );
     expect(stream.markdown).toHaveBeenCalledWith('Yes');
+  });
+
+  it('should reuse thinking id for consecutive reasoning parts', async () => {
+    const stream = mockStream();
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'hi', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'reasoning', text: '', messageId: 'msg_a1', id: 'prt_r1' } },
+      { type: 'part.delta', partId: 'prt_r1', delta: 'first', field: 'text' },
+      { type: 'part.updated', part: { type: 'reasoning', text: '', messageId: 'msg_a1', id: 'prt_r2' } },
+      { type: 'part.delta', partId: 'prt_r2', delta: ' second', field: 'text' },
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge,events, stream, mockToken());
+
+    const thinkingCalls = stream.thinkingProgress.mock.calls
+      .map((call: unknown[]) => call[0] as { text: string; id?: string })
+      .filter(call => call.text);
+    const first = thinkingCalls.find(call => call.text === 'first');
+    const second = thinkingCalls.find(call => call.text === ' second');
+    expect(first?.id).toBeDefined();
+    expect(second?.id).toBe(first?.id);
+    expect(first?.id).not.toBe('prt_r1');
+  });
+
+  it('should start a new thinking id after assistant text activates', async () => {
+    const stream = mockStream();
+    const events = eventStream([
+      { type: 'part.updated', part: { type: 'text', text: 'hi', messageId: 'msg_u1', id: 'prt_u1' } },
+      { type: 'part.updated', part: { type: 'reasoning', text: '', messageId: 'msg_a1', id: 'prt_r1' } },
+      { type: 'part.delta', partId: 'prt_r1', delta: 'first', field: 'text' },
+      { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_t1' } },
+      { type: 'part.delta', partId: 'prt_t1', delta: 'answer', field: 'text' },
+      { type: 'part.updated', part: { type: 'reasoning', text: '', messageId: 'msg_a2', id: 'prt_r2' } },
+      { type: 'part.delta', partId: 'prt_r2', delta: 'second', field: 'text' },
+      idleEvent(),
+    ]);
+
+    await runBridge(bridge,events, stream, mockToken());
+
+    const thinkingCalls = stream.thinkingProgress.mock.calls
+      .map((call: unknown[]) => call[0] as { text: string; id?: string })
+      .filter(call => call.text);
+    const first = thinkingCalls.find(call => call.text === 'first');
+    const second = thinkingCalls.find(call => call.text === 'second');
+    expect(first?.id).toBeDefined();
+    expect(second?.id).toBeDefined();
+    expect(second?.id).not.toBe(first?.id);
+    expect(stream.markdown).toHaveBeenCalledWith('answer');
   });
 
   it('should skip thinkingProgress if fallback (no proposed API)', async () => {
@@ -418,7 +2194,7 @@ describe('OpenCodeBridge', () => {
       { type: 'part.delta', partId: pid, delta: 'hmm fallback', field: 'text' },
       idleEvent(),
     ]);
-    await bridge.bridgeEventsToStream(events, stream, mockToken());
+    await runBridge(bridge,events, stream, mockToken());
     // Fallback stream doesn't have thinkingProgress
     expect((stream as any).thinkingProgress).toBeUndefined();
   });
@@ -427,21 +2203,21 @@ describe('OpenCodeBridge', () => {
 
   it('should stop on session.idle matching target session', async () => {
     const stream = mockStream();
-    const scopedBridge = new OpenCodeBridge(undefined, undefined, undefined, { sessionId: 'ses_a' });
+    const scopedBridge = new OpenCodeBridge(mockBackend(), 'ses_a', undefined, { sessionId: 'ses_a' });
     const events = eventStream([
       { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
       deltaEvent('Yes'),
       idleEventFor('ses_a'),
       deltaEvent('IGNORED', 'prt_ai1'),
     ]);
-    await scopedBridge.bridgeEventsToStream(events, stream, mockToken());
+    await runBridge(scopedBridge,events, stream, mockToken());
     expect(stream.markdown).toHaveBeenCalledWith('Yes');
     expect(stream.markdown).not.toHaveBeenCalledWith('IGNORED');
   });
 
   it('should ignore session.idle from a different session when target session is set', async () => {
     const stream = mockStream();
-    const scopedBridge = new OpenCodeBridge(undefined, undefined, undefined, { sessionId: 'ses_target' });
+    const scopedBridge = new OpenCodeBridge(mockBackend(), 'ses_target', undefined, { sessionId: 'ses_target' });
     const events = eventStream([
       {
         type: 'part.updated',
@@ -454,7 +2230,7 @@ describe('OpenCodeBridge', () => {
       deltaEvent('IGNORED', 'prt_ai1'),
     ]);
 
-    await scopedBridge.bridgeEventsToStream(events, stream, mockToken());
+    await runBridge(scopedBridge,events, stream, mockToken());
 
     expect(stream.markdown).toHaveBeenCalledWith('Hello');
     expect(stream.markdown).toHaveBeenCalledWith(' world');
@@ -465,13 +2241,13 @@ describe('OpenCodeBridge', () => {
 
   it('should return false when cancelled', async () => {
     const stream = mockStream();
-    const r = await bridge.bridgeEventsToStream(eventStream(fullTurnEvents({})), stream, mockToken(true));
+    const r = await runBridge(bridge,eventStream(fullTurnEvents({})), stream, mockToken(true));
     expect(r).toBe(false);
   });
 
   it('should return true when completed normally', async () => {
     const stream = mockStream();
-    const r = await bridge.bridgeEventsToStream(eventStream(fullTurnEvents({})), stream, mockToken());
+    const r = await runBridge(bridge,eventStream(fullTurnEvents({})), stream, mockToken());
     expect(r).toBe(true);
   });
 
@@ -479,9 +2255,9 @@ describe('OpenCodeBridge', () => {
 
   it('should reset state between bridge calls', async () => {
     const s1 = mockStream();
-    await bridge.bridgeEventsToStream(eventStream(fullTurnEvents({ tools: toolEvents({ toolName: 'read', callId: 'call_a', output: 'a' }) })), s1, mockToken());
+    await runBridge(bridge,eventStream(fullTurnEvents({ tools: toolEvents({ toolName: 'read', callId: 'call_a', output: 'a' }) })), s1, mockToken());
     const s2 = mockStream();
-    await bridge.bridgeEventsToStream(eventStream(fullTurnEvents({ tools: toolEvents({ toolName: 'read', callId: 'call_b', output: 'b' }) })), s2, mockToken());
+    await runBridge(bridge,eventStream(fullTurnEvents({ tools: toolEvents({ toolName: 'read', callId: 'call_b', output: 'b' }) })), s2, mockToken());
     // read tool uses hiddenAfterComplete and returns undefined for toolSpecificData
     const s2Pushed = (s2.push as ReturnType<typeof vi.fn>).mock.calls;
     const readPart = s2Pushed.find((call: unknown[]) => {
@@ -496,13 +2272,13 @@ describe('OpenCodeBridge', () => {
 
   it('should handle empty delta', async () => {
     const stream = mockStream();
-    await bridge.bridgeEventsToStream(eventStream([deltaEvent('', 'x'), idleEvent()]), stream, mockToken());
+    await runBridge(bridge,eventStream([deltaEvent('', 'x'), idleEvent()]), stream, mockToken());
     expect(stream.markdown).not.toHaveBeenCalled();
   });
 
   it('should handle unknown partId delta', async () => {
     const stream = mockStream();
-    await bridge.bridgeEventsToStream(eventStream([deltaEvent('x', 'prt_unknown'), idleEvent()]), stream, mockToken());
+    await runBridge(bridge,eventStream([deltaEvent('x', 'prt_unknown'), idleEvent()]), stream, mockToken());
     expect(stream.markdown).not.toHaveBeenCalled();
   });
 
@@ -516,8 +2292,12 @@ describe('OpenCodeBridge', () => {
       { type: 'part.updated', part: { type: 'tool', toolName: 'read', id: pid, state: { status: 'completed', input: { filePath: '/x.txt' }, output: 'ok' } } },
       idleEvent(),
     ]);
-    await bridge.bridgeEventsToStream(events, stream, mockToken());
-    expect(stream.beginToolInvocation).toHaveBeenCalledWith(pid, 'read');
+    await runBridge(bridge,events, stream, mockToken());
+    expect(stream.beginToolInvocation).toHaveBeenCalledWith(
+      pid,
+      'read',
+      expect.objectContaining({ isAttachedToThinking: true }),
+    );
   });
 
   // -----------------------------------------------------------------------
@@ -541,204 +2321,109 @@ describe('OpenCodeBridge', () => {
 
   describe('permission.asked lifecycle', () => {
     let mockPermissions: { reply: ReturnType<typeof vi.fn> };
-    let mockTracker: {
-      hasEdit: ReturnType<typeof vi.fn>;
-      isTrackingAny: ReturnType<typeof vi.fn>;
-      trackEdit: ReturnType<typeof vi.fn>;
-      completeEdit: ReturnType<typeof vi.fn>;
-      dispose: ReturnType<typeof vi.fn>;
-    };
 
     beforeEach(() => {
       mockPermissions = { reply: vi.fn(async () => ({ data: true, error: undefined })) };
-      mockTracker = {
-        hasEdit: vi.fn().mockReturnValue(false),
-        isTrackingAny: vi.fn().mockReturnValue(false),
-        trackEdit: vi.fn().mockResolvedValue(undefined),
-        completeEdit: vi.fn(),
-        dispose: vi.fn(),
-      };
     });
 
-    it('calls tracker.trackEdit with callId and filepath when both are present', async () => {
+    function permissionBridge(directory?: string, questions?: { reply: ReturnType<typeof vi.fn>; reject?: ReturnType<typeof vi.fn> }) {
+      return new OpenCodeBridge(mockBackend({ permissions: mockPermissions, questions }), 'ses_target', directory);
+    }
+
+    function firstExternalEditTarget(stream: MockStream): vscode.Uri[] {
+      return (stream.externalEdit as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as vscode.Uri[];
+    }
+
+    it('starts ExternalEditSSP with callId and filepath when both are present', async () => {
       const stream = mockStream();
-      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
-        sessionId: 'ses_target',
-      });
-      permBridge.setTracker(mockTracker as any);
       const events = eventStream([
         permissionAskedEvent(),
         idleEvent(),
       ]);
 
-      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(permissionBridge(), events, stream, mockToken());
 
-      // Permission handling triggered
-      expect(mockTracker.trackEdit).toHaveBeenCalledWith(
-        'call_edit_001',
-        expect.anything(),
-        stream,
-      );
-      // Auto-reply sent
-      expect(mockPermissions.reply).toHaveBeenCalledWith(
-        'ses_target',
-        'perm_42',
-        'once',
-        undefined,
-      );
+      expect(stream.externalEdit).toHaveBeenCalledTimes(1);
+      expect(firstExternalEditTarget(stream)[0].toString()).toBe('file:///workspace/src/app.ts');
+      expect(mockPermissions.reply).toHaveBeenCalledWith('ses_target', 'perm_42', 'once', undefined);
     });
 
     it('normalizes Windows file URI paths to lowercase without dropping the slash after the drive', async () => {
       const stream = mockStream();
-      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
-        sessionId: 'ses_target',
-      });
-      permBridge.setTracker(mockTracker as any);
       const events = eventStream([
         permissionAskedEvent({ metadata: { filepath: 'D:\\Temp\\sisyphus-greeting.txt' } }),
         idleEvent(),
       ]);
 
-      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(permissionBridge(), events, stream, mockToken());
 
-      const uris = mockTracker.trackEdit.mock.calls[0]?.[1] as vscode.Uri[];
+      const uris = firstExternalEditTarget(stream);
       expect(uris[0].path).toBe('/d:/temp/sisyphus-greeting.txt');
       expect(uris[0].toString()).toBe('file:///d:/temp/sisyphus-greeting.txt');
     });
 
-    it('resolves relative edit paths against the workspace before tracking externalEdit', async () => {
+    it('resolves relative edit paths against the workspace before starting externalEdit', async () => {
       const stream = mockStream();
-      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
-        sessionId: 'ses_target',
-        directory: 'D:\\Temp',
-      });
-      permBridge.setTracker(mockTracker as any);
       const events = eventStream([
         permissionAskedEvent({ metadata: { filepath: 'Hello-Sisyphus.txt' } }),
         idleEvent(),
       ]);
 
-      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(permissionBridge('D:\\Temp'), events, stream, mockToken());
 
-      const uris = mockTracker.trackEdit.mock.calls[0]?.[1] as vscode.Uri[];
+      const uris = firstExternalEditTarget(stream);
       expect(uris[0].path).toBe('/d:/temp/hello-sisyphus.txt');
       expect(uris[0].toString()).toBe('file:///d:/temp/hello-sisyphus.txt');
     });
 
-    it('does not call tracker.trackEdit when callId is missing', async () => {
+    it('does not start externalEdit when callId is missing', async () => {
       const stream = mockStream();
-      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
-        sessionId: 'ses_target',
-      });
-      permBridge.setTracker(mockTracker as any);
       const events = eventStream([
         permissionAskedEvent({ tool: undefined }),
         idleEvent(),
       ]);
 
-      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(permissionBridge(), events, stream, mockToken());
 
-      // No callId → no tracking
-      expect(mockTracker.trackEdit).not.toHaveBeenCalled();
-      // Still auto-replies
-      expect(mockPermissions.reply).toHaveBeenCalled();
+      expect(stream.externalEdit).not.toHaveBeenCalled();
+      expect(mockPermissions.reply).toHaveBeenCalledWith('ses_target', 'perm_42', 'once', undefined);
     });
 
-    it('does not call tracker.trackEdit when filepath is missing', async () => {
+    it('does not start externalEdit when filepath is missing', async () => {
       const stream = mockStream();
-      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
-        sessionId: 'ses_target',
-      });
-      permBridge.setTracker(mockTracker as any);
       const events = eventStream([
         permissionAskedEvent({ metadata: {} }),
         idleEvent(),
       ]);
 
-      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(permissionBridge(), events, stream, mockToken());
 
-      // No filepath in metadata → no tracking
-      expect(mockTracker.trackEdit).not.toHaveBeenCalled();
-    });
-
-    it('skips tracking when tracker is absent (null/undefined)', async () => {
-      const stream = mockStream();
-      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
-        sessionId: 'ses_target',
-      });
-      const events = eventStream([
-        permissionAskedEvent(),
-        idleEvent(),
-      ]);
-
-      await permBridge.bridgeEventsToStream(events, stream, mockToken());
-
-      // No tracker set → still auto-replies without tracking
-      expect(mockPermissions.reply).toHaveBeenCalled();
+      expect(stream.externalEdit).not.toHaveBeenCalled();
+      expect(mockPermissions.reply).toHaveBeenCalledWith('ses_target', 'perm_42', 'once', undefined);
     });
 
     it('bridge loop continues processing subsequent events after permission.asked', async () => {
       const stream = mockStream();
-      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
-        sessionId: 'ses_target',
-      });
-      permBridge.setTracker(mockTracker as any);
       const events = eventStream([
         permissionAskedEvent(),
-        // Regular tool event flow after permission.asked
         { type: 'part.updated', part: { type: 'text', text: '', messageId: 'msg_a1', id: 'prt_ai1' } },
         { type: 'part.delta', partId: 'prt_ai1', delta: 'Edit applied', field: 'text' },
         idleEvent(),
       ]);
 
-      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(permissionBridge(), events, stream, mockToken());
 
-      // Permission handling happened
-      expect(mockTracker.trackEdit).toHaveBeenCalledTimes(1);
+      expect(stream.externalEdit).toHaveBeenCalledTimes(1);
       expect(mockPermissions.reply).toHaveBeenCalledTimes(1);
-      // Subsequent text delta was rendered
       expect(stream.markdown).toHaveBeenCalledWith('Edit applied');
     });
 
-    it('persists permission.asked events through callbacks', async () => {
-      const stream = mockStream();
-      const onEvent = vi.fn();
-      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
-        sessionId: 'ses_target',
-      });
-      permBridge.setTracker(mockTracker as any);
-      permBridge.setCallbacks({
-        onEvent,
-        onSnapshot: vi.fn(),
-        onError: vi.fn(),
-      });
-      const permissionEvent = permissionAskedEvent();
-      const events = eventStream([
-        permissionEvent,
-        idleEvent(),
-      ]);
-
-      await permBridge.bridgeEventsToStream(events, stream, mockToken());
-
-      expect(onEvent).toHaveBeenCalledWith(permissionEvent);
-      expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ type: 'session.idle' }));
-    });
-
-    it('persists question.asked events through callbacks', async () => {
+    it('answers question.asked through QuestionSSP callbacks', async () => {
       const stream = {
         ...mockStream(),
         questionCarousel: vi.fn(async () => ({ q_0: 'Yes' })),
       } as any;
-      const onEvent = vi.fn();
-      const questions = { reply: vi.fn(async () => ({ data: true })) };
-      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, questions as any, {
-        sessionId: 'ses_target',
-      });
-      permBridge.setCallbacks({
-        onEvent,
-        onSnapshot: vi.fn(),
-        onError: vi.fn(),
-      });
+      const questions = { reply: vi.fn(async () => ({ data: true })), reject: vi.fn(async () => ({ data: true })) };
       const questionEvent = {
         type: 'question.asked',
         questionId: 'question-1',
@@ -752,40 +2437,27 @@ describe('OpenCodeBridge', () => {
         ],
       } as AcpEvent;
 
-      await permBridge.bridgeEventsToStream(eventStream([questionEvent, idleEvent()]), stream, mockToken());
+      await runBridge(permissionBridge(undefined, questions), eventStream([questionEvent, idleEvent()]), stream, mockToken());
 
       expect(questions.reply).toHaveBeenCalledWith('ses_target', 'question-1', [['Yes']], undefined);
-      expect(onEvent).toHaveBeenCalledWith(questionEvent);
-      expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ type: 'session.idle' }));
     });
 
     it('session.idle stops the bridge after permission.asked flow', async () => {
       const stream = mockStream();
-      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
-        sessionId: 'ses_target',
-      });
-      permBridge.setTracker(mockTracker as any);
       const events = eventStream([
         permissionAskedEvent(),
         { type: 'part.delta', partId: 'prt_ai1', delta: 'BEFORE', field: 'text' },
         idleEvent(),
-        // This delta should be IGNORED because idle stops the bridge
         { type: 'part.delta', partId: 'prt_ai1', delta: 'AFTER_IDLE', field: 'text' },
       ]);
 
-      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(permissionBridge(), events, stream, mockToken());
 
       expect(stream.markdown).not.toHaveBeenCalledWith('AFTER_IDLE');
     });
 
-    it('tool completion calls tracker.completeEdit with the same callId', async () => {
+    it('tool completion completes ExternalEditSSP and hides the normal edit card', async () => {
       const stream = mockStream();
-      mockTracker.trackEdit.mockResolvedValue(undefined);
-      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
-        sessionId: 'ses_target',
-      });
-      permBridge.setTracker(mockTracker as any);
-      // Simulate: permission.asked → tool pending → tool completed → idle
       const callId = 'call_edit_001';
       const partId = 'prt_edit_tool';
       const events = eventStream([
@@ -813,69 +2485,18 @@ describe('OpenCodeBridge', () => {
         idleEvent(),
       ]);
 
-      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(permissionBridge(), events, stream, mockToken());
 
-      // trackEdit was called during permission.asked handling
-      expect(mockTracker.trackEdit).toHaveBeenCalledWith(callId, expect.anything(), stream);
-      // completeEdit was called when tool completed with the same callId
-      expect(mockTracker.completeEdit).toHaveBeenCalledWith(callId);
+      expect(stream.externalEdit).toHaveBeenCalledTimes(1);
       expect(stream.beginToolInvocation).not.toHaveBeenCalledWith(callId, 'edit');
       const editParts = (stream.push as ReturnType<typeof vi.fn>).mock.calls
-        .map((call: unknown[]) => call[0] as {
-          toolName?: string;
-          isComplete?: boolean;
-          presentation?: string;
-          enablePartialUpdate?: boolean;
-          toolSpecificData?: unknown;
-        })
-        .filter((p) => p?.toolName === 'edit');
-      expect(editParts).toHaveLength(0);
+        .map((call: unknown[]) => call[0] as { toolName?: string; toolCallId?: string; presentation?: string; isComplete?: boolean })
+        .filter((p) => p?.toolName === 'edit' && p?.toolCallId === callId);
+      expect(editParts.filter((p) => p.isComplete === true && p.presentation !== 'hidden')).toHaveLength(0);
     });
 
-    it('persists externalEdit undo stop ids through callbacks', async () => {
+    it('defers write tool SSP until permission.asked, then uses ExternalEditSSP (no orphaned tool card)', async () => {
       const stream = mockStream();
-      const onExternalEdit = vi.fn();
-      mockTracker.trackEdit.mockResolvedValue(undefined);
-      mockTracker.completeEdit.mockReturnValue(Promise.resolve('undo-stop-from-vscode'));
-      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
-        sessionId: 'ses_target',
-      });
-      permBridge.setTracker(mockTracker as any);
-      permBridge.setCallbacks({
-        onEvent: vi.fn(),
-        onSnapshot: vi.fn(),
-        onExternalEdit,
-        onError: vi.fn(),
-      });
-      const callId = 'call_edit_001';
-      const partId = 'prt_edit_tool';
-      const events = eventStream([
-        permissionAskedEvent({ tool: { messageId: 'msg_t1', callId } }),
-        {
-          type: 'part.updated',
-          part: {
-            type: 'tool',
-            toolName: 'edit',
-            id: partId,
-            callId,
-            state: { status: 'completed', input: { filePath: '/src/app.ts' }, output: 'ok' },
-          },
-        },
-        idleEvent(),
-      ]);
-
-      await permBridge.bridgeEventsToStream(events, stream, mockToken());
-
-      expect(onExternalEdit).toHaveBeenCalledWith(callId, 'undo-stop-from-vscode');
-    });
-
-    it('hides an edit tool card that was pushed before permission.asked marks it as externalEdit', async () => {
-      const stream = mockStream();
-      mockTracker.trackEdit.mockResolvedValue(undefined);
-      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
-        sessionId: 'ses_target',
-      });
-      permBridge.setTracker(mockTracker as any);
       const callId = 'call_edit_late_permission';
       const partId = 'prt_edit_tool';
       const events = eventStream([
@@ -913,8 +2534,78 @@ describe('OpenCodeBridge', () => {
         idleEvent(),
       ]);
 
-      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(permissionBridge(), events, stream, mockToken());
 
+      // No ToolInvocationSSP should be pushed for write tools with external edit
+      const writeParts = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+        .map((call: unknown[]) => call[0] as {
+          toolName?: string;
+          toolCallId?: string;
+        })
+        .filter((p) => p?.toolName === 'write' && p?.toolCallId === callId);
+      expect(writeParts).toHaveLength(0);
+    });
+
+    it('completes child-session ExternalEditSSP when a child write tool completes', async () => {
+      const stream = mockStream();
+      const taskCallId = 'call_child_edit_task';
+      const childSessionId = 'ses_child_edit';
+      const writeCallId = 'call_child_write';
+      const events = eventStream([
+        { type: 'part.updated', part: { type: 'text', text: 'edit in child', messageId: 'msg_u1', id: 'prt_u1' } },
+        { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'task',
+            id: 'prt_child_edit_task',
+            callId: taskCallId,
+            state: {
+              status: 'completed',
+              input: { description: 'child edit' },
+              output: 'spawned',
+              title: 'child',
+              metadata: { sessionId: childSessionId },
+            },
+          },
+        },
+        permissionAskedEvent({
+          sessionId: childSessionId,
+          permissionId: 'perm_child_write',
+          metadata: { filepath: '/workspace/src/child.ts' },
+          tool: { messageId: 'msg_child_tool', callId: writeCallId },
+        }),
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'write',
+            id: 'prt_child_write',
+            callId: writeCallId,
+            sessionId: childSessionId,
+            state: { status: 'pending', input: { filePath: '/workspace/src/child.ts' } },
+          },
+        },
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'write',
+            id: 'prt_child_write',
+            callId: writeCallId,
+            sessionId: childSessionId,
+            state: { status: 'completed', input: { filePath: '/workspace/src/child.ts' }, output: 'ok' },
+          },
+        },
+        idleEventFor(childSessionId),
+        idleEvent(),
+      ]);
+
+      await runBridge(permissionBridge(), events, stream, mockToken());
+
+      expect(stream.externalEdit).toHaveBeenCalledTimes(1);
+      expect(mockPermissions.reply).toHaveBeenCalledWith(childSessionId, 'perm_child_write', 'once', undefined);
       const writeParts = (stream.push as ReturnType<typeof vi.fn>).mock.calls
         .map((call: unknown[]) => call[0] as {
           toolName?: string;
@@ -922,18 +2613,108 @@ describe('OpenCodeBridge', () => {
           isComplete?: boolean;
           presentation?: string;
         })
-        .filter((p) => p?.toolName === 'write' && p?.toolCallId === callId);
-      expect(writeParts.some((p) => p.isComplete === false)).toBe(true);
-      expect(writeParts.some((p) => p.presentation === 'hidden' && p.isComplete === true)).toBe(true);
+        .filter((p) => p?.toolName === 'write' && p?.toolCallId === writeCallId);
       expect(writeParts.filter((p) => p.isComplete === true && p.presentation !== 'hidden')).toHaveLength(0);
+    });
+
+    it('keeps child external edit state from hiding a root tool with the same callId', async () => {
+      const stream = mockStream();
+      const taskCallId = 'call_child_shared_task';
+      const childSessionId = 'ses_child_shared_edit';
+      const sharedWriteCallId = 'call_shared_write';
+      const events = eventStream([
+        { type: 'part.updated', part: { type: 'text', text: 'edit root and child', messageId: 'msg_u1', id: 'prt_u1' } },
+        { type: 'part.updated', part: { type: 'step-start', messageId: 'msg_a1', id: 'prt_s1' } },
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'task',
+            id: 'prt_child_shared_task',
+            callId: taskCallId,
+            state: {
+              status: 'completed',
+              input: { description: 'child edit' },
+              output: 'spawned',
+              title: 'child',
+              metadata: { sessionId: childSessionId },
+            },
+          },
+        },
+        permissionAskedEvent({
+          sessionId: childSessionId,
+          permissionId: 'perm_child_shared_write',
+          metadata: { filepath: '/workspace/src/child.ts' },
+          tool: { messageId: 'msg_child_tool', callId: sharedWriteCallId },
+        }),
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'write',
+            id: 'prt_root_write',
+            callId: sharedWriteCallId,
+            state: { status: 'pending', input: { filePath: '/workspace/src/root.ts' } },
+          },
+        },
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'write',
+            id: 'prt_root_write',
+            callId: sharedWriteCallId,
+            state: { status: 'completed', input: { filePath: '/workspace/src/root.ts' }, output: 'root ok' },
+          },
+        },
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'write',
+            id: 'prt_child_write_shared',
+            callId: sharedWriteCallId,
+            sessionId: childSessionId,
+            state: { status: 'pending', input: { filePath: '/workspace/src/child.ts' } },
+          },
+        },
+        {
+          type: 'part.updated',
+          part: {
+            type: 'tool',
+            toolName: 'write',
+            id: 'prt_child_write_shared',
+            callId: sharedWriteCallId,
+            sessionId: childSessionId,
+            state: { status: 'completed', input: { filePath: '/workspace/src/child.ts' }, output: 'child ok' },
+          },
+        },
+        idleEventFor(childSessionId),
+        idleEvent(),
+      ]);
+
+      await runBridge(permissionBridge(), events, stream, mockToken());
+
+      const writeParts = (stream.push as ReturnType<typeof vi.fn>).mock.calls
+        .map((call: unknown[]) => call[0] as {
+          toolName?: string;
+          toolCallId?: string;
+          subAgentInvocationId?: string;
+          isComplete?: boolean;
+          presentation?: string;
+        })
+        .filter((p) => p?.toolName === 'write' && p?.toolCallId === sharedWriteCallId && p?.isComplete === true);
+      const rootWrite = writeParts.find(part => !part.subAgentInvocationId);
+      const childWrite = writeParts.find(part => !!part.subAgentInvocationId);
+
+      expect(rootWrite).toBeDefined();
+      expect(rootWrite?.presentation).not.toBe('hidden');
+      expect(childWrite?.presentation).not.toBe('hidden');
     });
 
     it('does not push session.diff as MultiDiffPart', async () => {
       const stream = mockStream();
-      const permBridge = new OpenCodeBridge(undefined, mockPermissions as any, undefined, {
-        sessionId: 'ses_target',
-      });
-      permBridge.setTracker(mockTracker as any);
+      const permBridge = permissionBridge();
       const events = eventStream([
         {
           type: 'session.diff',
@@ -951,7 +2732,7 @@ describe('OpenCodeBridge', () => {
         idleEvent(),
       ]);
 
-      await permBridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(permBridge,events, stream, mockToken());
 
       const diffParts = (stream.push as ReturnType<typeof vi.fn>).mock.calls
         .map((call: unknown[]) => call[0] as { title?: string; value?: unknown[] })
@@ -988,7 +2769,7 @@ describe('OpenCodeBridge', () => {
         deltaEvent(' world'),
         idleEvent(),
       ]);
-      await bridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(bridge,events, stream, mockToken());
       // Both deltas rendered (session.diff in between is skipped gracefully)
       expect(stream.markdown).toHaveBeenCalledWith('Hello');
       expect(stream.markdown).toHaveBeenCalledWith(' world');
@@ -1014,7 +2795,7 @@ describe('OpenCodeBridge', () => {
         deltaEvent('Hello'),
         idleEvent(),
       ]);
-      await bridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(bridge,events, stream, mockToken());
       expect(stream.markdown).toHaveBeenCalledWith('Hello');
     });
 
@@ -1034,7 +2815,7 @@ describe('OpenCodeBridge', () => {
         deltaEvent(' world'),
         idleEvent(),
       ]);
-      await bridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(bridge,events, stream, mockToken());
       // permission.replied should be skipped without rendering or crash
       expect(stream.markdown).toHaveBeenCalledWith('Hello');
       expect(stream.markdown).toHaveBeenCalledWith(' world');
@@ -1059,7 +2840,7 @@ describe('OpenCodeBridge', () => {
         idleEvent(),
         deltaEvent('IGNORED_AFTER_IDLE'),
       ]);
-      await bridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(bridge,events, stream, mockToken());
       expect(stream.markdown).toHaveBeenCalledWith('Hello');
       expect(stream.markdown).not.toHaveBeenCalledWith('IGNORED_AFTER_IDLE');
     });
@@ -1091,13 +2872,17 @@ describe('OpenCodeBridge', () => {
         // This should be ignored
         { type: 'part.delta', partId: 'prt_ai1', delta: 'IGNORED', field: 'text' },
       ]);
-      await bridge.bridgeEventsToStream(events, stream, mockToken());
+      await runBridge(bridge,events, stream, mockToken());
       // Verify the full turn rendered correctly
       expect(stream.thinkingProgress).toHaveBeenCalledWith(
         expect.objectContaining({ text: 'thinking...' }),
       );
       expect(stream.markdown).toHaveBeenCalledWith('Hello world');
-      expect(stream.beginToolInvocation).toHaveBeenCalledWith('call_1', 'read');
+      expect(stream.beginToolInvocation).toHaveBeenCalledWith(
+        'call_1',
+        'read',
+        expect.objectContaining({ isAttachedToThinking: true }),
+      );
       expect(stream.markdown).not.toHaveBeenCalledWith('IGNORED');
     });
   });

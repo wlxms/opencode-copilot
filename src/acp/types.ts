@@ -122,6 +122,8 @@ export interface AcpTextPart extends AcpBasePart {
   type: 'text';
   text: string;
   synthetic?: boolean;
+  ignored?: boolean;
+  metadata?: Record<string, unknown>;
 }
 
 export interface AcpReasoningPart extends AcpBasePart {
@@ -170,6 +172,7 @@ export type AcpEventType =
 
 export interface AcpPartUpdatedEvent {
   type: 'part.updated';
+  sessionId?: string;
   part: AcpStreamPart;
   delta?: string;
 }
@@ -179,6 +182,7 @@ export interface AcpPartDeltaEvent {
   partId: string;
   delta: string;
   field?: string;
+  sessionId?: string;
 }
 
 export interface AcpSessionIdleEvent {
@@ -203,6 +207,7 @@ export interface AcpSessionDiffEvent {
 export interface AcpSessionLifecycleEvent {
   type: 'session.created' | 'session.updated' | 'session.deleted' | 'session.error';
   sessionId: string;
+  parentId?: string;
   title?: string;
   error?: string;
 }

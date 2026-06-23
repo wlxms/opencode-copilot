@@ -75,6 +75,7 @@ export class GlobalEventBroker {
   private sessionChannels: Map<string, SessionChannel> = new Map();
   private partSessions: Map<string, string> = new Map();
   private sessionParts: Map<string, Set<string>> = new Map();
+  private pendingPartDeltas: Map<string, OpenCodeStreamEvent[]> = new Map();
   private childToParent: Map<string, string> = new Map();
 
   async ensureStarted(client: OpenCodeClient, logger?: LoggerLike): Promise<void> {
@@ -181,6 +182,9 @@ export class GlobalEventBroker {
     const sessionId = this.getSessionId(event);
     this.log(`dispatch: type=${event.type}, sessionId=${sessionId ?? 'none'}, channels=${this.sessionChannels.size}`);
     if (!sessionId) {
+      if (event.type === 'message.part.delta') {
+        this.bufferPendingPartDelta(event.properties.partID, rawEvent);
+      }
       return;
     }
 
@@ -207,7 +211,9 @@ export class GlobalEventBroker {
       return; // truly no channel, drop event
     }
 
-    channel.push(rawEvent);
+    for (const eventToPush of this.eventsWithResolvedSessionId(rawEvent, event, sessionId)) {
+      channel.push(eventToPush);
+    }
     if (event.type === 'session.idle') {
       // Mark the channel as idle but do NOT close it. The consumer
       // (StreamBridge) decides when to actually close the stream —
@@ -269,6 +275,75 @@ export class GlobalEventBroker {
       this.sessionParts.set(sessionId, parts);
     }
     parts.add(partId);
+  }
+
+  private bufferPendingPartDelta(partId: string | undefined, event: OpenCodeStreamEvent): void {
+    if (!partId) {return;}
+    const pending = this.pendingPartDeltas.get(partId) ?? [];
+    pending.push(event);
+    this.pendingPartDeltas.set(partId, pending);
+  }
+
+  private eventsWithResolvedSessionId(
+    rawEvent: OpenCodeStreamEvent,
+    event: OpenCodeEvent,
+    sessionId: string,
+  ): OpenCodeStreamEvent[] {
+    const patched = this.withResolvedSessionId(rawEvent, event, sessionId);
+    if (event.type !== 'message.part.updated') {
+      return [patched];
+    }
+
+    const partId = event.properties?.part?.id;
+    if (!partId) {
+      return [patched];
+    }
+
+    const pending = this.pendingPartDeltas.get(partId);
+    if (!pending || pending.length === 0) {
+      return [patched];
+    }
+
+    this.pendingPartDeltas.delete(partId);
+    return [
+      ...pending.map((pendingEvent) => this.withResolvedSessionId(
+        pendingEvent,
+        unwrapStreamEvent(pendingEvent),
+        sessionId,
+      )),
+      patched,
+    ];
+  }
+
+  private withResolvedSessionId(
+    rawEvent: OpenCodeStreamEvent,
+    event: OpenCodeEvent,
+    sessionId: string,
+  ): OpenCodeStreamEvent {
+    if (event.type !== 'message.part.delta') {
+      return rawEvent;
+    }
+
+    if ((event.properties as { sessionID?: string }).sessionID) {
+      return rawEvent;
+    }
+
+    const patchedEvent = {
+      ...event,
+      properties: {
+        ...event.properties,
+        sessionID: sessionId,
+      },
+    } as OpenCodeEvent;
+
+    if ('payload' in rawEvent) {
+      return {
+        ...rawEvent,
+        payload: patchedEvent,
+      };
+    }
+
+    return patchedEvent;
   }
 
   private clearSessionParts(sessionId: string): void {

@@ -2,13 +2,12 @@ import * as vscode from 'vscode';
 import { routeCommand } from './commands';
 import { isEmptyPrompt, ErrorMessages } from './errors';
 import { SerializableSessionStream } from '../acp/streaming/session-stream';
-import type { SerializableSessionMeta } from '../acp/serializable/types';
+import { UserPromptSSP } from '../ssp/impl/user-prompt';
 import { applyProvisionalSessionTitle, applySessionTitle, isPlaceholderSessionTitle } from './session-title';
 
 import type { ExtensionState, TurnMapping } from '../types';
 import type { AcpChildSessionInfo, AcpSessionStatus, AcpResult, AcpModel, AcpAgent } from '../acp/types';
 import type { AcpEvent } from '../acp/types';
-import { ExternalEditTracker } from './external-edit-tracker';
 import { collectOpenFileUris } from './checkpoint';
 import { extractAttachmentsFromReferences } from './references';
 import { generateSessionTitleWithVsCodeLm, generateTitleWithBackendSession } from './title-generator';
@@ -92,6 +91,13 @@ export async function resolvePromptModel(
     return state.selection.get().model;
   }
 
+  // Strip vendor prefix (e.g. "opencode-cli/") from nativeModel.id so that
+  // the legacy fuzzy match compares against the bare model identifier that
+  // backend models report (e.g. "deepseek-v4-flash-free").
+  const modelIdForMatch = vendor && nativeModel.id.startsWith(vendor + '/')
+    ? nativeModel.id.substring(vendor.length + 1)
+    : nativeModel.id;
+
   // Attempt matching: native model.id to backend model.id
   // LanguageModelChat.id is opaque but often matches the model's common ID.
   // We also try .family and .name as fallbacks.
@@ -101,11 +107,11 @@ export async function resolvePromptModel(
   for (const bm of backendModels) {
     const providerID = bm.provider ?? 'default';
     // Match by id (exact)
-    if (bm.id === nativeModel.id) {
+    if (bm.id === modelIdForMatch) {
       candidates.push({ providerID, modelID: bm.id });
     }
     // Match by name (exact, case-insensitive)
-    else if (bm.name && bm.name.toLowerCase() === nativeModel.id.toLowerCase()) {
+    else if (bm.name && bm.name.toLowerCase() === modelIdForMatch.toLowerCase()) {
       candidates.push({ providerID, modelID: bm.id });
     }
     // Match by family (exact, case-insensitive)
@@ -114,9 +120,9 @@ export async function resolvePromptModel(
     }
     // Partial match: native id is a substring of backend model id (or vice versa)
     else if (
-      nativeModel.id.length >= 3 &&
-      (bm.id.toLowerCase().includes(nativeModel.id.toLowerCase()) ||
-       nativeModel.id.toLowerCase().includes(bm.id.toLowerCase()))
+      modelIdForMatch.length >= 3 &&
+      (bm.id.toLowerCase().includes(modelIdForMatch.toLowerCase()) ||
+       modelIdForMatch.toLowerCase().includes(bm.id.toLowerCase()))
     ) {
       candidates.push({ providerID, modelID: bm.id });
     }
@@ -544,7 +550,7 @@ export function createParticipantHandler(
     stream: vscode.ChatResponseStream,
     token: vscode.CancellationToken,
   ): Promise<vscode.ChatResult> => {
-    let tracker: ExternalEditTracker | undefined;
+    let sss: SerializableSessionStream | undefined;
     try {
       // 1. Early cancellation check
       if (token.isCancellationRequested) {
@@ -804,41 +810,35 @@ export function createParticipantHandler(
         let sessionTitleFromBridge: string | undefined;
         const liveTurnIndex = activeChatState?.turnMap.length ?? 0;
 
-        // JSONL event persistence (once per session)
+        // SSS persistence (v2 architecture)
         const workspaceRoot = getWorkspaceDirectory() ?? '';
-        const meta: SerializableSessionMeta = {
-          id: backendSessionId,
-          title: getInitialSessionTitle(vscodeSessionId),
-          titleSource: 'placeholder',
-          titleUpdatedAt: new Date().toISOString(),
-          createdAt: new Date().toISOString(),
-          backendName: state.backend.name,
-        };
         state.outputChannel.appendLine(
           `[handler] workspaceRoot="${workspaceRoot}" backend="${state.backend.name}" ` +
           `backendSessionId="${backendSessionId}" requestId="${request.id}" turn=${liveTurnIndex}`,
         );
-        const sessionStream = new SerializableSessionStream(
+        sss = new SerializableSessionStream(stream, {
           workspaceRoot,
-          state.backend.name,
-          backendSessionId,
-          meta,
-          liveTurnIndex,
-          request.prompt,
-          request.id,
-        );
-        tracker = new ExternalEditTracker(
-          snapshot => sessionStream.onSnapshot(snapshot),
-          () => liveTurnIndex,
-        );
-        await sessionStream.initialize();
-        state.outputChannel.appendLine(`[handler] SessionStream initialized`);
-        // Write the user prompt as a turn-start (event format)
-        sessionStream.onEvent({
-          type: 'part.updated',
-          part: { type: 'text' as any, id: `user-${backendSessionId}`, text: request.prompt },
-        } as AcpEvent);
-        state.outputChannel.appendLine(`[handler] User event queued`);
+          backendName: state.backend.name,
+          sessionId: backendSessionId,
+          turnIndex: liveTurnIndex,
+          requestId: request.id,
+        });
+        await sss.initialize();
+        state.outputChannel.appendLine(`[handler] SSS initialized`);
+
+        // Push user message before bridge.run (first record of the turn)
+        sss.push(new UserPromptSSP({
+          text: request.prompt,
+          command: request.command,
+          partId: `user-${backendSessionId}`,
+        }));
+        sss.writeMeta({
+          id: backendSessionId,
+          title: getInitialSessionTitle(vscodeSessionId),
+          titleSource: 'placeholder',
+          createdAt: new Date().toISOString(),
+        });
+        state.outputChannel.appendLine(`[handler] UserPromptSSP pushed`);
 
         try {
           while (needsContinue && !token.isCancellationRequested) {
@@ -847,15 +847,14 @@ export function createParticipantHandler(
 
             const events = state.backend.events.openSessionStream(backendSessionId);
 
-            const bridge = state.backend.createBridge(backendSessionId, directory, new Set(knownFileUris));
-            bridge.setStream(stream);
-            bridge.setCallbacks(sessionStream);
-            bridge.setTracker(tracker);
-            state.outputChannel.appendLine(`[handler] Bridge created, callbacks set`);
+            const bridge = state.backend.createBridge(backendSessionId, directory);
+            (bridge as any).setLogger?.(state.outputChannel);
+            bridge.setSSS(sss);
+            state.outputChannel.appendLine(`[handler] Bridge created, SSS set`);
 
             state.outputChannel.appendLine('[handler] bridge.run() starting...');
             await bridge.run(events.stream, token);
-            await sessionStream.flush();
+            await sss.flush();
             state.outputChannel.appendLine(`[handler] bridge.run() completed.`);
 
             state.backend.events.closeSessionStream(backendSessionId);
@@ -866,8 +865,6 @@ export function createParticipantHandler(
             }
 
             // Capture backend-generated session title from the first bridge run.
-            // session.updated events fire during streaming; the bridge stores the
-            // most recent non-placeholder title.
             if (!sessionTitleFromBridge) {
               const title = bridge.getSessionTitle();
               state.outputChannel.appendLine(
@@ -889,8 +886,9 @@ export function createParticipantHandler(
         } finally {
           cancelDisposable.dispose();
           state.backend.events.closeSessionStream(backendSessionId);
-          sessionStream.close();
-          await sessionStream.flush();
+          await sss.drain();
+          sss.close();
+          await sss.flush();
         }
 
         // 9. Ensure prompt promise settles
@@ -985,7 +983,7 @@ export function createParticipantHandler(
         state.bus.emit('session-list-changed', void 0);
       };
 
-      // 11. Execute turn with per-edit externalEdit lifecycle managed via tracker
+      // 11. Execute turn
       await executeTurnWithBridge();
 
       // 12. Return metadata for future turn recovery
@@ -1002,7 +1000,7 @@ export function createParticipantHandler(
       state.outputChannel.appendLine(`[handler] Error: ${msg}`);
       return { metadata: {} };
     } finally {
-      tracker?.dispose();
+      // SSS cleanup handled in executeTurnWithBridge's own finally block
     }
   };
 }

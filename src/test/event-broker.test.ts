@@ -45,6 +45,19 @@ async function collectTypes(stream: AsyncIterable<OpenCodeGlobalEventEnvelope>, 
   return types;
 }
 
+async function collectEvents(stream: AsyncIterable<OpenCodeGlobalEventEnvelope>, timeoutMs = 1000): Promise<OpenCodeGlobalEventEnvelope[]> {
+  const events: OpenCodeGlobalEventEnvelope[] = [];
+  const timer = setTimeout(() => stream[Symbol.asyncIterator]().return?.(), timeoutMs);
+  try {
+    for await (const event of stream) {
+      events.push(event);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+  return events;
+}
+
 describe('GlobalEventBroker', () => {
   it('should route only matching session events to a session stream', async () => {
     const broker = new GlobalEventBroker();
@@ -82,7 +95,8 @@ describe('GlobalEventBroker', () => {
     const started = broker.ensureStarted(client as never);
     started.catch(() => {}); // suppress unhandled rejection from reconnect error
     await started;
-    const types = await collectTypes(sessionStream.stream as AsyncIterable<OpenCodeGlobalEventEnvelope>);
+    const routed = await collectEvents(sessionStream.stream as AsyncIterable<OpenCodeGlobalEventEnvelope>);
+    const types = routed.map(event => event.payload.type);
 
     // session.idle is delivered but does NOT close the stream
     // Subsequent tool event should also be delivered
@@ -117,12 +131,14 @@ describe('GlobalEventBroker', () => {
     const started = broker.ensureStarted(client as never);
     started.catch(() => {}); // suppress unhandled rejection from reconnect error
     await started;
-    const types = await collectTypes(sessionStream.stream as AsyncIterable<OpenCodeGlobalEventEnvelope>);
+    const routed = await collectEvents(sessionStream.stream as AsyncIterable<OpenCodeGlobalEventEnvelope>);
+    const types = routed.map(event => event.payload.type);
 
     expect(types).toEqual([
       'message.part.updated',
       'message.part.delta',
       'session.idle',
     ]);
+    expect((routed[1].payload as any).properties.sessionID).toBe('ses_a');
   });
 });

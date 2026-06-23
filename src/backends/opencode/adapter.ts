@@ -179,12 +179,8 @@ export class OpenCodeBackend implements AcpBackend {
   }
 
   /** @inheritdoc */
-  createBridge(sessionId: string, directory?: string, knownFileUris?: Set<string>): AcpBridge {
-    const bridge = new OpenCodeBridge(this.sessions, this.permissions, this.questions);
-    bridge.setSessionId(sessionId);
-    if (directory) bridge.setDirectory(directory);
-    if (knownFileUris) bridge.setKnownFileUris(knownFileUris);
-    return bridge;
+  createBridge(sessionId: string, directory?: string): AcpBridge {
+    return new OpenCodeBridge(this, sessionId, directory);
   }
 
   // =======================================================================
