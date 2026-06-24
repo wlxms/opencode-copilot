@@ -4,6 +4,7 @@ import type { SspStream } from '../../ssp/types';
 import { SerializableStreamPart } from '../../ssp/types';
 import { ToolInvocationSSP } from '../../ssp/impl/tool-invocation';
 import type { SerializableToolState } from '../../ssp/types';
+import { ChatTodoStatus } from '../../types/vscode-proposed-additions';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -295,7 +296,7 @@ describe('ToolInvocationSSP', () => {
       expect(data.state?.exitCode).toBe(0);
     });
 
-    it('list → ChatSimpleToolResultData', () => {
+    it('list with path → ChatToolResourcesInvocationData (file URIs)', () => {
       const stream = mockStream();
       const ssp = new ToolInvocationSSP({
         partId: 'p1', toolName: 'list', callId: 'c1',
@@ -304,8 +305,21 @@ describe('ToolInvocationSSP', () => {
       ssp.render(stream);
       const data = lastPushedPart(stream).toolSpecificData;
       expect(data).toBeDefined();
-      expect(data.input).toBeTruthy();
-      expect(data.output).toBe('3 files');
+      expect(Array.isArray(data.values)).toBe(true);
+      expect(data.values.length).toBeGreaterThan(0);
+      expect(data.values[0]).toBeInstanceOf(vscode.Uri);
+    });
+
+    it('list without path/file refs → ChatSimpleToolResultData fallback', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'p1', toolName: 'list', callId: 'c1',
+        state: toolState({ status: 'completed', input: {}, output: 'no paths here' }),
+      });
+      ssp.render(stream);
+      const data = lastPushedPart(stream).toolSpecificData;
+      expect(data).toBeDefined();
+      expect(data.output).toBe('no paths here');
     });
 
     it('grep → ChatSimpleToolResultData', () => {
@@ -318,6 +332,97 @@ describe('ToolInvocationSSP', () => {
       const data = lastPushedPart(stream).toolSpecificData;
       expect(data).toBeDefined();
       expect(data.output).toBe('2 matches');
+    });
+
+    it('grep with file paths in output → ChatToolResourcesInvocationData', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'p1', toolName: 'grep', callId: 'c1',
+        state: toolState({
+          status: 'completed',
+          input: { pattern: 'foo' },
+          output: '/src/a.ts:1:foo\n/src/b.ts:2:bar',
+        }),
+      });
+      ssp.render(stream);
+      const data = lastPushedPart(stream).toolSpecificData;
+      expect(data).toBeDefined();
+      expect(Array.isArray(data.values)).toBe(true);
+      expect(data.values.length).toBe(2);
+      expect(data.values[0]).toBeInstanceOf(vscode.Uri);
+    });
+
+    it('websearch with query → ChatToolResourcesInvocationData (web URL URIs)', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'p1', toolName: 'websearch', callId: 'c1',
+        state: toolState({
+          status: 'completed',
+          input: { query: 'vscode chat api' },
+          output: 'see https://code.visualstudio.com/api',
+        }),
+      });
+      ssp.render(stream);
+      const data = lastPushedPart(stream).toolSpecificData;
+      expect(data).toBeDefined();
+      expect(Array.isArray(data.values)).toBe(true);
+      // Bing search URL for the query + parsed URL from output
+      expect(data.values.length).toBe(2);
+      expect(data.values[0]).toBeInstanceOf(vscode.Uri);
+      expect(String(data.values[0])).toContain('bing.com/search');
+      expect(String(data.values[1])).toContain('code.visualstudio.com');
+    });
+
+    it('todo root session → ChatTodoToolInvocationData with todoList', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'p1', toolName: 'todo', callId: 'c1',
+        state: toolState({
+          status: 'completed',
+          input: {
+            todos: [
+              { content: 'task A', status: 'completed' },
+              { content: 'task B', status: 'in_progress' },
+              { content: 'task C', status: 'pending' },
+            ],
+          },
+          output: '',
+        }),
+      });
+      ssp.render(stream);
+      const data = lastPushedPart(stream).toolSpecificData;
+      expect(data).toBeDefined();
+      expect(Array.isArray(data.todoList)).toBe(true);
+      expect(data.todoList).toHaveLength(3);
+      expect(data.todoList[0].title).toBe('task A');
+      expect(data.todoList[0].status).toBe(ChatTodoStatus.Completed);
+      expect(data.todoList[1].status).toBe(ChatTodoStatus.InProgress);
+      expect(data.todoList[2].status).toBe(ChatTodoStatus.NotStarted);
+    });
+
+    it('todo nested in subagent → ChatSimpleToolResultData text fallback', () => {
+      const stream = mockStream();
+      const ssp = new ToolInvocationSSP({
+        partId: 'p1', toolName: 'todo', callId: 'c1',
+        state: toolState({
+          status: 'completed',
+          input: {
+            todos: [
+              { content: 'nested A', status: 'completed' },
+              { content: 'nested B', status: 'pending' },
+            ],
+          },
+          output: '',
+        }),
+        subAgentInvocationId: 'parent-subagent-call',
+      });
+      ssp.render(stream);
+      const data = lastPushedPart(stream).toolSpecificData;
+      expect(data).toBeDefined();
+      expect(data.todoList).toBeUndefined();
+      expect(typeof data.input).toBe('string');
+      expect(data.input).toMatch(/nested A/);
+      expect(data.input).toMatch(/✓/);
     });
 
     it('task → ChatSubagentToolInvocationData', () => {
