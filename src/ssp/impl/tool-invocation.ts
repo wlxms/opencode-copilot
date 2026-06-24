@@ -46,6 +46,7 @@ import type {
   ChatSimpleToolResultData,
   ChatSubagentToolInvocationData,
   ChatTodoToolInvocationData,
+  ChatToolResourcesInvocationData,
   ChatToolInvocationPart,
 } from '../../types/vscode-proposed-additions';
 import { ChatTodoStatus } from '../../types/vscode-proposed-additions';
@@ -522,7 +523,7 @@ export class ToolInvocationSSP extends SerializableStreamPart<
     input: Record<string, unknown>,
     output: string,
     title: string,
-  ): ChatTerminalToolInvocationData | ChatSimpleToolResultData | (ChatSubagentToolInvocationData & { kind?: 'subagent' }) | ChatTodoToolInvocationData | undefined {
+  ): ChatTerminalToolInvocationData | ChatSimpleToolResultData | ChatToolResourcesInvocationData | (ChatSubagentToolInvocationData & { kind?: 'subagent' }) | ChatTodoToolInvocationData | undefined {
     const formatInput = (data: Record<string, unknown>, fallbackTitle: string): string => {
       const keys = Object.keys(data);
       if (keys.length === 0) {return fallbackTitle;}
@@ -537,6 +538,11 @@ export class ToolInvocationSSP extends SerializableStreamPart<
 
     const truncate = (s: string, max: number): string =>
       s.length > max ? s.substring(0, max) + '...' : s;
+
+    // Whether this tool runs nested inside a subagent (child tool).
+    // Drives the todo-rendering distinction: root → native todo widget,
+    // subagent → text fallback (no native widget in nested context).
+    const isSubagentTool = !!this.getEffectiveSubAgentInvocationId();
 
     switch (toolName) {
       case 'read':
@@ -566,11 +572,36 @@ export class ToolInvocationSSP extends SerializableStreamPart<
       case 'list':
       case 'grep':
       case 'glob':
-      case 'websearch':
-      case 'websearch_web_search_exa':
+      case 'grep_app_searchGitHub': {
+        // Collapsible file references list (matches VSCode Copilot search pattern).
+        // Parse file paths from input.path/filePath and from output lines.
+        const values: Array<vscode.Uri | vscode.Location> = [];
+        const path = (input.path as string | undefined) ?? (input.filePath as string | undefined);
+        if (path) {
+          try { values.push(vscode.Uri.file(path)); } catch { /* skip invalid path */ }
+        }
+        if (output) {
+          const lines = output.split('\n');
+          for (const line of lines) {
+            const fileMatch = line.match(/^[A-Za-z]:\\(?:[^\\]+\\)*[^:]+|^\/(?:[^\/]+\/)*[^:]+/);
+            if (fileMatch) {
+              try { values.push(vscode.Uri.file(fileMatch[0])); } catch { /* skip */ }
+            }
+          }
+        }
+        if (values.length > 0) {
+          return { values } satisfies ChatToolResourcesInvocationData;
+        }
+        return {
+          input: formatInput(input, title),
+          output: truncate(output, 2000),
+        } satisfies ChatSimpleToolResultData;
+      }
+
+      case 'fetch':
+      case 'webfetch':
       case 'read_url':
       case 'readUrl':
-      case 'fetch':
       case 'context': {
         return {
           input: formatInput(input, title),
@@ -578,29 +609,65 @@ export class ToolInvocationSSP extends SerializableStreamPart<
         } satisfies ChatSimpleToolResultData;
       }
 
-      case 'todo': {
-        const todos = input.todos as Array<{ content: string; status: string }> | undefined;
-        if (todos) {
-          const check = (s: string) =>
-            s === 'completed' ? '✓' : s === 'in_progress' ? '⟳' : '○';
-          const formatted = todos.map((item, idx) => {
-            return `[${check(item.status)}] ${idx + 1}. ${item.content}`;
-          }).join('\n');
-          return {
-            input: formatted,
-            output: truncate(output, 2000),
-          } satisfies ChatSimpleToolResultData;
+      case 'websearch':
+      case 'websearch_web_search_exa': {
+        // Clickable web URL references: a Bing search link for the query plus
+        // any URLs parsed from the result output.
+        const values: Array<vscode.Uri | vscode.Location> = [];
+        const query = input.query as string | undefined;
+        if (query) {
+          values.push(vscode.Uri.parse(`https://www.bing.com/search?q=${encodeURIComponent(query)}`));
         }
-        const todoList = (todos ?? []).map((item: { content: string; status: string }, idx: number) => ({
-          id: idx,
-          title: item.content,
-          status: item.status === 'completed'
-            ? ChatTodoStatus.Completed
-            : item.status === 'in_progress'
-              ? ChatTodoStatus.InProgress
-              : ChatTodoStatus.NotStarted,
-        }));
-        return { todoList } satisfies ChatTodoToolInvocationData;
+        if (output) {
+          const urlRegex = /https?:\/\/[^\s"')>]+/g;
+          let match: RegExpExecArray | null;
+          while ((match = urlRegex.exec(output)) !== null) {
+            try { values.push(vscode.Uri.parse(match[0])); } catch { /* skip */ }
+          }
+        }
+        if (values.length > 0) {
+          return { values } satisfies ChatToolResourcesInvocationData;
+        }
+        return {
+          input: formatInput(input, title),
+          output: truncate(output, 2000),
+        } satisfies ChatSimpleToolResultData;
+      }
+
+      case 'todo':
+      case 'todowrite': {
+        // Parse todo items from tool input (todos array).
+        const todos = input.todos as Array<{ content: string; status: string }> | undefined;
+        if (todos && Array.isArray(todos)) {
+          if (isSubagentTool) {
+            // Subagent-nested todo: formatted text fallback (no native todo widget
+            // available in the nested subagent card context).
+            const check = (s: string) =>
+              s === 'completed' ? '✓' : s === 'in_progress' ? '⟳' : '○';
+            const formatted = todos.map((item, idx) => {
+              return `[${check(item.status)}] ${idx + 1}. ${item.content}`;
+            }).join('\n');
+            return {
+              input: formatted,
+              output: truncate(output, 2000),
+            } satisfies ChatSimpleToolResultData;
+          }
+          // Root session: native ChatTodoToolInvocationData with proper status enum.
+          const todoList = todos.map((item, idx) => ({
+            id: idx,
+            title: item.content,
+            status: item.status === 'completed'
+              ? ChatTodoStatus.Completed
+              : item.status === 'in_progress'
+                ? ChatTodoStatus.InProgress
+                : ChatTodoStatus.NotStarted,
+          }));
+          return { todoList } satisfies ChatTodoToolInvocationData;
+        }
+        return {
+          input: formatInput(input, title),
+          output: truncate(output, 2000),
+        } satisfies ChatSimpleToolResultData;
       }
 
       case 'task':
