@@ -8,9 +8,9 @@ import { applyProvisionalSessionTitle, applySessionTitle, isPlaceholderSessionTi
 import type { ExtensionState, TurnMapping } from '../types';
 import type { AcpChildSessionInfo, AcpSessionStatus, AcpResult, AcpModel, AcpAgent } from '../acp/types';
 import type { AcpEvent } from '../acp/types';
+import type { SessionTitleSource } from '../acp/serializable/types';
 import { collectOpenFileUris } from './checkpoint';
 import { extractAttachmentsFromReferences } from './references';
-import { generateSessionTitleWithVsCodeLm, generateTitleWithBackendSession } from './title-generator';
 
 // ---------------------------------------------------------------------------
 // Native model sync
@@ -618,46 +618,6 @@ export function createParticipantHandler(
         );
       }
 
-      const earlyTitlePromise = shouldInitializeTitle
-        ? (async (): Promise<string | undefined> => {
-          let generatedTitle = await generateSessionTitleWithVsCodeLm(request.prompt, state);
-          if (!generatedTitle || isPlaceholderSessionTitle(generatedTitle)) {
-            state.outputChannel.appendLine(
-              `[handler] VS Code LM title unavailable for ${backendSessionId}; trying backend title generator`,
-            );
-            generatedTitle = await generateTitleWithBackendSession(request.prompt, state, backendSessionId, directory);
-            if (generatedTitle) {
-              state.outputChannel.appendLine(
-                `[handler] Backend title generator produced: "${generatedTitle}"`,
-              );
-            }
-          }
-          if (!generatedTitle || isPlaceholderSessionTitle(generatedTitle)) {
-            return undefined;
-          }
-          const applied = await applySessionTitle(state, {
-            backendSessionId,
-            vscodeSessionId,
-            title: generatedTitle,
-            directory,
-            updateBackend: true,
-            overwrite: false,
-            source: 'copilot-style',
-          });
-          if (applied) {
-            state.outputChannel.appendLine(
-              `[handler] Applied generated first-prompt title: "${applied}"`,
-            );
-          }
-          return applied;
-        })().catch((err: unknown) => {
-          state.outputChannel.appendLine(
-            `[handler] early title generation failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-          return undefined;
-        })
-        : Promise.resolve(undefined);
-
       const executeTurnWithBridge = async (): Promise<void> => {
         stream.progress('Connecting to event stream...');
         await state.backend.events.ensureStarted();
@@ -808,7 +768,9 @@ export function createParticipantHandler(
         let userMessageId: string | null = null;
         let needsContinue = true;
         let sessionTitleFromBridge: string | undefined;
+        let sessionTitleSourceFromBridge: SessionTitleSource | undefined;
         const liveTurnIndex = activeChatState?.turnMap.length ?? 0;
+        let titleUpdateChain: Promise<void> = Promise.resolve();
 
         // SSS persistence (v2 architecture)
         const workspaceRoot = getWorkspaceDirectory() ?? '';
@@ -822,9 +784,37 @@ export function createParticipantHandler(
           sessionId: backendSessionId,
           turnIndex: liveTurnIndex,
           requestId: request.id,
+          onTitleChanged: (update) => {
+            sessionTitleFromBridge = update.title;
+            sessionTitleSourceFromBridge = update.source;
+            titleUpdateChain = titleUpdateChain
+              .catch(() => undefined)
+              .then(async () => {
+                const applied = await applySessionTitle(state, {
+                  backendSessionId,
+                  vscodeSessionId,
+                  title: update.title,
+                  directory,
+                  updateBackend: false,
+                  overwrite: false,
+                  source: update.source,
+                });
+                if (applied) {
+                  state.outputChannel.appendLine(
+                    `[handler] Applied live SSS session title (${update.source}): "${applied}"`,
+                  );
+                }
+              })
+              .catch((err: unknown) => {
+                state.outputChannel.appendLine(
+                  `[handler] live SSS title update failed: ${err instanceof Error ? err.message : String(err)}`,
+                );
+              });
+          },
         });
         await sss.initialize();
         state.outputChannel.appendLine(`[handler] SSS initialized`);
+        sss.recordFirstPrompt(request.prompt);
 
         // Push user message before bridge.run (first record of the turn)
         sss.push(new UserPromptSSP({
@@ -872,6 +862,7 @@ export function createParticipantHandler(
               );
               if (title) {
                 sessionTitleFromBridge = title;
+                sessionTitleSourceFromBridge = bridge.getSessionTitleSource?.() ?? 'backend';
               }
             }
 
@@ -887,6 +878,7 @@ export function createParticipantHandler(
           cancelDisposable.dispose();
           state.backend.events.closeSessionStream(backendSessionId);
           await sss.drain();
+          await titleUpdateChain;
           sss.close();
           await sss.flush();
         }
@@ -923,11 +915,13 @@ export function createParticipantHandler(
         // 2. sessions.get() returns a meaningful title
         // 3. Derive from first prompt + push to backend via sessions.update()
         let resolvedTitle = sessionTitleFromBridge;
+        let resolvedTitleSource: SessionTitleSource | undefined = sessionTitleSourceFromBridge;
         if (isProvisionalTitleEcho(resolvedTitle, chatState)) {
           state.outputChannel.appendLine(
             `[handler] Ignoring provisional session title echo: "${resolvedTitle}"`,
           );
           resolvedTitle = undefined;
+          resolvedTitleSource = undefined;
         }
 
         if (!resolvedTitle || isPlaceholderSessionTitle(resolvedTitle)) {
@@ -940,6 +934,7 @@ export function createParticipantHandler(
               );
             } else if (backendTitle && !isPlaceholderSessionTitle(backendTitle)) {
               resolvedTitle = backendTitle;
+              resolvedTitleSource = 'backend';
               state.outputChannel.appendLine(
                 `[handler] Title from sessions.get(): "${backendTitle}"`,
               );
@@ -951,17 +946,10 @@ export function createParticipantHandler(
           }
         }
 
-        void earlyTitlePromise;
-
-        // Turn-end naming is only reconciliation. The first-prompt provisional
-        // title and async generated title are both applied near session start.
-        const existingChatTitle = chatState?.title;
-        const hasExistingGoodTitle = existingChatTitle
-          && !chatState?.provisionalTitle
-          && !isPlaceholderSessionTitle(existingChatTitle);
+        // Turn-end naming is only reconciliation. Bridge owns raw event title
+        // adaptation and SSS writes the live stream metadata.
         const shouldApplyReconciledTitle = !!resolvedTitle
-          && !isPlaceholderSessionTitle(resolvedTitle)
-          && !hasExistingGoodTitle;
+          && !isPlaceholderSessionTitle(resolvedTitle);
 
         // Persist resolved title across backend/sessionMap/SessionStore.
         if (shouldApplyReconciledTitle) {
@@ -972,10 +960,10 @@ export function createParticipantHandler(
             directory,
             updateBackend: false,
             overwrite: false,
-            source: 'backend',
+            source: resolvedTitleSource ?? 'backend',
           });
           state.outputChannel.appendLine(
-            `[handler] Applied reconciled session title (backend): "${resolvedTitle}"`,
+            `[handler] Applied reconciled session title (${resolvedTitleSource ?? 'backend'}): "${resolvedTitle}"`,
           );
         }
 

@@ -1,46 +1,12 @@
 /**
  * Chat-session-provider surface for VS Code's proposed API.
  *
- * Implements `vscode.ChatSessionContentProvider` — the proposed API that allows
- * extensions to register as a "session target" in VS Code's chat view. When
- * registered, OpenCode appears alongside Local, Copilot CLI, Cloud, Claude,
- * etc. in the Session Target dropdown at the bottom of the chat input.
+ * The provider restores persisted chat history and delegates new requests to
+ * the shared participant handler. Event rendering is owned by the bridge/SSP
+ * pipeline; this surface only asks that pipeline to rebuild response turns.
  *
- * == Architecture ==
- * ```
- * VS Code chat view
- *     │
- *     ▼  Session Target: "OpenCode" selected
- * ┌─────────────────────────────────────────────┐
- * │  ChatSessionContentProvider (this module)    │
- * │  ┌───────────────────────────────────────┐  │
- * │  │ provideChatSessionContent(uri, token)  │  │
- * │  │ → fetches session history from backend │  │
- * │  │ → returns ChatSessionContent           │  │
- * │  └───────────────────────────────────────┘  │
- * │  + optional optionGroups (agent picker)     │
- * └─────────────────────────────────────────────┘
- *     │
- *     ▼
- * OpenCodeBackend → OpenCode SDK → opencode daemon
- * ```
- *
- * == Registration ==
- * ```ts
- * // In extension.ts activate():
- * vscode.chat.registerChatSessionContentProvider(
- *   'opencode',                          // URI scheme
- *   createSessionContentProvider(state),  // provider
- *   participant,                         // ChatParticipant (@opencode)
- *   { supportsChangingSessionType: true } // capabilities
- * );
- * ```
- *
- * == Gating ==
- * Every proposed API call is gated behind runtime capability checks
- * (`hasRegisterChatSessionContentProvider()`). The extension degrades
- * gracefully to the stable participant surface when the proposed API
- * is unavailable.
+ * Runtime checks gate proposed VS Code APIs so the extension can fall back to
+ * the stable participant surface when the session-provider API is unavailable.
  *
  * @module
  */
@@ -48,7 +14,6 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import type { ExtensionState } from '../../types';
 import type { AcpEvent } from '../../acp/types';
-import type { AcpEventStream } from '../../acp/backend';
 import type {
   FileSnapshotRecord,
   SerializableRequestDetails,
@@ -60,19 +25,9 @@ import { isUserSelectableAgent } from '../../acp/types';
 
 
 import {
-  AcpRenderer,
-  buildToolSpecificData,
-  formatInvocationMsg,
-  formatPastTenseMsg,
-  renderToolFallback,
-} from './acp-renderer';
-
-import {
   hasRegisterChatSessionContentProvider,
   hasThinkingProgress,
   hasToolUI,
-  hasChatToolInvocationPart,
-  hasFullProposedSurface,
 } from './capabilities';
 
 import { CollectorStream } from '../../acp/streaming/collector-stream';
@@ -104,36 +59,11 @@ import { getCheckpointApproval, snapshotTurnIndex } from '../../acp/checkpoint/a
 import { pushSnapshotTextEditParts, replaySnapshotsToWorkspace } from '../../acp/checkpoint/replay';
 import { applySessionTitle } from '../../participant/session-title';
 import type { SessionTitleSource } from '../../acp/serializable/types';
+import { AcpProtocolBridge } from '../../backends/opencode/opencode-bridge';
 
 // ---------------------------------------------------------------------------
-// Internal types for session content rendering (not part of the VS Code API)
+// Internal types for session content restoration
 // ---------------------------------------------------------------------------
-
-/**
- * Content for a single chat session frame/response.
- * Internal representation used by `ExperimentalChatSession` before
- * converting to VS Code's `ChatSessionContent`.
- */
-export interface SessionFrameContent {
-  /** Markdown text content (the AI response) */
-  markdown?: string;
-  /** Tool invocations that occurred during this response */
-  toolInvocations?: SessionToolInvocation[];
-  /** Whether this frame contains reasoning (thinking) content */
-  hasReasoning?: boolean;
-  /** Reasoning text content, if any */
-  reasoningText?: string;
-}
-
-export interface SessionToolInvocation {
-  toolName: string;
-  toolCallId: string;
-  isError?: boolean;
-  invocationMessage?: string | vscode.MarkdownString;
-  pastTenseMessage?: string | vscode.MarkdownString;
-  toolSpecificData?: Record<string, unknown>;
-  isComplete?: boolean;
-}
 
 interface RestoredSessionHistory {
   history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[];
@@ -171,163 +101,6 @@ interface SessionListEntry {
   hasLiveTurns?: boolean;
 }
 
-// ---------------------------------------------------------------------------
-// ExperimentalChatSession — renders ACP events into structured content
-// ---------------------------------------------------------------------------
-
-/**
- * Accumulates ACP events for a single chat turn and produces structured
- * `SessionFrameContent` that a `ChatSessionContentProvider` can surface.
- *
- * Unlike `AcpRenderer` which pushes directly to a `ChatResponseStream`,
- * this class captures rendered output as structured data for later
- * consumption by a content provider.
- */
-export class ExperimentalChatSession {
-  private renderer: AcpRenderer;
-  private readonly logger?: { appendLine(m: string): void };
-
-  /** Accumulated content for the current turn */
-  private frames: SessionFrameContent[] = [];
-  private currentFrame: SessionFrameContent = {};
-
-  constructor(options?: { logger?: { appendLine(m: string): void } }) {
-    this.renderer = new AcpRenderer(options);
-    this.logger = options?.logger;
-  }
-
-  /**
-   * Process an ACP event and capture it as structured content.
-   * Call after each event from the OpenCode event stream.
-   */
-  processEvent(evt: AcpEvent): void {
-    switch (evt.type) {
-      case 'part.updated':
-        this.handlePartUpdated(evt);
-        break;
-      case 'part.delta':
-        this.handlePartDelta(evt);
-        break;
-      case 'session.diff':
-        break;
-        break;
-      case 'session.idle':
-        this.flushFrame();
-        break;
-    }
-  }
-
-  /**
-   * Get all accumulated frames and reset for the next turn.
-   */
-  consumeFrames(): SessionFrameContent[] {
-    const result = this.frames;
-    this.frames = [];
-    this.currentFrame = {};
-    this.renderer.reset();
-    return result;
-  }
-
-  /** Get the user message ID captured during rendering */
-  getUserMessageId(): string | null {
-    return this.renderer.getUserMessageId();
-  }
-
-  // -------------------------------------------------------------------
-  // Event handlers
-  // -------------------------------------------------------------------
-
-  private handlePartUpdated(evt: AcpEvent): void {
-    if (evt.type !== 'part.updated') {return;}
-    const part = evt.part;
-    if (!part) {return;}
-
-    switch (part.type) {
-      case 'reasoning':
-        this.currentFrame.hasReasoning = true;
-        break;
-      case 'tool':
-        this.handleToolState({
-          callID: part.callId,
-          tool: part.toolName,
-          state: part.state as { status: string; input?: Record<string, unknown>; output?: string; title?: string; error?: string; startTime?: number; endTime?: number },
-        });
-        break;
-    }
-  }
-
-  private handlePartDelta(evt: AcpEvent): void {
-    if (evt.type !== 'part.delta') {return;}
-    const delta = evt.delta;
-    if (!delta) {return;}
-
-    // We don't track part kinds here (that's the renderer's job).
-    // For structured content, we accumulate into the current frame.
-    if (this.currentFrame.hasReasoning) {
-      this.currentFrame.reasoningText =
-        (this.currentFrame.reasoningText ?? '') + delta;
-    } else {
-      this.currentFrame.markdown =
-        (this.currentFrame.markdown ?? '') + delta;
-    }
-  }
-
-  private handleToolState(toolPart: {
-    callID?: string;
-    tool?: string;
-    state?: { status: string; input?: Record<string, unknown>; output?: string; title?: string; error?: string; startTime?: number; endTime?: number };
-  }): void {
-    const state = toolPart.state;
-    if (!state) {return;}
-
-    const toolName = toolPart.tool ?? 'unknown';
-    const callID = toolPart.callID ?? 'unknown';
-    const status = state.status;
-
-    if (status === 'completed' || status === 'error') {
-      const invocation: SessionToolInvocation = {
-        toolName,
-        toolCallId: callID,
-        isError: status === 'error',
-        invocationMessage: formatInvocationMsg(toolName, state.input ?? {}, getTitle(state) ?? toolName),
-        pastTenseMessage: formatPastTenseMsg(
-          toolName,
-          getTitle(state) ?? toolName,
-          state.startTime,
-          state.endTime,
-          state.input ?? {},
-        ),
-        isComplete: true,
-      };
-
-      if (status === 'completed') {
-        const data = buildToolSpecificData(
-          toolName,
-          getTitle(state) ?? toolName,
-          state.input ?? {},
-          state.output ?? '',
-        );
-        if (data) {
-          invocation.toolSpecificData = data as unknown as Record<string, unknown>;
-        }
-      }
-
-      this.currentFrame.toolInvocations ??= [];
-      this.currentFrame.toolInvocations.push(invocation);
-    }
-  }
-
-  private flushFrame(): void {
-    if (
-      this.currentFrame.markdown ||
-      this.currentFrame.toolInvocations ||
-      this.currentFrame.hasReasoning
-    ) {
-      this.frames.push(this.currentFrame);
-    }
-    this.currentFrame = {};
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Content provider factory
@@ -356,13 +129,13 @@ function createSessionResource(sessionId: string): vscode.Uri {
  * The controller's `getChatSessionInputState` creates tracked inputState
  * objects via `controller.createChatSessionInputState()`. VSCode monitors
  * these objects, so `inputState.onDidChange` actually fires when the user
- * changes picker selections — unlike inputState received from the content
+ * changes picker selections; unlike inputState received from the content
  * provider's context, which is NOT tracked by VSCode.
  *
  * Flow:
- * 1. Controller's `getChatSessionInputState` → creates tracked inputState
+ * 1. Controller's `getChatSessionInputState` creates tracked inputState
  * 2. VSCode tracks it, fires `onDidChange` when user changes picker
- * 3. We subscribe to `onDidChange` → parse groups → update selection via state.selection.setAgent
+ * 3. We subscribe to `onDidChange`, parse groups, and update selection via state.selection.setAgent
  * 4. Handler reads state.selection.get() at prompt time
  *
  * @param state - The global extension state.
@@ -393,7 +166,7 @@ export function createSessionContentProvider(
   const logger = state.outputChannel;
   const directory = getWorkspaceDirectory();
 
-  // ── Local session cache ──────────────────────────────────────────────
+  // Local session cache
   const SESSION_CACHE_KEY = 'acp.sessionItems';
   interface CachedSessionItem { id: string; title: string; createdAt: number; }
 
@@ -407,7 +180,7 @@ export function createSessionContentProvider(
 
   const onDidChangeOptionsEmitter = new vscode.EventEmitter<void>();
   let cachedOptionGroups: vscode.ChatSessionProviderOptionGroup[] = [];
-  /** Guard against re-entrant refreshOptionGroups() calls (e.g. event fire → VSCode re-query loop) */
+  /** Guard against re-entrant refreshOptionGroups() calls (e.g. event fire -> VSCode re-query loop) */
   let optionGroupsRefreshInFlight: Promise<void> | null = null;
   let backendStartInFlight: Promise<void> | null = null;
   let loggedOfflineOptionGroups = false;
@@ -444,8 +217,8 @@ export function createSessionContentProvider(
   async function refreshOptionGroups(): Promise<void> {
     // Guard: if a refresh is already in-flight, return the existing promise.
     // This prevents re-entrant loops where provideChatSessionProviderOptions
-    // calls refreshOptionGroups → onDidChangeOptionsEmitter.fire() →
-    // VSCode re-calls provideChatSessionProviderOptions → refreshOptionGroups.
+    // calls refreshOptionGroups -> onDidChangeOptionsEmitter.fire() ->
+    // VSCode re-calls provideChatSessionProviderOptions -> refreshOptionGroups.
     if (optionGroupsRefreshInFlight) {
       return optionGroupsRefreshInFlight;
     }
@@ -458,7 +231,7 @@ export function createSessionContentProvider(
     }
   }
 
-  /** Actual work — separated so the guard can deduplicate calls */
+  /** Actual work; separated so the guard can deduplicate calls */
   async function doRefreshOptionGroups(): Promise<void> {
     try {
       // If backend is not running, show placeholder groups without calling backend
@@ -473,7 +246,7 @@ export function createSessionContentProvider(
           return;
         }
         loggedOfflineOptionGroups = true;
-        logger.appendLine('[session-provider] Backend not running — showing "Connecting…" option groups');
+        logger.appendLine('[session-provider] Backend not running; showing "Connecting" option groups');
         return;
       }
 
@@ -571,7 +344,7 @@ export function createSessionContentProvider(
       return `Session ${sessionId.slice(0, 8)}`;
     }
 
-    return normalized.length > 60 ? `${normalized.slice(0, 57).trimEnd()}…` : normalized;
+    return normalized.length > 60 ? `${normalized.slice(0, 57).trimEnd()}...` : normalized;
   }
 
   function getHistoryDerivedSessionTitle(
@@ -1190,19 +963,19 @@ export function createSessionContentProvider(
     // This preserves VSCode's default session list (user can navigate back)
     // instead of replacing it with an empty list.
     if (!state.backend.isRunning()) {
-      logger.appendLine('[session-provider] Backend not running — skipping session list refresh');
+      logger.appendLine('[session-provider] Backend not running; skipping session list refresh');
       return;
     }
 
     // ---- Re-entrancy guard ----
     // refreshSessionItems() can be called from multiple sources concurrently
     // (onBackendReady, handler post-turn, VS Code refreshHandler).  If a
-    // refresh is already in-flight, skip this call — the in-flight call will
+    // refresh is already in-flight, skip this call; the in-flight call will
     // publish the correct list.  We note the race so the cache-as-floor
     // protection below knows to supplement from cache.
     const isRace = sessionRefreshInFlight;
     if (isRace) {
-      logger.appendLine('[session-provider] Refresh already in-flight — deferring to prior call');
+      logger.appendLine('[session-provider] Refresh already in-flight; deferring to prior call');
     }
 
     sessionRefreshInFlight = true;
@@ -1226,7 +999,7 @@ export function createSessionContentProvider(
   }
 
   // Kick off initial option groups load (non-blocking).
-  // When backend is not running this will show "Connecting…" placeholders.
+  // When backend is not running this will show "Connecting" placeholders.
   // When backend IS already running this will populate real data.
   refreshOptionGroups().catch(err => {
     logger.appendLine(`[session-provider] Initial option groups load failed: ${err}`);
@@ -1236,7 +1009,7 @@ export function createSessionContentProvider(
   // we immediately refresh option groups + session list with real data.
   // This avoids polling: no repeated requests while backend is offline.
   const onBackendReadyHandler = () => {
-    logger.appendLine('[session-provider] Backend ready — refreshing option groups and session list');
+    logger.appendLine('[session-provider] Backend ready; refreshing option groups and session list');
     refreshOptionGroups().catch(err => {
       logger.appendLine(`[session-provider] Backend-ready option groups refresh failed: ${err}`);
     });
@@ -1328,7 +1101,7 @@ export function createSessionContentProvider(
             logger.appendLine(
               `[session-provider] Session item refresh failed: ${err instanceof Error ? err.message : String(err)}`,
             );
-            // Do NOT replace items with [] — that wipes VSCode's default
+            // Do NOT replace items with []; that wipes VSCode's default
             // session list and traps the user in an empty view. The
             // onBackendReady callback will populate items once the backend
             // is available.
@@ -1371,7 +1144,7 @@ export function createSessionContentProvider(
       _token: vscode.CancellationToken,
     ): vscode.ChatSessionInputState => {
       // Create a tracked inputState from our option groups.
-      // VSCode monitors this object — when the user changes a picker selection,
+      // VSCode monitors this object; when the user changes a picker selection,
       // onDidChange fires on the returned inputState.
       const inputState = controller!.createChatSessionInputState(cachedOptionGroups);
 
@@ -1388,7 +1161,7 @@ export function createSessionContentProvider(
         }
       });
 
-      // Subscribe to changes — update selection in real-time.
+      // Subscribe to changes and update selection in real-time.
       inputState.onDidChange(() => {
         const groups = inputState.groups ?? [];
         // [debug] logger.appendLine(
@@ -1400,7 +1173,7 @@ export function createSessionContentProvider(
           const selected = group.selected;
           if (!selected) { continue; }
 
-          // Skip placeholder items — they shouldn't leak into state
+          // Skip placeholder items; they shouldn't leak into state
           if (selected.id.endsWith('-connecting')) {
             // [debug] logger.appendLine(`[session-provider] Picker ignored placeholder selection: ${selected.id}`);
             continue;
@@ -1435,7 +1208,7 @@ export function createSessionContentProvider(
     controller.forkHandler = createForkHandler(controller);
 
   } else {
-    logger.appendLine('[session-provider] ChatSessionItemController API not available — picker changes will NOT propagate');
+    logger.appendLine('[session-provider] ChatSessionItemController API not available; picker changes will NOT propagate');
   }
 
   // Session-level forkHandler: attached to every ChatSession returned by
@@ -2185,7 +1958,7 @@ export function createSessionContentProvider(
     const history: (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[] = [];
 
     const attachRestoreBridge = (
-      bridge: ReturnType<typeof state.backend.createBridge>,
+      bridge: AcpProtocolBridge,
       collector: CollectorStream,
       sss: SerializableSessionStream,
     ): void => {
@@ -2201,22 +1974,10 @@ export function createSessionContentProvider(
     };
 
     const runRestoreBridge = async (
-      bridge: ReturnType<typeof state.backend.createBridge>,
+      bridge: AcpProtocolBridge,
       eventStreamForResponse: AsyncIterable<AcpEvent>,
     ): Promise<void> => {
-      const compat = bridge as unknown as {
-        setSSS?: (next: unknown) => void;
-        processEvent?: (event: AcpEvent) => void;
-        run?: (events: AsyncIterable<AcpEvent>, token: vscode.CancellationToken) => Promise<boolean>;
-      };
-      if (typeof compat.setSSS === 'function' || typeof compat.processEvent !== 'function') {
-        await bridge.run(eventStreamForResponse, token);
-        return;
-      }
-      for await (const event of eventStreamForResponse) {
-        if (token.isCancellationRequested) break;
-        compat.processEvent(event);
-      }
+      await bridge.run(eventStreamForResponse, token);
     };
 
     const buildResponseTurn = async (
@@ -2224,29 +1985,34 @@ export function createSessionContentProvider(
       snapshotsForResponse: readonly FileSnapshotRecord[],
     ): Promise<vscode.ChatResponseTurn | undefined> => {
       const collector = new CollectorStream();
-      // SSS without initialize() → no disk writes during replay
+      // SSS without initialize(): no disk writes during replay
       const sss = new SerializableSessionStream(
         collector as unknown as vscode.ChatResponseStream,
         { workspaceRoot: '', backendName: state.backend.name, sessionId, turnIndex: 0, requestId: '' },
       );
-      const bridge = state.backend.createBridge(sessionId);
+      const bridge = new AcpProtocolBridge(state.backend, sessionId);
       attachRestoreBridge(bridge, collector, sss);
 
-      // Async generator: yields events, interleaves snapshot restoration between them
-      async function* eventStream() {
-        for (const event of turnEventsForResponse) {
-          if (token.isCancellationRequested) return;
-          yield event;
-          pushSnapshotsForRestoredEditTools(
-            sessionId,
-            getRestoreSnapshotsForToolCompleteEvent(snapshotsForResponse, event),
-            collector,
-            toolIdEditMap,
-          );
-        }
+      async function* singleEvent(event: AcpEvent) {
+        yield event;
       }
 
-      await runRestoreBridge(bridge, eventStream());
+      for (const event of turnEventsForResponse) {
+        if (token.isCancellationRequested) break;
+        await runRestoreBridge(bridge, singleEvent(event));
+        await sss.flush();
+        const eventRestoreSnapshots = getRestoreSnapshotsForToolCompleteEvent(snapshotsForResponse, event);
+        pushSnapshotsForRestoredEditTools(
+          sessionId,
+          eventRestoreSnapshots,
+          collector,
+          toolIdEditMap,
+        );
+      }
+
+      if (!token.isCancellationRequested) {
+        await sss.flush();
+      }
 
       if (collector.parts.length === 0) {
         return undefined;
@@ -2278,7 +2044,7 @@ export function createSessionContentProvider(
         collector as unknown as vscode.ChatResponseStream,
         { workspaceRoot: '', backendName: state.backend.name, sessionId, turnIndex: 0, requestId: '' },
       );
-      let bridge = state.backend.createBridge(sessionId);
+      let bridge = new AcpProtocolBridge(state.backend, sessionId);
       attachRestoreBridge(bridge, collector, sss);
 
       const flushAssistantTurn = (): void => {
@@ -2292,7 +2058,7 @@ export function createSessionContentProvider(
           collector as unknown as vscode.ChatResponseStream,
           { workspaceRoot: '', backendName: state.backend.name, sessionId, turnIndex: 0, requestId: '' },
         );
-        bridge = state.backend.createBridge(sessionId);
+        bridge = new AcpProtocolBridge(state.backend, sessionId);
         attachRestoreBridge(bridge, collector, sss);
       };
 
@@ -2311,18 +2077,16 @@ export function createSessionContentProvider(
         }
 
         if (event.type === 'session.idle') {
+          await sss.flush();
           flushAssistantTurn();
           expectingUserMessage = true;
           legacyTurnIndex++;
           continue;
         }
 
-        // Feed event to bridge via run() — but since we need per-event control,
-        // use a single-event async generator
-        // The bridge.handleEvent is called internally by run()
-        // For legacy path, we process events individually
         async function* singleEvent() { yield event; }
         await runRestoreBridge(bridge, singleEvent());
+        await sss.flush();
         const eventRestoreSnapshots = getRestoreSnapshotsForToolCompleteEvent(snapshots, event);
         pushSnapshotsForRestoredEditTools(
           sessionId,
@@ -2333,6 +2097,9 @@ export function createSessionContentProvider(
         collectorRestoreSnapshots.push(...eventRestoreSnapshots);
       }
 
+      if (!token.isCancellationRequested) {
+        await sss.flush();
+      }
       flushAssistantTurn();
     }
 
@@ -2369,14 +2136,14 @@ export function createSessionContentProvider(
       kickBackendStart('provider options requested');
 
       // If a refresh is already in-flight, return the in-flight promise.
-      // This prevents re-entrant loops where fire() → VSCode re-query → refresh again.
+      // This prevents re-entrant loops where fire() -> VSCode re-query -> refresh again.
       if (optionGroupsRefreshInFlight) {
         return optionGroupsRefreshInFlight.then(() => ({
           optionGroups: cachedOptionGroups,
         }));
       }
 
-      // Backend might be running now — if so, fetch real data.
+      // Backend might be running now; if so, fetch real data.
       // If still offline, refreshOptionGroups() returns placeholders.
       return refreshOptionGroups().then(() => ({
         optionGroups: cachedOptionGroups,
@@ -2407,11 +2174,11 @@ export function createSessionContentProvider(
       }
 
       // NOTE: Picker selection changes are handled by the ChatSessionItemController's
-      // getChatSessionInputState → onDidChange subscription (set up above).
-      // We no longer need to read inputState here — the controller keeps
+      // getChatSessionInputState -> onDidChange subscription (set up above).
+      // We no longer need to read inputState here; the controller keeps
       // selection updated in real-time.
 
-      // New session — no history to restore
+      // New session; no history to restore
       // VSCode generates untitled-* URIs for fresh sessions; only real OpenCode
       // session IDs (e.g. from session.list()) should trigger history fetch.
       if (!sessionId || sessionId === 'new') {
@@ -2451,7 +2218,7 @@ export function createSessionContentProvider(
               if (!isPlaceholderSessionTitle(chatState.title) && chatState.title?.trim()) {
                 title = chatState.title.trim();
               } else {
-                // Try fetching the latest title from backend — it may have been
+                // Try fetching the latest title from backend; it may have been
                 // auto-generated after the first response completed.
                 try {
                   const sessionInfo = await state.backend.sessions.get(backendSessionId);
@@ -2502,7 +2269,7 @@ export function createSessionContentProvider(
           })();
         }
 
-        // No existing OpenCode session for this untitled tab — it's genuinely new
+        // No existing OpenCode session for this untitled tab; it's genuinely new
         return Promise.resolve({
           title: 'New OpenCode Session',
           history: [],
@@ -2511,7 +2278,7 @@ export function createSessionContentProvider(
         });
       }
 
-      // Existing session — fetch history from backend
+      // Existing session; fetch history from backend
       return (async (): Promise<vscode.ChatSession> => {
         try {
           await ensureBackendRunning();
@@ -2617,80 +2384,6 @@ export function createSessionContentProvider(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: render ACP events through the experimental surface
-// ---------------------------------------------------------------------------
-
-/**
- * Render ACP events into structured session content using all available
- * proposed APIs. This function:
- *
- * 1. Uses `AcpRenderer` for core rendering.
- * 2. Also captures structured `SessionFrameContent` via
- *    `ExperimentalChatSession`.
- * 3. Gates every proposed API behind runtime checks.
- * 4. Falls back to stable APIs when proposed APIs are unavailable.
- *
- * @param renderer - Pre-configured AcpRenderer instance.
- * @param eventStream - OpenCode event stream to consume.
- * @param stream - The VS Code chat response stream to render to.
- * @param token - Cancellation token.
- * @returns Structured session frames and whether the turn completed.
- */
-export async function renderWithExperimentalSurface(
-  renderer: AcpRenderer,
-  eventStream: AcpEventStream,
-  stream: vscode.ChatResponseStream,
-  token: vscode.CancellationToken,
-): Promise<{ frames: SessionFrameContent[]; completed: boolean }> {
-  const session = new ExperimentalChatSession();
-
-  // Check stream capabilities at runtime (may or may not be available)
-  const hasFullProposed = hasFullProposedSurface(stream);
-  const hasToolPart = hasChatToolInvocationPart();
-
-  const logger = { appendLine: (m: string) => { console.log(m); } };
-
-  logger.appendLine(
-    `[experimental-session] caps: fullProposed=${hasFullProposed}, ` +
-    `toolPart=${hasToolPart}`,
-  );
-
-  renderer.probeStream(stream);
-
-  try {
-    for await (const rawEvt of eventStream.stream) {
-      if (token.isCancellationRequested) {
-        stream.markdown('\n\u26A0\uFE0F Operation cancelled\n');
-        break;
-      }
-
-      const rawEvtTyped = rawEvt as AcpEvent;
-
-      // Render to the live stream (uses proposed APIs if available)
-      const result = renderer.renderEvent(rawEvtTyped, stream);
-
-      // Also capture as structured content
-      session.processEvent(rawEvtTyped);
-
-      if (result.rendered) {
-        await yieldToEventLoop();
-      }
-
-      if (rawEvtTyped.type === 'session.idle') {
-        const frames = session.consumeFrames();
-        return { frames, completed: true };
-      }
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Connection lost';
-    logger.appendLine(`[experimental-session] Error: ${msg}`);
-    stream.markdown(`\n\u26A0\uFE0F ${msg}\n`);
-  }
-
-  return { frames: session.consumeFrames(), completed: false };
-}
-
-// ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
 
@@ -2731,7 +2424,7 @@ function createRequestTurn(
 /**
  * Create a ChatResponseTurn for session history restoration.
  *
- * VSCode's internal ChatResponseTurn constructor requires 3–4 arguments:
+ * VSCode's internal ChatResponseTurn constructor requires 3 or 4 arguments:
  *   (response, result, participant, command?)
  * Missing the `participant` parameter causes VS Code to reject or silently
  * drop the turn during rendering.

@@ -211,7 +211,7 @@ export class GlobalEventBroker {
       return; // truly no channel, drop event
     }
 
-    for (const eventToPush of this.eventsWithResolvedSessionId(rawEvent, event, sessionId)) {
+    for (const eventToPush of this.eventsForDispatch(rawEvent, event)) {
       channel.push(eventToPush);
     }
     if (event.type === 'session.idle') {
@@ -284,66 +284,29 @@ export class GlobalEventBroker {
     this.pendingPartDeltas.set(partId, pending);
   }
 
-  private eventsWithResolvedSessionId(
+  private eventsForDispatch(
     rawEvent: OpenCodeStreamEvent,
     event: OpenCodeEvent,
-    sessionId: string,
   ): OpenCodeStreamEvent[] {
-    const patched = this.withResolvedSessionId(rawEvent, event, sessionId);
     if (event.type !== 'message.part.updated') {
-      return [patched];
+      return [rawEvent];
     }
 
     const partId = event.properties?.part?.id;
     if (!partId) {
-      return [patched];
+      return [rawEvent];
     }
 
     const pending = this.pendingPartDeltas.get(partId);
     if (!pending || pending.length === 0) {
-      return [patched];
+      return [rawEvent];
     }
 
     this.pendingPartDeltas.delete(partId);
     return [
-      ...pending.map((pendingEvent) => this.withResolvedSessionId(
-        pendingEvent,
-        unwrapStreamEvent(pendingEvent),
-        sessionId,
-      )),
-      patched,
+      ...pending,
+      rawEvent,
     ];
-  }
-
-  private withResolvedSessionId(
-    rawEvent: OpenCodeStreamEvent,
-    event: OpenCodeEvent,
-    sessionId: string,
-  ): OpenCodeStreamEvent {
-    if (event.type !== 'message.part.delta') {
-      return rawEvent;
-    }
-
-    if ((event.properties as { sessionID?: string }).sessionID) {
-      return rawEvent;
-    }
-
-    const patchedEvent = {
-      ...event,
-      properties: {
-        ...event.properties,
-        sessionID: sessionId,
-      },
-    } as OpenCodeEvent;
-
-    if ('payload' in rawEvent) {
-      return {
-        ...rawEvent,
-        payload: patchedEvent,
-      };
-    }
-
-    return patchedEvent;
   }
 
   private clearSessionParts(sessionId: string): void {

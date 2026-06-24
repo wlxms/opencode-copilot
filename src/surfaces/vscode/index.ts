@@ -1,36 +1,13 @@
 /**
- * VS Code surface abstractions for the ACP-first refactor.
+ * VS Code surface exports.
  *
- * This module separates rendering concerns from OpenCode wire protocol
- * management, providing:
- *
- * - `capabilities`     — Runtime gating helpers for proposed/experimental APIs
- * - `acp-renderer`     — Pure ACP event → VS Code output renderer
- * - `stable-participant` — Participant handler using only stable chat APIs
- * - `experimental-session` — Future `registerChatSessionContentProvider` surface
- *
- * == Architecture ==
- * ```
- * Wire Protocol (StreamBridge / handler.ts)
- *     │
- *     ▼  (OpenCodeEvent[])
- * ┌─────────────────────────────────────┐
- * │         AcpRenderer                │
- * │  (pure rendering, no wire logic)   │
- * └──────────┬──────────────────────────┘
- *            │
- *     ┌──────┴──────┐
- *     ▼              ▼
- *  Stable         Experimental
- *  Surface        Surface
- *  (markdown      (ChatSession
- *   only)         ContentProvider)
- * ```
+ * Runtime OpenCode events are interpreted by the backend bridge and emitted as
+ * SSP parts. The VS Code surfaces consume that shared bridge/SSP pipeline
+ * instead of owning protocol-specific rendering logic.
  *
  * @module
  */
 export * from './capabilities';
-export * from './acp-renderer';
 export * from './stable-participant';
 export * from './experimental-session';
 export * from './language-model-provider';

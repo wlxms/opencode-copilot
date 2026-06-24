@@ -2,7 +2,7 @@
  * ACP (Agent Communication Protocol) backend interface.
  *
  * Defines the contract that every backend adapter must fulfil.
- * The participant layer consumes this — never the raw SDK or VSCode APIs.
+ * The participant layer consumes this - never the raw SDK or VSCode APIs.
  */
 
 import type { CancellationToken } from 'vscode';
@@ -15,7 +15,6 @@ import type {
   AcpConfig,
   AcpFileAttachment,
   AcpResult,
-  AcpEvent,
   AcpModel,
   AcpPermissionResponse,
   AcpServerInfo,
@@ -24,14 +23,14 @@ import type {
   BackendSettingsDescriptor,
 } from './types';
 
-import type { FileSnapshotRecord } from '../acp/serializable/types';
+import type { FileSnapshotRecord, SessionTitleSource } from '../acp/serializable/types';
 
 // ===========================================================================
 // Event stream
 // ===========================================================================
 
-export interface AcpEventStream {
-  stream: AsyncIterable<AcpEvent>;
+export interface AcpEventStream<TEvent = unknown> {
+  stream: AsyncIterable<TEvent>;
 }
 
 // ===========================================================================
@@ -129,12 +128,12 @@ export interface AcpConfigOperations {
 // Event operations
 // ===========================================================================
 
-export interface AcpEventOperations {
+export interface AcpEventOperations<TEvent = unknown> {
   /** Open a per-session event stream */
-  openSessionStream(sessionId: string): AcpEventStream;
+  openSessionStream(sessionId: string): AcpEventStream<TEvent>;
 
   /** Open the global event stream (all sessions) */
-  openGlobalStream(): Promise<AcpEventStream>;
+  openGlobalStream(): Promise<AcpEventStream<TEvent>>;
 
   /** Close a previously-opened session stream */
   closeSessionStream(sessionId: string): void;
@@ -201,25 +200,27 @@ export interface AcpAuthOperations {
 }
 
 // ===========================================================================
-// AcpBridge — backend-specific event interpreter
+// AcpBridge - backend-specific event interpreter
 // ===========================================================================
 
-/** A bridge that interprets ACP events and translates them to push/update
- *  calls on the SerializableSessionStream (SSS).
+/** A bridge that interprets backend stream events and translates them to
+ *  push/update calls on the SerializableSessionStream (SSS).
  *
- *  The bridge does NOT touch the VS Code stream directly — SSS owns it.
+ *  The bridge does NOT touch the VS Code stream directly; SSS owns it.
  *  The bridge only calls sss.push(ssp) / sss.update(id, data).
  *
  *  Each backend provides its own implementation via {@link AcpBackend.createBridge}. */
-export interface AcpBridge {
+export interface AcpBridge<TEvent = unknown> {
   /** Inject the SerializableSessionStream (which owns the VS Code stream) */
   setSSS(sss: unknown): void;
-  /** Run the full event loop — translates events to push/update calls */
-  run(events: AsyncIterable<AcpEvent>, token: CancellationToken): Promise<boolean>;
+  /** Run the full event loop and translate events to push/update calls */
+  run(events: AsyncIterable<TEvent>, token: CancellationToken): Promise<boolean>;
   /** Get the captured user message ID, or null if no text part was seen */
   getUserMessageId(): string | null;
   /** Get the backend-generated session title, or null */
   getSessionTitle(): string | null;
+  /** Get the source of the captured session title, or null */
+  getSessionTitleSource?(): SessionTitleSource | null;
   /** Whether at least one subagent (task) tool completed during this session */
   getHadSubagentTasks(): boolean;
 }
@@ -228,7 +229,7 @@ export interface AcpBridge {
 // Complete backend contract
 // ===========================================================================
 
-export interface AcpBackend {
+export interface AcpBackend<TEvent = unknown> {
   /** Human-readable backend name */
   readonly name: string;
 
@@ -244,7 +245,7 @@ export interface AcpBackend {
 
   sessions: AcpSessionOperations;
   config: AcpConfigOperations;
-  events: AcpEventOperations;
+  events: AcpEventOperations<TEvent>;
   permissions: AcpPermissionOperations;
   questions: AcpQuestionOperations;
 
@@ -252,7 +253,7 @@ export interface AcpBackend {
    *  The bridge handles both live rendering and session restore (replay).
    *  @param sessionId - the session to bridge events for
    *  @param directory - optional workspace directory */
-  createBridge(sessionId: string, directory?: string): AcpBridge;
+  createBridge(sessionId: string, directory?: string): AcpBridge<TEvent>;
 
   auth: AcpAuthOperations;
 

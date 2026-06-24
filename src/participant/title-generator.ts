@@ -1,64 +1,54 @@
 import * as vscode from 'vscode';
-import type { AcpEvent, AcpPartUpdatedEvent } from '../acp/types';
 import type { ExtensionState } from '../types';
 import { applySessionTitle, isPlaceholderSessionTitle } from './session-title';
 
 // ===========================================================================
-// Title Generation via lightweight LLM
+// Title Generation via VS Code LM
 // ===========================================================================
 
 /**
  * Generate a short, descriptive session title from the first user prompt.
  *
- * Copilot-style path: use VS Code's built-in language model API first so
- * naming is independent from the active OpenCode backend/model. If no VS Code
- * model is available, fall back to the older backend child-session strategy.
+ * This deliberately uses VS Code's language model API only. Backend-specific
+ * event streams stay inside the bridge, and backend sessions are not used as a
+ * title-generation fallback.
  *
- * The caller should call `sessions.update()` on the real session with the
- * returned title.
- *
- * @returns The generated title, or `undefined` on any failure (the caller
- *          should fall back to the existing prompt-truncation logic).
+ * @returns The generated title, or `undefined` when VS Code LM is unavailable
+ *          or returns an unusable title.
  */
 export async function generateSessionTitle(
   firstPrompt: string,
   state: ExtensionState,
-  parentSessionId: string,
-  directory: string | undefined,
 ): Promise<string | undefined> {
-  const logger = state.outputChannel;
-
-  // Guard against empty or very short prompts
-  const normalized = firstPrompt.replace(/\s+/g, ' ').trim();
-  if (!normalized || normalized.length < 3) {
-    return undefined;
-  }
-
-  const vscodeTitle = await generateTitleWithVsCodeLm(normalized, logger);
-  if (vscodeTitle) {
-    logger.appendLine(`[title-generator] VS Code LM generated title: "${vscodeTitle}"`);
-    return vscodeTitle;
-  }
-
-  return generateTitleWithBackendSession(normalized, state, parentSessionId, directory);
+  return generateSessionTitleWithVsCodeLm(firstPrompt, state.outputChannel);
 }
 
 export async function generateSessionTitleWithVsCodeLm(
   firstPrompt: string,
-  state: ExtensionState,
+  loggerOrState: ExtensionState | { appendLine(message: string): void },
 ): Promise<string | undefined> {
   const normalized = firstPrompt.replace(/\s+/g, ' ').trim();
   if (!normalized || normalized.length < 3) {
     return undefined;
   }
 
-  return generateTitleWithVsCodeLm(normalized, state.outputChannel);
+  const logger = 'outputChannel' in loggerOrState ? loggerOrState.outputChannel : loggerOrState;
+  const title = await generateTitleWithVsCodeLm(normalized, logger);
+  if (title) {
+    logger.appendLine(`[title-generator] VS Code LM generated title: "${title}"`);
+  }
+  return title;
 }
 
-async function generateTitleWithVsCodeLm(
-  normalizedPrompt: string,
+export async function generateTitleWithVsCodeLm(
+  prompt: string,
   logger: { appendLine(message: string): void },
 ): Promise<string | undefined> {
+  const normalizedPrompt = prompt.replace(/\s+/g, ' ').trim();
+  if (!normalizedPrompt || normalizedPrompt.length < 3) {
+    return undefined;
+  }
+
   const lm = vscode.lm as unknown as {
     selectChatModels?: (selector?: vscode.LanguageModelChatSelector) => Thenable<vscode.LanguageModelChat[]>;
     languageModelAccessInformation?: { canSendRequest(chat: vscode.LanguageModelChat): boolean | undefined };
@@ -130,93 +120,10 @@ async function collectLmText(text: AsyncIterable<string>): Promise<string> {
   return result.trim();
 }
 
-export async function generateTitleWithBackendSession(
-  normalized: string,
-  state: ExtensionState,
-  parentSessionId: string,
-  directory: string | undefined,
-): Promise<string | undefined> {
-  const logger = state.outputChannel;
-  let childSessionId: string | undefined;
-
-  try {
-    // 1. Create a child session for title generation.
-    //    Using parentID keeps the session-tree clean.
-    const createResult = await state.backend.sessions.create({
-      parentId: parentSessionId,
-      directory,
-      title: 'Title Generator',
-    });
-
-    if (createResult.error || !createResult.data?.id) {
-      logger.appendLine(
-        `[title-generator] Failed to create child session: ${createResult.error ?? 'unknown'}`,
-      );
-      return undefined;
-    }
-
-    childSessionId = createResult.data.id;
-    logger.appendLine(`[title-generator] Created child session ${childSessionId}`);
-
-    // 2. Open the per-session event stream BEFORE sending the prompt
-    //    so we don't miss any events.
-    await state.backend.events.ensureStarted();
-    const eventStream = state.backend.events.openSessionStream(childSessionId);
-
-    // 3. Send the title-generation prompt.
-    const titlePrompt = buildTitlePrompt(normalized);
-    const promptResult = await state.backend.sessions.prompt(
-      childSessionId,
-      titlePrompt,
-      directory,
-    );
-
-    if (promptResult.error) {
-      logger.appendLine(
-        `[title-generator] Prompt failed: ${promptResult.error}`,
-      );
-      return undefined;
-    }
-
-    // 4. Collect the plain-text response from the event stream.
-    const responseText = await collectTextResponse(eventStream.stream);
-    if (!responseText) {
-      logger.appendLine('[title-generator] No text response received');
-      return undefined;
-    }
-
-    // 5. Clean and validate the generated title.
-    const cleaned = cleanGeneratedTitle(responseText);
-    if (!cleaned) {
-      logger.appendLine(
-        `[title-generator] Unusable response: "${responseText.slice(0, 80)}"`,
-      );
-      return undefined;
-    }
-
-    logger.appendLine(`[title-generator] Generated title: "${cleaned}"`);
-    return cleaned;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger.appendLine(`[title-generator] Error: ${msg}`);
-    return undefined;
-  } finally {
-    // 6. Best-effort cleanup of the child session.
-    if (childSessionId) {
-      try {
-        state.backend.events.closeSessionStream(childSessionId);
-        await state.backend.sessions.abort(childSessionId, directory);
-      } catch {
-        // Best effort - nothing we can do if cleanup fails.
-      }
-    }
-  }
-}
-
 /**
- * Fire-and-forget helper used by both the handler (first-turn auto-gen) and
- * the `/retitle` command.  Calls `generateSessionTitle`, then applies the
- * result to the real session (backend update + sessionMap + sidebar refresh).
+ * Fire-and-forget helper used by the `/retitle` command. Calls
+ * `generateSessionTitle`, then applies the result to the real session
+ * (backend update + sessionMap + sidebar refresh).
  *
  * @returns The generated title, or `undefined` on failure.
  */
@@ -228,7 +135,7 @@ export async function retitleSession(
   directory: string | undefined,
 ): Promise<string | undefined> {
   const logger = state.outputChannel;
-  const llmTitle = await generateSessionTitle(prompt, state, backendSessionId, directory);
+  const llmTitle = await generateSessionTitle(prompt, state);
   if (llmTitle && !isPlaceholderSessionTitle(llmTitle)) {
     await applySessionTitle(state, {
       backendSessionId,
@@ -252,8 +159,7 @@ export async function retitleSession(
 
 /**
  * Build a focused, low-token prompt that asks the model to produce a short
- * title.  Rules are included inline so every model (not just instruction-tuned
- * ones) produces something useable.
+ * title. Rules are included inline so every model produces something usable.
  */
 export function buildTitlePrompt(userMessage: string): string {
   const truncated =
@@ -279,51 +185,11 @@ export function buildTitlePrompt(userMessage: string): string {
   ].join('\n');
 }
 
-// ===========================================================================
-// Response parsing
-// ===========================================================================
-
-/**
- * Iterate the session's event stream and collect text-part content.
- *
- * `part.text` contains the FULL accumulated text for a given part, so we use
- * a Map keyed by part ID to correctly handle streaming updates (each update
- * overwrites the previous full text for that part). Multiple text parts are
- * joined in insertion order.
- *
- * Stops when a `session.idle` event is received.
- */
-async function collectTextResponse(stream: AsyncIterable<AcpEvent>): Promise<string> {
-  const textParts = new Map<string, string>();
-
-  for await (const rawEvt of stream) {
-    const evt = rawEvt as AcpEvent;
-
-    if (evt.type === 'part.updated') {
-      const partUpdated = evt as AcpPartUpdatedEvent;
-      if (partUpdated.part.type === 'text') {
-        // Overwrite with the latest full text for this part ID
-        textParts.set(partUpdated.part.id, partUpdated.part.text);
-      }
-    }
-
-    if (evt.type === 'session.idle') {
-      break;
-    }
-  }
-
-  return Array.from(textParts.values())
-    .join('')
-    .trim();
-}
-
 /**
  * Strip formatting artifacts from an LLM-generated title and validate it.
  * Returns `undefined` if the result is unusable.
  */
 export function cleanGeneratedTitle(raw: string): string | undefined {
-  // Remove formatting artifacts - order matters:
-  // bold markers first, then surrounding quotes, so `**"title"**` works correctly.
   const cleaned = raw
     .replace(/\*\*/g, '')
     .replace(/^["'`\u201C\u201D\u2018\u2019]+|["'`\u201C\u201D\u2018\u2019]+$/g, '')
@@ -335,7 +201,6 @@ export function cleanGeneratedTitle(raw: string): string | undefined {
     return undefined;
   }
 
-  // Reject anything the model clearly failed to process
   if (cleaned.length > 80 || /^(i'm |i am |here|sorry|i can)/i.test(cleaned)) {
     return undefined;
   }

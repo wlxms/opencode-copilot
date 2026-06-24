@@ -364,6 +364,60 @@ describe('SerializableSessionStream', () => {
     expect(session?.status).toBe('completed');
   });
 
+  it('records first prompt and persists title updates through SSS', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-title-'));
+    const sss = makeSSS(tmpDir);
+    await sss.initialize();
+
+    sss.recordFirstPrompt('  how to implement oauth middleware  ');
+    sss.recordFirstPrompt('ignored second prompt');
+    const persisted = sss.updateTitle('  OAuth Middleware  ', 'copilot-style');
+    await sss.flush();
+
+    expect(sss.getFirstPrompt()).toBe('how to implement oauth middleware');
+    expect(persisted).toBe('OAuth Middleware');
+
+    const metaIndex = await readMetaIndex(path.join(getSessionDir(tmpDir), 'meta.jsonl'));
+    const session = metaIndex.get('session');
+    expect(session?.title).toBe('OAuth Middleware');
+    expect(session?.titleSource).toBe('copilot-style');
+    expect(session?.provisionalTitle).toBe(false);
+    expect(typeof session?.titleUpdatedAt).toBe('string');
+  });
+
+  it('notifies when title changes', async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sss-title-cb-'));
+    const onTitleChanged = vi.fn();
+    const sss = new SerializableSessionStream(mockStream() as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test-backend',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'req-0',
+      onTitleChanged,
+    });
+    await sss.initialize();
+
+    sss.updateTitle('OAuth Middleware', 'copilot-style');
+    sss.updateTitle('OAuth Middleware', 'copilot-style');
+    sss.updateTitle('Backend OAuth Middleware', 'backend');
+    await sss.flush();
+
+    expect(onTitleChanged).toHaveBeenCalledTimes(2);
+    expect(onTitleChanged).toHaveBeenNthCalledWith(1, {
+      sessionId: 'test-session',
+      title: 'OAuth Middleware',
+      source: 'copilot-style',
+      provisional: false,
+    });
+    expect(onTitleChanged).toHaveBeenNthCalledWith(2, {
+      sessionId: 'test-session',
+      title: 'Backend OAuth Middleware',
+      source: 'backend',
+      provisional: false,
+    });
+  });
+
   // ── close ──────────────────────────────────────────────────────────────
 
   it('close writes turn-end to session.jsonl', async () => {
