@@ -66,7 +66,7 @@ export interface AcpTurnMapping {
 }
 
 // ===========================================================================
-// Stream parts (normalised semantic parts from events)
+// ACP protocol stream parts
 // ===========================================================================
 
 export type AcpPartType =
@@ -97,7 +97,7 @@ export interface AcpToolState {
 
 /**
  * A file attachment included with a prompt (image, document, etc.).
- * Protocol-agnostic — each backend adapter maps this to its SDK type.
+ * Protocol-agnostic - each backend adapter maps this to its SDK type.
  */
 export interface AcpFileAttachment {
   /** MIME type (e.g. "image/png", "text/plain", "application/pdf") */

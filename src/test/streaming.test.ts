@@ -187,6 +187,151 @@ describe('OpenCodeBridge', () => {
     bridge = new OpenCodeBridge(mockBackend(), 'test-session');
   });
 
+  it('generates and persists a VS Code LM title when backend title echoes the first prompt', async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-title-'));
+    const stream = mockStream();
+    const sss = new SerializableSessionStream(stream as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'req-title',
+    });
+    const model = {
+      id: 'gpt-4o-mini',
+      vendor: 'copilot',
+      family: 'gpt-4o-mini',
+      name: 'GPT-4o mini',
+      version: '1',
+      maxInputTokens: 4096,
+      sendRequest: vi.fn(async () => ({
+        text: (async function* () {
+          yield 'OAuth Middleware';
+        })(),
+      })),
+    } as unknown as vscode.LanguageModelChat;
+    vi.spyOn(vscode.lm, 'selectChatModels').mockResolvedValue([model]);
+
+    try {
+      await sss.initialize();
+      sss.recordFirstPrompt('how to implement oauth middleware');
+      bridge.setSSS(sss);
+
+      await bridge.run((async function* () {
+        yield {
+          type: 'session.updated',
+          properties: { info: { id: 'test-session', title: 'how to implement oauth middleware' } },
+        } as any;
+        yield { type: 'session.idle', properties: { sessionID: 'test-session' } } as any;
+      })(), mockToken());
+      await sss.flush();
+
+      const metaIndex = await readMetaIndex(path.join(getTestSessionDir(tmpDir), 'meta.jsonl'));
+      const sessionMeta = metaIndex.get('session');
+      expect(model.sendRequest).toHaveBeenCalled();
+      expect(bridge.getSessionTitle()).toBe('OAuth Middleware');
+      expect(bridge.getSessionTitleSource()).toBe('copilot-style');
+      expect(sessionMeta?.title).toBe('OAuth Middleware');
+      expect(sessionMeta?.titleSource).toBe('copilot-style');
+      expect(sessionMeta?.provisionalTitle).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('treats a truncated prompt-prefix backend title as an echo', async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-title-truncated-'));
+    const stream = mockStream();
+    const sss = new SerializableSessionStream(stream as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'req-title',
+    });
+    const model = {
+      id: 'gpt-4o-mini',
+      vendor: 'copilot',
+      family: 'gpt-4o-mini',
+      name: 'GPT-4o mini',
+      version: '1',
+      maxInputTokens: 4096,
+      sendRequest: vi.fn(async () => ({
+        text: (async function* () {
+          yield 'Refactor Bridge Title Flow';
+        })(),
+      })),
+    } as unknown as vscode.LanguageModelChat;
+    vi.spyOn(vscode.lm, 'selectChatModels').mockResolvedValue([model]);
+
+    try {
+      await sss.initialize();
+      sss.recordFirstPrompt('refactor bridge title flow to keep raw events inside the bridge boundary');
+      bridge.setSSS(sss);
+
+      await bridge.run((async function* () {
+        yield {
+          type: 'session.updated',
+          properties: { info: { id: 'test-session', title: 'refactor bridge title flow...' } },
+        } as any;
+        yield { type: 'session.idle', properties: { sessionID: 'test-session' } } as any;
+      })(), mockToken());
+      await sss.flush();
+
+      const metaIndex = await readMetaIndex(path.join(getTestSessionDir(tmpDir), 'meta.jsonl'));
+      const sessionMeta = metaIndex.get('session');
+      expect(model.sendRequest).toHaveBeenCalled();
+      expect(bridge.getSessionTitle()).toBe('Refactor Bridge Title Flow');
+      expect(bridge.getSessionTitleSource()).toBe('copilot-style');
+      expect(sessionMeta?.title).toBe('Refactor Bridge Title Flow');
+      expect(sessionMeta?.titleSource).toBe('copilot-style');
+    } finally {
+      vi.restoreAllMocks();
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('persists a non-echo backend session title without invoking VS Code LM', async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-title-backend-'));
+    const stream = mockStream();
+    const sss = new SerializableSessionStream(stream as any, {
+      workspaceRoot: tmpDir,
+      backendName: 'test',
+      sessionId: 'test-session',
+      turnIndex: 0,
+      requestId: 'req-title',
+    });
+    const selectChatModelsSpy = vi.spyOn(vscode.lm, 'selectChatModels').mockResolvedValue([]);
+    selectChatModelsSpy.mockClear();
+
+    try {
+      await sss.initialize();
+      sss.recordFirstPrompt('how to implement oauth middleware');
+      bridge.setSSS(sss);
+
+      await bridge.run((async function* () {
+        yield {
+          type: 'session.updated',
+          properties: { info: { id: 'test-session', title: 'OAuth Middleware' } },
+        } as any;
+        yield { type: 'session.idle', properties: { sessionID: 'test-session' } } as any;
+      })(), mockToken());
+      await sss.flush();
+
+      const metaIndex = await readMetaIndex(path.join(getTestSessionDir(tmpDir), 'meta.jsonl'));
+      const sessionMeta = metaIndex.get('session');
+      expect(selectChatModelsSpy).not.toHaveBeenCalled();
+      expect(bridge.getSessionTitle()).toBe('OAuth Middleware');
+      expect(bridge.getSessionTitleSource()).toBe('backend');
+      expect(sessionMeta?.title).toBe('OAuth Middleware');
+      expect(sessionMeta?.titleSource).toBe('backend');
+    } finally {
+      vi.restoreAllMocks();
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('should complete a full turn with tool + AI text', async () => {
     const stream = mockStream();
     const events = eventStream(fullTurnEvents({}));

@@ -1,8 +1,8 @@
 /**
- * OpenCodeBridge — translates ACP events to SSS push/update calls.
+ * OpenCodeBridge - translates raw OpenCode events to SSP push/update calls.
  *
  * Architecture (v2):
- * - Bridge does NOT touch the VS Code stream directly — SSS owns it
+ * - Bridge does NOT touch the VS Code stream directly; SSS owns it
  * - Bridge only calls sss.push(ssp) / sss.update(id, data)
  * - SubagentManager stays in bridge for scope tracking
  * - Child session events route to sss.subsession(id)
@@ -23,10 +23,17 @@ import type {
   AcpToolState,
 } from '../../acp/types';
 import type { AcpBridge } from '../../acp/backend';
+import type {
+  OpenCodeEvent,
+  OpenCodeStreamEvent,
+  StreamPart,
+  StreamToolState,
+} from './sdk-events';
 import type { SerializableSessionStream } from '../../acp/streaming/session-stream';
 import type { SubsessionStream } from '../../acp/streaming/subsession-stream';
 import type { SessionStreamNode } from '../../acp/streaming/session-stream-node';
 import type { SspStream } from '../../ssp/types';
+import type { SessionTitleSource } from '../../acp/serializable/types';
 import { SubagentManager, formatSubagentProgress, type SubagentScope } from '../../ssp/impl/subagent';
 import { AssistantTextSSP } from '../../ssp/impl/assistant-text';
 import { ReasoningSSP } from '../../ssp/impl/reasoning';
@@ -34,6 +41,8 @@ import { ToolInvocationSSP } from '../../ssp/impl/tool-invocation';
 import { ExternalEditSSP } from '../../ssp/impl/external-edit';
 import { QuestionSSP } from '../../ssp/impl/question';
 import { SessionLifecycleSSP } from '../../ssp/impl/session-lifecycle';
+import { generateSessionTitleWithVsCodeLm } from '../../participant/title-generator';
+import { isPlaceholderSessionTitle } from '../../participant/session-title';
 import {
   ChatQuestion,
   ChatQuestionType,
@@ -161,32 +170,33 @@ interface StreamNodeState {
   deltaText: Map<string, string>;
 }
 
-export class OpenCodeBridge implements AcpBridge {
+export class AcpProtocolBridge implements AcpBridge<AcpEvent> {
   private sss!: SerializableSessionStream;
-  private logger: BridgeLogger = { appendLine: () => {} };
-  private readonly sessionId: string;
+  protected logger: BridgeLogger = { appendLine: () => {} };
+  protected readonly sessionId: string;
 
   // Event state
-  private userMessageId: string | null = null;
-  private partTargets = new Map<string, SessionStreamNode>();
-  private nodeStates = new WeakMap<SessionStreamNode, StreamNodeState>();
-  private sessionTitle: string | undefined;
-  private hadSubagentTasks = false;
-  private pendingChildEvents = new Map<string, AcpEvent[]>();
-  private childSessionHints = new Map<string, string>();
-  private targetLabels = new WeakMap<SessionStreamNode, string>();
-  private externalEditIds = new Set<string>();
+  protected userMessageId: string | null = null;
+  protected partTargets = new Map<string, SessionStreamNode>();
+  protected nodeStates = new WeakMap<SessionStreamNode, StreamNodeState>();
+  protected sessionTitle: string | undefined;
+  protected sessionTitleSource: SessionTitleSource | undefined;
+  protected hadSubagentTasks = false;
+  protected pendingChildEvents = new Map<string, AcpEvent[]>();
+  protected childSessionHints = new Map<string, string>();
+  protected targetLabels = new WeakMap<SessionStreamNode, string>();
+  protected externalEditIds = new Set<string>();
 
   // Subagent management
-  private subagents = new SubagentManager();
+  protected subagents = new SubagentManager();
 
   // Deferred idle
-  private deferredIdle = false;
-  private static readonly DEFERRED_IDLE_TIMEOUT_MS = 120_000;
-  private deferredIdleTimer: ReturnType<typeof setTimeout> | null = null;
+  protected deferredIdle = false;
+  protected static readonly DEFERRED_IDLE_TIMEOUT_MS = 120_000;
+  protected deferredIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
-    private readonly backend: AcpBackend,
+    private readonly backend: AcpBackend<unknown>,
     sessionId: string,
     private readonly directory?: string,
     options?: { sessionId?: string },
@@ -207,9 +217,9 @@ export class OpenCodeBridge implements AcpBridge {
   private log: (msg: string) => void = () => {};
   private logTag(tag: string, msg: string): void { this.log(`[${tag}] ${msg}`); }
 
-  // ════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
   // Event loop
-  // ════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
 
   async run(events: AsyncIterable<AcpEvent>, token: { isCancellationRequested: boolean }): Promise<boolean> {
     try {
@@ -224,9 +234,9 @@ export class OpenCodeBridge implements AcpBridge {
     return !token.isCancellationRequested;
   }
 
-  // ════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
   // Event dispatch
-  // ════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
 
   private async handleEvent(event: AcpEvent): Promise<boolean | undefined> {
     // 1. Check if this is a child/descendant session event
@@ -244,7 +254,7 @@ export class OpenCodeBridge implements AcpBridge {
       case 'part.delta':         this.handlePartDelta(event); break;
       case 'permission.asked':   this.handlePermissionAsked(event); break;
       case 'question.asked':     this.handleQuestionAsked(event); break;
-      case 'session.updated':    this.handleSessionUpdated(event); break;
+      case 'session.updated':    await this.handleSessionUpdated(event); break;
       case 'session.created':    this.handleSessionCreated(event); break;
       case 'session.idle':       return this.handleSessionIdle();
       case 'session.diff':       this.handleSessionDiff(event); break;
@@ -254,9 +264,9 @@ export class OpenCodeBridge implements AcpBridge {
     return false;
   }
 
-  // ════════════════════════════════════════════════════════════════════════
-  // Append-only: text / reasoning deltas → always push
-  // ════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
+  // Append-only: text / reasoning deltas always push
+  // ---------------------------------------------------------------------------
 
   private handlePartDelta(event: AcpPartDeltaEvent): void {
     if (!event.delta) return;
@@ -277,7 +287,7 @@ export class OpenCodeBridge implements AcpBridge {
     this.logTag('route', `part.updated target=${this.describeTarget(target)} captureRootUser=${captureRootUserMessage} part=${this.describePart(part)} eventSession=${event.sessionId ?? '<none>'}`);
     switch (part.type) {
       case 'text': {
-        // Skip if already routed — part.updated fires again at completion
+        // Skip if already routed; part.updated fires again at completion
         // with the full accumulated text; deltas already rendered the content.
         const existingRoute = nodeState.partRoutes.get(part.id);
         if (existingRoute) {
@@ -362,7 +372,7 @@ export class OpenCodeBridge implements AcpBridge {
         break;
       }
       case 'reasoning':
-        // Skip if already routed — same dedup as text (see above)
+        // Skip if already routed; same dedup as text (see above)
         if (nodeState.partRoutes.has(part.id)) {
           this.partTargets.set(part.id, target);
           this.logTag('route', `part.updated duplicate reasoning partID=${part.id} target=${this.describeTarget(target)} action=keep-existing-route`);
@@ -615,9 +625,9 @@ export class OpenCodeBridge implements AcpBridge {
     return state;
   }
 
-  // ════════════════════════════════════════════════════════════════════════
-  // Mutable: tool lifecycle → push (pending) / update (running/completed)
-  // ════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
+  // Mutable: tool lifecycle push/update
+  // ---------------------------------------------------------------------------
 
   private handleToolState(
     part: AcpToolPart,
@@ -644,19 +654,19 @@ export class OpenCodeBridge implements AcpBridge {
     // If permission never comes (auto-approve), create ToolInvocationSSP at completion.
     if (this.isWriteEditTool(part.toolName)) {
       if (this.hasExternalEdit(key, target)) {
-        // ExternalEditSSP exists → external edit path
+        // ExternalEditSSP exists: external edit path
         if (status === 'completed' || status === 'error') {
           this.completeExternalEdit(key, target);
         }
         return;
       }
-      // No ExternalEditSSP yet — keep deferring at pending/running
+      // No ExternalEditSSP yet; keep deferring at pending/running
       if (status === 'pending' || status === 'running') return;
-      // completed/error without permission → fall through to normal tool handling
+      // completed/error without permission: fall through to normal tool handling
     }
 
     if (!target.has(key)) {
-      // Task/subagent → start scope
+      // Task/subagent: start scope
       if (part.toolName === 'task' || part.toolName === 'subagent') {
         this.ensureRootSubagentScope(part, sessionId);
         target.push(new ToolInvocationSSP({
@@ -711,9 +721,9 @@ export class OpenCodeBridge implements AcpBridge {
     }
   }
 
-  // ════════════════════════════════════════════════════════════════════════
-  // Permission → ExternalEditSSP with callbacks
-  // ════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
+  // Permission to ExternalEditSSP with callbacks
+  // ---------------------------------------------------------------------------
 
   private completeExternalEdit(callId: string, target: SessionStreamNode): void {
     target.update(callId, { status: 'completed' });
@@ -758,7 +768,7 @@ export class OpenCodeBridge implements AcpBridge {
       },
       {
         onBaselineCaptured: () => {
-          // Baseline captured → auto-reply permission
+          // Baseline captured: auto-reply permission
           this.backend.permissions.reply(
             event.sessionId,
             event.permissionId,
@@ -773,9 +783,9 @@ export class OpenCodeBridge implements AcpBridge {
     ));
   }
 
-  // ════════════════════════════════════════════════════════════════════════
-  // Question → QuestionSSP with callbacks
-  // ════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
+  // Question to QuestionSSP with callbacks
+  // ---------------------------------------------------------------------------
 
   private handleQuestionAsked(event: AcpQuestionRequestEvent): void {
     this.startQuestion(event, this.sss);
@@ -813,7 +823,7 @@ export class OpenCodeBridge implements AcpBridge {
     ));
   }
 
-  /** Map VS Code questionCarousel result → OpenCode string[][] format */
+  /** Map VS Code questionCarousel result to OpenCode string[][] format */
   private mapQuestionAnswers(
     vscodeRaw: unknown,
     questions: AcpQuestionInfo[],
@@ -847,16 +857,41 @@ export class OpenCodeBridge implements AcpBridge {
     });
   }
 
-  // ════════════════════════════════════════════════════════════════════════
-  // Session lifecycle events → writeMeta
-  // ════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
+  // Session lifecycle events write metadata
+  // ---------------------------------------------------------------------------
 
-  private handleSessionUpdated(event: AcpEvent): void {
+  private async handleSessionUpdated(event: AcpEvent): Promise<void> {
     const e = event as { title?: string };
     if (e.title) {
-      this.sessionTitle = e.title;
-      this.sss.writeMeta({ title: e.title, titleSource: 'backend' });
+      await this.updateSessionTitle(e.title);
     }
+  }
+
+  private async updateSessionTitle(rawTitle: string): Promise<void> {
+    const title = normalizeTitleText(rawTitle);
+    if (!title || isPlaceholderSessionTitle(title)) return;
+
+    const firstPrompt = this.sss.getFirstPrompt();
+    if (firstPrompt && isPromptEchoTitle(firstPrompt, title)) {
+      const generatedTitle = await generateSessionTitleWithVsCodeLm(firstPrompt, this.logger);
+      if (!generatedTitle || isPlaceholderSessionTitle(generatedTitle)) {
+        this.logTag('title', `ignored prompt-echo title="${previewText(title)}"; VS Code LM title unavailable`);
+        return;
+      }
+      this.setSessionTitle(generatedTitle, 'copilot-style');
+      this.logTag('title', `updated prompt-echo title via VS Code LM title="${previewText(generatedTitle)}"`);
+      return;
+    }
+
+    this.setSessionTitle(title, 'backend');
+  }
+
+  private setSessionTitle(title: string, source: SessionTitleSource): void {
+    const persisted = this.sss.updateTitle(title, source, { provisional: false });
+    if (!persisted) return;
+    this.sessionTitle = persisted;
+    this.sessionTitleSource = source;
   }
 
   private handleSessionCreated(event: AcpEvent): void {
@@ -875,9 +910,9 @@ export class OpenCodeBridge implements AcpBridge {
     }
   }
 
-  // ════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
   // Session idle + deferred idle (wait for subagents)
-  // ════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
 
   private handleSessionIdle(): boolean {
     this.sss.writeMeta({ status: 'completed' });
@@ -885,10 +920,10 @@ export class OpenCodeBridge implements AcpBridge {
     if (this.subagents.hasBusyDescendant()) {
       this.deferredIdle = true;
       this.startDeferredIdleTimer();
-      this.logTag('idle', 'deferred — waiting for subagent sessions to complete');
+      this.logTag('idle', 'deferred; waiting for subagent sessions to complete');
       return false;
     }
-    // No busy subagents — clean up and let loop end
+    // No busy subagents; clean up and let loop end
     this.subagents.clear();
     return true;
   }
@@ -896,10 +931,10 @@ export class OpenCodeBridge implements AcpBridge {
   private startDeferredIdleTimer(): void {
     this.clearDeferredIdleTimer();
     this.deferredIdleTimer = setTimeout(() => {
-      this.logTag('idle', `deferred idle timeout (${OpenCodeBridge.DEFERRED_IDLE_TIMEOUT_MS / 1000}s) — stopping`);
+      this.logTag('idle', `deferred idle timeout (${AcpProtocolBridge.DEFERRED_IDLE_TIMEOUT_MS / 1000}s); stopping`);
       this.deferredIdle = false;
       this.subagents.clear();
-    }, OpenCodeBridge.DEFERRED_IDLE_TIMEOUT_MS);
+    }, AcpProtocolBridge.DEFERRED_IDLE_TIMEOUT_MS);
   }
 
   private clearDeferredIdleTimer(): void {
@@ -926,9 +961,9 @@ export class OpenCodeBridge implements AcpBridge {
     return false;
   }
 
-  // ════════════════════════════════════════════════════════════════════════
-  // Child session event routing → subsession
-  // ════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
+  // Child session event routing to subsession
+  // ---------------------------------------------------------------------------
 
   private handleChildSessionEvent(event: AcpEvent, eventSessionId: string): void {
     this.logTag('subagent', `child event start sessionID=${eventSessionId} ${this.describeEvent(event)}`);
@@ -1031,7 +1066,7 @@ export class OpenCodeBridge implements AcpBridge {
       return;
     }
 
-    // Handle tool events from child → route to subsession
+    // Handle tool events from child and route to subsession
     if (event.type === 'part.updated') {
       const part = (event as { part?: { type?: string } }).part;
       if (part?.type === 'tool') {
@@ -1181,9 +1216,9 @@ export class OpenCodeBridge implements AcpBridge {
         }
         return;
       }
-      // No ExternalEditSSP yet — keep deferring at pending/running
+      // No ExternalEditSSP yet; keep deferring at pending/running
       if (childStatus === 'pending' || childStatus === 'running') return;
-      // completed/error without permission → fall through to normal handling
+      // completed/error without permission: fall through to normal handling
     }
     let nestedScope: SubagentScope | undefined;
     if (toolPart.toolName === 'task' || toolPart.toolName === 'subagent') {
@@ -1296,9 +1331,9 @@ export class OpenCodeBridge implements AcpBridge {
     return typeof raw === 'string' && raw.length > 0 ? raw : undefined;
   }
 
-  // ════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
   // Utility
-  // ════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
 
   private isWriteEditTool(toolName: string): boolean {
     return toolName === 'write' || toolName === 'edit';
@@ -1306,6 +1341,7 @@ export class OpenCodeBridge implements AcpBridge {
 
   getUserMessageId(): string | null { return this.userMessageId; }
   getSessionTitle(): string | null { return this.sessionTitle ?? null; }
+  getSessionTitleSource(): SessionTitleSource | null { return this.sessionTitleSource ?? null; }
   getHadSubagentTasks(): boolean { return this.hadSubagentTasks; }
 
   private describeTarget(target: SessionStreamNode): string {
@@ -1369,8 +1405,324 @@ export class OpenCodeBridge implements AcpBridge {
   }
 }
 
+export class OpenCodeBridge extends AcpProtocolBridge implements AcpBridge<OpenCodeStreamEvent | AcpEvent> {
+  async run(events: AsyncIterable<OpenCodeStreamEvent | AcpEvent>, token: { isCancellationRequested: boolean }): Promise<boolean> {
+    async function* projected() {
+      for await (const rawEvent of events) {
+        const acpEvents = isAcpEvent(rawEvent)
+          ? [rawEvent]
+          : projectOpenCodeStreamEvent(rawEvent);
+        for (const event of acpEvents) {
+          yield event;
+        }
+      }
+    }
+
+    return super.run(projected(), token);
+  }
+}
+
 function previewText(text: unknown, maxLen = 80): string {
   if (text === undefined || text === null) return '';
   const normalized = String(text).replace(/\s+/g, ' ').trim();
   return normalized.length > maxLen ? normalized.slice(0, maxLen - 3) + '...' : normalized;
+}
+
+function normalizeTitleText(title: string | undefined): string | undefined {
+  const normalized = title?.replace(/\s+/g, ' ').trim();
+  return normalized || undefined;
+}
+
+function normalizeEchoPrefixText(title: string | undefined): string | undefined {
+  const normalized = normalizeTitleText(title)
+    ?.replace(/(?:\s*(?:\.{3}|\u2026))+$/u, '')
+    .trim();
+  return normalized || undefined;
+}
+
+function isPromptEchoTitle(firstPrompt: string, title: string): boolean {
+  const prompt = normalizeTitleText(firstPrompt);
+  const candidate = normalizeEchoPrefixText(title);
+  return !!prompt && !!candidate && prompt.startsWith(candidate);
+}
+
+function projectOpenCodeStreamEvent(rawEvent: OpenCodeStreamEvent): AcpEvent[] {
+  const event = unwrapOpenCodeStreamEvent(rawEvent);
+  switch (event.type) {
+    case 'server.connected':
+      return [{ type: 'server.connected' }];
+    case 'session.created':
+    case 'session.updated': {
+      const info = (event.properties as { info?: { id?: string; title?: string; parentID?: string } } | undefined)?.info;
+      return [{
+        type: event.type,
+        sessionId: info?.id ?? '',
+        parentId: info?.parentID,
+        title: info?.title,
+      }];
+    }
+    case 'session.deleted': {
+      const info = (event.properties as { info?: { id?: string } } | undefined)?.info;
+      return [{ type: 'session.deleted', sessionId: info?.id ?? '' }];
+    }
+    case 'session.error':
+      return [{
+        type: 'session.error',
+        sessionId: getRawEventSessionId(event) ?? '',
+        error: formatOpenCodeError((event.properties as Record<string, unknown> | undefined)?.error),
+      }];
+    case 'session.idle':
+      return [{ type: 'session.idle', sessionId: event.properties?.sessionID }];
+    case 'session.diff':
+      return [{
+        type: 'session.diff',
+        sessionId: event.properties.sessionID,
+        diffs: event.properties.diff.map(toAcpFileDiff),
+      }];
+    case 'session.status':
+      return [{
+        type: 'session.status',
+        sessionId: event.properties.sessionID,
+        status: event.properties.status as never,
+      }];
+    case 'message.part.updated':
+      return [{
+        type: 'part.updated',
+        sessionId: getRawEventSessionId(event),
+        part: projectStreamPart(event.properties.part),
+        delta: event.properties.delta,
+      }];
+    case 'message.part.delta':
+      return [{
+        type: 'part.delta',
+        partId: event.properties.partID,
+        delta: event.properties.delta,
+        field: event.properties.field,
+        sessionId: getRawEventSessionId(event),
+      }];
+    case 'message.removed':
+      return [{ type: 'session.updated', sessionId: getRawEventSessionId(event) ?? '' }];
+    case 'permission.asked':
+      return [{
+        type: 'permission.asked',
+        permissionId: event.properties.id,
+        sessionId: event.properties.sessionID,
+        permission: event.properties.permission,
+        patterns: event.properties.patterns,
+        metadata: event.properties.metadata,
+        always: event.properties.always,
+        tool: event.properties.tool
+          ? { messageId: event.properties.tool.messageID, callId: event.properties.tool.callID }
+          : undefined,
+      }];
+    case 'permission.replied':
+      return [{
+        type: 'permission.replied',
+        sessionId: event.properties.sessionID,
+        permissionId: event.properties.requestID,
+        response: event.properties.reply,
+      }];
+    case 'question.asked':
+      return [{
+        type: 'question.asked',
+        questionId: event.properties.id,
+        sessionId: event.properties.sessionID,
+        questions: event.properties.questions.map(q => ({
+          question: q.question,
+          header: q.header,
+          options: q.options.map(o => ({ label: o.label, description: o.description })),
+          multiple: q.multiple,
+          custom: q.custom,
+        })),
+        tool: event.properties.tool
+          ? { messageId: event.properties.tool.messageID, callId: event.properties.tool.callID }
+          : undefined,
+      }];
+    case 'question.replied':
+      return [{
+        type: 'question.replied',
+        sessionId: event.properties.sessionID,
+        requestId: event.properties.requestID,
+      }];
+    case 'question.rejected':
+      return [{
+        type: 'question.rejected',
+        sessionId: event.properties.sessionID,
+        requestId: event.properties.requestID,
+      }];
+    default:
+      return [];
+  }
+}
+
+function isAcpEvent(event: OpenCodeStreamEvent | AcpEvent): event is AcpEvent {
+  if ('payload' in event) return false;
+  if ('properties' in event) return false;
+  switch (event.type) {
+    case 'part.updated':
+    case 'part.delta':
+    case 'permission.asked':
+    case 'permission.replied':
+    case 'question.asked':
+    case 'question.replied':
+    case 'question.rejected':
+    case 'session.created':
+    case 'session.updated':
+    case 'session.deleted':
+    case 'session.error':
+    case 'session.idle':
+    case 'session.diff':
+    case 'session.status':
+    case 'server.connected':
+    case 'server.heartbeat':
+      return true;
+    default:
+      return false;
+  }
+}
+
+function unwrapOpenCodeStreamEvent(event: OpenCodeStreamEvent): OpenCodeEvent {
+  return 'payload' in event ? event.payload : event;
+}
+
+function getRawEventSessionId(event: OpenCodeEvent): string | undefined {
+  switch (event.type) {
+    case 'message.part.updated':
+      return event.properties?.part?.sessionID;
+    case 'message.part.delta':
+      return (event.properties as { sessionID?: string }).sessionID;
+    case 'session.created':
+    case 'session.updated':
+    case 'session.deleted':
+      return (event.properties as { info?: { id?: string } }).info?.id;
+    default:
+      return (event.properties as { sessionID?: string } | undefined)?.sessionID;
+  }
+}
+
+function projectStreamPart(part: StreamPart): AcpPartUpdatedEvent['part'] {
+  const base = {
+    id: part.id,
+    messageId: part.messageID,
+    sessionId: part.sessionID,
+  };
+
+  switch (part.type) {
+    case 'text':
+      return {
+        ...base,
+        type: 'text',
+        text: part.text,
+        synthetic: part.synthetic,
+        ignored: part.ignored,
+        metadata: part.metadata,
+      };
+    case 'reasoning':
+      return {
+        ...base,
+        type: 'reasoning',
+        text: part.text,
+      };
+    case 'tool':
+      return {
+        ...base,
+        type: 'tool',
+        toolName: part.tool,
+        callId: part.callID,
+        state: projectToolState(part.state),
+      };
+    case 'step-start':
+    case 'step-finish':
+      return {
+        ...base,
+        type: part.type,
+        reason: part.type === 'step-finish' ? part.reason : undefined,
+        snapshot: part.snapshot,
+      };
+    default:
+      return {
+        ...base,
+        type: 'text',
+        text: '',
+      };
+  }
+}
+
+function projectToolState(state: StreamToolState): AcpToolState {
+  const base: Pick<AcpToolState, 'status' | 'input'> = {
+    status: state.status,
+    input: state.input,
+  };
+
+  switch (state.status) {
+    case 'pending':
+      return { ...base, status: 'pending' };
+    case 'running':
+      return {
+        ...base,
+        status: 'running',
+        title: state.title,
+        metadata: state.metadata,
+        startTime: state.time?.start,
+      };
+    case 'completed':
+      return {
+        ...base,
+        status: 'completed',
+        output: state.output,
+        title: state.title,
+        metadata: state.metadata,
+        startTime: state.time?.start,
+        endTime: state.time?.end,
+      };
+    case 'error':
+      return {
+        ...base,
+        status: 'error',
+        error: state.error,
+        metadata: state.metadata,
+        startTime: state.time?.start,
+        endTime: state.time?.end,
+      };
+  }
+}
+
+interface RawFileDiff {
+  file?: string;
+  patch?: string;
+  additions: number;
+  deletions: number;
+  status?: 'added' | 'deleted' | 'modified';
+}
+
+function toAcpFileDiff(diff: RawFileDiff) {
+  const file = diff.file ?? '';
+  return {
+    file,
+    patch: diff.patch ?? `--- a/${file}\n+++ b/${file}\n`,
+    additions: diff.additions,
+    deletions: diff.deletions,
+    status: diff.status,
+  };
+}
+
+function formatOpenCodeError(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  if (value instanceof Error) return value.message;
+  if (!value || typeof value !== 'object') return undefined;
+
+  const record = value as Record<string, unknown>;
+  const data = record.data;
+  if (data && typeof data === 'object') {
+    const message = (data as Record<string, unknown>).message;
+    if (typeof message === 'string' && message.trim()) return message;
+  }
+  if (typeof record.message === 'string' && record.message.trim()) return record.message;
+  if (typeof record.name === 'string' && record.name.trim()) return record.name;
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }

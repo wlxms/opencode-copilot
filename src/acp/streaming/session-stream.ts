@@ -13,7 +13,7 @@ import { ensureSessionDir } from './workspace-setup';
 import { SubsessionStream } from './subsession-stream';
 import { SessionStreamNodeBase } from './session-stream-node';
 import type { SessionStreamSchedulingMode } from './session-stream-node';
-import type { FileSnapshotRecord } from '../serializable/types';
+import type { FileSnapshotRecord, SessionTitleSource } from '../serializable/types';
 import type { SspStream } from '../../ssp/types';
 
 export interface SSSConfig {
@@ -23,12 +23,24 @@ export interface SSSConfig {
   turnIndex: number;
   requestId: string;
   schedulingMode?: SessionStreamSchedulingMode;
+  onTitleChanged?: (update: SSSTitleUpdate) => void;
+}
+
+export interface SSSTitleUpdate {
+  sessionId: string;
+  title: string;
+  source: SessionTitleSource;
+  provisional: boolean;
 }
 
 export class SerializableSessionStream extends SessionStreamNodeBase<SubsessionStream> {
   private readonly rootStream: vscode.ChatResponseStream;
   private readonly rootConfig: SSSConfig;
   private headerWritten = false;
+  private firstPrompt: string | undefined;
+  private currentTitle: string | undefined;
+  private currentTitleSource: SessionTitleSource | undefined;
+  private currentTitleProvisional: boolean | undefined;
 
   constructor(stream: vscode.ChatResponseStream, config: SSSConfig) {
     const schedulingMode = config.schedulingMode ?? getConfiguredSchedulingMode();
@@ -63,6 +75,50 @@ export class SerializableSessionStream extends SessionStreamNodeBase<SubsessionS
   writeMeta(patch: Record<string, unknown>): void {
     if (!this.isActive) return;
     this.appendMeta({ type: 'session', ...patch });
+  }
+
+  recordFirstPrompt(prompt: string | undefined): void {
+    const normalized = prompt?.replace(/\s+/g, ' ').trim();
+    if (!normalized || this.firstPrompt) return;
+    this.firstPrompt = normalized;
+  }
+
+  getFirstPrompt(): string | undefined {
+    return this.firstPrompt;
+  }
+
+  updateTitle(
+    title: string,
+    source: SessionTitleSource,
+    options?: { provisional?: boolean },
+  ): string | undefined {
+    const normalized = title.replace(/\s+/g, ' ').trim();
+    if (!normalized) return undefined;
+    const provisional = options?.provisional ?? false;
+
+    this.writeMeta({
+      title: normalized,
+      titleSource: source,
+      titleUpdatedAt: new Date().toISOString(),
+      provisionalTitle: provisional,
+    });
+
+    const changed = this.currentTitle !== normalized
+      || this.currentTitleSource !== source
+      || this.currentTitleProvisional !== provisional;
+    this.currentTitle = normalized;
+    this.currentTitleSource = source;
+    this.currentTitleProvisional = provisional;
+
+    if (changed) {
+      this.rootConfig.onTitleChanged?.({
+        sessionId: this.rootConfig.sessionId,
+        title: normalized,
+        source,
+        provisional,
+      });
+    }
+    return normalized;
   }
 
   serializeSnapshot(snapshot: FileSnapshotRecord): void {

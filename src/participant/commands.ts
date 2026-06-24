@@ -12,6 +12,13 @@ import type {
 import { ChatQuestion, ChatQuestionType } from '../types/vscode-proposed-additions';
 import { ErrorMessages } from './errors';
 import { ensureServer } from './handler';
+import type {
+  MessagePartDeltaEvent,
+  OpenCodeEvent,
+  OpenCodeStreamEvent,
+  PermissionAskedEvent,
+  SessionDiffEvent,
+} from '../backends/opencode/sdk-events';
 
 // Minimal inline tracker for diagnostic commands (replaces deleted ExternalEditTracker)
 class DiagnosticEditTracker {
@@ -36,6 +43,23 @@ class DiagnosticEditTracker {
     return e.onDidComplete;
   }
   dispose() { for (const e of this._edits.values()) e.resolve(); this._edits.clear(); }
+}
+
+function unwrapOpenCodeEvent(rawEvent: unknown): OpenCodeEvent | undefined {
+  if (!rawEvent || typeof rawEvent !== 'object') return undefined;
+  const maybeEnvelope = rawEvent as Partial<OpenCodeStreamEvent> & { payload?: OpenCodeEvent };
+  if (maybeEnvelope.payload) return maybeEnvelope.payload;
+  if (typeof (rawEvent as { type?: unknown }).type === 'string') {
+    return rawEvent as OpenCodeEvent;
+  }
+  return undefined;
+}
+
+async function* readOpenCodeEvents(stream: AsyncIterable<unknown>): AsyncIterable<OpenCodeEvent> {
+  for await (const rawEvent of stream) {
+    const event = unwrapOpenCodeEvent(rawEvent);
+    if (event) yield event;
+  }
 }
 
 export async function routeCommand(
@@ -638,17 +662,18 @@ async function handleTestExternalEditE2ECommand(
   let editCallID = '';
 
   try {
-    for await (const evt of eventStream.stream) {
+    for await (const evt of readOpenCodeEvents(eventStream.stream)) {
       if (token.isCancellationRequested) {break;}
       eventCount++;
       const evtType = evt.type;
 
       if (evtType === 'permission.asked') {
+        const properties = (evt as PermissionAskedEvent).properties;
         permissionAskedCount++;
-        const callID = evt.tool?.callId ?? '';
-        const filepath = evt.metadata?.filepath ?? '';
+        const callID = properties.tool?.callID ?? '';
+        const filepath = properties.metadata?.filepath ?? '';
         stream.markdown(
-          `[${eventCount}] 🔐 permission.asked id=${evt.permissionId ?? '?'} ` +
+          `[${eventCount}] 🔐 permission.asked id=${properties.id ?? '?'} ` +
           `callID=${callID || '(empty)'} ` +
           `filepath=${filepath || '(empty)'}\n`,
         );
@@ -664,9 +689,9 @@ async function handleTestExternalEditE2ECommand(
               stream.markdown(`     ❌ trackEdit error: ${err}\n`);
             }),
             (async () => {
-              if (evt.sessionId && evt.permissionId) {
+              if (properties.sessionID && properties.id) {
                 try {
-                  await state.backend.permissions.reply(evt.sessionId, evt.permissionId, 'once', directory);
+                  await state.backend.permissions.reply(properties.sessionID, properties.id, 'once', directory);
                   stream.markdown(`     ✅ Replied "once"\n`);
                 } catch (err) {
                   stream.markdown(`     ❌ Reply failed: ${err}\n`);
@@ -674,22 +699,22 @@ async function handleTestExternalEditE2ECommand(
               }
             })(),
           ]);
-        } else if (evt.sessionId && evt.permissionId) {
+        } else if (properties.sessionID && properties.id) {
           // Non-matching filepath — just reply "once"
           try {
-            await state.backend.permissions.reply(evt.sessionId, evt.permissionId, 'once', directory);
+            await state.backend.permissions.reply(properties.sessionID, properties.id, 'once', directory);
             stream.markdown(`     ✅ Replied "once"\n`);
           } catch (err) {
             stream.markdown(`     ❌ Reply failed: ${err}\n`);
           }
         }
-      } else if (evtType === 'part.updated') {
-        const part = evt.part;
+      } else if (evtType === 'message.part.updated') {
+        const part = evt.properties.part;
         if (part?.type === 'tool' && part?.state?.status === 'completed') {
           toolCompletedCount++;
-          const toolCallID = part.callId ?? part.id ?? '';
+          const toolCallID = part.callID ?? part.id ?? '';
           stream.markdown(
-            `[${eventCount}] 🔧 tool completed: ${part.toolName ?? '?'} callID=${toolCallID}\n`,
+            `[${eventCount}] 🔧 tool completed: ${part.tool ?? '?'} callID=${toolCallID}\n`,
           );
           // completeEdit when the matched tool finishes
           if (baselineCaptured && !editComplete && editCallID && toolCallID === editCallID) {
@@ -704,7 +729,7 @@ async function handleTestExternalEditE2ECommand(
           }
         } else if (part?.type === 'tool' && part?.state?.status) {
           stream.markdown(
-            `[${eventCount}] 🔧 tool ${part.state.status}: ${part.toolName ?? '?'}\n`,
+            `[${eventCount}] 🔧 tool ${part.state.status}: ${part.tool ?? '?'}\n`,
           );
         }
       } else if (evtType === 'session.idle') {
@@ -1652,7 +1677,7 @@ async function handleTestStreamLatencyCommand(
     });
 
     const collectPromise = (async () => {
-      for await (const event of eventStream.stream) {
+      for await (const event of readOpenCodeEvents(eventStream.stream)) {
         if (token.isCancellationRequested) {break;}
 
         const now = perfNow();
@@ -1663,9 +1688,9 @@ async function handleTestStreamLatencyCommand(
         allEvents.push({ ts: now, type: eventType });
 
         // Track deltas (the streaming tokens)
-        if (event.type === 'part.delta') {
-          const deltaEvent = event as { partId: string; delta: string };
-          const deltaText = deltaEvent.delta ?? '';
+        if (event.type === 'message.part.delta') {
+          const deltaEvent = event as MessagePartDeltaEvent;
+          const deltaText = deltaEvent.properties.delta ?? '';
           const gapMs = lastDeltaTs > 0 ? now - lastDeltaTs : 0;
 
           if (firstDeltaTs === 0) {
@@ -1683,7 +1708,7 @@ async function handleTestStreamLatencyCommand(
 
           // Stream thinking content in real-time
           if (hasThinking && extendedStream.thinkingProgress) {
-            extendedStream.thinkingProgress({ text: deltaText, id: deltaEvent.partId });
+            extendedStream.thinkingProgress({ text: deltaText, id: deltaEvent.properties.partID });
           }
 
           lastDeltaTs = now;

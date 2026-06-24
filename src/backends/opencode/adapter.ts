@@ -1,5 +1,5 @@
 /**
- * OpenCode backend adapter — concrete AcpBackend implementation.
+ * OpenCode backend adapter - concrete AcpBackend implementation.
  *
  * Maps every ACP operation to the OpenCode SDK, reusing
  * OpenCodeServerManager for lifecycle and GlobalEventBroker
@@ -30,47 +30,13 @@ import type {
   AcpFileAttachment,
   AcpResult,
   AcpPermissionResponse,
-  AcpEvent,
   AcpMessageHistory,
   AcpHistoryMessage,
 } from '../../acp/types';
-import { normalizeStreamEvent } from './events';
-import type { OpenCodeEventStream } from './sdk-events';
+import type { OpenCodeStreamEvent } from './sdk-events';
 import type { OpenCodeClient, SdkAgentData } from './sdk-types';
 import { OpenCodeBridge } from './opencode-bridge';
 import { OpenCodeSettingsProvider } from './settings';
-
-// ===========================================================================
-// AcpEventStream implementation wrapping OpenCodeEventStream
-// ===========================================================================
-
-class NormalizingEventStream implements AcpEventStream {
-  constructor(private readonly inner: OpenCodeEventStream) {}
-
-  readonly stream: AsyncIterable<AcpEvent> = {
-    [Symbol.asyncIterator]: (): AsyncIterator<AcpEvent> => {
-      const innerIter = this.inner.stream[Symbol.asyncIterator]();
-      let buffer: AcpEvent[] = [];
-
-      const next = async (): Promise<IteratorResult<AcpEvent>> => {
-        while (buffer.length > 0) {
-          const ev = buffer.shift()!;
-          return { value: ev, done: false };
-        }
-
-        const result = await innerIter.next();
-        if (result.done) {
-          return { value: undefined, done: true };
-        }
-
-        buffer = normalizeStreamEvent(result.value);
-        return next();
-      };
-
-      return { next };
-    },
-  };
-}
 
 // ===========================================================================
 // Helpers
@@ -130,7 +96,7 @@ function formatResultError(value: unknown, fallback: string): string {
 // Adapter
 // ===========================================================================
 
-export class OpenCodeBackend implements AcpBackend {
+export class OpenCodeBackend implements AcpBackend<OpenCodeStreamEvent> {
   readonly name = 'opencode';
 
   private readonly serverManager = new OpenCodeServerManager();
@@ -179,7 +145,7 @@ export class OpenCodeBackend implements AcpBackend {
   }
 
   /** @inheritdoc */
-  createBridge(sessionId: string, directory?: string): AcpBridge {
+  createBridge(sessionId: string, directory?: string): AcpBridge<OpenCodeStreamEvent> {
     return new OpenCodeBridge(this, sessionId, directory);
   }
 
@@ -398,7 +364,9 @@ export class OpenCodeBackend implements AcpBackend {
           if (item.info.role === 'user') {
             // UserMessage: text is in the parts (type='text')
             const text = item.parts
-              .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+              .filter((p): p is typeof p & { type: 'text'; text: string } =>
+                p.type === 'text' && typeof (p as { text?: unknown }).text === 'string'
+              )
               .map(p => p.text)
               .join('\n');
             mapped.push({
@@ -560,24 +528,22 @@ export class OpenCodeBackend implements AcpBackend {
   };
 
   // =======================================================================
-  // Settings provider — declarative backend-specific settings UI
+  // Settings provider - declarative backend-specific settings UI
   // =======================================================================
 
   readonly settingsProvider = new OpenCodeSettingsProvider(this.config);
 
   // =======================================================================
-  // Events — delegates to GlobalEventBroker + normalisation
+  // Events - delegates raw OpenCode stream multiplexing to GlobalEventBroker
   // =======================================================================
 
-  readonly events: AcpEventOperations = {
-    openSessionStream: (sessionId: string): AcpEventStream => {
-      const rawStream = this.eventBroker.openSessionStream(sessionId);
-      return new NormalizingEventStream(rawStream);
+  readonly events: AcpEventOperations<OpenCodeStreamEvent> = {
+    openSessionStream: (sessionId: string): AcpEventStream<OpenCodeStreamEvent> => {
+      return this.eventBroker.openSessionStream(sessionId);
     },
 
-    openGlobalStream: async (): Promise<AcpEventStream> => {
-      const rawStream = await this.sdk.global.event();
-      return new NormalizingEventStream(rawStream);
+    openGlobalStream: async (): Promise<AcpEventStream<OpenCodeStreamEvent>> => {
+      return await this.sdk.global.event();
     },
 
     closeSessionStream: (sessionId: string): void => {
@@ -661,7 +627,7 @@ export class OpenCodeBackend implements AcpBackend {
   };
 
   // =======================================================================
-  // Auth — delegates to v2 SDK auth.set / auth.remove
+  // Auth - delegates to v2 SDK auth.set / auth.remove
   // =======================================================================
 
   readonly auth: AcpAuthOperations = {
