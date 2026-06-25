@@ -1,7 +1,7 @@
 /**
  * Status bar controller — single item, markdown table tooltip.
  *
- * Status bar: $(hubot) (icon only)
+ * Status bar: $(acpilot-a) (icon only)
  * Hover: markdown table | Backend | Agent | Model |
  * Click: acpilot.openSettings
  */
@@ -22,7 +22,7 @@ export class StatusBarManager implements vscode.Disposable {
       vscode.StatusBarAlignment.Right,
       100,
     );
-    this.item.text = '$(hubot)';
+    this.item.text = '$(acpilot-a)';
     this.item.command = 'acpilot.openSettings';
     this.item.name = 'ACP';
     this.item.show();
