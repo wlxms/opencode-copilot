@@ -207,7 +207,7 @@ async function fileHasContent(filePath: string): Promise<boolean> {
 function getConfiguredSchedulingMode(): SessionStreamSchedulingMode {
   try {
     const raw = vscode.workspace
-      .getConfiguration('opencode')
+      .getConfiguration('acpilot')
       .get<string>('experimental.streamSchedulingMode', 'tool-first');
     return isSchedulingMode(raw) ? raw : 'tool-first';
   } catch {

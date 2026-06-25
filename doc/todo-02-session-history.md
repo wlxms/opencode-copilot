@@ -34,7 +34,7 @@
 ],
 "contributes": {
     "chatSessions": [{
-        "type": "opencode-copilot.opencode",
+        "type": "acpilot.opencode",
         "name": "opencode",
         "displayName": "OpenCode",
         "description": "AI coding agent powered by OpenCode",
@@ -68,7 +68,7 @@ interface ChatSessionContentProvider {
 - `resource` 参数是一个 URI，包含 session ID（在 `path` 中）
 - `context.inputState` 包含用户选择的选项（model、agent 等）
 - 当用户选择 session target 或切换已有 session 时，VS Code 调用此方法
-- 当前 scheme 是 `opencode-copilot.opencode`（定义见 `OPENCODE_SESSION_SCHEME`）
+- 当前 scheme 是 `acpilot.opencode`（定义见 `OPENCODE_SESSION_SCHEME`）
 
 ### 2.3 ChatSession 返回类型
 
@@ -906,9 +906,9 @@ private async fetchAndBuildHistory(
 ```typescript
 // VS Code 传给 provideChatSessionContent 的 URI 示例
 // 方案 A: /{sessionID}
-//   示例: opencode-copilot.opencode:/abc123
+//   示例: acpilot.opencode:/abc123
 // 方案 B: /chat/{sessionID}
-//   示例: opencode-copilot.opencode:/chat/abc123
+//   示例: acpilot.opencode:/chat/abc123
 
 // 解析方式
 const sessionId = resource.path

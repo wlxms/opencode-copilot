@@ -1,12 +1,12 @@
 {
-  "name": "opencode-copilot",
-  "displayName": "OpenCode Copilot",
+  "name": "acpilot",
+  "displayName": "ACPilot",
   "version": "0.5.0",
-  "description": "AI coding assistant powered by OpenCode",
+  "description": "ACP coding assistant powered by ACP backends",
   "publisher": "wlxms",
   "repository": {
     "type": "git",
-    "url": "https://github.com/wlxms/opencode-copilot.git"
+    "url": "https://github.com/wlxms/acpilot.git"
   },
   "engines": {
     "vscode": "^1.125.0"
@@ -35,7 +35,7 @@
     },
     "commands": [
       {
-        "command": "opencode.openSettings",
+        "command": "acpilot.openSettings",
         "title": "ACP: Open Settings",
         "category": "ACP"
       }
@@ -44,38 +44,38 @@
       {
         "vendor": "opencode-cli",
         "displayName": "OpenCode CLI",
-        "managementCommand": "opencode.openSettings"
+        "managementCommand": "acpilot.openSettings"
       },
       {
         "vendor": "opencode-zen",
         "displayName": "OpenCode Zen",
-        "managementCommand": "opencode.openSettings"
+        "managementCommand": "acpilot.openSettings"
       }
     ],
     "configuration": {
-      "title": "OpenCode",
+      "title": "ACPilot",
       "properties": {
-        "opencode.experimental.sessionProvider": {
+        "acpilot.experimental.sessionProvider": {
           "type": "boolean",
           "default": false,
           "description": "Enable the experimental ACP-compatible VS Code chat session provider surface when the runtime exposes the required proposed API."
         },
-        "opencode.experimental.acpBackendModelSupport": {
+        "acpilot.experimental.acpBackendModelSupport": {
           "type": "boolean",
           "default": true,
           "description": "When enabled, ACP backend-specific models (e.g. OpenCode Zen/Go) are registered with sessionOnly=false so they appear in all Copilot session targets. Non-specific models get sessionOnly=true (opencode target only). When disabled, all models get sessionOnly=true."
         },
-        "opencode.experimental.acpModelBridge": {
+        "acpilot.experimental.acpModelBridge": {
           "type": "boolean",
           "default": false,
           "description": "[Experimental] Enable ACP Model Bridge — bridges ACP backend models into Copilot's native model picker with full vendor isolation. (Not yet implemented)"
         },
-        "opencode.experimental.checkpointReplay": {
+        "acpilot.experimental.checkpointReplay": {
           "type": "boolean",
           "default": true,
           "description": "Replay restored session file checkpoints through VS Code chat external edits when available, preserving ordinary workspace edits on conflicts."
         },
-        "opencode.experimental.streamSchedulingMode": {
+        "acpilot.experimental.streamSchedulingMode": {
           "type": "string",
           "default": "tool-first",
           "enum": [
@@ -94,7 +94,7 @@
     },
     "chatSessions": [
       {
-        "type": "opencode-copilot.opencode",
+        "type": "acpilot.opencode",
         "name": "opencode",
         "displayName": "OpenCode",
         "description": "AI coding agent powered by OpenCode",

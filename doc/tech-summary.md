@@ -1,8 +1,8 @@
-# OpenCode Copilot — VSCode 扩展技术总结
+# ACPilot — VSCode 扩展技术总结
 
 ## 概述
 
-`opencode-copilot` 是一个 VSCode 扩展，将 OpenCode AI 编码助手集成到 Copilot Chat 中。通过在聊天输入框中使用 `@opencode`，用户可以无缝地与 OpenCode 服务器交互，获得完整的 AI 思考过程、工具调用和流式响应。
+`acpilot` 是一个 VSCode 扩展，将 OpenCode AI 编码助手集成到 Copilot Chat 中。通过在聊天输入框中使用 `@opencode`，用户可以无缝地与 OpenCode 服务器交互，获得完整的 AI 思考过程、工具调用和流式响应。
 
 ---
 
@@ -128,7 +128,7 @@ src/
 // package.json
 "contributes": {
   "chatParticipants": [{
-    "id": "opencode-copilot.opencode",
+    "id": "acpilot.opencode",
     "name": "opencode",
     "isSticky": true,
     "commands": [{"name": "new"}, {"name": "help"}, {"name": "model"}]
@@ -137,7 +137,7 @@ src/
 
 // extension.ts
 const participant = vscode.chat.createChatParticipant(
-  'opencode-copilot.opencode',
+  'acpilot.opencode',
   createParticipantHandler(state),
 );
 ```

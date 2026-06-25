@@ -1,4 +1,4 @@
-# OpenCode Copilot - Session Target TODO
+# ACPilot - Session Target TODO
 
 ## High Priority
 

@@ -554,7 +554,7 @@ describe('createParticipantHandler', () => {
 
   it('should reuse restored target session when state exists under sessionResource', async () => {
     backendStatus = 'running';
-    const resourceKey = 'opencode-copilot.opencode:///session-existing';
+    const resourceKey = 'acpilot.opencode:///session-existing';
     const restoredState = {
       backendSessionId: 'existing-session',
       turnMap: [],
@@ -609,8 +609,8 @@ describe('createParticipantHandler', () => {
     await handler(
       createRequest({
         prompt: 'provider start',
-        sessionId: 'opencode-copilot.opencode:/untitled-123',
-        sessionResource: { toString: () => 'opencode-copilot.opencode:/untitled-123', fsPath: '/test/chat' } as vscode.Uri,
+        sessionId: 'acpilot.opencode:/untitled-123',
+        sessionResource: { toString: () => 'acpilot.opencode:/untitled-123', fsPath: '/test/chat' } as vscode.Uri,
       }),
       { history: [] },
       stream,
@@ -1288,7 +1288,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     const handler = createParticipantHandler(state);
 
     backendStatus = 'running';
-    state.sessionMap.set('opencode-copilot.opencode:/ses-title-provider', {
+    state.sessionMap.set('acpilot.opencode:/ses-title-provider', {
       backendSessionId: 'ses-title-provider',
       turnMap: [],
       title: 'how to implement oauth middleware',
@@ -1324,7 +1324,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     const result = await handler(
       createRequest({
         prompt: 'how to implement oauth middleware',
-        sessionId: 'opencode-copilot.opencode:/ses-title-provider',
+        sessionId: 'acpilot.opencode:/ses-title-provider',
       }),
       { history: [] },
       stream,
@@ -1332,7 +1332,7 @@ const reqTurn = new vscode.ChatRequestTurn('initial', undefined);
     );
 
     expect(result!.metadata).toHaveProperty('sessionId', 'ses-title-provider');
-    const chatState = state.sessionMap.get('opencode-copilot.opencode:/ses-title-provider');
+    const chatState = state.sessionMap.get('acpilot.opencode:/ses-title-provider');
     expect(chatState?.title).toBe('OAuth Middleware');
     expect(chatState?.titleSource).toBe('copilot-style');
     expect(chatState?.provisionalTitle).toBe(false);

@@ -229,7 +229,7 @@ describe('createSessionContentProvider', () => {
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
     );
 
-    expect(item.resource.scheme).toBe('opencode-copilot.opencode');
+    expect(item.resource.scheme).toBe('acpilot.opencode');
     expect(item.resource.path).toBe('/ses_new_real');
     expect(item.label).toBe('Fix restored edits');
     expect(controller!.items.get(item.resource)).toBe(item);
@@ -438,11 +438,11 @@ describe('createSessionContentProvider', () => {
     );
 
     const session = await provider.provideChatSessionContent(
-      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      vscode.Uri.parse('acpilot.opencode:/ses_restore'),
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
       { inputState: {} as vscode.ChatSessionInputState },
     );
-    const restoredResourceKey = vscode.Uri.parse('opencode-copilot.opencode:/ses_restore').toString();
+    const restoredResourceKey = vscode.Uri.parse('acpilot.opencode:/ses_restore').toString();
 
     expect(state.sessionStore.getTurnsPath).toHaveBeenCalledWith('ses_restore');
     expect(session.title).toBe('Need help with session titles');
@@ -484,7 +484,7 @@ describe('createSessionContentProvider', () => {
     );
 
     const session = await provider.provideChatSessionContent(
-      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      vscode.Uri.parse('acpilot.opencode:/ses_restore'),
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
       { inputState: {} as vscode.ChatSessionInputState },
     );
@@ -546,7 +546,7 @@ describe('createSessionContentProvider', () => {
     );
 
     const session = await provider.provideChatSessionContent(
-      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      vscode.Uri.parse('acpilot.opencode:/ses_restore'),
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
       { inputState: {} as vscode.ChatSessionInputState },
     );
@@ -637,7 +637,7 @@ describe('createSessionContentProvider', () => {
     );
 
     const session = await provider.provideChatSessionContent(
-      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      vscode.Uri.parse('acpilot.opencode:/ses_restore'),
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
       { inputState: {} as vscode.ChatSessionInputState },
     );
@@ -733,7 +733,7 @@ describe('createSessionContentProvider', () => {
     );
 
     const session = await provider.provideChatSessionContent(
-      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      vscode.Uri.parse('acpilot.opencode:/ses_restore'),
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
       { inputState: {} as vscode.ChatSessionInputState },
     );
@@ -862,7 +862,7 @@ describe('createSessionContentProvider', () => {
     );
 
     const session = await provider.provideChatSessionContent(
-      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      vscode.Uri.parse('acpilot.opencode:/ses_restore'),
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
       { inputState: {} as vscode.ChatSessionInputState },
     );
@@ -887,7 +887,7 @@ describe('createSessionContentProvider', () => {
     );
 
     await provider.provideChatSessionContent(
-      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      vscode.Uri.parse('acpilot.opencode:/ses_restore'),
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
       { inputState: {} as vscode.ChatSessionInputState },
     );
@@ -973,7 +973,7 @@ describe('createSessionContentProvider', () => {
     );
 
     const session = await provider.provideChatSessionContent(
-      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      vscode.Uri.parse('acpilot.opencode:/ses_restore'),
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
       { inputState: {} as vscode.ChatSessionInputState },
     );
@@ -1047,7 +1047,7 @@ describe('createSessionContentProvider', () => {
     );
 
     const session = await provider.provideChatSessionContent(
-      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      vscode.Uri.parse('acpilot.opencode:/ses_restore'),
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
       { inputState: {} as vscode.ChatSessionInputState },
     );
@@ -1122,7 +1122,7 @@ describe('createSessionContentProvider', () => {
     );
 
     const session = await provider.provideChatSessionContent(
-      vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+      vscode.Uri.parse('acpilot.opencode:/ses_restore'),
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
       { inputState: {} as vscode.ChatSessionInputState },
     );
@@ -1141,7 +1141,7 @@ describe('createSessionContentProvider', () => {
       title: 'Live Session',
       createdAt: new Date('2026-06-05T00:00:00.000Z'),
     };
-    const liveKey = 'opencode-copilot.opencode:/untitled-live';
+    const liveKey = 'acpilot.opencode:/untitled-live';
     state.sessions.set(liveKey, liveState);
     state.backend.sessions.get = vi.fn(async () => ({
       data: { id: 'ses_live', title: 'Live Session', createdAt: liveState.createdAt },
@@ -1179,7 +1179,7 @@ describe('createSessionContentProvider', () => {
       state,
       { subscriptions: [] } as unknown as vscode.ExtensionContext,
     );
-    const resource = vscode.Uri.parse('opencode-copilot.opencode:/ses_live');
+    const resource = vscode.Uri.parse('acpilot.opencode:/ses_live');
     const session = await provider.provideChatSessionContent(
       resource,
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
@@ -1217,7 +1217,7 @@ describe('createSessionContentProvider', () => {
     );
 
     const session = await provider.provideChatSessionContent(
-      vscode.Uri.parse('opencode-copilot.opencode:/ses_placeholder'),
+      vscode.Uri.parse('acpilot.opencode:/ses_placeholder'),
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
       { inputState: {} as vscode.ChatSessionInputState },
     );
@@ -1239,7 +1239,7 @@ describe('createSessionContentProvider', () => {
     );
 
     const session = await provider.provideChatSessionContent(
-      vscode.Uri.parse('opencode-copilot.opencode:/ses_abc12345'),
+      vscode.Uri.parse('acpilot.opencode:/ses_abc12345'),
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
       { inputState: {} as vscode.ChatSessionInputState },
     );
@@ -1253,7 +1253,7 @@ describe('createSessionContentProvider', () => {
     ]);
 
     // Original tab entry with derived title
-    state.sessions.set('opencode-copilot.opencode:/untitled-1', {
+    state.sessions.set('acpilot.opencode:/untitled-1', {
       backendSessionId: 'ses_dup',
       turnMap: [],
       title: 'Derived From Prompt',
@@ -1261,7 +1261,7 @@ describe('createSessionContentProvider', () => {
     });
 
     // Session list click created a duplicate entry with placeholder title
-    state.sessions.set('opencode-copilot.opencode:/ses_dup', {
+    state.sessions.set('acpilot.opencode:/ses_dup', {
       backendSessionId: 'ses_dup',
       turnMap: [],
       title: 'New OpenCode Session',
@@ -1288,7 +1288,7 @@ describe('createSessionContentProvider', () => {
       { id: 'ses_renamed', title: 'New OpenCode Session', createdAt: '2026-05-28T01:00:00.000Z', backendName: 'opencode' },
     ]);
 
-    state.sessions.set('opencode-copilot.opencode:/untitled-rename', {
+    state.sessions.set('acpilot.opencode:/untitled-rename', {
       backendSessionId: 'ses_renamed',
       turnMap: [],
       title: 'Runtime Rename Title',
@@ -1312,7 +1312,7 @@ describe('createSessionContentProvider', () => {
 
   it('restoring existing session reuses non-placeholder title from another sessionMap entry', async () => {
     // Pre-populate sessionMap with the original entry that has the derived title
-    state.sessions.set('opencode-copilot.opencode:/untitled-1', {
+    state.sessions.set('acpilot.opencode:/untitled-1', {
       backendSessionId: 'ses_existing',
       turnMap: [],
       title: 'My original prompt title',
@@ -1333,12 +1333,12 @@ describe('createSessionContentProvider', () => {
     );
 
     const session = await provider.provideChatSessionContent(
-      vscode.Uri.parse('opencode-copilot.opencode:/ses_existing'),
+      vscode.Uri.parse('acpilot.opencode:/ses_existing'),
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
       { inputState: {} as vscode.ChatSessionInputState },
     );
 
-    const newKey = vscode.Uri.parse('opencode-copilot.opencode:/ses_existing').toString();
+    const newKey = vscode.Uri.parse('acpilot.opencode:/ses_existing').toString();
     expect(state.sessions.get(newKey)?.title).toBe('My original prompt title');
     expect(session.title).toBe('My original prompt title');
   });

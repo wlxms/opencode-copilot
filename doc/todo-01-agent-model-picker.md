@@ -159,13 +159,13 @@ provider.optionGroups = [
 
 // 3. 创建 ChatParticipant
 const participant = vscode.chat.createChatParticipant(
-    'opencode-copilot.opencode',
+    'acpilot.opencode',
     handler,
 );
 
 // 4. 注册 Session Content Provider
 vscode.chat.registerChatSessionContentProvider(
-    OPENCODE_SESSION_SCHEME,          // 'opencode-copilot.opencode'
+    OPENCODE_SESSION_SCHEME,          // 'acpilot.opencode'
     provider,                         // ChatSessionContentProvider
     participant,                      // ChatParticipant
     { supportsChangingSessionType: true }

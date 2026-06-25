@@ -4,7 +4,7 @@
  * Registers backend models via `vscode.lm.registerLanguageModelChatProvider` so
  * that VS Code's model picker (and any extension using `vscode.lm.selectChatModels`)
  * can discover and target OpenCode models for the
- * `opencode-copilot.opencode` session type.
+ * `acpilot.opencode` session type.
  *
  * == Architecture ==
  * ```
@@ -130,7 +130,7 @@ export function createLanguageModelChatProvider(
             capabilities: r.capabilities,
             isUserSelectable: true,
             isDefault: i === 0 ? true : undefined,
-            targetChatSessionType: r.sessionOnly ? 'opencode-copilot.opencode' : undefined,
+            targetChatSessionType: r.sessionOnly ? 'acpilot.opencode' : undefined,
             providerID: routeProviderID,
           }));
 

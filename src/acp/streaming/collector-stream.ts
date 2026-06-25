@@ -164,7 +164,7 @@ export class CollectorStream {
       ) => vscode.ChatResponseTurn2;
     }).ChatResponseTurn2;
     if (Turn2Ctor) {
-      return new Turn2Ctor(this._parts, result, 'opencode-copilot.opencode');
+      return new Turn2Ctor(this._parts, result, 'acpilot.opencode');
     }
 
     const TurnCtor = vscode.ChatResponseTurn as unknown as new (
@@ -173,7 +173,7 @@ export class CollectorStream {
       participant: string,
       command?: string,
     ) => vscode.ChatResponseTurn;
-    return new TurnCtor(this._parts, result, 'opencode-copilot.opencode');
+    return new TurnCtor(this._parts, result, 'acpilot.opencode');
   }
 
   /** Clear all captured parts. */

@@ -3,7 +3,7 @@ import type { AcpAgent, AcpModel, AcpConfig, AcpProviderConfig, BackendSettingsD
 import './backends/opencode/index'; // side-effect: registers 'opencode' backend
 import { createBackend } from './acp/backend-registry';
 import { createParticipantHandler } from './participant/handler';
-import { createSessionContentProvider, OPENCODE_SESSION_SCHEME } from './surfaces/vscode/experimental-session';
+import { createSessionContentProvider, ACP_SESSION_SCHEME } from './surfaces/vscode/experimental-session';
 import { hasRegisterChatSessionContentProvider } from './surfaces/vscode/capabilities';
 import { registerLanguageModelChatProvider } from './surfaces/vscode/language-model-provider';
 import { StatusBarManager } from './statusbar';
@@ -36,7 +36,7 @@ const KNOWN_PROVIDERS = [
 ];
 
 /**
- * Descriptor for extension-level global settings (opencode.experimental.*).
+ * Descriptor for extension-level global settings (acpilot.experimental.*).
  * Mirrors the `contributes.configuration` entries in package.json so the
  * panel can edit them alongside the native VS Code Settings UI.
  */
@@ -126,8 +126,8 @@ async function refreshStatusBar(s: ExtensionState): Promise<void> {
 // loadDefaultsFromConfig removed — logic moved to SelectionStore.resolveDefaults()
 
 export function activate(context: vscode.ExtensionContext) {
-  const outputChannel = vscode.window.createOutputChannel('OpenCode Copilot');
-  outputChannel.appendLine('[extension] OpenCode Copilot activating...');
+  const outputChannel = vscode.window.createOutputChannel('ACPilot');
+  outputChannel.appendLine('[extension] ACPilot activating...');
 
   const backend = createBackend('opencode');
   const statusBar = new StatusBarManager();
@@ -135,7 +135,7 @@ export function activate(context: vscode.ExtensionContext) {
   const selection = new SelectionStore(backend, bus);
   const sessions = new SessionManager(backend, bus);
   const authReader = new AuthReader();
-  const backendModelSupport = vscode.workspace.getConfiguration('opencode').get('experimental.acpBackendModelSupport', true);
+  const backendModelSupport = vscode.workspace.getConfiguration('acpilot').get('experimental.acpBackendModelSupport', true);
   const acpModels = createAcpModels({
     backends: new Map([['opencode', backend]]),
     authReader,
@@ -196,7 +196,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Register the settings panel command
   const openSettingsCommand = vscode.commands.registerCommand(
-    'opencode.openSettings',
+    'acpilot.openSettings',
     async () => {
       const panel = SettingsPanel.createOrShow(context.extensionUri);
 
@@ -252,7 +252,7 @@ export function activate(context: vscode.ExtensionContext) {
             }
             case 'setGlobalSetting': {
               await vscode.workspace
-                .getConfiguration('opencode')
+                .getConfiguration('acpilot')
                 .update(`experimental.${message.key}`, message.value, vscode.ConfigurationTarget.Global);
               await pushDataToPanel(state, panel);
               break;
@@ -321,7 +321,7 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   const participant = vscode.chat.createChatParticipant(
-    'opencode-copilot.opencode',
+    'acpilot.opencode',
     createParticipantHandler(state),
   );
   participant.iconPath = {
@@ -338,7 +338,7 @@ export function activate(context: vscode.ExtensionContext) {
   if (hasRegisterChatSessionContentProvider()) {
     const { provider, controller } = createSessionContentProvider(state, context);
     const registration = vscode.chat.registerChatSessionContentProvider(
-      OPENCODE_SESSION_SCHEME,
+      ACP_SESSION_SCHEME,
       provider,
       participant,
       { supportsChangingSessionType: true },
@@ -361,7 +361,7 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   context.subscriptions.push(outputChannel, participant, statusBar, openSettingsCommand);
-  outputChannel.appendLine('[extension] OpenCode Copilot activated');
+  outputChannel.appendLine('[extension] ACPilot activated');
 }
 
 function maskApiKey(key: string): string {
@@ -409,9 +409,9 @@ function computeConnectedProviders(
   return result;
 }
 
-/** Read extension-level global settings (opencode.experimental.*) for the panel. */
+/** Read extension-level global settings (acpilot.experimental.*) for the panel. */
 function readGlobalSettings(): GlobalSettingItem[] {
-  const cfg = vscode.workspace.getConfiguration('opencode');
+  const cfg = vscode.workspace.getConfiguration('acpilot');
   return GLOBAL_SETTINGS_DESCRIPTOR.map(d => {
     const raw = cfg.get<boolean | string>(`experimental.${d.key}`, d.default);
     return {

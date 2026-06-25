@@ -3,7 +3,7 @@
  *
  * Status bar: $(hubot) (icon only)
  * Hover: markdown table | Backend | Agent | Model |
- * Click: opencode.openSettings
+ * Click: acpilot.openSettings
  */
 import * as vscode from 'vscode';
 
@@ -23,7 +23,7 @@ export class StatusBarManager implements vscode.Disposable {
       100,
     );
     this.item.text = '$(hubot)';
-    this.item.command = 'opencode.openSettings';
+    this.item.command = 'acpilot.openSettings';
     this.item.name = 'ACP';
     this.item.show();
   }

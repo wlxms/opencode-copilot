@@ -561,7 +561,7 @@ await promptPromise;
     permission: "edit",                      // "edit" | "bash" | "read" | ...
     patterns: ["_permission_test_file.txt"], // 匹配的文件/命令模式
     metadata: {
-      filepath: "H:\\PyProjects\\opencode-copilot\\_permission_test_file.txt",
+      filepath: "H:\\PyProjects\\acpilot\\_permission_test_file.txt",
       diff: "Index: ...\n--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1,2 @@\n hello world\n-version=1.0.0\n+version=2.0.0\n"
       // ★ edit 类型的 permission 包含完整 unified diff
     },

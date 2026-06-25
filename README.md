@@ -1,8 +1,10 @@
-# OpenCode Copilot
+# ACPilot
 
-在 VSCode Copilot Chat 中直接使用 OpenCode AI 编码助手。
+在 VSCode Copilot Chat 中使用任意 [ACP (Agent Client Protocol)](https://github.com/zcovex/acp) 兼容的 AI 编码助手后端。
 
 `@opencode hello` → 实时推理过程 → 工具调用 → AI 流式输出
+
+ACPilot 以 ACP 协议为语义核心,将后端与 VS Code surface 解耦。当前内置 OpenCode backend,后续将拓展支持所有 ACP 协议兼容的 backend。
 
 ## 功能
 
@@ -12,7 +14,7 @@
 - **子代理支持**: 子代理/子任务自动以可展开卡片展示
 - **流式输出**: AI 回复 token-by-token 实时显示
 - **斜杠命令**: `/new` 新会话, `/help` 帮助, `/model` 模型列表
-- **ACP-first 架构**: 以 ACP 语义层解耦 backend 与 VS Code surface，OpenCode 只是一个 backend 实现
+- **ACP-first 架构**: 以 ACP 语义层解耦 backend 与 VS Code surface,OpenCode 是当前内置 backend,架构上可扩展到任意 ACP 协议 backend
 - **实验性 Session Provider 开关**: 可在入口层按运行时能力切换是否启用实验性 surface
 
 ## 工具调用 UI 展示
@@ -29,8 +31,8 @@ task / subagent      → 点击展开子代理完整对话
 1. 确保已安装 [OpenCode CLI](https://opencode-ai.com) 并完成认证
 2. 克隆仓库
    ```bash
-   git clone https://github.com/wlxms/opencode-copilot.git
-   cd opencode-copilot
+   git clone https://github.com/wlxms/acpilot.git
+   cd acpilot
    npm install
    ```
 3. 构建
@@ -128,7 +130,7 @@ src/
 
 ```json
 {
-  "opencode.experimental.sessionProvider": true
+  "acpilot.experimental.sessionProvider": true
 }
 ```
 

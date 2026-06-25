@@ -261,7 +261,7 @@ describe('SubSSS externalEdit restore', () => {
       );
 
       const session = await provider.provideChatSessionContent(
-        vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+        vscode.Uri.parse('acpilot.opencode:/ses_restore'),
         { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
         { inputState: {} as vscode.ChatSessionInputState },
       );
@@ -381,7 +381,7 @@ describe('SubSSS externalEdit restore', () => {
       );
 
       const session = await provider.provideChatSessionContent(
-        vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+        vscode.Uri.parse('acpilot.opencode:/ses_restore'),
         { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
         { inputState: {} as vscode.ChatSessionInputState },
       );
@@ -506,7 +506,7 @@ describe('SubSSS externalEdit restore', () => {
       );
 
       const session = await provider.provideChatSessionContent(
-        vscode.Uri.parse('opencode-copilot.opencode:/ses_restore'),
+        vscode.Uri.parse('acpilot.opencode:/ses_restore'),
         { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
         { inputState: {} as vscode.ChatSessionInputState },
       );

@@ -111,13 +111,13 @@ interface SessionListEntry {
  * Must match the `type` field in the `chatSessions` contribution
  * in package.json.
  */
-export const OPENCODE_SESSION_SCHEME = 'opencode-copilot.opencode';
+export const ACP_SESSION_SCHEME = 'acpilot.opencode';
 function getWorkspaceDirectory(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
 }
 
 function createSessionResource(sessionId: string): vscode.Uri {
-  return vscode.Uri.parse(`${OPENCODE_SESSION_SCHEME}:/${sessionId}`);
+  return vscode.Uri.parse(`${ACP_SESSION_SCHEME}:/${sessionId}`);
 }
 
 /**
@@ -364,7 +364,7 @@ export function createSessionContentProvider(
       if (!chatState.backendSessionId) {
         continue;
       }
-      const resource = stateKey.startsWith('opencode-copilot.opencode:')
+      const resource = stateKey.startsWith('acpilot.opencode:')
         ? vscode.Uri.parse(stateKey)
         : createSessionResource(stateKey);
 
@@ -373,7 +373,7 @@ export function createSessionContentProvider(
       const hasLiveTurns = chatState.turnMap.length > 0;
 
       // Prefer non-placeholder titles when multiple sessionMap entries share
-      // the same sessionId (e.g. untitled-N vs opencode-copilot.opencode:/ses_xxx).
+      // the same sessionId (e.g. untitled-N vs acpilot.opencode:/ses_xxx).
       if (existing) {
         const existingIsPlaceholder = isPlaceholderSessionTitle(existing.title);
         const newIsPlaceholder = isPlaceholderSessionTitle(newTitle);
@@ -1093,7 +1093,7 @@ export function createSessionContentProvider(
 
   if (hasControllerAPI) {
     controller = (vscode.chat as any).createChatSessionItemController(
-      OPENCODE_SESSION_SCHEME,
+      ACP_SESSION_SCHEME,
       async (_token: vscode.CancellationToken) => {
         await Promise.all([
           refreshOptionGroups(),
@@ -1229,7 +1229,7 @@ export function createSessionContentProvider(
 
   /**
    * Extract session ID from the resource URI.
-   * URI format: opencode-copilot.opencode:/<sessionId>
+   * URI format: acpilot.opencode:/<sessionId>
    */
   function extractSessionId(resource: vscode.Uri): string {
     const path = resource.path;
@@ -1948,7 +1948,7 @@ export function createSessionContentProvider(
         prompt,
         undefined,
         [],
-        'opencode-copilot.opencode',
+        'acpilot.opencode',
         [],
         undefined,
         requestId.id,
@@ -2391,7 +2391,7 @@ export function createSessionContentProvider(
  * The participant ID used to construct ChatRequestTurn / ChatResponseTurn
  * objects. Must match the ID passed to `vscode.chat.createChatParticipant()`.
  */
-const PARTICIPANT_ID = 'opencode-copilot.opencode';
+const PARTICIPANT_ID = 'acpilot.opencode';
 
 /**
  * Create a ChatRequestTurn for session history restoration.

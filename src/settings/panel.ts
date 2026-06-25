@@ -54,7 +54,7 @@ export interface SettingsData {
     isOpenAICompatible: boolean;
     icon: string;
   }>;
-  /** Extension-level global settings (opencode.experimental.*) */
+  /** Extension-level global settings (acpilot.experimental.*) */
   globalSettings?: GlobalSettingItem[];
 }
 
@@ -831,7 +831,7 @@ export class SettingsPanel {
     }
 
     // =========================================================================
-    // Global extension settings rendering (opencode.experimental.*)
+    // Global extension settings rendering (acpilot.experimental.*)
     // =========================================================================
 
     function renderGlobalSettings(items) {
