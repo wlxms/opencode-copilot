@@ -321,8 +321,9 @@ export class SettingsPanel {
     .backend-target-main { display: flex; align-items: center; gap: 10px; }
     .backend-badge {
       width: 32px; height: 32px; border-radius: 8px; background: var(--accent); color: var(--accent-fg);
-      display: flex; align-items: center; justify-content: center; font-weight: 700;
+      display: flex; align-items: center; justify-content: center; flex-shrink: 0;
     }
+    .backend-badge svg { width: 20px; height: 20px; display: block; }
     .backend-meta { color: var(--muted); font-size: 11px; }
 
     .session-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -543,7 +544,11 @@ export class SettingsPanel {
         <div class="card">
           <div class="backend-target">
             <div class="backend-target-main">
-              <div class="backend-badge">AI</div>
+              <div class="backend-badge">
+                <svg viewBox="0 0 24 24" fill="currentColor" aria-label="OpenCode">
+                  <path d="M22 24H2V0h20zM17 4.8H7v14.4h10z"/>
+                </svg>
+              </div>
               <div>
                 <div style="font-weight:600;" id="backend-target-name">OpenCode</div>
                 <div class="backend-meta">Current backend target</div>
