@@ -32,6 +32,7 @@ export class OpenCodeSettingsProvider implements BackendSettingsProvider {
         (m.name || m.id) +
         (m.providerName ? ` (${m.providerName})` : m.provider ? ` (${m.provider})` : ''),
     }));
+    const modelSelectOptions = [{ value: '', label: '(none)' }, ...modelOptions];
 
     // ── Override tab ──────────────────────────────────────────────────────
     const overrideGroups: SettingsFieldGroup[] = [
@@ -39,19 +40,19 @@ export class OpenCodeSettingsProvider implements BackendSettingsProvider {
         key: 'global',
         fields: [
           {
-            type: 'text',
+            type: 'select',
             key: 'model',
             label: 'Global Default Model',
             description: 'Fallback model for all agents',
-            placeholder: 'e.g., gpt-4o',
-          } satisfies TextField,
+            options: modelSelectOptions,
+          } satisfies SelectField,
           {
-            type: 'text',
+            type: 'select',
             key: 'small_model',
             label: 'Small Model',
             description: 'Lightweight model for quick tasks',
-            placeholder: 'e.g., gpt-4o-mini',
-          } satisfies TextField,
+            options: modelSelectOptions,
+          } satisfies SelectField,
         ],
       },
     ];

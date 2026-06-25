@@ -1,6 +1,15 @@
 import * as vscode from 'vscode';
 import type { BackendSettingsDescriptor } from '../acp/types';
 
+export interface GlobalSettingItem {
+  key: string;
+  label: string;
+  description: string;
+  type: 'toggle' | 'select';
+  value: boolean | string;
+  options?: Array<{ value: string; label: string }>;
+}
+
 export type SettingsMessage =
   | { type: 'ready' }
   | { type: 'refreshData' }
@@ -9,6 +18,7 @@ export type SettingsMessage =
   | { type: 'setDefaultModel'; model: string }
   | { type: 'setDefaultAgent'; agent: string }
   | { type: 'saveBackendSettings'; values: Record<string, unknown> }
+  | { type: 'setGlobalSetting'; key: string; value: boolean | string }
 | { type: 'connectProvider'; providerId: string; apiKey: string; baseURL?: string; displayName?: string }
 | { type: 'disconnectProvider'; configKey: string }
 | { type: 'updateProvider'; configKey: string; apiKey: string; baseURL?: string };
@@ -44,6 +54,8 @@ export interface SettingsData {
     isOpenAICompatible: boolean;
     icon: string;
   }>;
+  /** Extension-level global settings (opencode.experimental.*) */
+  globalSettings?: GlobalSettingItem[];
 }
 
 export class SettingsPanel {
@@ -124,63 +136,258 @@ export class SettingsPanel {
       --card: var(--vscode-editorWidget-background);
       --input-bg: var(--vscode-input-background);
       --input-fg: var(--vscode-input-foreground);
-      --input-border: var(--vscode-input-border);
+      --input-border: var(--vscode-input-border, transparent);
       --accent: var(--vscode-button-background);
       --accent-hover: var(--vscode-button-hoverBackground);
       --accent-fg: var(--vscode-button-foreground);
       --focus: var(--vscode-focusBorder);
+      --toc-active: var(--vscode-list-activeSelectionBackground);
+      --toc-hover: var(--vscode-list-hoverBackground);
+      --row-hover: var(--vscode-list-hoverBackground);
+      --group-title-fg: var(--vscode-foreground);
     }
     * { box-sizing: border-box; }
-    body {
+    html, body {
+      height: 100%;
       margin: 0;
-      padding: 24px 32px 32px;
+      padding: 0;
+    }
+    body {
       font-family: var(--vscode-font-family);
       background: var(--bg);
       color: var(--fg);
       font-size: 13px;
-      line-height: 1.5;
+      line-height: 1.4;
+      overflow: hidden;
     }
-    h1 { margin: 0 0 6px; font-size: 22px; font-weight: 600; }
-    h2 { margin: 0; font-size: 13px; text-transform: uppercase; letter-spacing: .3px; color: var(--accent); }
-    h3 { margin: 0 0 10px; font-size: 14px; font-weight: 600; }
-    .subtitle { margin: 0 0 18px; color: var(--muted); }
-    .tabs, .subtabs {
+
+    /* ── Root split layout: left TOC + right body ────────────────────── */
+    .settings-root {
       display: flex;
-      gap: 0;
-      border-bottom: 1px solid var(--border);
-      margin-bottom: 18px;
+      align-items: stretch;
+      height: 100%;
+      width: 100%;
     }
-    .tab, .subtab {
-      padding: 8px 16px;
+
+    /* ── Left navigation TOC (native settings sidebar) ───────────────── */
+    .settings-toc {
+      width: 220px;
+      flex-shrink: 0;
+      padding: 12px 0;
+      background: var(--bg);
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+    }
+    .toc-header {
+      padding: 0 20px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--muted);
+    }
+    .toc-item {
+      padding: 4px 20px;
+      line-height: 22px;
       cursor: pointer;
       color: var(--muted);
-      border-bottom: 2px solid transparent;
+      opacity: 0.9;
       user-select: none;
     }
-    .tab.active, .subtab.active { color: var(--fg); border-bottom-color: var(--accent); }
-    .hidden { display: none !important; }
-    .section { margin-top: 24px; }
-    .section-header {
+    .toc-item:hover { background: var(--toc-hover); opacity: 1; }
+    .toc-item.active {
+      font-weight: 700;
+      color: var(--fg);
+      background: var(--toc-active);
+      opacity: 1;
+    }
+    .toc-spacer { flex: 1; }
+    .toc-separator {
+      margin: 8px 16px;
+      border-top: 1px solid var(--border);
+    }
+    .toc-add-btn {
+      margin: 0 16px;
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 10px;
+      justify-content: center;
+      gap: 4px;
+      height: 28px;
+      padding: 0 12px;
+      background: transparent;
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      cursor: pointer;
+      font: inherit;
+      font-size: 12px;
     }
+    .toc-add-btn:hover { background: var(--input-bg); border-color: var(--accent); }
+
+    /* ── Right body ──────────────────────────────────────────────────── */
+    .settings-body {
+      flex: 1;
+      min-width: 0;
+      overflow-y: auto;
+      padding: 20px 28px 40px;
+    }
+    .settings-body-inner {
+      max-width: 1000px;
+      margin: 0 auto;
+    }
+
+    /* ── Common elements ─────────────────────────────────────────────── */
+    .hidden { display: none !important; }
+
+    /* Settings group title — like native settings-group-title-label */
+    .group-title {
+      margin: 22px 0 8px;
+      font-size: 17px;
+      font-weight: 600;
+      color: var(--group-title-fg);
+    }
+    .group-title:first-child { margin-top: 0; }
+
+    /* Setting row — VS Code native style.
+       Default (text/select): label / desc / control stacked vertically.
+       Bool variant: label on top, then a row with toggle + description.
+       Mirrors setting-item-contents (padding 12px 14px 18px) and
+       setting-value (margin-top: 9px) from settingsEditor2.css. */
+    .setting-item {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 12px 14px 18px;
+      border-radius: 4px;
+    }
+    .setting-item:hover { background: var(--row-hover); }
+    .setting-item.is-bool { gap: 9px; }
+    .setting-label { font-weight: 600; font-size: 13px; }
+    .setting-desc { color: var(--fg); opacity: 0.9; font-size: 12px; }
+    /* Inline control+description row for bool settings (toggle then desc) */
+    .setting-bool-row { display: flex; align-items: center; gap: 9px; }
+    /* Control sits below the description with native setting-value spacing */
+    .setting-control {
+      display: flex;
+      align-items: center;
+      width: 100%;
+      margin-top: 5px;
+    }
+    .setting-item.is-bool .setting-bool-row { margin-top: 0; }
+    /* Native VS Code toggle switch */
+    .setting-toggle {
+      position: relative;
+      width: 40px;
+      height: 20px;
+      flex-shrink: 0;
+      background: var(--input-border);
+      border: 1px solid var(--vscode-checkbox-border, transparent);
+      border-radius: 10px;
+      cursor: pointer;
+      transition: background 0.12s ease, border-color 0.12s ease;
+      appearance: none;
+      -webkit-appearance: none;
+      margin: 0;
+    }
+    .setting-toggle::after {
+      content: '';
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--fg);
+      opacity: 0.8;
+      transition: left 0.12s ease, background 0.12s ease;
+    }
+    .setting-toggle:checked {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .setting-toggle:checked::after { left: 22px; background: var(--accent-fg); opacity: 1; }
+
+    /* Cards retained for Backend Target / Current Session */
     .card {
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 16px;
-      margin-bottom: 12px;
+      border-radius: 6px;
+      padding: 14px;
+      margin-bottom: 10px;
     }
-    .field { margin-bottom: 12px; }
-    .field:last-child { margin-bottom: 0; }
-    .field label { display: block; margin-bottom: 4px; font-size: 12px; font-weight: 600; }
-    .desc { color: var(--muted); font-size: 11px; margin-bottom: 6px; }
-    select, input[type="text"] {
-      width: 100%;
-      padding: 7px 9px;
+    .backend-target { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .backend-target-main { display: flex; align-items: center; gap: 10px; }
+    .backend-badge {
+      width: 32px; height: 32px; border-radius: 8px; background: var(--accent); color: var(--accent-fg);
+      display: flex; align-items: center; justify-content: center; font-weight: 700;
+    }
+    .backend-meta { color: var(--muted); font-size: 11px; }
+
+    .session-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .session-grid > .card { display: flex; flex-direction: column; margin-bottom: 0; }
+    .session-grid h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+    .session-grid .desc { color: var(--muted); font-size: 11px; margin-bottom: 6px; }
+
+    /* Dropdowns */
+    .dropdown-container { position: relative; width: 100%; min-width: 0; }
+    .dropdown-trigger {
+      display: flex; justify-content: space-between; align-items: center; width: 100%;
+      padding: 6px 10px; background: var(--input-bg); border: 1px solid var(--input-border);
+      border-radius: 4px; cursor: pointer; color: var(--fg); text-align: left; gap: 8px;
+      transition: border-color 0.12s ease;
+      min-width: 0;
+    }
+    .dropdown-trigger:hover { border-color: var(--focus); }
+    /* Selected (collapsed) value container — truncate long titles */
+    .dropdown-trigger > #agent-dropdown-selected,
+    .dropdown-trigger > #model-dropdown-selected {
+      min-width: 0;
+      overflow: hidden;
+      flex: 1;
+    }
+    .dropdown-trigger .item-title {
+      font-weight: 600; font-size: 13px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .dropdown-trigger .item-meta { color: var(--muted); font-size: 11px; }
+    .dropdown-trigger-icon { margin-left: auto; color: var(--muted); font-size: 10px; flex-shrink: 0; }
+    .dropdown-panel {
+      position: absolute; top: 100%; left: 0; right: 0; margin-top: 4px;
+      background: var(--card); border: 1px solid var(--border); border-radius: 4px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.2); max-height: 240px; overflow-y: auto; z-index: 100;
+      padding: 4px; display: none;
+    }
+    .dropdown-panel.open { display: block; }
+    .list-card-item {
+      padding: 7px 10px; border-radius: 4px; margin-bottom: 2px; cursor: pointer;
+      transition: background 0.12s ease;
+    }
+    .list-card-item:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); }
+    .list-card-item.selected { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+    .list-card-item .item-title { font-weight: 600; font-size: 12px; }
+    .list-card-item .item-meta { color: var(--muted); font-size: 11px; }
+
+    /* Controls — native VS Code sizing (text 420px, select 320px), height 26px,
+       border-radius 2px. Inputs are NOT full-width — mirrors native settings. */
+    input[type="text"], input[type="password"] {
+      width: 420px;
+      max-width: 100%;
+      height: 26px;
+      padding: 2px 8px;
+      background: var(--input-bg);
+      color: var(--input-fg);
+      border: 1px solid var(--input-border);
+      border-radius: 6px;
+      outline: none;
+      font: inherit;
+    }
+    select {
+      width: 320px;
+      max-width: 100%;
+      height: 26px;
+      padding: 2px 6px;
       background: var(--input-bg);
       color: var(--input-fg);
       border: 1px solid var(--input-border);
@@ -190,7 +397,8 @@ export class SettingsPanel {
     }
     select:focus, input:focus { border-color: var(--focus); }
     button {
-      padding: 7px 14px;
+      height: 26px;
+      padding: 2px 12px;
       background: var(--accent);
       color: var(--accent-fg);
       border: none;
@@ -205,209 +413,216 @@ export class SettingsPanel {
       border: 1px solid var(--border);
     }
     .button-secondary:hover { background: var(--input-bg); }
-    .backend-target { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-    .backend-target-main { display: flex; align-items: center; gap: 12px; }
-    .backend-badge {
-      width: 40px; height: 40px; border-radius: 10px; background: var(--accent); color: var(--accent-fg);
-      display: flex; align-items: center; justify-content: center; font-weight: 700;
-    }
-    .backend-meta { color: var(--muted); font-size: 11px; }
-    .session-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    .session-grid > .card { display: flex; flex-direction: column; margin-bottom: 0; }
-    .list-card-item {
-      padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 8px; cursor: pointer;
-      transition: background 0.15s ease, border-color 0.15s ease;
-    }
-    .list-card-item:hover {
-      background: color-mix(in srgb, var(--fg) 6%, transparent);
-      border-color: color-mix(in srgb, var(--fg) 15%, transparent);
-    }
-    .list-card-item.selected {
-      border-color: color-mix(in srgb, var(--fg) 25%, transparent);
-      background: color-mix(in srgb, var(--fg) 8%, transparent);
-    }
-    .list-card-item.selected:hover {
-      background: color-mix(in srgb, var(--fg) 12%, transparent);
-      border-color: color-mix(in srgb, var(--fg) 35%, transparent);
-    }
-    .item-title { font-weight: 600; }
-    .item-meta { color: var(--muted); font-size: 11px; }
-    .provider-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
-    .provider-card { padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--input-bg); }
-    .modal-backdrop {
-      position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 10;
-    }
-    .modal { width: min(560px, calc(100vw - 32px)); background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
-    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
-    .empty-state {
-      color: var(--muted); padding: 18px; border: 1px dashed var(--border); border-radius: 8px; text-align: center;
-    }
-    .dropdown-container { position: relative; width: 100%; }
-    .dropdown-trigger { display: flex; justify-content: space-between; align-items: center; width: 100%; padding: 10px 12px; background: var(--input-bg); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; color: var(--fg); text-align: left; transition: background 0.15s ease, border-color 0.15s ease; }
-    .dropdown-trigger:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); border-color: color-mix(in srgb, var(--fg) 15%, transparent); }
-    .dropdown-trigger .item-title { font-weight: 600; font-size: 13px; }
-    .dropdown-trigger .item-meta { color: var(--muted); font-size: 11px; }
-    .dropdown-trigger-icon { margin-left: 8px; color: var(--muted); font-size: 10px; }
-    .dropdown-panel { position: absolute; top: 100%; left: 0; right: 0; margin-top: 4px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); max-height: 250px; overflow-y: auto; z-index: 100; padding: 8px; display: none; }
-    .dropdown-panel.open { display: block; }
-    .dropdown-panel .list-card-item { margin-bottom: 4px; }
-    .dropdown-panel .list-card-item:last-child { margin-bottom: 0; }
-    @media (max-width: 900px) { .session-grid { grid-template-columns: 1fr; } }
+    .section-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
 
-    /* Provider management styles */
-    .provider-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+    .empty-state {
+      color: var(--muted); padding: 16px; border: 1px dashed var(--border); border-radius: 4px;
+      text-align: center; font-size: 12px;
+    }
+
+    /* Subtabs inside OpenCode (Setting | Provider) */
+    .subtabs {
+      display: flex;
+      gap: 0;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 10px;
+    }
+    .subtab {
+      padding: 6px 14px;
+      cursor: pointer;
+      color: var(--muted);
+      border-bottom: 2px solid transparent;
+      user-select: none;
+      font-size: 12px;
+    }
+    .subtab.active { color: var(--fg); border-bottom-color: var(--accent); }
+
+    /* Collapsible group — the summary IS the section header (group-title level).
+       The foldout marker hangs to the LEFT (negative margin) so the title text
+       aligns with non-collapsible group titles — the icon never pushes text. */
+    details { margin: 22px 0 0; }
+    details:first-child { margin-top: 0; }
+    details > summary {
+      cursor: pointer;
+      font-size: 17px;
+      font-weight: 600;
+      color: var(--group-title-fg);
+      margin: 0 0 8px;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      user-select: none;
+    }
+    details > summary::-webkit-details-marker { display: none; }
+    /* Marker hangs in the left gutter (negative margin), outside the text column */
+    details > summary::before {
+      content: '▸'; color: var(--muted); font-size: 13px;
+      width: 14px; flex-shrink: 0; text-align: center;
+      margin-left: -18px;   /* pull the marker out into the left gutter */
+    }
+    details[open] > summary::before { content: '▾'; }
+
+    /* Map field — its label becomes a subsection subtitle under the group header */
+    .map-subtitle {
+      font-size: 12px;
+      color: var(--muted);
+      margin: 0 0 8px;
+    }
+
+    /* Map field items (e.g. each agent) — tertiary headers */
+    .map-item-title {
+      font-weight: 600; font-size: 13px;
+      margin: 12px 0 4px;
+      padding-bottom: 3px;
+      border-bottom: 1px solid var(--border);
+    }
+    .map-item-title:first-child { margin-top: 0; }
+
+    /* Provider management */
+    .provider-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
     .provider-item {
-      padding: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--input-bg);
-      cursor: pointer; transition: background 0.15s ease, border-color 0.15s ease;
-      display: flex; flex-direction: column; gap: 6px;
+      padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--input-bg);
+      display: flex; flex-direction: column; gap: 4px;
     }
-    .provider-item:hover {
-      background: color-mix(in srgb, var(--fg) 6%, transparent);
-      border-color: color-mix(in srgb, var(--fg) 15%, transparent);
-    }
-    .provider-item-header { display: flex; align-items: center; justify-content: space-between; }
+    .provider-item-header { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
     .provider-item-name { font-weight: 600; font-size: 13px; }
     .provider-item-status {
-      font-size: 10px; padding: 2px 6px; border-radius: 4px;
+      font-size: 9px; padding: 1px 6px; border-radius: 2px;
       background: color-mix(in srgb, var(--accent) 20%, transparent);
-      color: var(--accent); font-weight: 600;
+      color: var(--accent); font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px;
     }
-    .provider-item-actions { display: flex; gap: 6px; margin-top: 4px; }
-    .provider-item-actions button { font-size: 11px; padding: 3px 8px; }
+    .provider-item-actions { display: flex; gap: 6px; margin-top: 2px; }
+    .provider-item-actions button { font-size: 11px; padding: 1px 8px; }
     .provider-add-btn {
-      width: 28px; height: 28px; border-radius: 6px; border: 1px solid var(--border);
+      width: 26px; height: 26px; border-radius: 4px; border: 1px solid var(--border);
       background: transparent; color: var(--fg); cursor: pointer; font-size: 16px;
       display: flex; align-items: center; justify-content: center; line-height: 1;
     }
     .provider-add-btn:hover { background: var(--input-bg); border-color: var(--accent); }
-    .provider-grid-add { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-bottom: 16px; }
+    .provider-grid-add { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-bottom: 12px; }
     .provider-option {
-      padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--input-bg);
-      cursor: pointer; text-align: center; transition: all 0.15s ease;
+      padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--input-bg);
+      cursor: pointer; text-align: center; transition: all 0.12s ease;
     }
-    .provider-option:hover {
-      border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent);
-    }
-    .provider-option.selected {
-      border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent);
-    }
+    .provider-option:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .provider-option.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
     .provider-option-name { font-weight: 600; font-size: 12px; }
     .provider-option-desc { color: var(--muted); font-size: 10px; margin-top: 2px; }
-    .provider-form { margin-top: 16px; }
-    .provider-form .field { margin-bottom: 10px; }
+    .provider-form { margin-top: 8px; }
+    .provider-form .setting-item { padding: 8px 0; }
     .provider-form input { width: 100%; }
-    .provider-form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+    /* Modals */
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 10;
+    }
+    .modal { width: min(540px, calc(100vw - 32px)); background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 18px; }
+    .modal h3 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+    .modal .desc { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
   </style>
 </head>
 <body>
-  <h1>ACP Settings</h1>
-  <p class="subtitle">Configure backend, agent, model, and backend-specific options.</p>
+  <div class="settings-root">
+    <!-- Left navigation TOC -->
+    <nav class="settings-toc">
+      <div class="toc-header">Settings</div>
+      <div class="toc-item active" data-nav="global">Global</div>
+      <div class="toc-item" data-nav="opencode">OpenCode</div>
+      <div class="toc-spacer"></div>
+      <div class="toc-separator"></div>
+      <button id="btn-acp-backend-add" class="toc-add-btn">+ ACP Backend</button>
+    </nav>
 
-  <div class="tabs">
-    <div class="tab active" data-tab="backend">Backend</div>
-    <div class="tab" data-tab="global">Global Setting</div>
-  </div>
+    <!-- Right content body -->
+    <main class="settings-body">
+      <!-- ═══ Global nav content ═══ -->
+      <section id="nav-global" class="settings-body-inner">
+        <div class="group-title">Backend Target</div>
+        <div class="card">
+          <div class="backend-target">
+            <div class="backend-target-main">
+              <div class="backend-badge">AI</div>
+              <div>
+                <div style="font-weight:600;" id="backend-target-name">OpenCode</div>
+                <div class="backend-meta">Current backend target</div>
+              </div>
+            </div>
+            <button id="btn-backend-chooser" class="button-secondary">Backend</button>
+          </div>
+        </div>
 
-  <section id="tab-backend" class="tab-content">
-    <div class="section">
-      <div class="section-header">
-        <h2>Backend</h2>
-        <button id="btn-backend-chooser" class="button-secondary">Backend</button>
-      </div>
-      <div class="card">
-        <div class="backend-target">
-          <div class="backend-target-main">
-            <div class="backend-badge">AI</div>
-            <div>
-              <h3 id="backend-target-name">OpenCode</h3>
-              <div class="backend-meta">Current backend target</div>
+        <div class="group-title">Current Session</div>
+        <div class="session-grid">
+          <div class="card">
+            <h3>Agent</h3>
+            <div class="desc">Agent for the next request</div>
+            <div class="dropdown-container">
+              <button id="agent-dropdown-trigger" class="dropdown-trigger">
+                <div id="agent-dropdown-selected">
+                  <div class="item-title">Select Agent</div>
+                  <div class="item-meta">...</div>
+                </div>
+                <div class="dropdown-trigger-icon">▼</div>
+              </button>
+              <div id="agent-dropdown-panel" class="dropdown-panel"></div>
+            </div>
+          </div>
+          <div class="card">
+            <h3>Model</h3>
+            <div class="desc">Model for the next request</div>
+            <div class="dropdown-container">
+              <button id="model-dropdown-trigger" class="dropdown-trigger">
+                <div id="model-dropdown-selected">
+                  <div class="item-title">Select Model</div>
+                  <div class="item-meta">...</div>
+                </div>
+                <div class="dropdown-trigger-icon">▼</div>
+              </button>
+              <div id="model-dropdown-panel" class="dropdown-panel"></div>
             </div>
           </div>
         </div>
-      </div>
-    </div>
 
-    <div class="section">
-      <div class="section-header"><h2>Current Session</h2></div>
-      <div class="session-grid">
-        <div class="card">
-          <h3>Agent</h3>
-          <div class="desc">Agent for the next request</div>
-          <div class="dropdown-container">
-            <button id="agent-dropdown-trigger" class="dropdown-trigger">
-              <div id="agent-dropdown-selected">
-                <div class="item-title">Select Agent</div>
-                <div class="item-meta">...</div>
-              </div>
-              <div class="dropdown-trigger-icon">▼</div>
-            </button>
-            <div id="agent-dropdown-panel" class="dropdown-panel"></div>
+        <details id="global-settings-details" open>
+          <summary>Extension Settings</summary>
+          <div class="details-content" id="global-settings-container">
+            <div class="empty-state">Loading global settings...</div>
           </div>
-        </div>
-        <div class="card">
-          <h3>Models</h3>
-          <div class="desc">Model for the next request</div>
-          <div class="dropdown-container">
-            <button id="model-dropdown-trigger" class="dropdown-trigger">
-              <div id="model-dropdown-selected">
-                <div class="item-title">Select Model</div>
-                <div class="item-meta">...</div>
-              </div>
-              <div class="dropdown-trigger-icon">▼</div>
-            </button>
-            <div id="model-dropdown-panel" class="dropdown-panel"></div>
-          </div>
-        </div>
-      </div>
-    </div>
+        </details>
+      </section>
 
-    <div class="section">
-      <div class="section-header"><h2>Backend Setting</h2></div>
-      <div id="backend-settings-container">
-        <div class="empty-state">Loading backend settings...</div>
-      </div>
-    </div>
-
-    <div class="section">
-      <div class="section-header"><h2>Default</h2></div>
-      <div class="card">
-        <div class="field">
-          <label>Default Agent</label>
-          <div class="desc">Agent used when starting new sessions</div>
-          <select id="sel-default-agent"></select>
+      <!-- ═══ OpenCode nav content ═══ -->
+      <section id="nav-opencode" class="settings-body-inner hidden">
+        <div id="backend-settings-container">
+          <div class="empty-state">Loading backend settings...</div>
         </div>
-        <div class="field">
-          <label>Default Model</label>
-          <div class="desc">Model used when no model is specified per-agent</div>
-          <select id="sel-default-model"></select>
-        </div>
-      </div>
-    </div>
-  </section>
+      </section>
+    </main>
+  </div>
 
-  <section id="tab-global" class="tab-content hidden">
-    <div class="section">
-      <div class="section-header"><h2>Global Setting</h2></div>
-      <div class="empty-state">Global ACP extension settings will be added here later.</div>
-    </div>
-  </section>
-
+  <!-- Provider modals + backend chooser (kept outside root for fixed overlay) -->
   <div id="add-provider-modal" class="modal-backdrop hidden">
     <div class="modal">
       <h3>Connect Provider</h3>
       <div id="add-provider-grid" class="provider-grid-add"></div>
       <div id="add-provider-form-section" class="provider-form hidden">
-        <div class="field">
-          <label>API Key</label>
-          <div class="desc">Enter your API key for this provider</div>
-          <input type="password" id="add-provider-apikey" placeholder="Enter API key">
+        <div class="setting-item" style="padding:8px 0;">
+          <div class="setting-text">
+            <div class="setting-label">API Key</div>
+            <div class="setting-desc">Enter your API key for this provider</div>
+          </div>
+          <div class="setting-control"><input type="password" id="add-provider-apikey" placeholder="Enter API key"></div>
         </div>
-        <div class="field hidden" id="add-provider-baseurl-field">
-          <label>Base URL</label>
-          <div class="desc">Custom API endpoint (optional)</div>
-          <input type="text" id="add-provider-baseurl" placeholder="https://api.example.com/v1">
+        <div class="setting-item hidden" id="add-provider-baseurl-field" style="padding:8px 0;">
+          <div class="setting-text">
+            <div class="setting-label">Base URL</div>
+            <div class="setting-desc">Custom API endpoint (optional)</div>
+          </div>
+          <div class="setting-control"><input type="text" id="add-provider-baseurl" placeholder="https://api.example.com/v1"></div>
         </div>
-        <div class="provider-form-actions">
+        <div class="modal-actions">
           <button id="btn-add-provider-cancel" class="button-secondary">Cancel</button>
           <button id="btn-add-provider-connect">Connect</button>
         </div>
@@ -419,18 +634,22 @@ export class SettingsPanel {
     <div class="modal">
       <h3>Edit Provider</h3>
       <div class="provider-form">
-        <div class="field">
-          <label>API Key</label>
-          <div class="desc">Update your API key for this provider</div>
-          <input type="password" id="edit-provider-apikey" placeholder="Enter new API key">
+        <div class="setting-item" style="padding:8px 0;">
+          <div class="setting-text">
+            <div class="setting-label">API Key</div>
+            <div class="setting-desc">Update your API key for this provider</div>
+          </div>
+          <div class="setting-control"><input type="password" id="edit-provider-apikey" placeholder="Enter new API key"></div>
         </div>
-        <div class="field hidden" id="edit-provider-baseurl-field">
-          <label>Base URL</label>
-          <div class="desc">Custom API endpoint (optional)</div>
-          <input type="text" id="edit-provider-baseurl" placeholder="https://api.example.com/v1">
+        <div class="setting-item hidden" id="edit-provider-baseurl-field" style="padding:8px 0;">
+          <div class="setting-text">
+            <div class="setting-label">Base URL</div>
+            <div class="setting-desc">Custom API endpoint (optional)</div>
+          </div>
+          <div class="setting-control"><input type="text" id="edit-provider-baseurl" placeholder="https://api.example.com/v1"></div>
         </div>
-        <div class="provider-form-actions">
-          <button id="btn-edit-provider-disconnect" class="button-secondary" style="color: #f44; border-color: #f44;">Disconnect</button>
+        <div class="modal-actions">
+          <button id="btn-edit-provider-disconnect" class="button-secondary" style="color:#f48771; border-color:#f48771;">Disconnect</button>
           <button id="btn-edit-provider-cancel" class="button-secondary">Cancel</button>
           <button id="btn-edit-provider-save">Save</button>
         </div>
@@ -442,7 +661,7 @@ export class SettingsPanel {
     <div class="modal">
       <h3>Choose Backend</h3>
       <div class="desc">Backend switching UI placeholder. Current implementation only supports OpenCode. Custom backend entry is interface-only for now.</div>
-      <div class="card">
+      <div class="card" style="padding:0; border:none; background:transparent;">
         <div class="list-card-item selected">
           <div class="item-title">OpenCode</div>
           <div class="item-meta">Built-in backend</div>
@@ -462,16 +681,19 @@ export class SettingsPanel {
     const vscode = acquireVsCodeApi();
     let currentData = null;
 
-    document.querySelectorAll('.tab').forEach(tab => {
-      tab.addEventListener('click', () => {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
-        tab.classList.add('active');
-        document.getElementById('tab-' + tab.dataset.tab).classList.remove('hidden');
+    // ── Left navigation switching ──────────────────────────────────────
+    document.querySelectorAll('.toc-item').forEach(item => {
+      item.addEventListener('click', () => {
+        const nav = item.dataset.nav;
+        if (!nav) return;
+        document.querySelectorAll('.toc-item').forEach(t => t.classList.remove('active'));
+        item.classList.add('active');
+        document.getElementById('nav-global').classList.toggle('hidden', nav !== 'global');
+        document.getElementById('nav-opencode').classList.toggle('hidden', nav !== 'opencode');
       });
     });
 
-    // Subtab switching via event delegation (works for dynamic subtabs)
+    // Subtab switching via event delegation (Setting | Provider inside OpenCode)
     document.getElementById('backend-settings-container').addEventListener('click', (event) => {
       const subtab = event.target.closest('.subtab');
       if (subtab && subtab.dataset.subtab) {
@@ -484,6 +706,7 @@ export class SettingsPanel {
       }
     });
 
+    // Backend chooser
     document.getElementById('btn-backend-chooser').addEventListener('click', () => {
       document.getElementById('backend-chooser-modal').classList.remove('hidden');
     });
@@ -495,11 +718,16 @@ export class SettingsPanel {
         document.getElementById('backend-chooser-modal').classList.add('hidden');
       }
     });
+    // + ACP Backend button reuses the backend chooser for now
+    document.getElementById('btn-acp-backend-add').addEventListener('click', () => {
+      document.getElementById('backend-chooser-modal').classList.remove('hidden');
+    });
 
+    // Click-outside to close dropdowns
     document.addEventListener('click', (event) => {
       const isAgentDropdown = event.target.closest('#agent-dropdown-trigger');
       const isModelDropdown = event.target.closest('#model-dropdown-trigger');
-      
+
       if (isAgentDropdown) {
         document.getElementById('agent-dropdown-panel').classList.toggle('open');
         document.getElementById('model-dropdown-panel').classList.remove('open');
@@ -518,6 +746,7 @@ export class SettingsPanel {
         currentData = msg.data;
         renderData(msg.data);
         renderProviders();
+        renderGlobalSettings(msg.data.globalSettings);
       }
     });
 
@@ -527,10 +756,10 @@ export class SettingsPanel {
       const agentSelected = document.getElementById('agent-dropdown-selected');
       const agentPanel = document.getElementById('agent-dropdown-panel');
       agentPanel.innerHTML = '';
-      
+
       let currentAgentName = 'Select Agent';
       let currentAgentMeta = '...';
-      
+
       (data.agents || []).filter(a => !a.hidden && a.mode !== 'subagent').forEach(a => {
         const isSelected = a.id === data.currentAgent;
         if (isSelected) {
@@ -548,14 +777,15 @@ export class SettingsPanel {
         };
         agentPanel.appendChild(item);
       });
-      
-      agentSelected.innerHTML = '<div class="item-title">' + escapeHtml(currentAgentName) + '</div>' +
-        '<div class="item-meta">' + escapeHtml(currentAgentMeta) + '</div>';
+
+      // Collapsed trigger shows only the selected title (description is shown
+      // inside the expanded dropdown panel on each option).
+      agentSelected.innerHTML = '<div class="item-title">' + escapeHtml(currentAgentName) + '</div>';
 
       const modelSelected = document.getElementById('model-dropdown-selected');
       const modelPanel = document.getElementById('model-dropdown-panel');
       modelPanel.innerHTML = '';
-      
+
       let currentModelName = data.currentModelDisplayName || data.defaultModel || 'Select Model';
       let currentModelMeta = '...';
       const currentModelId = (data.currentModel && data.currentModel.modelID) || data.defaultModel;
@@ -563,7 +793,6 @@ export class SettingsPanel {
       if (!data.models || data.models.length === 0) {
         modelPanel.innerHTML = '<div class="empty-state">No models available from the current backend configuration.</div>';
       } else {
-        let matched = false;
         data.models.forEach(m => {
           let isSelected = false;
           if (currentModelId) {
@@ -579,7 +808,6 @@ export class SettingsPanel {
             }
           }
           if (isSelected) {
-            matched = true;
             currentModelName = m.name || m.id;
             currentModelMeta = m.provider || 'Unknown provider';
           }
@@ -595,41 +823,89 @@ export class SettingsPanel {
           modelPanel.appendChild(item);
         });
       }
-      
-      modelSelected.innerHTML = '<div class="item-title">' + escapeHtml(currentModelName) + '</div>' +
-        '<div class="item-meta">' + escapeHtml(currentModelMeta) + '</div>';
 
-      const selDefaultAgent = document.getElementById('sel-default-agent');
-      selDefaultAgent.innerHTML = '<option value="">(none)</option>';
-      (data.agents || []).filter(a => !a.hidden && a.mode !== 'subagent').forEach(a => {
-        const opt = document.createElement('option');
-        opt.value = a.id;
-        opt.textContent = a.name || a.id;
-        if (a.id === data.defaultAgent) opt.selected = true;
-        selDefaultAgent.appendChild(opt);
+      modelSelected.innerHTML = '<div class="item-title">' + escapeHtml(currentModelName) + '</div>';
+
+      // Render backend-specific settings from descriptor (OpenCode nav)
+      renderBackendSettings(data.backendSettings, data);
+    }
+
+    // =========================================================================
+    // Global extension settings rendering (opencode.experimental.*)
+    // =========================================================================
+
+    function renderGlobalSettings(items) {
+      const container = document.getElementById('global-settings-container');
+      if (!container) return;
+      container.innerHTML = '';
+
+      if (!items || items.length === 0) {
+        container.innerHTML = '<div class="empty-state">No global settings available.</div>';
+        return;
+      }
+
+      items.forEach(item => {
+        const row = document.createElement('div');
+
+        if (item.type === 'select') {
+          // text/select: label / desc / control stacked
+          row.className = 'setting-item';
+          const label = document.createElement('div');
+          label.className = 'setting-label';
+          label.textContent = item.label;
+          row.appendChild(label);
+          if (item.description) {
+            const desc = document.createElement('div');
+            desc.className = 'setting-desc';
+            desc.textContent = item.description;
+            row.appendChild(desc);
+          }
+          const control = document.createElement('div');
+          control.className = 'setting-control';
+          const select = document.createElement('select');
+          (item.options || []).forEach(opt => {
+            const option = document.createElement('option');
+            option.value = opt.value;
+            option.textContent = opt.label;
+            if (opt.value === String(item.value)) option.selected = true;
+            select.appendChild(option);
+          });
+          select.onchange = () => vscode.postMessage({ type: 'setGlobalSetting', key: item.key, value: select.value });
+          control.appendChild(select);
+          row.appendChild(control);
+        } else {
+          // bool: label on top, then [toggle] + desc inline
+          row.className = 'setting-item is-bool';
+          const label = document.createElement('div');
+          label.className = 'setting-label';
+          label.textContent = item.label;
+          row.appendChild(label);
+
+          const boolRow = document.createElement('div');
+          boolRow.className = 'setting-bool-row';
+          const toggle = document.createElement('input');
+          toggle.type = 'checkbox';
+          toggle.className = 'setting-toggle';
+          toggle.checked = Boolean(item.value);
+          toggle.onchange = () => vscode.postMessage({ type: 'setGlobalSetting', key: item.key, value: toggle.checked });
+          boolRow.appendChild(toggle);
+          if (item.description) {
+            const desc = document.createElement('div');
+            desc.className = 'setting-desc';
+            desc.textContent = item.description;
+            boolRow.appendChild(desc);
+          }
+          row.appendChild(boolRow);
+        }
+        container.appendChild(row);
       });
-      selDefaultAgent.onchange = () => vscode.postMessage({ type: 'setDefaultAgent', agent: selDefaultAgent.value });
-
-      const selDefaultModel = document.getElementById('sel-default-model');
-      selDefaultModel.innerHTML = '<option value="">(none)</option>';
-      (data.models || []).forEach(m => {
-        const opt = document.createElement('option');
-        opt.value = m.id;
-        opt.textContent = (m.name || m.id) + (m.provider ? ' (' + m.provider + ')' : '');
-        if (m.id === data.defaultModel) opt.selected = true;
-        selDefaultModel.appendChild(opt);
-      });
-      selDefaultModel.onchange = () => vscode.postMessage({ type: 'setDefaultModel', model: selDefaultModel.value });
-
-      // Render backend-specific settings from descriptor
-      renderBackendSettings(data.backendSettings);
     }
 
     // =========================================================================
     // Dynamic backend settings rendering
     // =========================================================================
 
-    function renderBackendSettings(descriptor) {
+    function renderBackendSettings(descriptor, data) {
       const container = document.getElementById('backend-settings-container');
       container.innerHTML = '';
 
@@ -638,19 +914,17 @@ export class SettingsPanel {
         return;
       }
 
-      // Create subtabs if multiple tabs
-      if (descriptor.tabs.length > 1) {
-        const subtabs = document.createElement('div');
-        subtabs.className = 'subtabs';
-        descriptor.tabs.forEach((tab, i) => {
-          const subtab = document.createElement('div');
-          subtab.className = 'subtab' + (i === 0 ? ' active' : '');
-          subtab.dataset.subtab = tab.id;
-          subtab.textContent = tab.title;
-          subtabs.appendChild(subtab);
-        });
-        container.appendChild(subtabs);
-      }
+      // Build subtabs: always show Setting | Provider
+      const subtabs = document.createElement('div');
+      subtabs.className = 'subtabs';
+      descriptor.tabs.forEach((tab, i) => {
+        const subtab = document.createElement('div');
+        subtab.className = 'subtab' + (i === 0 ? ' active' : '');
+        subtab.dataset.subtab = tab.id;
+        subtab.textContent = tab.title;
+        subtabs.appendChild(subtab);
+      });
+      container.appendChild(subtabs);
 
       // Create tab content sections
       descriptor.tabs.forEach((tab, tabIndex) => {
@@ -658,18 +932,20 @@ export class SettingsPanel {
         section.id = 'bs-tab-' + tab.id;
         section.className = 'subtab-content' + (tabIndex > 0 ? ' hidden' : '');
 
-        // Special rendering for Provider tab
         if (tab.id === 'provider') {
           renderProviderContent(section);
         } else {
+          // ── Setting tab: Default FIRST, then backend groups ──
+          renderDefaultBlock(section, data);
+
           tab.groups.forEach(group => {
             const groupEl = renderGroup(group, descriptor.values);
             section.appendChild(groupEl);
           });
 
-          // Save button per tab
+          // Save button
           const saveRow = document.createElement('div');
-          saveRow.style.marginTop = '12px';
+          saveRow.className = 'section-actions';
           const saveBtn = document.createElement('button');
           saveBtn.textContent = 'Save Configuration';
           saveBtn.addEventListener('click', () => {
@@ -684,24 +960,94 @@ export class SettingsPanel {
       });
     }
 
+    // Render the Default block (Default Agent / Default Model) as a collapsible
+    // section — same pattern as the "Override" group so both are peer-level
+    // L1 headers with indented content underneath.
+    function renderDefaultBlock(section, data) {
+      const details = document.createElement('details');
+      details.open = true;
+      const summary = document.createElement('summary');
+      summary.textContent = 'Default';
+      details.appendChild(summary);
+
+      const wrapper = document.createElement('div');
+      wrapper.className = 'details-content';
+
+      // Default Agent
+      const agentRow = document.createElement('div');
+      agentRow.className = 'setting-item';
+      const agentText = document.createElement('div');
+      agentText.className = 'setting-text';
+      agentText.innerHTML = '<div class="setting-label">Default Agent</div><div class="setting-desc">Agent used when starting new sessions</div>';
+      agentRow.appendChild(agentText);
+      const agentCtrl = document.createElement('div');
+      agentCtrl.className = 'setting-control';
+      const selDefaultAgent = document.createElement('select');
+      selDefaultAgent.id = 'sel-default-agent';
+      const noneOptA = document.createElement('option');
+      noneOptA.value = ''; noneOptA.textContent = '(none)';
+      selDefaultAgent.appendChild(noneOptA);
+      (data.agents || []).filter(a => !a.hidden && a.mode !== 'subagent').forEach(a => {
+        const opt = document.createElement('option');
+        opt.value = a.id;
+        opt.textContent = a.name || a.id;
+        if (a.id === data.defaultAgent) opt.selected = true;
+        selDefaultAgent.appendChild(opt);
+      });
+      selDefaultAgent.onchange = () => vscode.postMessage({ type: 'setDefaultAgent', agent: selDefaultAgent.value });
+      agentCtrl.appendChild(selDefaultAgent);
+      agentRow.appendChild(agentCtrl);
+      wrapper.appendChild(agentRow);
+
+      // Default Model
+      const modelRow = document.createElement('div');
+      modelRow.className = 'setting-item';
+      const modelText = document.createElement('div');
+      modelText.className = 'setting-text';
+      modelText.innerHTML = '<div class="setting-label">Default Model</div><div class="setting-desc">Model used when no model is specified per-agent</div>';
+      modelRow.appendChild(modelText);
+      const modelCtrl = document.createElement('div');
+      modelCtrl.className = 'setting-control';
+      const selDefaultModel = document.createElement('select');
+      selDefaultModel.id = 'sel-default-model';
+      const noneOptM = document.createElement('option');
+      noneOptM.value = ''; noneOptM.textContent = '(none)';
+      selDefaultModel.appendChild(noneOptM);
+      (data.models || []).forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = (m.name || m.id) + (m.provider ? ' (' + m.provider + ')' : '');
+        if (m.id === data.defaultModel) opt.selected = true;
+        selDefaultModel.appendChild(opt);
+      });
+      selDefaultModel.onchange = () => vscode.postMessage({ type: 'setDefaultModel', model: selDefaultModel.value });
+      modelCtrl.appendChild(selDefaultModel);
+      modelRow.appendChild(modelCtrl);
+      wrapper.appendChild(modelRow);
+
+      details.appendChild(wrapper);
+      section.appendChild(details);
+    }
+
     function renderProviderContent(section) {
-      // Section header with title and + button
-      const header = document.createElement('div');
-      header.className = 'section-header';
-      const title = document.createElement('h2');
-      title.textContent = 'Provider';
-      header.appendChild(title);
+      const title = document.createElement('div');
+      title.className = 'group-title';
+      title.style.display = 'flex';
+      title.style.alignItems = 'center';
+      title.style.justifyContent = 'space-between';
+      const titleText = document.createElement('span');
+      titleText.textContent = 'Provider';
+      title.appendChild(titleText);
 
       const addBtn = document.createElement('button');
       addBtn.className = 'provider-add-btn';
       addBtn.textContent = '+';
       addBtn.title = 'Add provider';
       addBtn.addEventListener('click', openAddProviderModal);
-      header.appendChild(addBtn);
+      title.appendChild(addBtn);
 
-      section.appendChild(header);
+      section.appendChild(title);
 
-      // Provider list container
       const list = document.createElement('div');
       list.className = 'provider-list';
       list.id = 'provider-list';
@@ -732,12 +1078,11 @@ export class SettingsPanel {
           '</div>' +
           '<div class="provider-item-actions">' +
             '<button class="button-secondary provider-edit-btn" data-configkey="' + escapeHtml(p.configKey) + '" data-id="' + escapeHtml(p.id) + '">Edit</button>' +
-            '<button class="button-secondary provider-disconnect-btn" data-configkey="' + escapeHtml(p.configKey) + '" data-id="' + escapeHtml(p.id) + '" style="color: #f44; border-color: #f44;">Disconnect</button>' +
+            '<button class="button-secondary provider-disconnect-btn" data-configkey="' + escapeHtml(p.configKey) + '" data-id="' + escapeHtml(p.id) + '" style="color:#f48771; border-color:#f48771;">Disconnect</button>' +
           '</div>';
         list.appendChild(card);
       });
 
-      // Attach event handlers
       list.querySelectorAll('.provider-edit-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
           e.stopPropagation();
@@ -765,7 +1110,6 @@ export class SettingsPanel {
       const grid = document.getElementById('add-provider-grid');
       grid.innerHTML = '';
 
-      // Filter out already-connected providers (by id)
       const connectedIds = new Set((currentData.connectedProviders || []).map(p => p.id));
       const available = currentData.availableProviders.filter(p => !connectedIds.has(p.id));
       if (available.length === 0) {
@@ -783,14 +1127,11 @@ export class SettingsPanel {
         });
       }
 
-      // Reset form
       document.getElementById('add-provider-form-section').classList.add('hidden');
       selectedAddProviderId = null;
       document.getElementById('add-provider-apikey').value = '';
       document.getElementById('add-provider-baseurl').value = '';
       document.getElementById('add-provider-baseurl-field').classList.add('hidden');
-
-      // Remove any previous selection
       grid.querySelectorAll('.provider-option.selected').forEach(el => el.classList.remove('selected'));
 
       document.getElementById('add-provider-modal').classList.remove('hidden');
@@ -804,11 +1145,9 @@ export class SettingsPanel {
 
       selectedAddProviderId = providerId;
 
-      // Show form
       const form = document.getElementById('add-provider-form-section');
       form.classList.remove('hidden');
 
-      // Show/hide base URL field based on provider type
       const available = (currentData?.availableProviders || []);
       const provider = available.find(p => p.id === providerId);
       const baseURLField = document.getElementById('add-provider-baseurl-field');
@@ -844,7 +1183,6 @@ export class SettingsPanel {
       document.getElementById('edit-provider-apikey').value = '';
       document.getElementById('edit-provider-baseurl').value = '';
 
-      // Show/hide base URL field
       const baseURLField = document.getElementById('edit-provider-baseurl-field');
       if (provider.hasBaseURL || provider.baseURL) {
         baseURLField.classList.remove('hidden');
@@ -880,40 +1218,26 @@ export class SettingsPanel {
     }
 
     // ── Modal event bindings ────────────────────────────────────────────
-
-    // Close add-provider modal (click backdrop)
     document.getElementById('add-provider-modal').addEventListener('click', (event) => {
       if (event.target.id === 'add-provider-modal') {
         document.getElementById('add-provider-modal').classList.add('hidden');
       }
     });
-
-    // Add: connect button
     document.getElementById('btn-add-provider-connect').addEventListener('click', submitConnectProvider);
-
-    // Add: cancel button
     document.getElementById('btn-add-provider-cancel').addEventListener('click', () => {
       document.getElementById('add-provider-modal').classList.add('hidden');
     });
-
-    // Edit: save button
     document.getElementById('btn-edit-provider-save').addEventListener('click', submitEditProvider);
-
-    // Edit: cancel button
     document.getElementById('btn-edit-provider-cancel').addEventListener('click', () => {
       document.getElementById('edit-provider-modal').classList.add('hidden');
       editingProviderConfigKey = null;
     });
-
-    // Edit: disconnect button
     document.getElementById('btn-edit-provider-disconnect').addEventListener('click', () => {
       if (!editingProviderConfigKey) return;
       disconnectProvider(editingProviderConfigKey);
       document.getElementById('edit-provider-modal').classList.add('hidden');
       editingProviderConfigKey = null;
     });
-
-    // Close edit-provider modal (click backdrop)
     document.getElementById('edit-provider-modal').addEventListener('click', (event) => {
       if (event.target.id === 'edit-provider-modal') {
         document.getElementById('edit-provider-modal').classList.add('hidden');
@@ -928,32 +1252,25 @@ export class SettingsPanel {
 
       if (group.collapsible && group.title) {
         const details = document.createElement('details');
-        details.className = 'card';
         details.open = true;
         const summary = document.createElement('summary');
-        summary.style.cssText = 'cursor:pointer; font-weight:600;';
         summary.textContent = group.title;
         details.appendChild(summary);
 
         const inner = document.createElement('div');
-        inner.style.marginTop = '12px';
+        inner.className = 'details-content';
         group.fields.forEach(field => inner.appendChild(renderField(field, values)));
         details.appendChild(inner);
 
         wrapper.appendChild(details);
       } else if (group.title) {
-        const card = document.createElement('div');
-        card.className = 'card';
-        const title = document.createElement('h3');
+        const title = document.createElement('div');
+        title.className = 'group-title';
         title.textContent = group.title;
-        card.appendChild(title);
-        group.fields.forEach(field => card.appendChild(renderField(field, values)));
-        wrapper.appendChild(card);
+        wrapper.appendChild(title);
+        group.fields.forEach(field => wrapper.appendChild(renderField(field, values)));
       } else {
-        const card = document.createElement('div');
-        card.className = 'card';
-        group.fields.forEach(field => card.appendChild(renderField(field, values)));
-        wrapper.appendChild(card);
+        group.fields.forEach(field => wrapper.appendChild(renderField(field, values)));
       }
 
       return wrapper;
@@ -972,52 +1289,118 @@ export class SettingsPanel {
 
     function renderTextField(field, values) {
       const currentValue = getNestedValue(values, field.key) || '';
-      const el = document.createElement('div');
-      el.className = 'field';
-      el.innerHTML =
-        '<label>' + escapeHtml(field.label) + '</label>' +
-        (field.description ? '<div class="desc">' + escapeHtml(field.description) + '</div>' : '') +
-        '<input type="text" data-bs-path="' + escapeHtml(field.key) + '" value="' + escapeHtml(String(currentValue)) + '"' +
-        (field.placeholder ? ' placeholder="' + escapeHtml(field.placeholder) + '"' : '') + '>';
-      return el;
+      const row = document.createElement('div');
+      row.className = 'setting-item';
+
+      const text = document.createElement('div');
+      text.className = 'setting-text';
+      const label = document.createElement('div');
+      label.className = 'setting-label';
+      label.textContent = field.label;
+      text.appendChild(label);
+      if (field.description) {
+        const desc = document.createElement('div');
+        desc.className = 'setting-desc';
+        desc.textContent = field.description;
+        text.appendChild(desc);
+      }
+      row.appendChild(text);
+
+      const control = document.createElement('div');
+      control.className = 'setting-control';
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.dataset.bsPath = field.key;
+      input.value = String(currentValue);
+      if (field.placeholder) input.placeholder = field.placeholder;
+      control.appendChild(input);
+      row.appendChild(control);
+      return row;
     }
 
     function renderSelectField(field, values) {
       const currentValue = getNestedValue(values, field.key) || '';
-      const el = document.createElement('div');
-      el.className = 'field';
-      const optionsHtml = (field.options || []).map(opt => {
-        const selected = opt.value === currentValue ? ' selected' : '';
-        return '<option value="' + escapeHtml(opt.value) + '"' + selected + '>' + escapeHtml(opt.label) + '</option>';
-      }).join('');
-      el.innerHTML =
-        '<label>' + escapeHtml(field.label) + '</label>' +
-        (field.description ? '<div class="desc">' + escapeHtml(field.description) + '</div>' : '') +
-        '<select data-bs-path="' + escapeHtml(field.key) + '">' + optionsHtml + '</select>';
-      return el;
+      const row = document.createElement('div');
+      row.className = 'setting-item';
+
+      const text = document.createElement('div');
+      text.className = 'setting-text';
+      const label = document.createElement('div');
+      label.className = 'setting-label';
+      label.textContent = field.label;
+      text.appendChild(label);
+      if (field.description) {
+        const desc = document.createElement('div');
+        desc.className = 'setting-desc';
+        desc.textContent = field.description;
+        text.appendChild(desc);
+      }
+      row.appendChild(text);
+
+      const control = document.createElement('div');
+      control.className = 'setting-control';
+      const select = document.createElement('select');
+      select.dataset.bsPath = field.key;
+      (field.options || []).forEach(opt => {
+        const option = document.createElement('option');
+        option.value = opt.value;
+        option.textContent = opt.label;
+        if (opt.value === currentValue) option.selected = true;
+        select.appendChild(option);
+      });
+      control.appendChild(select);
+      row.appendChild(control);
+      return row;
     }
 
     function renderToggleField(field, values) {
       const currentValue = getNestedValue(values, field.key) || false;
-      const el = document.createElement('div');
-      el.className = 'field';
-      el.innerHTML =
-        '<label>' + escapeHtml(field.label) + '</label>' +
-        (field.description ? '<div class="desc">' + escapeHtml(field.description) + '</div>' : '') +
-        '<input type="checkbox" data-bs-path="' + escapeHtml(field.key) + '"' + (currentValue ? ' checked' : '') + '>';
-      return el;
+      const row = document.createElement('div');
+      row.className = 'setting-item is-bool';
+
+      // Title on its own line
+      const label = document.createElement('div');
+      label.className = 'setting-label';
+      label.textContent = field.label;
+      row.appendChild(label);
+
+      // Second line: toggle + description inline
+      const boolRow = document.createElement('div');
+      boolRow.className = 'setting-bool-row';
+
+      const toggle = document.createElement('input');
+      toggle.type = 'checkbox';
+      toggle.className = 'setting-toggle';
+      toggle.dataset.bsPath = field.key;
+      if (currentValue) toggle.checked = true;
+      boolRow.appendChild(toggle);
+
+      if (field.description) {
+        const desc = document.createElement('div');
+        desc.className = 'setting-desc';
+        desc.textContent = field.description;
+        boolRow.appendChild(desc);
+      }
+      row.appendChild(boolRow);
+      return row;
     }
 
     function renderInfoCards(field) {
       const grid = document.createElement('div');
-      grid.className = 'provider-grid';
+      grid.className = 'provider-list';
       (field.items || []).forEach(item => {
         const card = document.createElement('div');
-        card.className = 'provider-card';
-        card.innerHTML = '<h3>' + escapeHtml(item.title) + '</h3>' +
-          (item.details || []).map(d =>
-            '<div class="field"><label>' + escapeHtml(d.label) + '</label><div class="desc">' + escapeHtml(d.value) + '</div></div>'
-          ).join('');
+        card.className = 'provider-item';
+        const title = document.createElement('div');
+        title.className = 'provider-item-name';
+        title.textContent = item.title;
+        card.appendChild(title);
+        (item.details || []).forEach(d => {
+          const row = document.createElement('div');
+          row.className = 'setting-desc';
+          row.innerHTML = '<strong>' + escapeHtml(d.label) + ':</strong> ' + escapeHtml(d.value);
+          card.appendChild(row);
+        });
         grid.appendChild(card);
       });
       if ((field.items || []).length === 0) {
@@ -1028,54 +1411,91 @@ export class SettingsPanel {
 
     function renderMapField(field, values) {
       const container = document.createElement('div');
-      if (field.label) {
-        const title = document.createElement('h3');
-        title.textContent = field.label;
-        container.appendChild(title);
-      }
+      // The map field's label/description is a SUBTITLE under the collapsible
+      // group header — rendered smaller so it doesn't compete with the parent.
       if (field.description) {
         const desc = document.createElement('div');
-        desc.className = 'desc';
+        desc.className = 'map-subtitle';
         desc.textContent = field.description;
-        desc.style.marginBottom = '10px';
+        container.appendChild(desc);
+      } else if (field.label) {
+        const desc = document.createElement('div');
+        desc.className = 'map-subtitle';
+        desc.textContent = field.label;
         container.appendChild(desc);
       }
       (field.items || []).forEach(item => {
-        const card = document.createElement('div');
-        card.className = 'card';
-        const itemTitle = document.createElement('h3');
+        const itemTitle = document.createElement('div');
+        itemTitle.className = 'map-item-title';
         itemTitle.textContent = item.label;
-        card.appendChild(itemTitle);
+        container.appendChild(itemTitle);
+
+        if (item.description) {
+          const itemDesc = document.createElement('div');
+          itemDesc.className = 'setting-desc';
+          itemDesc.style.margin = '0 0 6px';
+          itemDesc.textContent = item.description;
+          container.appendChild(itemDesc);
+        }
 
         field.fields.forEach(subField => {
           const path = field.key + '.' + item.id + '.' + subField.key;
           const subValues = getNestedValue(values, field.key + '.' + item.id) || {};
           const el = createSubFieldElement(subField, path, subValues);
-          card.appendChild(el);
+          container.appendChild(el);
         });
-
-        container.appendChild(card);
       });
       return container;
     }
 
     function createSubFieldElement(field, path, values) {
-      const wrapper = document.createElement('div');
-      wrapper.className = 'field';
-
-      const label = document.createElement('label');
-      label.textContent = field.label;
-      wrapper.appendChild(label);
-
-      if (field.description) {
-        const desc = document.createElement('div');
-        desc.className = 'desc';
-        desc.textContent = field.description;
-        wrapper.appendChild(desc);
-      }
-
       const currentValue = values[field.key] || '';
 
+      // Bool/toggle: label on top, then [toggle] + desc inline
+      if (field.type === 'toggle') {
+        const row = document.createElement('div');
+        row.className = 'setting-item is-bool';
+
+        const label = document.createElement('div');
+        label.className = 'setting-label';
+        label.textContent = field.label;
+        row.appendChild(label);
+
+        const boolRow = document.createElement('div');
+        boolRow.className = 'setting-bool-row';
+        const toggle = document.createElement('input');
+        toggle.type = 'checkbox';
+        toggle.className = 'setting-toggle';
+        toggle.dataset.bsPath = path;
+        if (currentValue) toggle.checked = true;
+        boolRow.appendChild(toggle);
+        if (field.description) {
+          const desc = document.createElement('div');
+          desc.className = 'setting-desc';
+          desc.textContent = field.description;
+          boolRow.appendChild(desc);
+        }
+        row.appendChild(boolRow);
+        return row;
+      }
+
+      // text/select: label / desc / control stacked
+      const row = document.createElement('div');
+      row.className = 'setting-item';
+
+      const label = document.createElement('div');
+      label.className = 'setting-label';
+      label.textContent = field.label;
+      row.appendChild(label);
+      if (field.description) {
+        const desc = document.createElement('div');
+        desc.className = 'setting-desc';
+        desc.textContent = field.description;
+        row.appendChild(desc);
+      }
+
+      const control = document.createElement('div');
+      control.className = 'setting-control';
       if (field.type === 'select') {
         const select = document.createElement('select');
         select.dataset.bsPath = path;
@@ -1086,23 +1506,17 @@ export class SettingsPanel {
           if (opt.value === currentValue) option.selected = true;
           select.appendChild(option);
         });
-        wrapper.appendChild(select);
-      } else if (field.type === 'text') {
+        control.appendChild(select);
+      } else {
         const input = document.createElement('input');
         input.type = 'text';
         input.dataset.bsPath = path;
         input.value = currentValue;
         if (field.placeholder) input.placeholder = field.placeholder;
-        wrapper.appendChild(input);
-      } else if (field.type === 'toggle') {
-        const input = document.createElement('input');
-        input.type = 'checkbox';
-        input.dataset.bsPath = path;
-        if (currentValue) input.checked = true;
-        wrapper.appendChild(input);
+        control.appendChild(input);
       }
-
-      return wrapper;
+      row.appendChild(control);
+      return row;
     }
 
     // -- Value collection -----------------------------------------------

@@ -7,7 +7,7 @@ import { createSessionContentProvider, OPENCODE_SESSION_SCHEME } from './surface
 import { hasRegisterChatSessionContentProvider } from './surfaces/vscode/capabilities';
 import { registerLanguageModelChatProvider } from './surfaces/vscode/language-model-provider';
 import { StatusBarManager } from './statusbar';
-import { SettingsPanel, type SettingsMessage, type SettingsData } from './settings/panel';
+import { SettingsPanel, type SettingsMessage, type SettingsData, type GlobalSettingItem } from './settings/panel';
 import { loadPersistedSettingsState, savePersistedSettingsState } from './settings/state-persistence';
 import { AppEventBus } from './acp/app-event-bus';
 import { SelectionStore } from './acp/selection-store';
@@ -33,6 +33,63 @@ const KNOWN_PROVIDERS = [
   { id: 'ollama', name: 'Ollama', description: 'Local models', requiresBaseURL: true, isOpenAICompatible: false, icon: '\ud83e\udd99' },
   { id: 'openrouter', name: 'OpenRouter', description: 'Multi-model gateway', requiresBaseURL: false, isOpenAICompatible: false, icon: '\ud83c\udf10' },
   { id: 'openai-compatible', name: 'OpenAI Compatible', description: 'Any OpenAI-compatible endpoint', requiresBaseURL: true, isOpenAICompatible: true, icon: '\ud83d\udd0c' },
+];
+
+/**
+ * Descriptor for extension-level global settings (opencode.experimental.*).
+ * Mirrors the `contributes.configuration` entries in package.json so the
+ * panel can edit them alongside the native VS Code Settings UI.
+ */
+interface GlobalSettingDescriptor {
+  key: string;
+  label: string;
+  description: string;
+  type: 'toggle' | 'select';
+  default: boolean | string;
+  options?: Array<{ value: string; label: string }>;
+}
+
+const GLOBAL_SETTINGS_DESCRIPTOR: GlobalSettingDescriptor[] = [
+  {
+    key: 'sessionProvider',
+    label: 'Session Provider (Experimental)',
+    description: 'Enable the experimental ACP-compatible VS Code chat session provider surface when the runtime exposes the required proposed API.',
+    type: 'toggle',
+    default: false,
+  },
+  {
+    key: 'acpBackendModelSupport',
+    label: 'ACP Backend Model Support',
+    description: 'When enabled, ACP backend models (e.g. OpenCode Zen/Go) are registered with sessionOnly=false so they appear in all Copilot session targets. Non-specific models get sessionOnly=true (opencode target only). When disabled, all models get sessionOnly=true.',
+    type: 'toggle',
+    default: true,
+  },
+  {
+    key: 'acpModelBridge',
+    label: 'ACP Model Bridge (Experimental)',
+    description: '[Experimental] Enable ACP Model Bridge — bridges ACP backend models into Copilot\'s native model picker with full vendor isolation. (Not yet implemented)',
+    type: 'toggle',
+    default: false,
+  },
+  {
+    key: 'checkpointReplay',
+    label: 'Checkpoint Replay',
+    description: 'Replay restored session file checkpoints through VS Code chat external edits when available, preserving ordinary workspace edits on conflicts.',
+    type: 'toggle',
+    default: true,
+  },
+  {
+    key: 'streamSchedulingMode',
+    label: 'Stream Scheduling Mode',
+    description: 'Controls how ACP stream parts are scheduled before rendering to VS Code chat.',
+    type: 'select',
+    default: 'tool-first',
+    options: [
+      { value: 'immediate', label: 'Immediate — render stream parts as they arrive' },
+      { value: 'continuous', label: 'Continuous — keep root reasoning/markdown/tools continuous' },
+      { value: 'tool-first', label: 'Tool-first — render tools immediately, buffer reasoning' },
+    ],
+  },
 ];
 
 function getWorkspaceDirectory(): string | undefined {
@@ -193,6 +250,13 @@ export function activate(context: vscode.ExtensionContext) {
               await pushDataToPanel(state, panel);
               break;
             }
+            case 'setGlobalSetting': {
+              await vscode.workspace
+                .getConfiguration('opencode')
+                .update(`experimental.${message.key}`, message.value, vscode.ConfigurationTarget.Global);
+              await pushDataToPanel(state, panel);
+              break;
+            }
             case 'connectProvider': {
               const known = KNOWN_PROVIDERS.find(p => p.id === message.providerId);
               const apiType = message.providerId === 'openai-compatible' ? 'openai' : message.providerId;
@@ -345,6 +409,22 @@ function computeConnectedProviders(
   return result;
 }
 
+/** Read extension-level global settings (opencode.experimental.*) for the panel. */
+function readGlobalSettings(): GlobalSettingItem[] {
+  const cfg = vscode.workspace.getConfiguration('opencode');
+  return GLOBAL_SETTINGS_DESCRIPTOR.map(d => {
+    const raw = cfg.get<boolean | string>(`experimental.${d.key}`, d.default);
+    return {
+      key: d.key,
+      label: d.label,
+      description: d.description,
+      type: d.type,
+      value: raw,
+      options: d.options,
+    } satisfies GlobalSettingItem;
+  });
+}
+
 /** Push current backend data into the settings webview panel */
 async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise<void> {
   try {
@@ -395,6 +475,7 @@ async function pushDataToPanel(s: ExtensionState, panel: SettingsPanel): Promise
       backendSettings,
       connectedProviders: computeConnectedProviders(config, models),
       availableProviders: KNOWN_PROVIDERS,
+      globalSettings: readGlobalSettings(),
     };
 
     s.outputChannel.appendLine(`[settings] pushDataToPanel: currentModel=${JSON.stringify(data.currentModel)}, configModel=${config.model}, currentAgent=${data.currentAgent}`);
